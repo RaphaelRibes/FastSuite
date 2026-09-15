@@ -1,0 +1,32 @@
+# build artifacts
+target/
+**/target/
+
+# pixi / environments
+.pixi/
+**/.pixi/
+pixi.lock.orig
+
+# run outputs and generated data
+examples/runs/
+runs/
+data/
+**/tmp_*/
+*.part
+
+# report artifacts
+report.json
+report.tsv
+report.md
+report.html
+manifest.json
+heatmap.data
+heatmap.preview
+heatmap.png
+heatmap.svg
+heatmap_3d.html
+
+# misc
+*.bak
+*.orig
+.DS_Store

@@ -1,0 +1,14 @@
+# Profiling artifacts
+perf.data
+perf.data.old
+flamegraph.svg
+fastp.html
+fastp.json
+out/
+*.tar.xz
+
+# Build + benchmark data (large, never committed)
+/target/
+/data/
+*.fastq
+*.fastq.gz

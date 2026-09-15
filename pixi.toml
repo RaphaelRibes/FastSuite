@@ -1,0 +1,25 @@
+[workspace]
+name = "fastsuite"
+version = "0.1.0"
+description = "FastSuite — Rust QC and preprocessing tools sharing one CLI, one report schema and one runner"
+authors = ["RaphaelRibes <raphael.ribes@gmail.com>"]
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64"]
+
+[dependencies]
+rust = ">=1.85,<1.96"
+pkg-config = "*"
+c-compiler = "*"
+cmake = "*"       # flate2's zlib-ng builds from source
+zlib = "*"
+zstd = "*"
+
+[tasks]
+# Build every tool in dependency order (fasthelper last).
+build = { cmd = "for t in fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release); done", depends-on = [] }
+build-offline = "for t in fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release --offline); done"
+test = "for t in fastprep fastdedup fastsim fastmaps fasthelper; do (cd tools/$t && cargo test --offline); done"
+doctor = "./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools"
+demo = "bash examples/demo.sh"
+report = "./tools/fasthelper/target/release/fasthelper report examples/runs/demo -o examples/runs/demo --format html,tsv"
+schema = "./tools/fasthelper/target/release/fasthelper schema"

@@ -1,0 +1,41 @@
+[workspace]
+authors = ["RaphaelRibes <raphael.ribes@gmail.com>"]
+channels = ["conda-forge", "bioconda"]
+name = "fastsim"
+platforms = ["linux-64"]
+version = "0.1.0"
+description = "FastSim — NovaSeq-like paired-end read simulator with full ground truth (polyG artefact profiles, adapters, quality models)"
+
+# ---------------------------------------------------------------------------
+# build: the Rust toolchain.
+# ---------------------------------------------------------------------------
+[feature.build.dependencies]
+rust = "~=1.83"
+pkg-config = "*"
+cmake = "*"          # flate2's zlib-ng builds from source
+c-compiler = "*"
+zlib = "*"
+zstd = "*"
+
+[feature.build.tasks]
+build = "cargo build --release"
+check = "cargo check"
+test = "cargo test"
+
+# ---------------------------------------------------------------------------
+# analysis: Python for profile building + validation plots.
+# ---------------------------------------------------------------------------
+[feature.analysis.dependencies]
+python = ">=3.11,<3.12"
+numpy = "*"
+matplotlib-base = "*"
+pandas = "*"
+
+[feature.analysis.tasks]
+build-profile = "python scripts/build_profile.py"
+validate = "python scripts/validate_sim.py"
+plot-heads-tails = "bash scripts/run_plot_heads_tails.sh"
+
+[environments]
+build = { features = ["build"], no-default-feature = true }
+analysis = { features = ["analysis"], no-default-feature = true }

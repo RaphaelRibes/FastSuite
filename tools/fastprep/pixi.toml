@@ -1,0 +1,20 @@
+[workspace]
+authors = ["RaphaelRibes <raphael.ribes@gmail.com>"]
+channels = ["conda-forge", "bioconda"]
+name = "fastprep"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+typst = ">=0.14.2,<0.15"
+python = ">=3.14.4,<3.15"
+fastqc = ">=0.12.1,<0.13"
+multiqc = ">=1.35,<2"
+
+[feature.cutadapt.dependencies]
+cutadapt = "*"
+
+[environments]
+cutadapt = { features = ["cutadapt"], no-default-feature = true }

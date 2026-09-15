@@ -1,0 +1,238 @@
+//! fastsim binary: simulate NovaSeq-like paired-end reads with ground
+//! truth, driven by a measured profile.
+//!
+//! Writes:
+//! - `PREFIX_R1.fastq[.gz]`
+//! - `PREFIX_R2.fastq[.gz]`
+//! - `PREFIX.gt.tsv` (ground truth: insert, h/t per mate, full flag)
+
+mod cli;
+
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+
+use fastsim::artefact::{build_read, decide};
+use fastsim::biology::{insert_from_reference, random_dna, read_fasta, sample_insert_len, History};
+use fastsim::fastq::FastqWriter;
+use fastsim::profile::{AdapterMode, Mate, Profile};
+use fastsim::quality::qualify;
+use fastsim::truth::GtWriter;
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cfg = cli::parse(&args)?;
+    run(&cfg)
+}
+
+fn run(cfg: &cli::Config) -> Result<()> {
+    let t0 = std::time::Instant::now();
+    // Load profile and apply CLI overrides.
+    let mut profile = Profile::from_json(Path::new(&cfg.profile))?;
+    if let Some(seq) = &cfg.adapter_seq {
+        if seq.is_empty() {
+            profile.adapter.mode = AdapterMode::None;
+        } else {
+            profile.adapter.seq = seq.as_bytes().to_vec();
+            profile.adapter.mode = AdapterMode::Readthrough;
+        }
+    }
+    if cfg.read_len != profile.read_len {
+        bail!(
+            "--read-len {} does not match profile read_len {}",
+            cfg.read_len,
+            profile.read_len
+        );
+    }
+
+    // Reference contigs (optional).
+    let contigs = match &cfg.reference {
+        Some(p) => Some(read_fasta(Path::new(p))?),
+        None => None,
+    };
+
+    // Open outputs.
+    let (r1_path, r2_path) = if cfg.gzip {
+        (
+            format!("{}_R1.fastq.gz", cfg.out),
+            format!("{}_R2.fastq.gz", cfg.out),
+        )
+    } else {
+        (
+            format!("{}_R1.fastq", cfg.out),
+            format!("{}_R2.fastq", cfg.out),
+        )
+    };
+    let gt_path = format!("{}.gt.tsv", cfg.out);
+
+    let mut w1 = if cfg.gzip {
+        FastqWriter::open_gz(Path::new(&r1_path))?
+    } else {
+        FastqWriter::open_plain(Path::new(&r1_path))?
+    };
+    let mut w2 = if cfg.gzip {
+        FastqWriter::open_gz(Path::new(&r2_path))?
+    } else {
+        FastqWriter::open_plain(Path::new(&r2_path))?
+    };
+    let mut gt = GtWriter::open(Path::new(&gt_path), profile.read_len)?;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
+
+    // Duplicate pool: recently emitted inserts. A duplicate re-sequences a
+    // stored fragment with fresh artefacts/quality (per-cluster dropout).
+    let mut hist = History::new(cfg.dup_pool as usize);
+
+    let mut n_full = 0u64;
+    let mut n_adapter = 0u64;
+    let mut n_dup = 0u64;
+    let mut n_drop = 0u64;
+    for pair_idx in 0..cfg.pairs {
+        // 1. Insert. Two orthogonal forced classes, then the ordinary draw:
+        //   - PCR duplicate: re-sequence a stored fragment (only fresh
+        //     inserts enter the pool, so a copy always has an earlier
+        //     original that was itself sequenced once).
+        //   - must-drop: fragment too short to survive trimming. With
+        //     insert < drop_min_len the GT keep window [h, min(I, L-t)) is
+        //     below min_length on BOTH mates, so a correct trimmer drops
+        //     the pair. The read is still read_len bases (adapter
+        //     readthrough fills the rest) — we are simulating sequencer
+        //     output, not the fragment.
+        let is_dup = cfg.dup_rate > 0.0 && rng.gen::<f64>() < cfg.dup_rate;
+        let is_drop = !is_dup && cfg.drop_rate > 0.0 && rng.gen::<f64>() < cfg.drop_rate;
+        let (insert, insert_len): (Vec<u8>, u32) = if is_dup {
+            match hist.sample(&mut rng) {
+                Some(ins) => (ins.to_vec(), ins.len() as u32),
+                None => {
+                    // Pool not primed yet (first pairs): emit fresh instead.
+                    let l = sample_insert_len(
+                        cfg.insert_mean,
+                        cfg.insert_sd,
+                        cfg.insert_min,
+                        &mut rng,
+                    );
+                    let i = match &contigs {
+                        Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
+                        None => random_dna(l as usize, cfg.gc, &mut rng),
+                    };
+                    (i, l)
+                }
+            }
+        } else if is_drop {
+            // Forced short fragment: I ~ U[1, drop_min_len). Short enough
+            // that even with zero artefacts the kept window is < min_len.
+            let l = rng.gen_range(1..=cfg.drop_min_len.saturating_sub(1).max(1));
+            let i = match &contigs {
+                Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
+                None => random_dna(l as usize, cfg.gc, &mut rng),
+            };
+            (i, l)
+        } else {
+            let l = sample_insert_len(
+                cfg.insert_mean,
+                cfg.insert_sd,
+                cfg.insert_min,
+                &mut rng,
+            );
+            let i = match &contigs {
+                Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
+                None => random_dna(l as usize, cfg.gc, &mut rng),
+            };
+            hist.push(i.clone());
+            (i, l)
+        };
+        if is_dup {
+            n_dup += 1;
+        }
+        if is_drop {
+            n_drop += 1;
+        }
+
+        // 2. Artefact decision (correlated tails, heads, full spike).
+        // Drawn fresh even for duplicates: dropout is a per-cluster failure,
+        // so a copy gets its own polyG runs, exactly like the measured data.
+        let a = decide(&profile, &mut rng);
+        if a.full {
+            n_full += 1;
+        }
+
+        // 3. Build reads.
+        let r1 = build_read(&profile, &insert, insert_len, Mate::R1, &a, &mut rng);
+        let r2 = build_read(&profile, &insert, insert_len, Mate::R2, &a, &mut rng);
+        // Sequencer output is always exactly read_len bases — every branch
+        // of build_read pads to L (adapter readthrough or Ns). This is the
+        // contract the bench relies on, so assert it per pair.
+        debug_assert_eq!(r1.seq.len() as u32, profile.read_len, "R1 length");
+        debug_assert_eq!(r2.seq.len() as u32, profile.read_len, "R2 length");
+        if r1.adapter_len > 0 {
+            n_adapter += 1;
+        }
+
+        // 4. Quality + errors.
+        let m1 = qualify(&profile, Mate::R1, &r1, &mut rng);
+        let m2 = qualify(&profile, Mate::R2, &r2, &mut rng);
+
+        // 5. Write.
+        w1.write_record(&w1.header(pair_idx, 1), &m1)?;
+        w2.write_record(&w2.header(pair_idx, 2), &m2)?;
+        gt.write_pair(pair_idx, insert_len, &a, is_dup)?;
+    }
+
+    w1.finish().context("finish R1")?;
+    w2.finish().context("finish R2")?;
+    gt.finish().context("finish GT")?;
+
+    eprintln!(
+        "fastsim: {} pairs, read_len {}, full-artefact {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%)",
+        cfg.pairs,
+        profile.read_len,
+        n_full,
+        n_full as f64 / cfg.pairs as f64 * 100.0,
+        n_adapter,
+        n_adapter as f64 / cfg.pairs as f64 * 100.0,
+        n_dup,
+        n_dup as f64 / cfg.pairs as f64 * 100.0,
+        n_drop,
+        n_drop as f64 / cfg.pairs as f64 * 100.0,
+    );
+
+    // FastSuite report (schema v1) so the synthetic control is aggregatable
+    // alongside the real samples.
+    if let Some(path) = &cfg.json {
+        let report = serde_json::json!({
+            "schema": "fastsuite.report.v1",
+            "tool": "fastsim",
+            "tool_version": env!("CARGO_PKG_VERSION"),
+            "command": std::env::args().collect::<Vec<_>>().join(" "),
+            "mode": "paired",
+            "dry_run": false,
+            "inputs": { "profile": cfg.profile },
+            "outputs": {
+                "r1": format!("{}_R1.fastq{}", cfg.out, if cfg.gzip { ".gz" } else { "" }),
+                "r2": format!("{}_R2.fastq{}", cfg.out, if cfg.gzip { ".gz" } else { "" }),
+                "gt": format!("{}.gt.tsv", cfg.out),
+            },
+            "elapsed_s": t0.elapsed().as_secs_f64(),
+            "metrics": {
+                "reads_in": 2 * cfg.pairs,
+                "pairs_simulated": cfg.pairs,
+                "read_len": profile.read_len,
+                "seed": cfg.seed,
+                "full_artefact_pairs": n_full,
+                "adapter_readthrough_pairs": n_adapter,
+                "duplicate_pairs": n_dup,
+                "must_drop_pairs": n_drop,
+                "full_artefact_rate": n_full as f64 / cfg.pairs as f64,
+                "adapter_readthrough_rate": n_adapter as f64 / cfg.pairs as f64,
+                "duplicate_rate_observed": n_dup as f64 / cfg.pairs as f64,
+                "must_drop_rate": n_drop as f64 / cfg.pairs as f64
+            }
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&report)? + "\n")
+            .with_context(|| format!("writing JSON report to {path}"))?;
+    }
+    Ok(())
+}

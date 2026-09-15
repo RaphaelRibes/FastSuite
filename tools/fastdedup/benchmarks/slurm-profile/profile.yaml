@@ -1,0 +1,11 @@
+executor: slurm
+
+# Max concurrent SLURM jobs to submit. Snakemake will queue up to this many
+# jobs; SLURM decides how many run concurrently based on your 64-core budget.
+jobs: 100
+
+# Default resources for rules without their own specification.
+# run_benchmark overrides: mem_mb=16384, runtime per dataset, threads per wildcard.
+default-resources:
+  mem_mb: 16384
+  runtime: 60

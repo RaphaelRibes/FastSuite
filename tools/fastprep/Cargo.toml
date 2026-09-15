@@ -1,0 +1,42 @@
+[package]
+name = "fastprep"
+version = "0.1.0"
+edition = "2021"
+description = "Asymmetric quality-weighted polyX trimming for FASTQ/FASTA reads"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
+gzp = "2"
+libc = "0.2"
+memchr = "2"
+mimalloc = { version = "0.1", default-features = false }
+needletail = "0.7.3"
+rayon = "1"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+# CPU target lives in .cargo/config.toml ([build] rustflags): without
+# -C target-cpu=native the binary is baseline x86-64 (SSE2 only) and the
+# byte-compare hot loops cannot vectorise (measured ~12% slower Aug 2026).
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
+[[bin]]
+name = "fastprep"
+path = "src/main.rs"
+
+[[bin]]
+name = "fastprep-meta"
+path = "src/bin/pxmt.rs"

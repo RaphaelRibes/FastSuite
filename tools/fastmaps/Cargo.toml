@@ -1,0 +1,16 @@
+[package]
+name = "fastmaps"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fastmaps"
+path = "src/main.rs"
+
+[dependencies]
+png    = "0.18.1"
+flate2 = "1.0"
+clap   = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,156 @@
+"""
+FastDedup Snakemake Benchmark Pipeline
+=======================================
+
+Matrix: 3 datasets × 3 I/O modes × 6 threads × 2 modes × 3 variants = 324 runs.
+
+Usage (local):
+    pixi run snakemake --cores 4
+
+Usage (SLURM):
+    sbatch slurm.sh
+    # or manually:
+    pixi run snakemake --profile slurm-profile --jobs 64
+"""
+
+import os
+
+ROOT = workflow.basedir
+FDEDUP = os.path.join(ROOT, "..", "target", "release", "fdedup")
+DATA_DIR = os.path.join(ROOT, "data")
+RESULTS_DIR = os.path.join(ROOT, "results")
+SCRIPTS_DIR = os.path.join(ROOT, "scripts")
+AGGREGATED = os.path.join(ROOT, "benchmark.tsv")
+
+# Wildcard values — match generate_reads.py filename convention
+DATASETS = ["100000", "1000000", "10000000"]           # filenames
+DATASET_LABEL = {"100000": "100K", "1000000": "1M", "10000000": "10M"}
+IO_MODES = ["u2u", "c2u", "c2c"]
+THREADS = ["1", "2", "3", "4", "5", "6"]
+MODES = ["SE", "PE"]
+VARIANTS = ["normal", "abundance", "abundance_tempdir"]
+
+
+def data_path(dataset, read_num, compressed=False):
+    suffix = ".gz" if compressed else ""
+    return os.path.join(DATA_DIR, f"{dataset}_{read_num}.fastq{suffix}")
+
+
+def result_txt(dataset, io, threads, mode, variant):
+    return os.path.join(RESULTS_DIR, dataset, io, f"{threads}t", mode,
+                        f"{variant}.txt")
+
+
+# ─── Generate data ─────────────────────────────────────────────────────
+rule generate_data:
+    message: "Generate all synthetic FASTQ datasets"
+    output:
+        touch(os.path.join(DATA_DIR, ".generated")),
+    resources:
+        # Runs locally on login node — minimal resources
+        mem_mb=2048,
+        threads=1,
+    run:
+        import glob
+        existing = glob.glob(os.path.join(DATA_DIR, "*.fastq"))
+        if existing:
+            print(f"Skipping generation — {len(existing)} FASTQ files already exist in {DATA_DIR}")
+        else:
+            sizes = " ".join(DATASETS)
+            shell(f"cd {ROOT} && python3 scripts/generate_reads.py {sizes} --output-dir {DATA_DIR}")
+
+
+# ─── Single benchmark run ──────────────────────────────────────────────
+rule run_benchmark:
+    message:
+        "fdedup {wildcards.dataset} {wildcards.io_mode} "
+        "{wildcards.threads}t {wildcards.mode} {wildcards.variant}"
+    threads: lambda wildcards: int(wildcards.threads)
+    resources:
+        mem_mb=16384,
+        runtime=lambda wildcards: {
+            "100000": 5,
+            "1000000": 15,
+            "10000000": 30,
+        }.get(wildcards.dataset, 30),
+    input:
+        r1_input = lambda wc: data_path(
+            wc.dataset, "R1", compressed=(wc.io_mode != "u2u")
+        ),
+    output:
+        txt = temp(result_txt("{dataset}", "{io_mode}", "{threads}",
+                              "{mode}", "{variant}")),
+    run:
+        dataset_label = DATASET_LABEL[wildcards.dataset]
+
+        r2_input = None
+        r2_out = None
+        if wildcards.mode == "PE":
+            r2_input = data_path(wildcards.dataset, "R2",
+                                 compressed=(wildcards.io_mode != "u2u"))
+            r2_out = os.path.join(
+                RESULTS_DIR, wildcards.dataset, wildcards.io_mode,
+                f"{wildcards.threads}t", wildcards.mode,
+                f"out_{wildcards.variant}_R2.fastq"
+            )
+            if wildcards.io_mode == "c2c":
+                r2_out += ".gz"
+
+        r1_out = os.path.join(
+            RESULTS_DIR, wildcards.dataset, wildcards.io_mode,
+            f"{wildcards.threads}t", wildcards.mode,
+            f"out_{wildcards.variant}_R1.fastq"
+        )
+        if wildcards.io_mode == "c2c":
+            r1_out += ".gz"
+
+        cmd = (
+            f"python3 {SCRIPTS_DIR}/run_benchmark.py "
+            f"--fdedup {FDEDUP} "
+            f"--dataset {dataset_label} "
+            f"--io-mode {wildcards.io_mode} "
+            f"--se-pe {wildcards.mode} "
+            f"--threads {wildcards.threads} "
+            f"--variant {wildcards.variant} "
+            f"--input-r1 {input.r1_input} "
+            f"--output-r1 {r1_out} "
+            f"--output-file {output.txt}"
+        )
+
+        if wildcards.mode == "PE":
+            cmd += f" --input-r2 {r2_input} --output-r2 {r2_out}"
+
+        shell(cmd)
+
+
+# ─── Aggregate all results ─────────────────────────────────────────────
+rule aggregate:
+    message: "Concatenate all per-run .txt files"
+    input:
+        [result_txt(d, io, t, m, v)
+         for d in DATASETS
+         for io in IO_MODES
+         for t in THREADS
+         for m in MODES
+         for v in VARIANTS],
+    output:
+        AGGREGATED,
+    resources:
+        mem_mb=4096,
+        threads=1,
+    run:
+        header = ("dataset\tio\tmode\tthreads\tvariant\t"
+                  "wall_sec\tcpu_user_sec\tcpu_sys_sec\t"
+                  "max_rss_kb\tio_in_blocks\tio_out_blocks\t"
+                  "reads_processed\tduplicates_pct\treturncode")
+        with open(output[0], "w") as out:
+            out.write(header + "\n")
+            for f in input:
+                with open(f) as inp:
+                    out.write(inp.read())
+
+
+# ─── Default target ────────────────────────────────────────────────────
+rule all:
+    input:
+        AGGREGATED,

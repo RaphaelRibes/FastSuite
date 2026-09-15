@@ -1,0 +1,109 @@
+[workspace]
+name = "FastDedup"
+version = "1.3.0"
+description = "A fast and memory-efficient FASTX PCR deduplication tool"
+authors = ["Raphaël Ribes", "Céline Mandier", "Alice Baniel"]
+platforms = ["linux-64", "osx-64", "linux-aarch64", "osx-arm64"]
+channels = ["conda-forge"]
+preview = ["pixi-build"]
+homepage = "https://github.com/RaphaelRibes/FastDedup.git"
+repository = "https://github.com/RaphaelRibes/FastDedup.git"
+
+[package.build.backend]
+name = "pixi-build-rust"
+version = "*"
+channels = ["https://prefix.dev/conda-forge"]
+
+[package.build.config]
+compilers = ["rust", "c", "cxx"]
+env = { RUSTFLAGS = "-C link-self-contained=yes" }
+
+[tool.pixitainer]
+add-file = [
+    "Cargo.lock:/opt/conf/Cargo.lock",
+    "Cargo.toml:/opt/conf/Cargo.toml",
+    "src:/opt/conf/src"
+]
+post-command = [
+    "pixi run cargo build --release",
+    "mv ./target/release/fdedup /usr/local/bin/fdedup",
+    "rm -rf /opt/conf/target",
+]
+keep-def = true
+env = ["default"]
+output = "fdedup.sif"
+pixi-version = "0.64.0"
+label = [
+    "Authors:Raphaël Ribes, Céline Mandier, Alice Baniel",
+    "Description:A fast and memory-efficient FASTX PCR deduplication tool",
+    "License:MIT"
+]
+base-image = "ubuntu:24.04"
+
+[tool.pixitainer.docker]
+output = "fdedup"
+user = "nobody"
+
+[dependencies]
+rust = ">=1.93.1,<1.94"
+c-compiler = ">=1.11.0,<2"
+cmake = ">=4.2.3,<5"
+cxx-compiler = ">=1.11.0,<2"
+make = ">=4.4.1,<5"
+
+[tasks]
+
+### BUILD
+[tasks._build_conda]
+description = "Build the conda package"
+cmd = "pixi publish"
+
+[tasks._extract_build]
+description = "Extract and renames the fdedup binary"
+depends-on = ["_build_conda"]
+cmd = '''unzip -p *.conda 'pkg-*.tar.zst' | \
+         tar --zstd -x --strip-components=1 bin/fdedup && \
+         mv fdedup fdedup_$(grep -m 1 -oP '^version\s*=\s*"\K[^"]+' pixi.toml)_linux_x86_64'''
+
+[tasks._archive_build]
+description = "Build the archive of the fdedup binary"
+depends-on = ["_extract_build"]
+cmd = '''tar -czvf fdedup_$(grep -m 1 -oP '^version\s*=\s*"\K[^"]+' pixi.toml)_linux_x86_64.tar.gz fdedup_$(grep -m 1 -oP '^version\s*=\s*"\K[^"]+' pixi.toml)_linux_x86_64'''
+
+[tasks._containerize_apptainer]
+description = "Build the Apptainer container"
+cmd = "pixi containerize"
+outputs = ["fdedup.sif"]
+
+[tasks._containerize_docker]
+description = "Build the Docker container"
+cmd = "pixi containerize-docker"
+outputs = ["Dockerfile.fdedup"]
+
+[tasks.build]
+description = "Build the conda package, the archive and the Apptainer container"
+depends-on = ["_archive_build", "_containerize_apptainer", "_containerize_docker"]
+cmd = "echo 'Build completed!'"
+
+### PROFILE
+[feature.profile.tasks._profile-normal]
+description = "Profile FDedup with uncompressed output using samply"
+cmd = "samply record -s -o normal.json.gz ./target/release/fdedup data/E14_seq2_R1_001.fastq.gz data/E14_seq2_R1_001_dedup.fastq -v --force"
+inputs = ["data/E14_seq2_R1_001.fastq.gz"]
+
+[feature.profile.tasks._profile-compressed]
+description = "Profile FDedup with compressed output using samply"
+cmd = "samply record -s -o gz.json.gz ./target/release/fdedup data/E14_seq2_R1_001.fastq.gz data/E14_seq2_R1_001.fastq_dedup.gz -v --force"
+inputs = ["data/E14_seq2_R1_001.fastq.gz"]
+
+[feature.profile.dependencies]
+samply = "*"
+inferno = "*"
+
+### DEMO
+[tasks.demo]
+description = "Run a demonstration of FDedup"
+cmd = "./demo.sh"
+
+[environments]
+profile = ["profile"]
