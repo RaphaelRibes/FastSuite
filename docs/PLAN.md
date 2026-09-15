@@ -129,6 +129,10 @@ to `pigz` and the `--gz-level` semantics are identical everywhere.
 
 ## Phase 4 — FastQC/Falco module parity (3–4 days)
 
+> **Superseded by `docs/PLAN-QC.md`** (a full QC binary, `fastquality`, rather
+> than modules bolted onto fastmaps). The table below is the module checklist
+> that plan inherits; read PLAN-QC.md for the design, memory model and phases.
+
 Add the missing QC modules — as `fastmaps` submodules writing into the same
 report schema, so `fasthelper` needs no change:
 
