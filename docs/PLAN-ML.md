@@ -23,29 +23,53 @@ a direct QC→params regressor would throw away all but one row per dataset.
 
 ## 1. Measured cost model (this machine, release builds, 150 bp, gz→gz)
 
-Not estimates — numbers produced while writing this plan, on
-`/tmp/pairent_r{1,2}.fastq.gz` (2 000 000 pairs each) and 200k-pair output.
+Every number below is a 3-run mean with < 1 % variance, measured while writing
+this plan. Two ways of measuring turned out to matter, so both are given:
 
-| operation | input size | time | rate | RSS |
+| operation | work | wall | CPU actually used | verdict |
 |---|---|---|---|---|
-| `fastprep -j1` (trim, gz in → gz out) | 2 M pairs | **15.48 s** | 258 420 reads/s | bounded by chunk |
-| `fastprep -j8` | 2 M pairs | **5.45 s** | 734 272 reads/s | " |
-| `fastcheck` (score pass, pair, 16 cores) | 2 M pairs | **3.71 s** | 1.08 M reads/s | 15.6 MB |
-| `fastsim` (PE, gz + gt) | 200 k pairs | **19.9 s** | 10 050 pairs/s | small |
+| `fastprep -j1` **pinned to one CPU** | 200 k pairs | **3.03 s** | 1.0 core-s | the honest cost of a 1-core task |
+| `fastprep -j1`, unpinned | 200 k pairs | 1.27 s | 3.4 core-s | the 2.6× extra is **Rayon spin-waiting**, not work |
+| `fastprep -j4` on 4 CPUs | 200 k pairs | **1.27 s** | 4.6 core-s | 2.4× less wall, +50 % core-seconds |
+| `fastprep -j8` on 8 CPUs | 200 k pairs | 0.54 s | 5.6 core-s | flat past 4 — the win is the gz output pool |
+| `fastcheck` score pass, 4 CPUs | 200 k-pair output | **0.38 s** | 0.86 core-s | |
+| `fastsim --pairs` | 200 k pairs + GT | 19.9 s | 1.0 core-s | 10 050 pairs/s |
+| fixed cost | — | ~0 | ~0 | 20 k-pair run: 0.135 s wall / 0.337 s core → cost is linear in pairs |
 
-**Work unit chosen for the sweep: one dataset = 200 000 read pairs (~37 MB gz,
-~4.5 MB gt).** Scaling the table linearly (fixed startup costs are ~0.1 s):
+Three operational consequences, each of which changes the plan:
 
-| per (dataset, config) | core-seconds |
+1. **`fastprep -j1` unpinned does not fit in one core** — 3.4 core-seconds of CPU
+   for 1.27 s of wall, and `--gz-threads 1` does not change it. The extra CPU is
+   Rayon workers spinning instead of parking: burned without doing work. So
+   budget by *allocated cores × wall*, and pin tasks (cgroup / taskset) so the
+   spin cannot steal from neighbours.
+2. **More threads cost more core-hours, not fewer.** `-j4` is 2.4× faster in
+   wall time but consumes 4.6 core-s instead of 3.0. On a cluster that bills
+   core-hours, a 1-core task is the efficient shape; `-jN` is a latency lever to
+   pull only when the queue is the bottleneck and the budget is not.
+3. Per-pair cost is ~15–17 µcore-s under either accounting, so **the unit size
+   is the budget dial**:
+
+| sweep unit (pairs) | tier-1 evaluation | 1.14 M evaluations | wall on 200 slots | wall on 32 cores |
+|---|---|---|---|---|
+| 200 k | 3.1 core-s | 1013 core-h | 5 h | 32 h |
+| **100 k (chosen)** | **1.57 core-s** | **507 core-h** | **2.5 h** | **16 h** |
+| 50 k | 0.79 core-s | 254 core-h | 1.3 h | 8 h |
+
+**Work unit: one dataset = 100 000 read pairs (~18 MB gz, ~2 MB gt).** That is a
+0.15–0.22 % standard error on a per-read rate — below the `eps = 0.005` tie
+tolerance already used when comparing configurations — and it halves the budget
+for no loss of ranking signal. Task 0.8 verifies this empirically instead of
+trusting the argument, and the unit size is one constant in the harness if the
+measurement disagrees.
+
+| per (dataset, config), 100 k-pair unit | core-seconds |
 |---|---|
-| `fastprep -j1` on 200k pairs | ≈ 1.55 |
-| tier-1 score (PXMT vs GT, streaming) | ≈ 0.10 |
-| **tier-1 evaluation total** | **≈ 1.65** |
-| tier-3 score (fastcheck on output) instead | ≈ 0.40 |
-| tier-2 score (alignment, validation subset only) | 30–60 |
-
-So: **one exact evaluation ≈ 1.7 core-seconds.** Everything below is priced
-from that one number.
+| `fastprep -j1`, 1 allocated core | 1.52 |
+| tier-1 score (PXMT vs GT, streaming) | ≈ 0.05 (measured in task 0.8) |
+| **tier-1 evaluation total** | **≈ 1.57** |
+| tier-3 instead (fastcheck on the output) | 1.52 + 0.43 = 1.95 |
+| tier-2 (alignment, validation subset only) | 30–60 |
 
 ---
 
@@ -88,7 +112,7 @@ Default weights (explicit, arguable, versioned — `score_weights.toml`):
 `w_drop = 0.5`. A near-tie tolerance `eps = 0.005` is applied when reporting
 "best config", so noise-level differences are not treated as signal.
 
-**Why this matters:** it is exact (no proxy), cheap (~0.1 s), needs no
+**Why this matters:** it is exact (no proxy), cheap (~0.05 core-s), needs no
 aligner, no reference and no network, and it is the only tier where the
 *right answer is known*. It is what makes 10⁶ evaluations affordable.
 
@@ -188,15 +212,16 @@ real) × 30 configs, and produce the first "predicted vs achieved" scatter.
 | 0.5 Five real datasets downloaded, subsampled, hashed, raw deleted | `scripts/ena_query.py`, `scripts/subsample.sh` | `manifests/real.tsv` has 5 rows with sha256, no data in the repo |
 | 0.6 Snakefile: `acquire → simulate → sweep → score → aggregate` | `Snakefile`, `workflow/rules/*.smk` | `snakemake -n` plans the whole DAG; a full run finishes < 30 min on 8 cores |
 | 0.7 Baseline rows for the same datasets: fastp defaults, fastprep `--adapter-preset nextera` alone, and "no preprocessing" | `scripts/run_baseline.py` | baselines appear in the same parquet as ordinary configs |
+| 0.8 **Label-noise calibration** (decides the unit size): same dataset, same config, 10 subsample seeds, at 50 k / 100 k / 200 k pairs | `scripts/label_noise.py` | SD of the score per unit size; keep the smallest whose SD stays under `eps`/2 |
 
 **Acceptance:** `results/matrix.parquet` with 300 tier-1 rows, a scatter of
 predicted (in-sample, 10 points) and measured score, and a written list of the
 top-3 configs per dataset. If the plumbing surprises us, it surprises us here,
 for 2 core-hours.
 
-### Phase 1 — real dataset corpus (~30 core-hours + network)
+### Phase 1 — real dataset corpus (~15 core-hours + network)
 
-**Objective:** 700 real runs across strata, each reduced to a 200k-pair
+**Objective:** 700 real runs across strata, each reduced to a 100k-pair
 subsample plus its QC profile.
 
 * Query ENA (not SRA: ENA serves FASTQ over HTTPS, no `sra-tools`, no
@@ -213,8 +238,9 @@ subsample plus its QC profile.
 * `study_accession` is the **split unit** (train/val/test 70/15/15, stratified
   by instrument). Splitting runs from the same study across train and test is
   the single most likely way to get a beautiful, meaningless result.
-* Deterministic subsample: `seqtk sample -s 42` to 200k pairs (seqtk and the
-  aligner are the only non-FastSuite dependencies in the whole pipeline).
+* Deterministic subsample: `seqkit sample -s 42` to 100k pairs (seqkit and the
+  aligner are the only non-FastSuite dependencies in the whole pipeline; seqkit
+  is already present under `~/.pixi/bin`, and it is the pixi-native choice).
 * Parallel downloads: `aria2c -x8 -j4` or `curl --parallel`, 4 concurrent,
   retry-on-503, checksum against ENA's `fastq_md5` when present.
 
@@ -222,7 +248,7 @@ subsample plus its QC profile.
 subsample, QC profile path), zero raw FASTQ left on scratch, all 700 tier-3 QC
 reports present, and a per-stratum count table with no stratum below its floor.
 
-### Phase 2 — simulated corpus (~30 core-hours)
+### Phase 2 — simulated corpus (~8 core-hours)
 
 **Objective:** the training corpus, with exact truth and wide parameter
 coverage.
@@ -242,18 +268,18 @@ coverage.
   keep the GT.
 
 **Acceptance:** 5 000 `work/<dataset_id>/{in_r1,in_r2}.fastq.gz,gt.tsv`
-generated and hashed in ≤ 30 core-hours, with a coverage report showing each
+generated and hashed in ≤ 8 core-hours (100 k pairs ≈ 10 s each), with a coverage report showing each
 artefact dimension spanning its range.
 
 ### Phase 3 — the sweep (~620 core-hours, the bulk)
 
 **Objective:** 1.06 M exact evaluations.
 
-| tier | datasets | configs | evaluations | core-hours |
-|---|---|---|---|---|
-| simulated | 5 000 | 200 | 1 000 000 | 458 |
-| real (tier-1 unavailable → tier-3) | 700 | 200 | 140 000 | 76 (fastprep + fastcheck = 1.95 core-s each) |
-| **total** | | | **1.14 M** | **~534** |
+| tier | datasets | configs | evaluations | core-s each | core-hours |
+|---|---|---|---|---|---|
+| simulated | 5 000 | 200 | 1 000 000 | 1.57 | 436 |
+| real (tier-1 unavailable → tier-3) | 700 | 200 | 140 000 | 1.95 | 76 |
+| **total** | | | **1.14 M** | | **~512** |
 
 * Configs per dataset: 150 Latin-hypercube samples from `config_space.toml`
   (covers the 12–14 dimensions without a grid blow-up) + 30 hand-picked
@@ -271,8 +297,9 @@ artefact dimension spanning its range.
 * Parallelism: **two levels, both used** — many samples in flight (the
   scheduler's job) and `fastprep -jN` inside a task (measured 2.8× at `-j8` on
   2 M pairs, 15.48 s → 5.45 s, thanks to the gz output thread pool). One SLURM array task = one dataset × all its
-  configs (~200 × 0.6 s ≈ 2 min at `-j4`), so 5 700 tasks, walltime limit
-  30 min, 4 cores, 2 GB each.
+  configs (200 × 1.57 ≈ 5 min on one core), so 5 700 tasks, walltime limit
+  30 min, **1 core**, 2 GB each. Raise to `-j4` only if the queue, not the
+  budget, is the bottleneck.
 * Idempotency: a task writes `results/sweep/<dataset_id>.parquet.tmp`, then
   renames. Existence of the final file = done; nothing recomputes, nothing
   half-writes.
@@ -362,7 +389,9 @@ default and refuses to run without a model file.
   `sbatch --array=1-5700%200` driving `run_dataset.sh` with an index file.
   Arrays are the right primitive: thousands of tiny, independent, 2-minute
   tasks.
-* Resources: 1 task = 1 dataset, 4 cores, 2 GB, 30 min walltime. The sweep is
+* Resources: 1 task = 1 dataset, **1 core**, 2 GB, 30 min walltime (measured
+  200 configs × 1.57 core-s ≈ 5 min, so 30 min is a 6× margin). `-j4` is a
+  latency lever: 2.4× less wall for +50 % core-hours. The sweep is
   embarrassingly parallel; the only shared resource is scratch I/O, so keep
   concurrent readers bounded (`%200`) and stage per-dataset work inside
   `$SCRATCH` (never `$HOME`).
@@ -398,14 +427,14 @@ default and refuses to run without a model file.
 |---|---|---|---|---|
 | 0 pilot | plumbing proven, 300 rows | 2 | 1 min | 4 min |
 | 1 acquire | 700 real datasets, manifests | 30 + network | ~1 h (bandwidth-bound) | ~1 h |
-| 2 simulate | 5 000 datasets + GT | 30 | 10 min | 1 h |
-| 3 sweep | 1.1 M scored configs | 536 | 2.7 h | 17 h |
+| 2 simulate | 5 000 datasets + GT | 8 | 3 min | 15 min |
+| 3 sweep | 1.14 M scored configs | 512 | 2.6 h | 16 h |
 | 4 features | feature builder | 1 | seconds | seconds |
 | 5 train | ranker + model card | 2 | seconds | seconds |
 | 6 productise | `--auto-params` | 2 | seconds | seconds |
-| **total** | | **~600 core-hours** | **~4 h** | **~1.5 days** |
+| **total** | | **~550 core-hours** | **~3 h** | **~17 h** |
 
-600 core-hours is the whole project. Storage peak: ~60 GB scratch. No GPU
+~550 core-hours is the whole project. Storage peak: ~60 GB scratch. No GPU
 needed at any point — this is the reason the plan prefers a 1 MB tree ensemble
 over a neural model.
 
@@ -416,7 +445,7 @@ over a neural model.
 1. **Score weights** (`w_over = 0.5`, `w_under = 0.25`): is over-trimming
    really twice as bad as under-trimming *for your downstream use*? If the
    downstream is an assembler, yes; if it is a k-mer counter, less so.
-2. **Cluster budget**: is ~600 core-hours available in one run, or should the
+2. **Cluster budget**: is ~550 core-hours available in one run, or should the
    sweep be staged over several days? (Staged is safe: the sweep is
    checkpointed per dataset, so it can be stopped and resumed.)
 3. **Strata mix**: 700 real datasets weighted toward Illumina NovaSeq/NextSeq
