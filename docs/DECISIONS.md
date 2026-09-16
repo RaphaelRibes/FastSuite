@@ -5,171 +5,176 @@ One entry per decision that shapes more than one tool. Status: **decided** /
 
 ---
 
-## D-1 — Shared code: none. Tools are independent. ✅ decided
+## D-1 — FastSuite is a naming scheme, not an architecture. ✅ decided
 
-Each tool is its own crate and its own binary. What they share is **naming and
-the common option set**, for continuity: `-1/-2`, `-o/-p`, `-j/--threads`,
-`--gz-level`, `--json`, `--force`, `--dry-run`, `-q/-v`, `-V/-h`, and the
-`fastsuite.report.v1` payload.
+FastSuite is the *name* for a group of independent preprocessing tools. What
+they share is naming, the common option set and the `fastsuite.report.v1`
+payload — nothing else.
 
-Consequences, accepted:
-
-* No `fastsuite-core`. Anything two tools need (BGZF reader, FASTQ scanner,
-  fingerprint table, report writer) exists **twice**, copied per tool.
-* The report schema and the CLI spec are the only interfaces. They cannot be
-  enforced by the compiler, so they are enforced by **tests**:
-  * `fasthelper check -c fastsuite.toml` validates that each tool's `--json`
-    matches `REPORT-SCHEMA.md` (phase 2 task).
-  * Any two tools that compute the same quantity (fastdedup's duplicate rate,
-    fastcheck's duplication module) get a **fixture-agreement test**: same
-    input file, identical numbers. That test is what replaces a shared library.
-* A bug fixed in one copy does **not** propagate. Fix or accept per tool, and
-  say which in the changelog.
+* No shared crate, no workspace, no `fastsuite-core`. Tools are separate
+  binaries that happen to look alike and talk the same report format.
+* Anything two tools need (BGZF reader, FASTQ scanner, fingerprint table,
+  report writer) exists **twice**, copied per tool, and may drift. Fix per tool
+  and say which in the changelog.
+* Consistency is enforced by **tests**, not by the compiler:
+  `fasthelper check` validates each tool's `--json` against
+  `REPORT-SCHEMA.md`; any two tools computing the same quantity (fastdedup vs
+  fastcheck duplication) get a fixture-agreement test on the same input file.
 
 ---
 
-## D-2 — Versioning and releases: one suite version or one per tool? ⏳ open
+## D-2 — Versioning ✅ decided (forced by bioconda)
 
-**Why it is big:** it decides what "FastSuite 1.0" means, how compatibility is
-communicated, and whether the replacement claim ("replaces FastQC/fastp") is
-made about a suite or about a binary.
-
-* Option A — **one suite version** (all tools released together, same number).
-  Simple to explain and to cite; forces six changelogs into lockstep.
-* Option B — **independent versions** (fastdedup 1.3.0, fastcheck 0.1.0, …).
-  Honest about maturity differences; needs a compatibility note instead of a
-  version number.
-
-Recommendation: **A, with a maturity column per tool** (`stable` / `beta`), so
-`FastSuite 1.0` can ship with fastcheck still marked beta.
+**One semver per tool, plus a suite release train.** bioconda recipes are
+per-package, so each tool carries its own version and its own `meta.yaml`.
+A `docs/RELEASES.md` lists which tool versions made up each "FastSuite N"
+release, together with each tool's maturity (`stable` / `beta`).
 
 ---
 
-## D-3 — Distribution and install ⏳ open
+## D-3 — Distribution ✅ decided
 
-**Why it is big:** it decides whether anyone but you can use it. Your real
-deployment target is a headless HPC cluster with no root and jobs submitted
-under SLURM — `cargo install` is not available there.
+Everything ships *in a pixi environment*, published to **bioconda**, and
+containerised with **pixitainer**.
 
-* Options: static release binaries (musl + gnu) on GitHub releases ·
-  bioconda recipe · pixi/conda channel (you already prefer pixi) · Apptainer
-  definitions (already used for the mandrill pipeline) · crates.io.
-* Recommendation: **static binaries + Apptainer defs** first (works on Io
-  today, no root), **bioconda second** (that is where FastQC/fastp users live),
-  crates.io only if the names stay free.
+Consequences to implement:
 
----
-
-## D-4 — Standard streams and FASTA: is the fastp-replacement claim honest? ⏳ open
-
-**Why it is big:** `fastp` is used in pipes (`zcat x | fastp | ...`) and on
-FASTA. fastcheck currently refuses FASTA and nothing supports `-`. Without
-this, "we replace fastp" is a claim about flags, not about fit.
-
-* Options: implement `-` in/out for fastprep/fastmaps/fastcheck (blocked on a
-  non-seeking reader), or declare pipes out of scope and say so.
-* Recommendation: implement `-` for **input** only (the common case, cheap
-  with the existing sequential reader), keep output-to-file, and document the
-  limitation rather than half-supporting it.
+* every tool gets a `pixi.toml` (fastcheck is missing one) and the suite root
+  `pixi.toml` is the dev environment;
+* one bioconda recipe per tool (`meta.yaml`, license file, `run`/`test`
+  sections invoking the binary's `--version` and a tiny fixture run);
+* one pixitainer recipe per tool for the container images;
+* version pinning matters from now on (D-2), and the recipes must not download
+  anything at build time.
 
 ---
 
-## D-5 — fastcheck ↔ fasthelper boundary ⏳ open
+## D-4 — Standard streams and FASTA ⏳ OPEN (explaining)
 
-**Why it is big:** it decides where aggregation lives, and MultiQC's job must
-not end up implemented twice.
+The question: should a tool be usable **in the middle of a shell pipe**, and
+should it accept FASTA?
 
-* Proposal: **fastcheck analyses files (one row per file in `per_file`),
-  fasthelper aggregates samples/runs.** fastcheck never reads a run directory,
-  never renders HTML, and has no cross-sample logic.
-* Cross-sample questions ("worst retention", "highest polyG") are fasthelper's,
-  driven by its own config, not by fastcheck flags.
+Today:
+
+* `fastcheck reads.fastq.gz` works. `zcat reads.fastq.gz | fastcheck -` does
+  **not** — `-` is not accepted, and the reader infers compression from the
+  file extension, which a stream does not have.
+* `fastcheck ref.fasta` exits with an error (no quality string to check).
+  fastprep and fastdedup already accept FASTA; fastcheck and fastmaps are
+  FASTQ-only by nature.
+
+Why it could matter: `fastp` is routinely used inside pipes
+(`zcat in.fq.gz | fastp ... | ...`), and pipe-based pipelines (Snakemake,
+Nextflow) exist partly to avoid writing intermediates to disk — which is
+exactly the I/O argument this suite is built on. Composing
+`fastdedup | fastprep | fastmaps` without intermediates needs **stdin on the
+consumer and stdout on the producer**.
+
+Options: (a) stdin input only, outputs stay files; (b) stdin **and** stdout, so
+a full chain runs with zero intermediates; (c) neither, and say so in the docs.
+Cost: (a) is small (read sequentially, detect gzip from magic bytes instead of
+extension); (b) adds an explicit output-format flag, since a stream has no
+filename to infer from.
 
 ---
 
-## D-6 — "Never guess" as a suite-wide stance ⏳ open
+## D-5 — fastcheck ↔ fasthelper boundary ✅ decided
 
-**Why it is big:** it is a repeated UX decision (fastprep refuses to guess an
-adapter and exits 1; fastcheck reports an uncertain Phred offset instead of
-asserting one; fastsim hardcodes the adapter sequence). Users migrating from
-FastQC/fastp expect a tool that always produces output.
-
-* Option A — strict by default, one `--lenient` flag that guesses **and says
-  it guessed in the report** (`"assumed": true`).
-* Option B — guess by default, warn.
-* Recommendation: **A**. Your existing tools already behave this way and it is
-  the strongest differentiator against FastQC/Fastp.
+* **fastcheck = the FastQC/Falco slot**: one pass over FASTQ files, per-file
+  QC report, per-position matrices. It never reads a run directory and never
+  renders HTML.
+* **fasthelper = the MultiQC slot**: aggregates every tool's reports across
+  samples, computes cross-sample statistics, renders the HTML/TSV/MD report,
+  runs the chain from a config.
 
 ---
 
-## D-7 — Long reads (ONT/PacBio) ⏳ open
+## D-6 — Behaviour when a detection returns nothing ⏳ OPEN (explaining)
 
-**Why it is big:** per-position matrices are O(read length); the heatmap grid
-is O(len²). Short-read-only is a defensible scope, but it must be stated.
+The question is not about heuristics; it is about what a tool does when it
+cannot determine something from the data:
 
-* Options: hard cap with exclusion reporting (current: `--max-read-len 1000`) ·
-  binned positions as the default beyond a threshold · refuse long reads
-  explicitly.
-* Recommendation: cap + exclusion now, **binned mode as an explicit opt-in**,
-  and a one-line "short-read QC" statement in the tool's `--help`.
+* **fastprep, adapter detection** — it fingerprints the first ~2 000 reads to
+  identify the adapter. On genuinely adapter-free data it finds nothing and
+  today **exits 1** with instructions. In a 700-sample array job that turns a
+  *good* sample into a failed task.
+* **fastcheck, Phred offset** — it can prove `+33` when a quality byte below 64
+  exists; otherwise it assumes `+33`, records `phred_offset_certain: 0` and
+  keeps going.
+* **fastsim, adapter sequence** — a hardcoded Nextera constant in the profile.
+
+So the suite is currently inconsistent, and both extremes are defensible.
+The question is which one becomes the rule:
+
+* Option A — **refuse** (fastprep's current behaviour): never produce a result
+  that rests on an unproven assumption.
+* Option B — **take the safe action, label it, continue**: no adapter
+  detected ⇒ trim no adapter (the safe action), record the assumption in the
+  report, exit 0. `--strict` restores Option A for anyone who wants it.
+* Option C — guess and warn (what FastQC/fastp effectively do).
+
+Recommendation now: **B**, because with `"assumptions": [...]` in the JSON and
+in the summary line, nothing is hidden — the report says "adapter: none
+detected, trimming skipped" — and batch runs do not fail on good samples.
+Option A stays available per run via `--strict`.
+
+---
+
+## D-7 — Short reads only, for now. ✅ decided
+
+`--max-read-len` cap with exclusion reporting stays. Binned positions and
+long-read modes are out of scope until the short-read suite is finished and
+published; `--help` says "short-read QC".
 
 ---
 
 ## D-8 — Compatibility horizon ⏳ open
 
-**Why it is big:** it decides how long `rpolyx`/`fdedup`/`novaseq-sim` names,
-`--compression`, `--input/--output` and the legacy JSON shapes must keep
-working — and therefore how long fasthelper keeps its adapter layer.
-
-* Recommendation: old **flags** forever (aliases are free), old **binary
-  names** as symlinks shipped by `fasthelper install` (not by cargo), legacy
-  **JSON** accepted for one release then dropped with a changelog entry.
+Old **flags** forever (aliases cost nothing). Old **binary names**
+(`rpolyx`, `fdedup`, `novaseq-sim`) as symlinks installed by
+`fasthelper install`, not by cargo/bioconda. Legacy **JSON** shapes accepted by
+fasthelper for one release, then dropped with a changelog entry.
 
 ---
 
-## D-9 — Licensing and attribution ⏳ open
+## D-9 — Licensing and attribution ✅ decided in scope, ⏳ license text open
 
-**Why it is big:** it gates publication, packaging and citation, and it is
-awkward to change later. Who is credited matters here: the tools were built in
-the Mandrillus Project context (ISDM/ISEM, Céline Mandier, Alice Baniel).
-
-* Recommendation: MIT for all tools (fastdedup already is), one `AUTHORS`/
-  citation block listing every contributor, and a `CITATION.cff` so the suite is
-  citable per tool.
+* **Only FastPreprocessing and FastDedup belong to the Mandrillus Project** —
+  they carry the project, ISDM/ISEM and Céline Mandier / Alice Baniel credits.
+* **Everything else (fastsim, fastmaps, fastcheck, fasthelper) is the author's
+  own work**, credited to Raphaël Ribes alone.
+* Still to fix: the license text per tool (MIT proposed, fastdedup already is)
+  and a `CITATION.cff` per tool so each is independently citable.
 
 ---
 
 ## D-10 — Repository layout ⏳ open
 
-**Why it is big:** six independent tools in one repo is convenient now and
-painful at release time (six tags, six issue queues, one CI). The earlier
-rpolyx split (code / bench / paper) already showed both sides of this.
-
-* Options: keep the monorepo · one repo per tool plus a meta-repo for docs and
-  releases · monorepo now, split when the first tool reaches 1.0.
-* Recommendation: **monorepo until D-3 (distribution) is settled**, then split
-  per tool if bioconda/release automation demands it.
+Monorepo now. The suite is a naming scheme (D-1), so the repo does not need to
+mirror it: keep one repo while D-3 (bioconda recipes + pixitainer) is built
+out, then split per tool if release automation or citation demands it.
 
 ---
 
-## D-11 — Canonical validation data ⏳ open
+## D-11 — NEVER SHIP ANY DATA. ✅ decided (hard rule)
 
-**Why it is big:** it decides whether anyone else can reproduce the claims.
-Candidates: the mandrill E dataset (read-only on Io), fastsim profiles +
-ground truth, one small public dataset (a single SRA/ENA run) for
-external readers.
+No sequencing data, no subsets, no derived tables of real reads, in any repo,
+container, tarball, test fixture or example. Everything demonstrated publicly
+uses **generated** data (fastsim) or hand-written literal fixtures.
 
-* Recommendation: fastsim ground-truth tests in CI (fast, self-contained) +
-  one published real run as the acceptance fixture, referenced by accession in
-  the docs. Never ship the mandrill reads themselves.
+Files currently in the tree that fall under this rule and need a ruling:
+
+| file | what it is | concern |
+|---|---|---|
+| `tools/fastsim/profiles/mandril_E.json` | statistical profile measured from the mandrill E dataset (CDFs, quality curves, GC) | derived from Mandrillus Project data, ~96 KB, currently committed |
+| `tools/fastsim/validation/*.png` | closed-loop validation plots from that dataset | same |
+| `tests/*` inline FASTQ literals | hand-written 6-read strings ("ACGTACGT…") | not data — but confirm the policy is "no real data", not "no FASTQ bytes at all" |
 
 ---
 
 ## D-12 — What the suite refuses to do ⏳ open
 
-**Why it is big:** it is the defence against feature creep, and it makes the
-scope honest in writing. Currently out: PE overlap/merge (deliberately removed
-from the polyx lineage), UMI handling, alignment-dependent QC, workflow-engine
-semantics (SLURM arrays/resume), per-tile modules (implemented but off).
-
-* Recommendation: keep this list in the README, one line each with the reason.
+Planned list, one line each in the README with the reason: PE overlap/merge
+(removed from the polyx lineage deliberately), UMI handling, alignment-based QC,
+workflow-engine semantics (arrays, resume — that is Snakemake/Nextflow's job),
+per-tile modules (implemented, off by default), long reads (D-7).
