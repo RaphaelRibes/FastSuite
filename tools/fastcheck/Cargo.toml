@@ -1,0 +1,22 @@
+[package]
+name = "fastcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Exact, one-pass FASTQ quality control: no sampling, no hidden thresholds, no verdicts"
+authors = ["Raphaël Ribes <raphael.ribes@gmail.com>"]
+license = "MIT"
+
+[[bin]]
+name = "fastcheck"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
+gzp = "2"
+serde_json = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -13,6 +13,7 @@ of merely coexisting in a pipeline.
 | **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, optional dedup | working (was `rpolyx`) |
 | **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data | working (was `novaseq-sim`) |
 | **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | working (was `fastmaps` in `heatmaps/`) |
+| **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, adapter content, k-mer content — no sampling, no verdicts, memory printed before the run | v0.1 working: statistics + per-position modules; duplication/adapters/k-mers next (`docs/PLAN-QC.md`) |
 | **fasthelper** | MultiQC (+ workflow glue) | runs the chain from one TOML config, aggregates every tool's JSON into one multi-sample report (json/tsv/md/html), checks the install, owns the report schema | new, this repo |
 
 Still outside the suite on purpose: `fastx-diff` (visual before/after
@@ -34,6 +35,7 @@ FastSuite/
 │   ├── fastsuite.toml       a complete run config (synthetic control sample)
 │   └── demo.sh              end-to-end demo on generated data
 └── tools/
+    ├── fastcheck/           src, tests (incl. the Python differential harness)
     ├── fastdedup/           src, tests, benchmarks, paper/
     ├── fastprep/            src, paper/
     ├── fastsim/             src, tests, profiles/, scripts/, validation/
@@ -44,7 +46,7 @@ FastSuite/
 ## Build
 
 ```fish
-for t in fastdedup fastprep fastsim fastmaps fasthelper
+for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper
     cd tools/$t; and cargo build --release --offline; and cd ../..
 end
 ```

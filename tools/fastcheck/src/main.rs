@@ -1,0 +1,158 @@
+//! fastcheck — exact, one-pass FASTQ QC.
+//!
+//! One pass over the input, dense integer counters, no temp files. BGZF input
+//! is inflated block-parallel; multiple files are scanned concurrently; a
+//! single file is scanned by one thread whose BGZF pool uses all the threads.
+//! Budgets (`--reads`, `--bytes`) stop the source and the report declares the
+//! run partial with the exact reason.
+
+mod accum;
+mod cli;
+mod reader;
+mod report;
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use anyhow::Result;
+use clap::Parser;
+
+use accum::{offset_verdict, Accum};
+use cli::Cli;
+use reader::Limits;
+use report::FileReport;
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let requested_offset = cli.requested_offset()?;
+    let threads = cli.thread_count();
+    let limits = Limits {
+        max_reads: cli.reads,
+        max_bytes: cli.bytes,
+    };
+
+    let started = Instant::now();
+    let files: Vec<PathBuf> = cli.files.clone();
+    let max_pos = cli.max_read_len;
+
+    // A single file already has all the parallelism it can use inside the
+    // BGZF inflate pool; several files are scanned concurrently.
+    let reports: Vec<FileReport> = if files.len() == 1 || threads <= 1 {
+        let mut out = Vec::with_capacity(files.len());
+        for path in &files {
+            out.push(scan_one(path, threads.max(1), limits, max_pos)?);
+        }
+        out
+    } else {
+        let workers = threads.min(files.len());
+        let per_worker_threads = (threads / workers).max(1);
+        let mut handles = Vec::with_capacity(workers);
+        for w in 0..workers {
+            let chunk: Vec<PathBuf> =
+                files.iter().skip(w).step_by(workers).cloned().collect();
+            handles.push(std::thread::spawn(move || -> Result<Vec<FileReport>> {
+                let mut out = Vec::with_capacity(chunk.len());
+                for path in &chunk {
+                    out.push(scan_one(path, per_worker_threads, limits, max_pos)?);
+                }
+                Ok(out)
+            }));
+        }
+        let mut all = Vec::with_capacity(files.len());
+        for h in handles {
+            let mut part = h.join().map_err(|_| anyhow::anyhow!("a worker thread panicked"))??;
+            all.append(&mut part);
+        }
+        // Restore input order, so the report is stable across -j.
+        all.sort_by_key(|r| files.iter().position(|f| f == &r.path).unwrap_or(usize::MAX));
+        all
+    };
+
+    let mut total = Accum::new(cli.max_read_len);
+    let mut stopped: Option<&'static str> = None;
+    for r in &reports {
+        total.merge(&r.acc);
+        stopped = stopped.or(r.scan.stopped);
+    }
+
+    // Memory projection, printed before the numbers: what this run's analysis
+    // state costs is a function of read length and file count, not of size.
+    let projection = total.resident_bytes() * reports.len().max(1);
+    eprintln!(
+        "fastcheck: accumulator state {:.1} MB for {} file(s) at --max-read-len {}",
+        projection as f64 / (1024.0 * 1024.0),
+        reports.len(),
+        cli.max_read_len
+    );
+
+    let verdict = offset_verdict(&total.qual_byte, requested_offset);
+    let elapsed = started.elapsed().as_secs_f64();
+
+    if let Some(p) = &cli.json {
+        report::write_report(
+            p,
+            &reports,
+            &total,
+            &verdict,
+            elapsed,
+            stopped,
+            cli.positions_tsv.as_deref(),
+        )?;
+    }
+    if let Some(p) = &cli.positions_tsv {
+        report::write_positions_tsv(p, &total, verdict.offset)?;
+    }
+
+    if !cli.quiet {
+        let gc = 100.0 * report_gc(&total);
+        let mean_q = report_mean_q(&total, verdict.offset);
+        println!(
+            "fastcheck: {} file(s), {} reads, {} bases, mean length {:.1}, GC {:.2}%, \
+             mean read Q {:.2} (Phred+{}{}), {:.2}s{}",
+            reports.len(),
+            total.reads,
+            total.bases,
+            if total.reads == 0 { 0.0 } else { total.bases as f64 / total.reads as f64 },
+            gc,
+            mean_q,
+            verdict.offset,
+            if verdict.certain { "" } else { ", uncertain" },
+            elapsed,
+            stopped.map(|s| format!(" [{s}]")).unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn scan_one(path: &PathBuf, gz_threads: usize, limits: Limits, max_pos: usize) -> Result<FileReport> {
+    let mut acc = Accum::new(max_pos);
+    let scan = reader::scan_file(path, gz_threads, limits, &mut acc)?;
+    Ok(FileReport {
+        path: path.clone(),
+        acc,
+        scan,
+    })
+}
+
+// The two helpers below exist only for the summary line; the report module
+// owns the same computations for the JSON, and they are tested there.
+fn report_gc(a: &Accum) -> f64 {
+    let acgt: u64 = (0..a.acgt_hist.len()).map(|i| i as u64 * a.acgt_hist[i]).sum();
+    let gc: u64 = (0..a.gc_hist.len()).map(|i| i as u64 * a.gc_hist[i]).sum();
+    if acgt == 0 {
+        0.0
+    } else {
+        gc as f64 / acgt as f64
+    }
+}
+
+fn report_mean_q(a: &Accum, offset: u8) -> f64 {
+    if a.reads == 0 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for (b, &c) in a.meanq_raw_hist.iter().enumerate() {
+        sum += (b as i64 - offset as i64).max(0) as f64 * c as f64;
+    }
+    sum / a.reads as f64
+}

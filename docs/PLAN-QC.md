@@ -1,4 +1,4 @@
-# Plan — `fastquality`: a real QC binary
+# Plan — `fastcheck`: a real QC binary
 
 Replace the two-wheeled approach (fastmaps for composition + a hypothetical
 "add the FastQC modules later" phase 4) with one QC binary that answers every
@@ -8,6 +8,55 @@ projection** and **no hidden thresholds**.
 Non-goals: PASS/WARN/FAIL verdicts from magic constants; sampling presented as
 measurement; "enrichment" scores whose formula lives only in the source; a
 zipped HTML bundle.
+
+---
+
+
+## 0. Phase 1–2 status: implemented, measured (`tools/fastcheck`)
+
+Built: one-pass reader (plain / `.gz` / BGZF block-parallel via `gzp`), exact
+integer counters, basic statistics, per-position base + N + quality matrices,
+per-read mean-Q and length histograms, exact quality-byte census with an
+explicit Phred-offset verdict, `--reads`/`--bytes` budgets with self-declared
+partial runs, `fastsuite.report.v1` JSON, per-position TSV, memory projection
+printed before the numbers. 23 tests, plus a differential harness against an
+independent Python implementation (`tests/reference_qc.py` +
+`tests/differential.py`) that compares **every** metric, both histograms and all
+150 per-position rows: identical on the 6-read fixture and on 20 000 real reads
+from fastsim, in both the serial-gzip and the BGZF-parallel paths.
+
+Measured on 2 M reads x 150 bp (16 cores, /tmp = tmpfs, so RAM-backed I/O):
+
+| run | wall | peak RSS |
+|---|---|---|
+| `fastcheck -j1`, uncompressed (pure scan, no inflate) | 4.51 s | 15.5 MB |
+| `fastcheck -j1`, single-member BGZF | 5.49 s | 15.8 MB |
+| `fastcheck -j16`, single-member BGZF | 4.54 s | 15.6 MB |
+| `fastmaps` (current), same BGZF file | 4.76 s | 33.2 MB |
+| `fastcheck --reads 5000` on a 20 k-read file (budget path) | 10 ms | 17 MB |
+
+What that says honestly:
+
+* **The analysis is the bottleneck, not inflate.** Uncompressed input (zero
+  inflate cost) still takes 4.51 s, so ~75 % of the BGZF wall clock is the
+  counter scan; parallel inflate accounts for 5.49 s -> 4.54 s.
+* **Single-file scan is single-threaded.** `-j` parallelises inflation and
+  multiple files, not one file's scan. Closing that gap is the next task:
+  dispatch BGZF blocks to workers, each with its own `Accum`, merged at the end
+  (the merge is exact and cheap: 5 x R + 256 x R counters plus histograms).
+  Expected 3-4x on one big file, to be *measured*, not assumed.
+* **Layout experiment, negative result.** Storing the per-position planes
+  plane-major (`plane[code * max_pos + pos]`) to improve locality made the scan
+  **25 % slower** (5.14 s vs 4.10 s) because the quality plane is
+  `256 x max_read_len x 8 B` = 2 MB at the default `--max-read-len 1000`.
+  Position-major keeps the working set at `read_len x 2 KB` = 300 KB. Reverted;
+  the reasoning is recorded in `src/accum.rs` so it is not retried blindly.
+* Memory is flat in dataset size: 15.6 MB peak RSS regardless of file size, and
+  the accumulator state is printed (0.3 MB per file at R=150).
+
+Still open from the phase list: duplication/over-representation/adapters/k-mers
+/ per-tile modules (phases 3-4), and the `fasthelper` step + HTML wiring
+(phase 5).
 
 ---
 
@@ -185,7 +234,7 @@ whole.
 
 `fastmaps` remains as a thin alias/step for the heatmap + corner-extraction
 workflow; the QC binary owns the decode and the metrics, so nothing decodes a
-file twice. `fasthelper` gains the module as a step name (`fastquality`), and
+file twice. `fasthelper` gains the module as a step name (`fastcheck`), and
 `fastsuite.toml` can request `--only` module subsets per step.
 
 ---
@@ -225,7 +274,7 @@ file twice. `fasthelper` gains the module as a step name (`fastquality`), and
 | phase | work | files | estimate |
 |---|---|---|---|
 | **0** | Decisions (§9) + freeze the metric names in `REPORT-SCHEMA.md` | docs | 1 h |
-| **1** | **Skeleton + reader.** New crate `tools/fastquality`: CLI, record scanner, block sources (BGZF parallel via `gzp`, plain-gzip serial, mmap chunked), worker pool over blocks, merge, JSON writer. No modules yet; the "basic statistics" + length/GC/meanQ modules only. Tests: fixtures + determinism + no-temp-files | new crate, ~1200 LOC | 2 d |
+| **1** | **Skeleton + reader.** New crate `tools/fastcheck`: CLI, record scanner, block sources (BGZF parallel via `gzp`, plain-gzip serial, mmap chunked), worker pool over blocks, merge, JSON writer. No modules yet; the "basic statistics" + length/GC/meanQ modules only. Tests: fixtures + determinism + no-temp-files | new crate, ~1200 LOC | 2 d |
 | **2** | **Position accumulators.** base/qual/N per position, quality-byte census, quantiles from histograms. Differential vs the Python reference on 3 fixtures | `src/pos.rs`, tests | 1.5 d |
 | **3** | **Table modules.** duplication-level histogram (reuse fastdedup's hasher via the shared crate, §9.2), memory projection + admission, overrep modes (§5.9) | `src/dup.rs`, `src/report.rs` | 2 d |
 | **4** | **Sequence modules.** adapter-per-position (reuse fastprep's catalogue/matcher), k-mer with the stated expectation model, per-tile modules | `src/adapter.rs`, `src/kmer.rs`, `src/tile.rs` | 2.5 d |
@@ -237,16 +286,16 @@ census) and are the minimum to retire Falco.
 
 ## 9. Decisions needed before phase 1
 
-1. **Name.** `fastquality` (my proposal), or `fastqc` (honest, but collides with
+1. **Name.** `fastcheck` (my proposal), or `fastqc` (honest, but collides with
    the tool being replaced in every search and on every PATH), or keep growing
    `fastmaps`?
 2. **Shared core crate.** Extract `fastsuite-core` (report writer, hasher, BGZF
    reader, FASTQ scanner) out of the five tools, or copy the ~600 lines into
-   `fastquality` and keep the tools independent? Proposal: extract — it is the
+   `fastcheck` and keep the tools independent? Proposal: extract — it is the
    only way `fastsuite.report.v1` stays true across tools, and the BGZF reader
    is needed by three of them.
 3. **Fingerprint sharing with fastdedup.** Reuse one implementation (library
-   call) so `fastdedup --json` and `fastquality --modules dup` cannot disagree.
+   call) so `fastdedup --json` and `fastcheck --modules dup` cannot disagree.
 4. **Long reads.** Bound at `--max-read-len 1000` with exclusion reporting
    (proposal), or implement binned positions as the default for R > 1000?
 5. **Tile modules.** Worth the header parsing + 5 MB/100 tiles? Only useful for

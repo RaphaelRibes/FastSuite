@@ -16,8 +16,8 @@ zstd = "*"
 
 [tasks]
 # Build every tool in dependency order (fasthelper last).
-build = { cmd = "for t in fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release); done", depends-on = [] }
-build-offline = "for t in fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release --offline); done"
+build = { cmd = "for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release); done", depends-on = [] }
+build-offline = "for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release --offline); done"
 test = "for t in fastprep fastdedup fastsim fastmaps fasthelper; do (cd tools/$t && cargo test --offline); done"
 doctor = "./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools"
 demo = "bash examples/demo.sh"
