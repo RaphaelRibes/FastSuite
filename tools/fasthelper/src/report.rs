@@ -652,7 +652,7 @@ pub fn write_reports(
     Ok(written)
 }
 
-pub fn cmd_report(a: &ReportArgs) -> Result<()> {
+pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
     let reports = collect(&a.inputs, a.sample.as_deref())?;
     if reports.is_empty() {
         anyhow::bail!(
@@ -671,7 +671,7 @@ pub fn cmd_report(a: &ReportArgs) -> Result<()> {
         print!("{}", matrix_tsv(&build_matrix(&reports)));
     }
     println!(
-        "fasthelper: {} report(s) from {} sample(s) -> {}",
+        "fasthelper: concatenated {} report(s) from {} sample(s) -> {}",
         reports.len(),
         reports
             .iter()

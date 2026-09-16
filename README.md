@@ -14,7 +14,7 @@ of merely coexisting in a pipeline.
 | **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data | working (was `novaseq-sim`) |
 | **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | working (was `fastmaps` in `heatmaps/`) |
 | **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, adapter content, k-mer content — no sampling, no verdicts, memory printed before the run | v0.1 working: statistics + per-position modules; duplication/adapters/k-mers next (`docs/PLAN-QC.md`) |
-| **fasthelper** | MultiQC (+ workflow glue) | runs the chain from one TOML config, aggregates every tool's JSON into one multi-sample report (json/tsv/md/html), checks the install, owns the report schema | new, this repo |
+| **fasthelper** | MultiQC (+ workflow glue) | a toolbox: `concatenate` (per-sample reports → one table/report), `run` (the chain from one TOML config), `doctor`, `schema` (json/tsv/md/html), checks the install, owns the report schema | new, this repo |
 
 Still outside the suite on purpose: `fastx-diff` (visual before/after
 inspection) and `gzippy` (compression engine) are natural candidates for
@@ -72,7 +72,7 @@ last consumer has read them.
 Aggregate reports you already have (including from the pre-suite binaries):
 
 ```fish
-fasthelper report runs/ -o report/ --format html,tsv
+fasthelper concatenate runs/ -o report/ --format html,tsv
 ```
 
 Every tool is still a normal Unix filter — the suite adds an interface, it does

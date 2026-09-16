@@ -38,7 +38,7 @@ independently verifiable.
 * `src/main.rs`: write the wrapper from both the single and paired paths.
 * Test: `tests/report_v1.rs` — run on a 4-read fixture, assert `schema`,
   `tool`, `metrics.reads_in`, and that `metrics` has no nested value.
-* Verify: `fasthelper report <out.json>` no longer needs the legacy adapter
+* Verify: `fasthelper concatenate <out.json>` no longer needs the legacy adapter
   (assert it stops adding the `legacy raw stats` note).
 
 **1.2 fastprep: `--force`, `--dry-run`, `--quiet`** (~3 h)

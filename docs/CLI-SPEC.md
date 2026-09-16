@@ -34,6 +34,9 @@ Rules:
    Compression is decided from **magic bytes**, never from a filename, so a
    stream and a mislabelled file behave identically. When stdout carries a
    report (`--json -`), the summary line moves to stderr.
+   **Exception: `fastmaps` is file-only**, by design — taking *many* files and
+   classifying R1/R2 by name is its job, and a stream has no name. It is the
+   one tool where a pipe would remove information rather than save I/O.
 1. **No positional inputs** except tools whose job is many files (`fastmaps`).
 2. Short flags are a scarce resource: `-1 -2 -o -p -j -q -v -f -V -h` are the
    suite's; anything else a tool uses for its own options (`fastdedup -t`

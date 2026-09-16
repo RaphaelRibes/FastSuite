@@ -69,9 +69,11 @@ Consequences:
   streaming.
 * FASTA stays tool-dependent and explicit: fastprep and fastdedup accept it;
   fastcheck and fastmaps need qualities and refuse it with a clear message.
+* **`fastmaps` is file-only.** It exists to take *many* files and classify
+  R1/R2 by filename; a stream removes that information, so a pipe there would
+  cost capability instead of saving I/O. The other four tools take `-`.
 
-Reference implementation: `fastcheck` (input side done). fastprep, fastdedup
-and fastmaps follow.
+Reference implementation: `fastcheck`. fastprep and fastdedup follow.
 
 ---
 

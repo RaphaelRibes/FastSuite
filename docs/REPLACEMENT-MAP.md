@@ -33,7 +33,7 @@ explicitly marked as a gap with the phase that closes it.
 | duplication levels | `fastdedup` exact rate (not FastQC's estimate) | ✅ better: exact, no sampling |
 | overrepresented sequences | not implemented | ⚠ gap, phase 4 (cheap once fastdedup's fingerprint table is reused) |
 | k-mer content | not implemented | ⚠ gap, low priority |
-| per-sample HTML/zip report | `fasthelper report/report.html` | ✅ different shape (multi-sample, one file, no zip) |
+| per-sample HTML/zip report | `fasthelper concatenate` → `report.html` | ✅ different shape (multi-sample, one file, no zip) |
 | multi-file / batch QC | `fasthelper run` | ✅ one config, N samples |
 
 Honest summary: **fastmaps is not a drop-in FastQC replacement yet.** It replaces
@@ -46,7 +46,7 @@ is "FastQC's composition modules, replaced and extended", not "all of FastQC".
 
 | MultiQC behaviour | FastSuite | status |
 |---|---|---|
-| discover per-tool outputs in a run directory | `fasthelper report <dir>` walks for `*.json` and auto-detects the producing tool | ✅ |
+| discover per-tool outputs in a run directory | `fasthelper concatenate <dir>` walks for `*.json` and auto-detects the producing tool | ✅ |
 | aggregate heterogeneous tools into one report | normalises into one metric space; three adapters (v1 wrapper, fastprep raw stats, fastmaps grid) | ✅ |
 | per-sample + per-module tables | `report.html` (per-tool sections), `report.tsv`, `report.md`, `report.json` | ✅ |
 | interactive plots | static inline SVG bars on rate metrics | ⚠ multiline/threshold plots are phase 5 — deliberately no JavaScript in the report |

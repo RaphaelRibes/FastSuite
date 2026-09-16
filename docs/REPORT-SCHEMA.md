@@ -102,7 +102,7 @@ diagonal at (150,150). Reproduce with `examples/demo.sh`.
 
 ## Aggregate report (fasthelper output)
 
-`fasthelper report` / `fasthelper run` write:
+`fasthelper concatenate` (alias `report`) / `fasthelper run` write:
 
 | file | content |
 |---|---|

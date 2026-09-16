@@ -25,8 +25,10 @@ pub struct Cli {
 pub enum Cmd {
     /// Run a FastSuite chain (dedup -> prep -> maps) described by a TOML config.
     Run(RunArgs),
-    /// Aggregate per-tool reports (fastsuite.report.v1 or legacy JSON) into one report.
-    Report(ReportArgs),
+    /// Concatenate per-sample reports into one table (the MultiQC slot):
+    /// discovery, normalisation, html/tsv/md/json.
+    #[command(visible_alias = "report")]
+    Concatenate(ReportArgs),
     /// Check that the FastSuite binaries are found and runnable.
     Doctor(DoctorArgs),
     /// Print the report schema (version, fields, how each tool contributes).
