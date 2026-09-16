@@ -367,11 +367,18 @@ artefact dimension spanning its range.
   the sampled reads carry no adapter, so the simulated corpus floors
   `adapter_rate` at 2 %, and a refusal is recorded as its own outcome — never
   silently retried with a preset, which would change what is measured.
-* **The two end-scans are not swept off**: the simulator injects G-runs at both
-  ends of every read (`[0,h)` and `[L−t,L)`), so disabling one leaves whole
-  artefact runs in the output (guaranteed under-trim). The interior scan and the
-  two scan *directions* are swept, which tests the documented "NovaSeq R2 5′
-  polyG needs `--r2-scan-reverse`" recommendation instead of assuming it.
+* **Only `--no-interior` is swept among the scan flags.** The two end-scans stay
+  on (the simulator injects G-runs at both ends of every read, `[0,h)` and
+  `[L−t,L)`, so disabling one leaves whole artefact runs → guaranteed
+  under-trim), and the scan directions stay forward. Dropping the directions
+  takes the swept space from 15 to 10 dimensions (coarse grid 34 M per dataset
+  instead of 569 M).
+  *Caveat recorded:* `fastsim/src/artefact.rs` models a **per-mate head CDF** and
+  calls it "the 5′-R2 regime" — the simulator does inject 5′ R2 artefacts, which
+  is exactly what `--r2-scan-reverse` exists for ("Recommended for
+  Nextera/NextSeq/NovaSeq libraries" per `fastprep --help`). Leaving it out of
+  the sweep means the model can never recommend it, on data that contains the
+  artefact it addresses. Cheap to revisit: one boolean, 2 levels.
 * Parallelism: **two levels, both used** — many samples in flight (the
   scheduler's job) and `fastprep -jN` inside a task (measured 2.8× at `-j8` on
   2 M pairs, 15.48 s → 5.45 s, thanks to the gz output thread pool). One SLURM array task = one dataset × all its
