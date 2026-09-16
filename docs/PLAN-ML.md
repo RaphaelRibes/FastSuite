@@ -22,6 +22,8 @@ Randomisation does not disappear entirely: it survives only where the profile is
 **not identifiable from QC** (see step 3), as a small controlled ensemble rather
 than the whole design.
 
+**Step-by-step execution, with acceptance tests and gates: `PLAN-ML-STEPS.md`.**
+
 ## The pipeline
 
 | # | step | what it produces |
