@@ -1,99 +1,175 @@
-# PLAN-ML — parameter recommendation from QC (final)
+# PLAN-ML — parameter recommendation from QC (final, rev 3)
 
-**Revision 2 (final).** Supersedes the v1 narrative: several of its statements were
-contradicted by measurement and are corrected here. Every line below is either a
-**decision record** or a **measurement** — nothing is an estimate unless it says
-so.
+**Revision 3 supersedes rev 2's *pipeline*.** Rev 2 synthesised datasets from
+invented artefact profiles and swept them. Rev 3 profiles a **real downloaded
+dataset**, simulates the matching data, sweeps it, then validates the winner
+against **fastp** on the real reads and records the pair as a label. The measured
+appendices (cost model, scoring tiers, schema, storage) still apply.
 
-**Goal.** `fastprep --auto-params <qc.json>` recommends the preprocessing
-parameters for a dataset from its QC profile alone — the manual tuning loop
-fastp makes you do by hand.
+## Why rev 2 was wrong about synthetic data
 
-**Shape.** Learn `f(QC features, config) → score`, then take the argmax over a
-candidate set. Not `QC → params`: dozens of configurations are near-optimal for
-the same data, so the argmax is a multimodal target, while scoring a candidate
-is well-posed and every sweep row becomes a training row.
+Rev 2 randomised artefact parameters to guarantee that datasets differed in the
+things trimming depends on. That was a **substitute for real diversity**: with no
+datasets on hand, inventing profiles was the only way to get variety. It has two
+costs that rev 3 removes — invented profiles can drift from reality, and the
+resulting optimum is "best for my simulator", not "best for real reads". Rev 3
+takes the diversity from the datasets themselves, and because each simulated
+dataset is *fitted to a real QC profile*, the sweep optimises in the right
+neighbourhood by construction. It is also **~10x cheaper** (below), and the fastp
+comparison falls out as a by-product instead of being a separate project.
 
----
+Randomisation does not disappear entirely: it survives only where the profile is
+**not identifiable from QC** (see step 3), as a small controlled ensemble rather
+than the whole design.
 
-## 1. What is built and verified (workstation)
+## The pipeline
 
-| component | state | evidence |
+| # | step | what it produces |
 |---|---|---|
-| `bench/scripts/score_gt.py` | exact tier-1 scorer: PXMT v3 vs ground truth, config-aware | **19 unit tests green**, refuses a misaligned join |
-| `bench/scripts/sample_configs.py` | Latin hypercube + anchors, repairs fastprep's own feasibility couplings | 40 sampled points, 0 refusable |
-| `bench/scripts/run_shard.py` | N datasets × M configs → one TSV row each; crash-safe, idempotent | 400/400 rows scored in 244 s |
-| `bench/scripts/gen_profiles.py` | randomised synthetic libraries | 12 profiles, 0 % – 44 % adapter readthrough, all load |
-| `bench/scripts/run_pilot.sh` | cluster probe: build, egress, env, one dataset E2E | `PROBE PASS` |
-| `deploy/io/*.sbatch`, `slurm/config.yaml` | the SLURM headers (pilot, dispatcher, acquire) + cell profile | ready, not submitted |
+| 1 | **download** a real dataset | a 100 k-pair work unit + its manifest entry |
+| 2 | **fastcheck** | the QC profile: per-position base composition, quality plane, GC, length and duplication estimates. This is the model INPUT |
+| 3 | **fastsim** on a profile *fitted to that QC* | a matching dataset **with exact ground truth** |
+| 4 | **sweep fastprep** — 200 configurations | the exact best configuration for that dataset |
+| 5 | **validate the winner against fastp on the REAL reads** | the benchmark: quality, speed, memory |
+| 6 | **record the label** | (QC profile -> best parameters, achieved gain, fastp delta) |
 
-Verified end to end: profile generation → 8-dimension sampling → fastprep →
-PXMT parsing → exact scoring → results table.
+Then: one **small model per domain** — generalised, metagenomics, human gut,
+virome, and the others the metadata supports.
 
-**Findings that changed the plan** (full detail in `bench/FINDINGS.md`):
-the PXMT→GT join is flowcell coordinates (`pair = y×10000 + x`, `x` resets every
-10 000) — a monotonic assumption would have mislabelled **100 %** of rows; the
-ground truth's `r*_h`/`r*_t` are G-run lengths and the correct window is
-`[h, min(I, L−t))`; the strict score is only usable once the corpus contains the
-artefact it scores; and a corpus whose artefact model does not vary trains a
-model to output a **constant**.
+### Step 1 — datasets, by domain
 
----
+Domains are the model boundaries, so they are chosen first:
 
-## 2. Decisions (frozen)
-
-| decision | value | why |
+| domain | how the domain is assigned | target datasets |
 |---|---|---|
-| adapter mode | **`auto` only** | the deployment case: no prior knowledge of the kit. Its refusal on an adapter-free dataset is handled by the corpus floor (≥ 2 % readthrough) and recorded as its own outcome — never retried with a preset, which would change what is measured |
-| Phred offset | **`auto`** | fastprep decides from the quality-byte census and reports its certainty |
-| interior scan | **always `--no-interior`** | the corpus injects artefact only at the ends and the GT window carries no interior annotation, so nothing measurable is given up |
-| dedup | **always `--dedup`** | measured cost 31.5 MB vs 27.5 MB peak, 0.54 s vs 0.59 s — and the scorer then runs with `--dedup`, because dropping an `is_dup` pair is always correct |
-| scan directions | **not swept** | *caveat on record:* fastsim models a per-mate head CDF ("the 5′-R2 regime"), so it does inject 5′ R2 artefacts and `--r2-scan-reverse` is what fastprep's help recommends for them. The model can therefore never recommend that flag. Re-adding is one boolean |
-| swept dimensions | **8**: `adapter_error_rate` (0.03–0.20), `min_adapter_overlap` (4–14), `min_run` (4–12), `min_len` (0.3L–0.9L), `mean_q` (0/25), **`head_dropout` (0–4)**, `trim_5`, `trim_3` (`{0,2,5,7,10,12,15,17,20}`) | `--head-dropout` is the flag built for the NovaSeq first-cycle G-dropout; a hard trim was a blunt stand-in for it, and 1–3 base runs are too short for the polyX scan to find |
-| sampling design | **170 shared + 30 per-dataset refinement** | each shared configuration is then observed ~5 700 times instead of ~1.14 M mostly-unique rows |
-| boundary tolerance | **K = 0, strict** | with the corpus now carrying the artefact, exactness is reachable (0.468 on the winner), so no tolerance is needed to make the score informative |
-| corpus | **per-dataset randomised synthetic profiles** + 700 real runs | a single profile gave the *same* winner on 10/10 datasets |
-| split unit | `study_accession` | splitting runs of one study across train/test is the fastest way to a meaningless result |
+| generalised | all datasets pooled | (a view over the others) |
+| metagenomics | `library_strategy=WGS`, environment broad | 100 |
+| human gut | ENA `host`/`sample_type` metadata | 100 |
+| virome | ENA metadata + study description | 100 |
+| bacterial isolate | metadata, single organism | 100 |
+| RNA-seq | `library_strategy=RNA-Seq` | 100 |
 
-Grid if enumerated: **5 056 128 combinations per dataset** (28.8 billion
-corpus-wide, ~15 years at 100 cores) — hence sampling, at 200 per dataset.
+**Caveat on record:** the domain comes from ENA *metadata*, not from the reads.
+Metadata is uneven — a "human gut" run may be a mixed or mislabelled sample — so
+the assignment is recorded per dataset and its disagreement with a read-based
+signal is worth measuring later, not assuming away. 500 datasets x ~2 GB is about
+**1 TB of transfer** (~3 h at 100 MB/s), ~40 GB peak on disk with the rolling
+window (raw deleted once its subsample is hashed).
 
----
+### Step 2 — fastcheck, the model input
 
-## 3. The remaining work, in order, with cost
+`fastcheck --json` plus the per-position TSV. Everything the model sees comes from
+here: position-major base composition (where polyG and readthrough live), the
+quality plane, GC, length distribution, the quality-byte census (offset
+certainty), duplication, N rate.
 
-| # | step | where | cost | note |
-|---|---|---|---|---|
-| 1 | Snakefile wiring the shard runner + corpus index | local | ~1 core-h | the last code before the cluster |
-| 2 | generate the corpus: 5 000 randomised profiles + datasets | Io | 8 core-h | 100 k-pair units |
-| 3 | **the sweep: 1.14 M exact evaluations** | Io | **512 core-h** | 5 700 datasets × 200 configs; ~5 h wall at 100 cores |
-| 4 | features + train the ranker | **local** | 3 core-h | LightGBM is not installable on Io and does not need to be |
-| 5 | tier-2 alignment validation on a 50-dataset subset | Io | 12 core-h | the transfer check |
-| 6 | productise `--auto-params` + model card | local | 2 core-h | ~150 lines of Rust tree-walking, no C dependency |
-|  | **total outstanding** |  | **~537 core-h** | peak disk ~43 GB against ~45 TB free |
+### Step 3 — the profile fitted to that QC (the new hard part)
 
-Cluster shape (partitions/accounts/time are in `deploy/io/DEPLOY-IO.md`, with the
-`scp` + `ssh Io` + `srun --time=01:00:00` workflow): one dispatcher under
-`@cirad-long`, 570 one-core cells under `@cirad-normal`, 256 MB each, **hard
-ceiling 100 cores** enforced by the profile's summed resource cap.
+`qc_to_profile.py`: fastcheck report -> fastsim profile.
 
----
+| profile field | where it comes from in QC | reliable? |
+|---|---|---|
+| `read_len`, `gc` | measured directly | yes |
+| `head`, `tail` (G-run CDFs) | leading/trailing positions where the composition is G-dominated | yes — exactly what the per-position matrix shows |
+| `pos_q` (quality curve) | the per-position quality plane | yes |
+| `read_meanq`, `tail_q_collapse` | the quality distribution | yes |
+| duplicate rate | fastcheck's duplication estimate | yes, as a rate |
+| adapter readthrough rate | fraction of reads with readthrough — but the split between "adapter" and "short insert" is **not observable** | **no** |
+| insert-length distribution | only constrained by the readthrough fraction | **no** |
+| full-length spike rate | over-represented all-artefact reads | weakly |
 
-## 4. Acceptance criteria
+**This is where the controlled randomisation lives, and it is not optional to be
+honest about it:** two or three profile variants per dataset for the
+non-identifiable fields (insert shape, readthrough split), swept in parallel, so
+the chosen configuration must be robust across the ensemble. A single fitted
+profile would present an unidentifiable quantity as if it had been measured.
+Cost: 3 x 200 configurations per dataset instead of 200.
 
-1. **regret** `1 − score(recommended)/score(best in sweep)` ≤ 5 % median on
-   held-out studies;
-2. beats **fastp defaults** on ≥ 70 % of held-out datasets, with the oracle as
-   the ceiling;
-3. a **model card** stating the training distribution, the per-stratum
-   breakdown, and the measured tier-2 transfer gap — including the strata where
-   a baseline wins;
-4. the achievable ceiling is reported too: on some libraries no configuration
-   does well (measured: −0.08 on the hardest of 10), and saying so is part of
-   the deliverable.
+### Step 4 — the sweep
 
----
+Same machinery as rev 2 (`sample_configs.py`, `run_shard.py`, `score_gt.py`),
+scoring exactly against the fitted simulation's ground truth with the **8 frozen
+dimensions** (adapter `auto`, phred `auto`, `--no-interior` always, `--dedup`
+always; swept: adapter-error-rate, min-adapter-overlap, min-run, min-len, mean-q,
+`--head-dropout`, trim-5, trim-3).
 
+### Step 5 — the fastp comparison (this is also the suite's benchmark)
+
+On the **real** reads, same inputs, same threads:
+
+* **quality** — adapter residue, polyG residue, Q30 fraction, read retention,
+  duplication rate; **plus alignment** (`mapped_frac`, `proper_pair_frac`, insert
+  IQR) on a reference subset, because on real reads every reference-free metric is
+  a proxy and a proxy-only comparison can be attacked.
+* **speed** — wall time and CPU-seconds at 1 thread and at N, plus throughput in
+  reads/s, so the comparison survives the "you used more cores" objection.
+* **efficiency** — peak RSS and output bytes per input byte.
+
+**Fairness rules, stated up front:** fastp runs at its defaults *and* in its
+best-effort mode (`--detect_adapter_for_pe`, its own auto-detection), because
+comparing our tuned configuration against fastp's defaults would be a rigged
+comparison. Both numbers are reported.
+
+### Step 6 — the labels
+
+One row per dataset:
+`domain, accession, QC feature vector, best params, achieved score, fastp delta
+(quality/speed/memory), profile-variant agreement, tool versions, git hash`.
+
+The `fastp delta` is what lets the models predict **how much is achievable**, not
+just which knobs to turn — so a user can be told "this library cannot be rescued,
+don't bother" instead of getting a confident bad recommendation.
+
+## The models
+
+One small model per domain, trained on ~100 datasets each — small by necessity,
+which is what we want: deployable and explainable, not general-purpose.
+
+* **Primary: a small LightGBM ranker** (`f(QC, config) -> score`), because it
+  consumes every sweep row (including the ensemble variants) and answers "which
+  config, and how much better".
+* **Product head: direct `QC -> params`**, distilled from the ranker. Rev 2
+  avoided this because the argmax is multimodal — but per domain, with ~100
+  datasets and a narrow space, it is what a user wants, and the ranker stays
+  available to score the recommendation and report confidence.
+* **Export:** tree ensemble -> ~150 lines of Rust tree-walking in `fastprep`, no C
+  dependency, so `--auto-params` stays offline and static-binary friendly.
+
+**Evaluation, per domain:** held-out *studies* (never reads within a study);
+regret vs the sweep's best; agreement with the sweep's top-5; and the headline
+number — **does the recommended configuration beat fastp on quality, speed and
+memory on held-out real datasets of that domain**.
+
+## Cost
+
+| step | where | cost |
+|---|---|---|
+| corpus download (500 datasets, 1 TB) | Io | ~3 h transfer, network-bound |
+| fastcheck + profile fit + fastsim, 500 datasets | Io | ~2 core-h |
+| **sweep: 500 datasets x 3 profile variants x 200 configs = 300 k exact evaluations** | Io | **~131 core-h** (~1.3 h wall at 100 cores) |
+| fastp + fastprep validation on real reads | Io | ~10 core-h |
+| alignment subset (50 datasets) | Io | ~12 core-h |
+| training 6 small models | **local** | ~2 core-h |
+| **total** | | **~160 core-h** (rev 2 wanted ~537 for a weaker premise) |
+
+**Pilot first:** 3 domains x 10 datasets = 30 datasets, ~1 core-h of sweep plus
+downloads. It validates step 3 — does a QC-fitted profile actually reproduce the
+dataset's QC? — which is the one genuinely new component and the likeliest to
+surprise us.
+
+## Falsifiers — what would kill this plan
+
+1. **A QC-fitted profile does not reproduce the dataset's QC.** Then step 3 is
+   broken, the sweep optimises the wrong data, and nothing below it can be
+   trusted. The pilot tests exactly this.
+2. **The simulated winner does not win on the real reads** (step 5 shows no gain
+   over fastp). Then simulated ground truth is the wrong training signal, and
+   labels must come from alignment-scored real data at ~30x the cost.
+3. **One configuration wins for every dataset in a domain.** Then ship that
+   configuration as the domain default and skip the model — a good outcome,
+   measured rather than guessed.
+4. **The domains do not separate** (generalised as good as per-domain). Then ship
+   one model, not six, and say so.
 
 ---
 
