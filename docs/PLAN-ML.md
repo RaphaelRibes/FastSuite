@@ -354,42 +354,31 @@ artefact dimension spanning its range.
   than inferred; the 30 refinement samples are drawn around that dataset's
   best-so-far. An all-per-dataset draw would leave ~1.14 M mostly-unique rows —
   a ranker fitting noise. Same evaluation count either way.
-* Dimensions (declared in `bench/config/config.yaml`, values taken from the real
-  `fastprep --help`, never hand-invented): `--adapter-error-rate` (0.03–0.20),
+* **Seven swept dimensions** (declared in `bench/config/config.yaml`, values from
+  the real `fastprep --help`): `--adapter-error-rate` (0.03–0.20),
   `--min-adapter-overlap` (4–14), `--min-run` (4–12), `--min-len` (0.3L–0.9L),
-  `--mean-q` (0–25), `--phred-offset` (auto/33/64), interior scan on/off,
-  `--r1-scan-reverse`, `--r2-scan-reverse`, `--trim-5`/`--trim-3` (0–5),
-  `--dedup`.
-* **Adapter mode is fixed to `auto`** (decided): `--adapter-preset`,
-  `--adapters` and `--no-adapter` are not swept, because auto-detection is what
-  a user with no prior knowledge of the library kit actually gets. The
-  consequence is handled explicitly: auto-detection **refuses** (exit 1) when
-  the sampled reads carry no adapter, so the simulated corpus floors
-  `adapter_rate` at 2 %, and a refusal is recorded as its own outcome — never
-  silently retried with a preset, which would change what is measured.
-* **Only `--no-interior` is swept among the scan flags.** The two end-scans stay
-  on (the simulator injects G-runs at both ends of every read, `[0,h)` and
-  `[L−t,L)`, so disabling one leaves whole artefact runs → guaranteed
-  under-trim), and the scan directions stay forward. Dropping the directions
-  takes the swept space from 15 to 10 dimensions (coarse grid 34 M per dataset
-  instead of 569 M).
-  *Caveat recorded:* `fastsim/src/artefact.rs` models a **per-mate head CDF** and
-  calls it "the 5′-R2 regime" — the simulator does inject 5′ R2 artefacts, which
-  is exactly what `--r2-scan-reverse` exists for ("Recommended for
-  Nextera/NextSeq/NovaSeq libraries" per `fastprep --help`). Leaving it out of
-  the sweep means the model can never recommend it, on data that contains the
-  artefact it addresses. Cheap to revisit: one boolean, 2 levels.
-* Parallelism: **two levels, both used** — many samples in flight (the
-  scheduler's job) and `fastprep -jN` inside a task (measured 2.8× at `-j8` on
-  2 M pairs, 15.48 s → 5.45 s, thanks to the gz output thread pool). One SLURM array task = one dataset × all its
-  configs (200 × 1.57 ≈ 5 min on one core), so 5 700 tasks, walltime limit
-  30 min, **1 core**, 2 GB each. Raise to `-j4` only if the queue, not the
-  budget, is the bottleneck.
-* Idempotency: a task writes `results/sweep/<dataset_id>.parquet.tmp`, then
-  renames. Existence of the final file = done; nothing recomputes, nothing
-  half-writes.
-* Every row records `tool_versions` with the git hash of each binary: a
-  result is only meaningful next to the binary that produced it.
+  `--mean-q` (0/25), `--trim-5` and `--trim-3` (both
+  `{2,5,7,10,12,15,17,20}`). Coarse grid: **5 056 128 per dataset**, 28.8 billion
+  across the corpus (~15 years at 100 cores) — hence sampling.
+* **Fixed by decision, not swept:** adapter mode `auto` (the deployment case;
+  its refusal on an adapter-free dataset is the corpus floor's problem and is
+  recorded as its own outcome), Phred offset `auto`, the interior scan always
+  off (`--no-interior`; the simulator injects artefact only at the ends and the
+  GT window carries no interior annotation, so nothing measurable is lost), and
+  `--dedup` always on (measured cost on a work unit: 31.5 MB vs 27.5 MB, so the
+  256 MB cell is unaffected; the scorer always runs with `--dedup` because
+  dropping an `is_dup` pair is then always correct).
+* **Verified before adopting the new design:** the hard trim *is* folded into the
+  PXMT `t5`/`t3` the scorer reads (with `--trim-5 10 --trim-3 7`, min `t5` = 10
+  and min `t3` = 7 across all 200 000 records of a work unit). Had it been
+  recorded separately, every label in the sweep would have been wrong in one
+  direction.
+* **Consequence of the trim sets:** 0 is not among the levels, so every
+  configuration hard-trims ≥ 2 bases per end, while the GT's correct window is
+  `[h, min(I, L−t))`. Under `K=0` strict, every configuration carries a baseline
+  over-trim penalty and these two dimensions are at risk of collapsing to
+  "smallest allowed wins". The boundary tolerance therefore has to be fixed
+  before the sweep runs, not after.
 
 **Acceptance:** `results/matrix.parquet` with ≥ 1.1 M rows, < 0.1 % failed
 configs, every row carrying its argv and tool versions, and a per-dataset
