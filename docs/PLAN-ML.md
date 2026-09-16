@@ -244,6 +244,40 @@ subsample plus its QC profile.
 * Parallel downloads: `aria2c -x8 -j4` or `curl --parallel`, 4 concurrent,
   retry-on-503, checksum against ENA's `fastq_md5` when present.
 
+### Storage and transfer (from real ENA metadata, not estimates)
+
+Queried the ENA portal API for Illumina WGS runs and read the published
+`fastq_bytes`: 199 runs, of which 66 fall in this plan's strata (5 M – 50 M
+reads). Compressed bytes per **base** is the stable metric — median **0.645**
+(p25 0.532, p75 0.722, max 0.845); bytes per *read* swings 33–212 because read
+length varies, so do not budget from it.
+
+| quantity | median case | worst case |
+|---|---|---|
+| one run, R1+R2 gzipped | 2.00 GB | 4.57 GB |
+| **700 runs, full download (transfer)** | **1.40 TB** | 3.20 TB |
+| at 100 MB/s | 3.9 h | 8.9 h |
+| **peak on disk** (download → subsample → hash → delete raw, 8 in flight) | **16 GB** | 36.6 GB |
+
+Transfer is the cost, not capacity: `/scratch` has ~45 TB, and the *total*
+footprint of the whole sweep peaks at **~43 GB** worst case (36.6 GB of raw
+reads in flight, 6 GB of sweep working set at 100 concurrent shards — a shard of
+10 datasets is 60 MB, measured — and ~0.4 GB of results Parquet).
+
+**Do not try to be clever with byte ranges.** A `urllib`/`curl -r 0-9000000`
+prefix is 200× smaller (a 100 k-pair unit needs only 9.2 MB, so ~11 GB for the
+whole corpus), but only a *contiguous prefix* of a gzip member is decodable —
+deflate state is sequential, so a range at 50 % cannot be decompressed without
+everything before it. A prefix unit therefore samples only the start of a run,
+where quality and artefact profiles genuinely drift. **Download whole runs
+(the 1.4 TB is cheap at cluster bandwidth) and keep the prefix trick as a
+fallback** if the link turns out slow — and then validate 50 runs against the
+full file before trusting a prefix-derived recommendation.
+
+Sanity check on the cost model: this bench file compresses to 0.624 bytes/base,
+within 3 % of the real-data median of 0.645 — the synthetic units cost the same
+to move as real ones.
+
 **Acceptance:** `manifests/real.tsv` (700 rows: accessions, strata, sha256 of
 subsample, QC profile path), zero raw FASTQ left on scratch, all 700 tier-3 QC
 reports present, and a per-stratum count table with no stratum below its floor.
