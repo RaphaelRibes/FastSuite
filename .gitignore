@@ -30,3 +30,13 @@ heatmap_3d.html
 *.bak
 *.orig
 .DS_Store
+
+# ---------------------------------------------------------------- data policy
+# NEVER SHIP ANY DATA. This repo becomes a bioconda package and a container
+# image, so nothing derived from a real dataset may live in it. The mandrill
+# profile is dataset-derived (distributions measured from the E-dataset) and is
+# kept outside the repo, in ~/hermes_scratch/fastsuite-local-artifacts/.
+# Hand-written test fixtures (inline 6-read literals) are not data and stay.
+tools/fastsim/profiles/mandril*.json
+tools/fastsim/profiles/*E.json
+tools/fastsim/validation/*.png

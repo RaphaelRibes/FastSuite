@@ -104,6 +104,20 @@ fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) {
     )
 }
 
+fn write_out(path: &Path, body: &str) -> Result<()> {
+    // D-4: `-` means "the stream", for reports as well as FASTQ.
+    if path.as_os_str() == "-" {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        out.write_all(body.as_bytes())
+            .and_then(|_| out.flush())
+            .context("writing the report to stdout")?;
+        return Ok(());
+    }
+    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 pub fn write_report(
     path: &Path,
     files: &[FileReport],
@@ -209,6 +223,18 @@ pub fn write_report(
         *e = json!(e.as_u64().unwrap_or(0) + c);
     }
 
+    // D-6: every assumption this run rests on, stated as data rather than as
+    // prose, so a consumer can act on it.
+    let mut assumptions: Vec<serde_json::Value> = Vec::new();
+    if !verdict.certain {
+        assumptions.push(json!({
+            "what": "phred_offset",
+            "value": offset,
+            "basis": verdict.reason,
+            "consequence": "quality-derived metrics use this offset; they are wrong by 31 if the file is Phred+64",
+        }));
+    }
+
     let doc = json!({
         "schema": "fastsuite.report.v1",
         "tool": "fastcheck",
@@ -218,6 +244,7 @@ pub fn write_report(
         "inputs": { "files": files.iter().map(|f| f.path.to_string_lossy().to_string()).collect::<Vec<_>>() },
         "elapsed_s": elapsed_s,
         "metrics": serde_json::Value::Object(metrics),
+        "assumptions": assumptions,
         "per_file": per_file,
         "base_composition": serde_json::Value::Object(composition),
         "read_length_hist": hist_json(&total.len_hist),
@@ -231,7 +258,7 @@ pub fn write_report(
     });
 
     let text = serde_json::to_string_pretty(&doc)? + "\n";
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+    write_out(path, &text)?;
     Ok(())
 }
 
@@ -258,6 +285,6 @@ pub fn write_positions_tsv(path: &Path, total: &Accum, offset: u8) -> Result<()>
             q90
         ));
     }
-    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
+    write_out(path, &out)?;
     Ok(())
 }

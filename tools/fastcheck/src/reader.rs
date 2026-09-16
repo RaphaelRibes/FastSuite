@@ -8,7 +8,7 @@
 //! extensions are refused next to the tool rather than half-supported.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -59,30 +59,57 @@ impl<R: Read> Read for Counting<R> {
 
 /// BGZF magic: gzip header with the FEXTRA flag and a `BC` subfield.
 fn looks_like_bgzf(buf: &[u8]) -> bool {
-    buf.len() >= 18 && buf[0] == 0x1f && buf[1] == 0x8b && buf[3] & 0x04 != 0 && buf[12] == b'B' && buf[13] == b'C'
+    buf.len() >= 18
+        && buf[0] == 0x1f
+        && buf[1] == 0x8b
+        && buf[3] & 0x04 != 0
+        && buf[12] == b'B'
+        && buf[13] == b'C'
 }
 
-/// Open a plain or `.gz` FASTQ, choosing the fast path when it exists.
-fn open(path: &Path, gz_threads: usize) -> Result<(Box<dyn BufRead + Send>, ByteCounter, &'static str)> {
-    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut head = [0u8; 18];
-    let n = file
-        .read(&mut head)
-        .with_context(|| format!("reading header of {}", path.display()))?;
-    let head = &head[..n];
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("rewinding {}", path.display()))?;
+/// gzip magic. Compression is decided from bytes, never from the filename, so
+/// that a stream (`-`) and a mislabelled file behave the same way.
+fn looks_like_gzip(buf: &[u8]) -> bool {
+    buf.len() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b
+}
 
-    let is_gz = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("gz"))
-        .unwrap_or(false);
-    let is_bgzf = is_gz && looks_like_bgzf(head);
+/// Read the first bytes of a stream, which cannot be rewound: they are chained
+/// back in front of the reader (D-4, docs/DECISIONS.md).
+fn peek<R: Read>(rdr: &mut R, n: usize) -> io::Result<Vec<u8>> {
+    let mut head = vec![0u8; n];
+    let mut have = 0;
+    while have < n {
+        let k = rdr.read(&mut head[have..])?;
+        if k == 0 {
+            break;
+        }
+        have += k;
+    }
+    head.truncate(have);
+    Ok(head)
+}
+
+/// Open a plain or `.gz` FASTQ, from a file or from stdin (`-`).
+fn open(
+    path: &Path,
+    gz_threads: usize,
+) -> Result<(Box<dyn BufRead + Send>, ByteCounter, &'static str)> {
+    let from_stdin = path.as_os_str() == "-";
+    let mut source: Box<dyn Read + Send> = if from_stdin {
+        Box::new(io::stdin())
+    } else {
+        Box::new(File::open(path).with_context(|| format!("opening {}", path.display()))?)
+    };
+
+    let head = peek(&mut source, 18)?;
+    let is_gz = looks_like_gzip(&head);
+    let is_bgzf = looks_like_bgzf(&head);
 
     let counter = ByteCounter(Arc::new(AtomicU64::new(0)));
+    // The peeked bytes go back in front; the counter sits *under* them so the
+    // byte budget counts bytes that actually came from the file, not the peek.
     let counting = Counting {
-        inner: file,
+        inner: io::Cursor::new(head).chain(source),
         n: Arc::clone(&counter.0),
     };
 
@@ -94,19 +121,28 @@ fn open(path: &Path, gz_threads: usize) -> Result<(Box<dyn BufRead + Send>, Byte
         Ok((
             Box::new(BufReader::with_capacity(INPUT_BUFFER, dec)),
             counter,
-            "bgzf-parallel",
+            if from_stdin { "stdin-bgzf-parallel" } else { "bgzf-parallel" },
         ))
     } else if is_gz {
         Ok((
-            Box::new(BufReader::with_capacity(INPUT_BUFFER, MultiGzDecoder::new(counting))),
+            Box::new(BufReader::with_capacity(
+                INPUT_BUFFER,
+                MultiGzDecoder::new(counting),
+            )),
             counter,
-            if is_bgzf { "bgzf-serial" } else { "gzip-serial" },
+            if is_bgzf {
+                "bgzf-serial"
+            } else if from_stdin {
+                "stdin-gzip-serial"
+            } else {
+                "gzip-serial"
+            },
         ))
     } else {
         Ok((
             Box::new(BufReader::with_capacity(INPUT_BUFFER, counting)),
             counter,
-            if gz_threads <= 1 { "plain" } else { "plain" },
+            if from_stdin { "stdin-plain" } else { "plain" },
         ))
     }
 }
@@ -122,11 +158,20 @@ fn read_line(rdr: &mut dyn BufRead, out: &mut Vec<u8>) -> io::Result<usize> {
 
 /// Read one file into `acc`, one pass, honouring the budgets.
 pub fn scan_file(path: &Path, gz_threads: usize, limits: Limits, acc: &mut Accum) -> Result<ScanResult> {
-    let ext_ok = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("gz") || e.eq_ignore_ascii_case("fq") || e.eq_ignore_ascii_case("fastq"))
-        .unwrap_or(true);
+    let from_stdin = path.as_os_str() == "-";
+    // A named file must have a plausible FASTQ extension, so a .bam/.bz2/.xz
+    // gets a clear message instead of being parsed as text. A stream has no
+    // name, so it is taken at face value.
+    let ext_ok = from_stdin
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                e.eq_ignore_ascii_case("gz")
+                    || e.eq_ignore_ascii_case("fq")
+                    || e.eq_ignore_ascii_case("fastq")
+            })
+            .unwrap_or(true);
     if !ext_ok {
         bail!(
             "{}: fastcheck reads plain FASTQ and .gz FASTQ only — decompress the file first",

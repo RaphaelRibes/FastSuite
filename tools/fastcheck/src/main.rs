@@ -106,13 +106,17 @@ fn main() -> Result<()> {
     if !cli.quiet {
         let gc = 100.0 * report_gc(&total);
         let mean_q = report_mean_q(&total, verdict.offset);
-        println!(
+        let line = format!(
             "fastcheck: {} file(s), {} reads, {} bases, mean length {:.1}, GC {:.2}%, \
              mean read Q {:.2} (Phred+{}{}), {:.2}s{}",
             reports.len(),
             total.reads,
             total.bases,
-            if total.reads == 0 { 0.0 } else { total.bases as f64 / total.reads as f64 },
+            if total.reads == 0 {
+                0.0
+            } else {
+                total.bases as f64 / total.reads as f64
+            },
             gc,
             mean_q,
             verdict.offset,
@@ -120,6 +124,13 @@ fn main() -> Result<()> {
             elapsed,
             stopped.map(|s| format!(" [{s}]")).unwrap_or_default()
         );
+        // With `--json -` stdout carries the report, so the summary goes to
+        // stderr: a consumer parsing the output must not have to skip a line.
+        if cli.json.as_deref() == Some(std::path::Path::new("-")) {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
     }
     Ok(())
 }

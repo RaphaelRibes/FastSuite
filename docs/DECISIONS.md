@@ -49,32 +49,29 @@ Consequences to implement:
 
 ---
 
-## D-4 — Standard streams and FASTA ⏳ OPEN (explaining)
+## D-4 — Standard streams and FASTA ✅ decided: both
 
-The question: should a tool be usable **in the middle of a shell pipe**, and
-should it accept FASTA?
+Tools work **in a shell pipe and on files**: `-` is accepted for FASTQ input
+and for FASTQ output, alongside ordinary paths. A chain like
+`zcat in.fq.gz | fastdedup -1 - -o - | fastprep -1 - -o clean.fq.gz` must run
+with **zero intermediate files** on disk.
 
-Today:
+Consequences:
 
-* `fastcheck reads.fastq.gz` works. `zcat reads.fastq.gz | fastcheck -` does
-  **not** — `-` is not accepted, and the reader infers compression from the
-  file extension, which a stream does not have.
-* `fastcheck ref.fasta` exits with an error (no quality string to check).
-  fastprep and fastdedup already accept FASTA; fastcheck and fastmaps are
-  FASTQ-only by nature.
+* gzip/BGZF detection must come from **magic bytes**, not from the file
+  extension (a stream has no name).
+* A stream cannot be seeked, so the reader peeks the header bytes and chains
+  them back in front of the stream.
+* Output to a stream needs an explicit format/compression decision, because
+  there is no filename to infer from: `--out-format fastq|fasta` and
+  `--out-compression none|gz` (defaults: fastq, none) — or `-o -` inherits the
+  input's compression. To be settled when the first tool implements output
+  streaming.
+* FASTA stays tool-dependent and explicit: fastprep and fastdedup accept it;
+  fastcheck and fastmaps need qualities and refuse it with a clear message.
 
-Why it could matter: `fastp` is routinely used inside pipes
-(`zcat in.fq.gz | fastp ... | ...`), and pipe-based pipelines (Snakemake,
-Nextflow) exist partly to avoid writing intermediates to disk — which is
-exactly the I/O argument this suite is built on. Composing
-`fastdedup | fastprep | fastmaps` without intermediates needs **stdin on the
-consumer and stdout on the producer**.
-
-Options: (a) stdin input only, outputs stay files; (b) stdin **and** stdout, so
-a full chain runs with zero intermediates; (c) neither, and say so in the docs.
-Cost: (a) is small (read sequentially, detect gzip from magic bytes instead of
-extension); (b) adds an explicit output-format flag, since a stream has no
-filename to infer from.
+Reference implementation: `fastcheck` (input side done). fastprep, fastdedup
+and fastmaps follow.
 
 ---
 
@@ -89,34 +86,24 @@ filename to infer from.
 
 ---
 
-## D-6 — Behaviour when a detection returns nothing ⏳ OPEN (explaining)
+## D-6 — Behaviour when a detection returns nothing ✅ decided: B
 
-The question is not about heuristics; it is about what a tool does when it
-cannot determine something from the data:
+**Take the safe action, label it in the report, exit 0. `--strict` restores
+refusal.**
 
-* **fastprep, adapter detection** — it fingerprints the first ~2 000 reads to
-  identify the adapter. On genuinely adapter-free data it finds nothing and
-  today **exits 1** with instructions. In a 700-sample array job that turns a
-  *good* sample into a failed task.
-* **fastcheck, Phred offset** — it can prove `+33` when a quality byte below 64
-  exists; otherwise it assumes `+33`, records `phred_offset_certain: 0` and
-  keeps going.
-* **fastsim, adapter sequence** — a hardcoded Nextera constant in the profile.
+Concretely: fastprep's adapter auto-detection finding nothing now means "trim
+no adapter" (the safe action), with the assumption printed on stderr and
+recorded in the report, instead of exit 1. Same for any future detection: the
+safe default plus an `assumptions` entry
+(`{"what":"adapter","value":"none detected","consequence":"no adapter trimming"}`).
 
-So the suite is currently inconsistent, and both extremes are defensible.
-The question is which one becomes the rule:
+`--strict` makes any assumption fatal, for anyone who prefers the old refusal.
+Nothing is ever guessed silently: every assumption appears in the JSON and in
+the summary line.
 
-* Option A — **refuse** (fastprep's current behaviour): never produce a result
-  that rests on an unproven assumption.
-* Option B — **take the safe action, label it, continue**: no adapter
-  detected ⇒ trim no adapter (the safe action), record the assumption in the
-  report, exit 0. `--strict` restores Option A for anyone who wants it.
-* Option C — guess and warn (what FastQC/fastp effectively do).
-
-Recommendation now: **B**, because with `"assumptions": [...]` in the JSON and
-in the summary line, nothing is hidden — the report says "adapter: none
-detected, trimming skipped" — and batch runs do not fail on good samples.
-Option A stays available per run via `--strict`.
+Applied so far: fastprep (`--strict` added, safe continuation by default).
+fastcheck already behaved this way for the Phred offset
+(`phred_offset_certain: 0`), and now also emits an `assumptions` array.
 
 ---
 
@@ -162,13 +149,22 @@ No sequencing data, no subsets, no derived tables of real reads, in any repo,
 container, tarball, test fixture or example. Everything demonstrated publicly
 uses **generated** data (fastsim) or hand-written literal fixtures.
 
-Files currently in the tree that fall under this rule and need a ruling:
+Files that were in the tree and are now **out** of it:
 
-| file | what it is | concern |
+| file | what it is | disposition |
 |---|---|---|
-| `tools/fastsim/profiles/mandril_E.json` | statistical profile measured from the mandrill E dataset (CDFs, quality curves, GC) | derived from Mandrillus Project data, ~96 KB, currently committed |
-| `tools/fastsim/validation/*.png` | closed-loop validation plots from that dataset | same |
-| `tests/*` inline FASTQ literals | hand-written 6-read strings ("ACGTACGT…") | not data — but confirm the policy is "no real data", not "no FASTQ bytes at all" |
+| `tools/fastsim/profiles/mandril_E.json` | statistical profile measured from the mandrill E-dataset (CDFs, quality curves, GC) | moved to `~/hermes_scratch/fastsuite-local-artifacts/profiles/`; also still in the untouched `~/hermes_scratch/novaseq-sim/` tree. Only the **synthetic** `test_small.json` ships |
+| `tools/fastsim/validation/closed_loop_validation.png` | validation plot from that dataset | moved to `~/hermes_scratch/fastsuite-local-artifacts/validation/` |
+
+Enforcement: `.gitignore` blocks `tools/fastsim/profiles/*E.json` and
+`tools/fastsim/validation/*.png`, so a profile cannot be re-committed by
+accident. Real profiles are built on the compute node
+(`scripts/build_profile.py STATS_DIR out.json`) and stay there.
+
+Not data, so they stay: hand-written test fixtures (inline literals such as
+`"@r1\nACGTACGT\n+\nIIIIIIII\n"`) and `profiles/test_small.json`, which is
+synthetic (gc 0.5, no artefacts, `full_length_rate: 0`).
+
 
 ---
 

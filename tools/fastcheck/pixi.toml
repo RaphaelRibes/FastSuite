@@ -1,0 +1,28 @@
+[workspace]
+name = "fastcheck"
+version = "0.1.0"
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+channels = ["conda-forge", "bioconda"]
+description = "Exact, one-pass FASTQ quality control: no sampling, no hidden thresholds, no verdicts"
+
+# Every tool ships in a pixi environment (docs/DECISIONS.md D-3), and the same
+# environment is what the bioconda recipe and the pixitainer container are
+# built from, so the three cannot drift.
+
+[dependencies]
+rust = ">=1.85,<1.96"
+pkg-config = "*"
+c-compiler = "*"     # flate2's zlib-ng builds from source
+cmake = "*"
+zlib = "*"
+
+[tasks]
+build = "cargo build --release"
+build-offline = "cargo build --release --offline"
+check = "cargo check --all-targets --offline"
+test = "cargo test --offline"
+# Differential gate: fastcheck's numbers must equal the independent Python
+# reference's, on every metric and every per-position row.
+differential = "python tests/differential.py ../../examples/runs/demo/sim_E/sim_R1.fastq.gz"
+# Smoke test on generated data: no real dataset is ever involved (D-11).
+smoke = "cargo run --release --offline -- --reads 20000 ../../examples/runs/demo/sim_E/sim_R1.fastq.gz --json /tmp/fastcheck.json"

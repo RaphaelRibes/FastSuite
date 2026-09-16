@@ -19,11 +19,16 @@ keep_intermediate = false
 
 # Synthetic control: fastsim writes a known-truth sample, fasthelper pushes it
 # through the same chain, so every run report carries a sample with a truth TSV.
+#
+# The profile here is the *synthetic* test profile, because this repo never
+# ships data: a real profile is measured from a dataset and therefore lives
+# outside the repo (see DECISIONS.md D-11). To use one, pass its path:
+#   fastsim --profile /path/to/local/mandril_E.json ...
 [simulate]
 enabled = true
 name = "sim_E"
 pairs = 20000
-profile = "../tools/fastsim/profiles/mandril_E.json"
+profile = "../tools/fastsim/profiles/test_small.json"
 seed = 42
 
 # Real samples: add one [[samples]] block per sample.

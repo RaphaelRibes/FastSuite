@@ -101,6 +101,13 @@ pub struct Cli {
     #[arg(long = "no-adapter", help_heading = "Adapter Trimming")]
     pub no_adapter: bool,
 
+    /// Treat an assumption as fatal. By default, when a detection returns
+    /// nothing (e.g. no adapter found in the sampled reads) fastprep takes the
+    /// safe action, records the assumption and carries on; with --strict it
+    /// refuses to run instead.
+    #[arg(long, help_heading = "Runtime")]
+    pub strict: bool,
+
 
     /// Maximum mismatch rate for adapter sequence matching [0, 1].
     #[arg(long, default_value_t = 0.1, value_name = "FLOAT", help_heading = "Adapter Trimming")]
@@ -488,37 +495,53 @@ impl Cli {
             let det = adapter::identify_from_reads(&refs);
 
             if det.adapters.is_empty() {
-                bail!(
-                    "adapter auto-detection found nothing in {} sampled reads.\n\
-                     No sequence was guessed, because trimming on a guess is \
-                     worse than not trimming. Pass one of:\n  \
-                     --adapter-preset <illumina|nextera|small-rna>\n  \
-                     --adapters <FASTA>   (sequence IDs become adapter names)\n  \
-                     --no-adapter         (disable adapter trimming)",
+                // D-6 (docs/DECISIONS.md): the safe action is to trim nothing,
+                // which is what we do — loudly, with the reason in the report.
+                // --strict restores the refusal for anyone who prefers it.
+                if self.strict {
+                    bail!(
+                        "--strict: adapter auto-detection found nothing in {} sampled reads.\n\
+                         No sequence was guessed, because trimming on a guess is \
+                         worse than not trimming. Pass one of:\n  \
+                         --adapter-preset <illumina|nextera|small-rna>\n  \
+                         --adapters <FASTA>   (sequence IDs become adapter names)\n  \
+                         --no-adapter         (disable adapter trimming)",
+                        det.sampled
+                    );
+                }
+                eprintln!(
+                    "fastprep: assumption — adapter auto-detection found nothing in {} sampled \
+                     reads, so NO adapter trimming will be applied (the safe action; pass \
+                     --adapter-preset/--adapters/--no-adapter to be explicit, or --strict to \
+                     make this fatal)",
                     det.sampled
                 );
-            }
-
-            // A run commits every read to this one decision, so say what it
-            // was and on what evidence.
-            eprintln!("fastprep: adapter auto-detection ({} reads sampled)", det.sampled);
-            for (kmer, count) in &det.evidence {
+                AdapterSource::None
+            } else {
+                // A run commits every read to this one decision, so say what it
+                // was and on what evidence.
                 eprintln!(
-                    "  fingerprint {} in {} reads ({:.2}%)",
-                    String::from_utf8_lossy(kmer),
-                    count,
-                    100.0 * *count as f64 / det.sampled.max(1) as f64
+                    "fastprep: adapter auto-detection ({} reads sampled)",
+                    det.sampled
                 );
-            }
-            for a in &det.adapters {
-                eprintln!("  using {} ({} bp)", a.name, a.seq.len());
-            }
+                for (kmer, count) in &det.evidence {
+                    eprintln!(
+                        "  fingerprint {} in {} reads ({:.2}%)",
+                        String::from_utf8_lossy(kmer),
+                        count,
+                        100.0 * *count as f64 / det.sampled.max(1) as f64
+                    );
+                }
+                for a in &det.adapters {
+                    eprintln!("  using {} ({} bp)", a.name, a.seq.len());
+                }
 
-            AdapterSource::Fixed(Arc::new(AdapterSet::new(
-                det.adapters,
-                self.adapter_error_rate,
-                self.min_adapter_overlap,
-            )))
+                AdapterSource::Fixed(Arc::new(AdapterSet::new(
+                    det.adapters,
+                    self.adapter_error_rate,
+                    self.min_adapter_overlap,
+                )))
+            }
         };
 
         // Build base Params.

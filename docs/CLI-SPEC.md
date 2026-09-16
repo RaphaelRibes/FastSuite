@@ -23,11 +23,18 @@ survives as an alias for one release.** Nothing breaks, everything converges.
 | quiet | `-q, --quiet` | flag | suppress the summary line |
 | verbose | `-v, --verbose` | flag | per-step detail on stderr |
 | temp location | `--temp-dir <PATH>` | path | where spill/intermediate files go |
+| strict mode | `--strict` | flag | an assumption becomes a fatal error (D-6) |
 | help / version | `-h, --help`, `-V, --version` | flag | `-V` prints `<binary> <semver>` |
 
 Rules:
 
-1. **No positional inputs** except for tools whose job is many files (`fastmaps`).
+0. **`-` means the stream** (D-4). FASTQ input from stdin and FASTQ/report
+   output to stdout, in a pipe or on a file, with no intermediate on disk:
+   `zcat in.fq.gz | fastdedup -1 - -o - | fastprep -1 - -o clean.fq.gz`.
+   Compression is decided from **magic bytes**, never from a filename, so a
+   stream and a mislabelled file behave identically. When stdout carries a
+   report (`--json -`), the summary line moves to stderr.
+1. **No positional inputs** except tools whose job is many files (`fastmaps`).
 2. Short flags are a scarce resource: `-1 -2 -o -p -j -q -v -f -V -h` are the
    suite's; anything else a tool uses for its own options (`fastdedup -t`
    threshold, `-H` hash, `-P` read length) stays tool-local.

@@ -210,6 +210,107 @@ fn mixed_read_lengths_report_the_true_minimum() {
 }
 
 #[test]
+fn stdin_is_read_exactly_like_a_file() {
+    // D-4: `-` must behave like the file it replaces, in every decompression
+    // path, and produce the same numbers.
+    let d = tmpdir("stdin");
+    let fq = write_fixture(&d);
+    let gz = d.join("reads.fastq.gz");
+    {
+        let mut enc = flate2::write::GzEncoder::new(
+            std::fs::File::create(&gz).unwrap(),
+            flate2::Compression::default(),
+        );
+        use std::io::Write;
+        enc.write_all(FASTQ).unwrap();
+        enc.finish().unwrap();
+    }
+
+    // plain file vs plain stdin
+    let a = d.join("file.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", a.to_str().unwrap(), "-q"]);
+    let from_pipe = Command::new(fastcheck())
+        .args(["-", "--json", "-", "-q"])
+        .current_dir(&d)
+        .stdin(std::fs::File::open(&fq).unwrap())
+        .output()
+        .unwrap();
+    assert!(from_pipe.status.success());
+    let piped = String::from_utf8_lossy(&from_pipe.stdout);
+    let file_text = std::fs::read_to_string(&a).unwrap();
+    assert!(
+        piped.contains("\"reads\": 6"),
+        "stdin/metrics: {piped}"
+    );
+    // The metric block is what must not change; the file name and the
+    // decompression-mode label legitimately differ for a stream.
+    let metrics_of = |s: &str| -> serde_json::Value {
+        let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+        v["metrics"]["elapsed_s"] = serde_json::json!(0.0);
+        v["metrics"].clone()
+    };
+    assert_eq!(
+        metrics_of(&piped),
+        metrics_of(&file_text),
+        "stdin must not change any number"
+    );
+    let v: serde_json::Value = serde_json::from_str(&piped).unwrap();
+    assert_eq!(v["per_file"][0]["name"], "-");
+    assert_eq!(
+        v["per_file"][0]["decompression"], "stdin-plain",
+        "the report must say the data came from a stream"
+    );
+
+    // gzip stdin: magic-byte detection, not the filename. No `-q` here, so the
+    // summary line is what lands on stdout.
+    let gz_pipe = Command::new(fastcheck())
+        .args(["-"])
+        .current_dir(&d)
+        .stdin(std::fs::File::open(&gz).unwrap())
+        .output()
+        .unwrap();
+    assert!(gz_pipe.status.success());
+    let gz_line = String::from_utf8_lossy(&gz_pipe.stdout);
+    assert!(gz_line.contains("6 reads"), "gzip stdin: {gz_line:?}");
+}
+
+#[test]
+fn assumptions_are_reported_as_data() {
+    // D-6: an unprovable Phred offset becomes an explicit assumption entry,
+    // not a silent default.
+    let d = tmpdir("assumptions");
+    let p = d.join("ambiguous.fastq");
+    // Every quality byte >= 64, so +33 cannot be proven: 'h' = 104 (Q40 under
+    // +33, Q71 under +64 — implausible, but arithmetically possible).
+    std::fs::write(
+        &p,
+        b"@r1\nACGTACGT\n+\nhhhhhhhh\n@r2\nACGTACGT\n+\nhhhhhhhh\n",
+    )
+    .unwrap();
+    let json = d.join("a.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[p.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&json);
+    assert_eq!(v["metrics"]["phred_offset_certain"], 0);
+    let a = &v["assumptions"][0];
+    assert_eq!(a["what"], "phred_offset");
+    assert!(
+        a["consequence"].as_str().unwrap().contains("Phred+64"),
+        "the consequence must be stated: {a}"
+    );
+
+    // A file that proves +33 has no assumptions at all.
+    let d2 = tmpdir("assumptions_none");
+    let fq = write_fixture(&d2);
+    let json2 = d2.join("b.json");
+    run(&d2, &[fq.to_str().unwrap(), "--json", json2.to_str().unwrap(), "-q"]);
+    assert_eq!(read_json(&json2)["assumptions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn fasta_input_fails_loudly() {
     let d = tmpdir("fasta");
     let p = d.join("ref.fastq");
