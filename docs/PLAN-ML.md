@@ -81,36 +81,67 @@ result row records the score version that produced it.
 
 ### Tier 1 — exact, simulated data only (the training signal)
 
-`fastsim` writes `PREFIX.gt.tsv` with one row per pair:
-`pair_id  insert  r1_h  r1_t  r2_h  r2_t  full_flag  is_dup`, where `r{n}_h` /
-`r{n}_t` are the head/tail bases a **correct** trimmer must remove from each
-mate. `fastprep --metadata` writes a PXMT record for every read it trims or
-drops. Comparing the two gives an exact, per-read, reference-free verdict:
+**As built:** `bench/scripts/score_gt.py`, 18 unit tests, verified against the
+producers' own code rather than assumed — the definitions below were corrected
+after the first pilot run contradicted an earlier draft.
+
+`fastsim` writes `PREFIX.gt.tsv`, one row per pair:
+`pair_id insert r1_h r1_t r2_h r2_t full_flag is_dup`. Per `fastsim/src/truth.rs`:
+
+* `r{n}_h` / `r{n}_t` are the **5′/3′ G-run lengths** of that mate — the artefact
+  spans, *not* "the trim a correct trimmer must make".
+* The correct kept window is `[h, min(I, L−t))`, so with `L` the read length the
+  ideal removals are: 5′ `= h`, 3′ `= L − min(I, L−t)`. When `I < L − t` the 3′
+  removal includes adapter readthrough (e.g. `I=58, t=0, L=150` → remove 92).
+* `full_flag = 1` → the window is empty and the correct action is **DROP**.
+
+`fastprep --metadata` writes PXMT v3 (`fastprep/src/metadata.rs`) recording
+**every** read — kept, trimmed or dropped — with per-end removals split into
+adapter and polyX parts (`t5 = t5_adapter + t5_poly`). The join to GT is
+asserted, not assumed, two independent ways: mates must alternate R1,R2,R1,R2,
+and the read ID must resolve to the same pair index.
+
+> **Flowcell geometry (found by that assertion, on the first real run):**
+> fastsim's IDs are `instr:run:flowcell:lane:tile:x:y` with
+> **`pair_index = y × TILE_WIDTH + x`**, `TILE_WIDTH = 10 000`. `x` resets to 0
+> every 10 000 pairs, so a scorer assuming a monotonic coordinate refuses real
+> files. A silent join error here would have mislabelled every row of the sweep.
+
+**The score is config-aware**, because the same read is a correct drop under one
+parameter set and a wrong drop under another:
 
 | counter | definition |
 |---|---|
-| `keep_clean_ok` | pair untouched by GT (h=t=0), untouched by fastprep |
-| `trim_exact` | pair trimmed, and `(h', t') == (h, t)` for both mates |
-| `trim_over` | fastprep removed more true bases than GT: `h' > h` or `t' > t` |
-| `trim_under` | fastprep left artefact: `h' < h` or `t' < t` |
-| `drop_wrong` | pair dropped by fastprep but GT keeps it |
-| `drop_ok` | pair dropped by fastprep and GT's within-pair overlap makes the pair untrimmable (`full_flag` / must-drop class) |
+| `exact` | kept, and both mates match the ideal removals exactly |
+| `over_trim` | kept, real sequence removed beyond the artefact window |
+| `under_trim` | kept, artefact left behind |
+| `mixed_trim` | kept, one mate over- and the other under-trimmed |
+| `drop_correct` | dropped, and dropping was right: `full_flag=1`, **or** the ideal window is shorter than the config's `--min-len` (default `0.6L`), **or** `is_dup=1` with `--dedup` on |
+| `drop_wrong` | dropped a pair that should have been kept |
+| `keep_wrong` | kept a pair whose window was empty or below `--min-len` |
+| `partial` | one mate kept, one dropped — the pair is broken |
 
 ```
-score_t1 = w_keep·keep_clean_ok
-         + w_exact·trim_exact
-         − w_over·trim_over        # deleting real sequence is the sin that matters
-         − w_under·trim_under      # leaving artefact is the milder one
-         − w_drop·drop_wrong       # losing a pair costs a downstream read pair
-           (all normalised by pairs_in; weights in score_weights.toml, sum of the
-            negative weights fixed at 1.0 of the pair budget so scores are comparable
-            across datasets)
+score = (exact + drop_correct − Σ wᵢ·errorᵢ) / pairs        # 1.0 = perfect
+w: over 0.5, under 0.25, mixed 0.4, drop_wrong 0.5, keep_wrong 0.5, partial 0.5
 ```
 
-Default weights (explicit, arguable, versioned — `score_weights.toml`):
-`w_keep = 1.0`, `w_exact = 1.0`, `w_over = 0.5`, `w_under = 0.25`,
-`w_drop = 0.5`. A near-tie tolerance `eps = 0.005` is applied when reporting
-"best config", so noise-level differences are not treated as signal.
+Weights live in `config/score_weights.toml` and the score version in every
+result row, so a weight change is visible in the data rather than silent.
+
+**First real measurement (100 k pairs, nextera preset, defaults, this profile):**
+
+| score | exact | over | under | mixed | drop_ok | drop_wrong |
+|---|---|---|---|---|---|---|
+| **0.277** | 0.450 | 0.274 | 0.090 | 0.140 | 0.044 | 0.0015 |
+
+The loss is dominated by over-trim, which is a calibration decision, not a bug
+report: fastprep's quality-weighted scan (mercy 3.0, `--min-run 8`) routinely
+takes a few bases beyond the injected G-run. Either that is real over-trimming
+(the current, strict reading — it is what a quality-agnostic ground truth says)
+or the score needs an explicit tolerance of *k* bases at the artefact boundary.
+**Decide before the sweep:** the choice sets the optimum the model will learn
+toward. Task 0.9 measures how sensitive the ranking is to it.
 
 **Why this matters:** it is exact (no proxy), cheap (~0.05 core-s), needs no
 aligner, no reference and no network, and it is the only tier where the
@@ -213,6 +244,7 @@ real) × 30 configs, and produce the first "predicted vs achieved" scatter.
 | 0.6 Snakefile: `acquire → simulate → sweep → score → aggregate` | `Snakefile`, `workflow/rules/*.smk` | `snakemake -n` plans the whole DAG; a full run finishes < 30 min on 8 cores |
 | 0.7 Baseline rows for the same datasets: fastp defaults, fastprep `--adapter-preset nextera` alone, and "no preprocessing" | `scripts/run_baseline.py` | baselines appear in the same parquet as ordinary configs |
 | 0.8 **Label-noise calibration** (decides the unit size): same dataset, same config, 10 subsample seeds, at 50 k / 100 k / 200 k pairs | `scripts/label_noise.py` | SD of the score per unit size; keep the smallest whose SD stays under `eps`/2 |
+| 0.9 Score-tolerance calibration: re-score the pilot with a k-base tolerance at the artefact boundary (k = 0,1,2,3) | `scripts/score_gt.py --boundary-tolerance k` | ranking of the pilot's configs is reported for each k; the plan's tier-1 text records the decision |
 
 **Acceptance:** `results/matrix.parquet` with 300 tier-1 rows, a scatter of
 predicted (in-sample, 10 points) and measured score, and a written list of the
@@ -315,19 +347,31 @@ artefact dimension spanning its range.
 | real (tier-1 unavailable → tier-3) | 700 | 200 | 140 000 | 1.95 | 76 |
 | **total** | | | **1.14 M** | | **~512** |
 
-* Configs per dataset: 150 Latin-hypercube samples from `config_space.toml`
-  (covers the 12–14 dimensions without a grid blow-up) + 30 hand-picked
-  anchors (fastp defaults, "trim nothing", "trim everything", preset
-  nextera/TruSeq, the extremes of each axis) + 20 local-refinement samples
-  around the best-so-far for that dataset (a second, cheap stage that fixes
-  the "the model can only recommend inside the grid" problem).
-* Dimensions (`config_space.toml`, generated from the real `fastprep --help`,
-  never hand-invented): adapter mode (auto / preset illumina / nextera /
-  small-rna / none), `--adapter-error-rate` (0.03–0.20),
-  `--min-adapter-overlap` (4–14), `--min-run` (4–12), `--min-len` (30–0.9L),
-  a 5′/3′/interior scan switch as a categorical, `--r2-scan-reverse` on/off,
-  `--mean-q` (0 / 10 / 15 / 20 / 25), `--phred-offset` (auto / 33 / 64),
-  `--trim-5`/`--trim-3` (0 / 1–5), `--dedup` on/off.
+* Configs per dataset: **170 shared + 30 per-dataset refinement**. The shared
+  core (Latin hypercube + anchors: fastp defaults, "trim nothing", "trim
+  everything", the extremes of each axis) is evaluated on *every* dataset, so
+  each configuration is observed ~5 700 times and its effect is measured rather
+  than inferred; the 30 refinement samples are drawn around that dataset's
+  best-so-far. An all-per-dataset draw would leave ~1.14 M mostly-unique rows —
+  a ranker fitting noise. Same evaluation count either way.
+* Dimensions (declared in `bench/config/config.yaml`, values taken from the real
+  `fastprep --help`, never hand-invented): `--adapter-error-rate` (0.03–0.20),
+  `--min-adapter-overlap` (4–14), `--min-run` (4–12), `--min-len` (0.3L–0.9L),
+  `--mean-q` (0–25), `--phred-offset` (auto/33/64), interior scan on/off,
+  `--r1-scan-reverse`, `--r2-scan-reverse`, `--trim-5`/`--trim-3` (0–5),
+  `--dedup`.
+* **Adapter mode is fixed to `auto`** (decided): `--adapter-preset`,
+  `--adapters` and `--no-adapter` are not swept, because auto-detection is what
+  a user with no prior knowledge of the library kit actually gets. The
+  consequence is handled explicitly: auto-detection **refuses** (exit 1) when
+  the sampled reads carry no adapter, so the simulated corpus floors
+  `adapter_rate` at 2 %, and a refusal is recorded as its own outcome — never
+  silently retried with a preset, which would change what is measured.
+* **The two end-scans are not swept off**: the simulator injects G-runs at both
+  ends of every read (`[0,h)` and `[L−t,L)`), so disabling one leaves whole
+  artefact runs in the output (guaranteed under-trim). The interior scan and the
+  two scan *directions* are swept, which tests the documented "NovaSeq R2 5′
+  polyG needs `--r2-scan-reverse`" recommendation instead of assuming it.
 * Parallelism: **two levels, both used** — many samples in flight (the
   scheduler's job) and `fastprep -jN` inside a task (measured 2.8× at `-j8` on
   2 M pairs, 15.48 s → 5.45 s, thanks to the gz output thread pool). One SLURM array task = one dataset × all its
