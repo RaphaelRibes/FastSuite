@@ -72,7 +72,13 @@ last consumer has read them.
 Aggregate reports you already have (including from the pre-suite binaries):
 
 ```fish
+# per-sample JSON reports -> one table (one row per sample, one column per metric)
 fasthelper concatenate runs/ -o report/ --format html,tsv
+
+# per-position tables (from `fastcheck --positions-tsv`) -> one positions x samples matrix
+fasthelper concatenate --positions runs/ -o matrix/                  # metric mean_q by default
+fasthelper concatenate --positions runs/ --metric depth --stdout     # any column of the table
+fasthelper concatenate --positions runs/ --all-metrics -o matrix/     # tidy: sample,pos,metric,value
 ```
 
 Every tool is still a normal Unix filter — the suite adds an interface, it does

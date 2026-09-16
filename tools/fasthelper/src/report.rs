@@ -93,7 +93,7 @@ pub fn sample_from_path(path: &Path) -> String {
     const GENERIC: &[&str] = &[
         "report", "reports", "stats", "json", "out", "output", "heatmap", "fastprep",
         "fastdedup", "fastmaps", "fastsim", "fasthelper", "dedup", "prep", "maps", "result",
-        "results", "summary", "manifest",
+        "results", "summary", "manifest", "positions", "position", "pos", "matrix",
     ];
     let stem = path
         .file_stem()

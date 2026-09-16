@@ -15,7 +15,21 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     match cli.command {
         cli::Cmd::Run(a) => runner::run(&a),
-        cli::Cmd::Concatenate(a) => report::cmd_concatenate(&a),
+        cli::Cmd::Concatenate(a) => {
+            // Two flavours of the same job: reports -> one table, or
+            // per-position TSVs -> one positions x samples matrix.
+            if a.positions {
+                fasthelper::positions::concatenate_positions(
+                    &a.inputs,
+                    &a.outdir,
+                    &a.metric,
+                    a.all_metrics,
+                    a.stdout,
+                )
+            } else {
+                report::cmd_concatenate(&a)
+            }
+        }
         cli::Cmd::Doctor(a) => runner::doctor(&a),
         cli::Cmd::Schema => {
             print!("{}", report::SCHEMA_DOC);

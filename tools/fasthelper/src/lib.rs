@@ -6,5 +6,6 @@
 
 pub mod cli;
 pub mod config;
+pub mod positions;
 pub mod report;
 pub mod runner;

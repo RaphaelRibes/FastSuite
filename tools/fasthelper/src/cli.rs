@@ -80,6 +80,20 @@ pub struct ReportArgs {
     #[arg(long)]
     pub sample: Option<String>,
 
+    /// Concatenate per-position TSVs (from `fastcheck --positions-tsv`) into
+    /// one positions x samples matrix instead of concatenating JSON reports.
+    #[arg(long)]
+    pub positions: bool,
+
+    /// Column to place in the wide matrix (any column of the input table).
+    #[arg(long, default_value = "mean_q", value_name = "NAME")]
+    pub metric: String,
+
+    /// Emit the tidy shape (sample, pos, metric, value) with every metric,
+    /// instead of a wide single-metric matrix.
+    #[arg(long)]
+    pub all_metrics: bool,
+
     /// Print the aggregated table to stdout.
     #[arg(long)]
     pub stdout: bool,
