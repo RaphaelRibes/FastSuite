@@ -1,0 +1,39 @@
+# Snakemake SLURM profile for the FastSuite PLAN-ML sweep (Io).
+#
+#   snakemake --profile slurm
+#
+# Structure copied from the working novaseq-bench profile on this cluster:
+# cluster IDENTITY lives here (partition, account, concurrency ceiling), while
+# per-rule resource VALUES live in the Snakefile — how much memory a rule needs
+# is a property of the workflow, where it runs is a property of the site.
+#
+# The CELLS' sbatch headers are generated from this file: there is no
+# per-cell .sbatch to edit. `slurm_account` and `slurm_partition` are resources,
+# not command-line flags.
+
+executor: slurm
+jobs: 100                  # max concurrent SLURM jobs (= cores here: 1 CPU each)
+latency-wait: 60           # shared filesystems lie about file visibility
+retries: 1                 # absorb one preempted or OOM-killed cell
+rerun-incomplete: true
+keep-going: true           # one failed shard must not abandon the matrix
+printshellcmds: true
+
+default-resources:
+  slurm_partition: "cpu-dedicated"
+  slurm_account: "dedicated-cpu@cirad-normal"   # cells only; the dispatcher
+                                                # sbatch file uses @cirad-long
+  runtime: 2880            # 48 h for every job — the standing over-request
+                           # policy (costs queue priority, not correctness)
+  mem_mb: 256              # measured peaks: fastprep 29.5 MB, fastcheck 10.7 MB,
+                           # fastsim 46.5 MB on the work unit. A comfortable
+                           # 2 GB request would reserve 200 GB across 100
+                           # concurrent cells and can trip AssocGrpMemLimit,
+                           # parking jobs in PENDING forever.
+  cpus_per_task: 1         # -jN buys wall time and costs core-hours (PLAN-ML §1)
+
+resources:
+  # Hard ceiling on cores in flight across ALL concurrent jobs. Snakemake sums
+  # this resource over running jobs, so the workflow cannot monopolise the
+  # partition whatever the DAG says. Raise with jobs: together, not separately.
+  cpus_per_task: 100

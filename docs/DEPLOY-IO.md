@@ -167,46 +167,34 @@ sed -i "s|#!.*/novaseq-bench/.pixi/envs/bench/bin/python|#!/scratch/users/ribesr
 
 ---
 
-## 6. Ready to submit (needs your confirmation — your rule)
+## 6. The SLURM headers, as written
 
-**Phase 0 pilot — one job, minutes:**
+Four files, all in `deploy/io/` — the headers are real, not sketches:
 
-```
-partition  cpu-dedicated
-account    dedicated-cpu@cirad-normal
-cpus       1        mem  1G        time  48:00:00
-command    cd /scratch/users/ribesr/fastsuite-bench
-           mkdir -p bench/slurm/logs
-           sbatch bench/slurm/pilot.sbatch
-```
+| file | role | header |
+|---|---|---|
+| `pilot.sbatch` | phase 0: build the three tools, prove egress, one dataset end to end, measure wall/RSS | `cpu-dedicated` / `@cirad-normal` / 1 CPU / **1G** / 48 h |
+| `dispatch.sbatch` | phase 3 controller: holds Snakemake, submits the cells | `cpu-dedicated` / `@cirad-long` / 1 CPU / 2G / **7-00:00:00** |
+| `acquire.sbatch` | phase 1: ENA downloads + subsample + hash + delete raw, resumable | `cpu-dedicated` / `@cirad-normal` / 1 CPU / 1G / 48 h |
+| `slurm-config.yaml` | the **cells** — no per-cell sbatch exists; these headers are generated from the profile | `cpu-dedicated` / `@cirad-normal` / 1 CPU / **256M** / 48 h (runtime 2880), `jobs: 100`, global core ceiling 100 |
 
-**Phase 3 sweep — dispatcher + 570 cells:**
+Plus `WORKFLOW-IO.md` for the `ssh Io` + `srun` path:
 
-```
-dispatcher partition  cpu-dedicated
-           account    dedicated-cpu@cirad-long
-           cpus 1     mem 2G          time 7-00:00:00
-           command    sbatch bench/slurm/dispatch.sbatch        # throttled at -j 100
-
-cells      partition  cpu-dedicated
-           account    dedicated-cpu@cirad-normal
-           cpus 1     mem 256M        time 48:00:00
-           count      570 shards × 10 datasets (submitted BY the dispatcher)
+```fish
+ssh Io
+srun --partition=cpu-dedicated --account=dedicated-cpu@cirad-normal \
+     --cpus-per-task=1 --mem=2G --time=01:00:00 --pty bash
 ```
 
-Confirm the two blocks (or the `-j` throttle) and I will write the sbatch files
-and the profile to match exactly. Nothing is submitted until you say go.
+Two deliberate choices inside those headers:
 
----
+* **The account split is load-bearing.** The dispatcher runs under
+  `@cirad-long` with a 7-day clock because it must outlive the matrix; under
+  `@cirad-normal` it can be killed at the QoS maximum mid-wave. The cells keep
+  `@cirad-normal`, where 48 h is plenty for a 52 min shard.
+* **`mem_mb: 256` is a measured request, not a cautious one** (peaks: 29.5 /
+  10.7 / 46.5 MB). A comfortable 2 GB would reserve 200 GB across 100
+  concurrent cells, which is exactly how jobs end up parked in PENDING on a
+  group allocation.
 
-## 7. Io-specific risks
-
-| risk | mitigation |
-|---|---|
-| `pixi install` deadlock → no new packages | env copied by directory; harness restricted to python 3.12 + polars (both already present); training kept local |
-| flaky rsync silently dropping files | per-file push, 3 retries, pull-back + `diff` verification |
-| over-large `--mem` → `AssocGrpMemLimit`, jobs stuck PENDING | 256 MB request against a measured 46.5 MB worst case |
-| group core-hour budget | the sweep is checkpointed per shard, so it can be stopped after any wave; `-j` is the throttle to dial |
-| rust 1.83 on the cluster vs the suite's newest crate | build only the three tools PLAN-ML uses; record `cargo --version` per run |
-| stale CMake cache in `target/` after any env move | the proven guard from `novaseq-bench`'s dispatcher (grep the old env path, `cargo clean`) is copied verbatim |
-| data hygiene | FASTQ lives only under `/scratch/users/ribesr/fastsuite-bench/data/`, rolling; repo and results carry manifests + hashes only, never reads |
+Nothing is submitted until you confirm partition + account + time for each role.
