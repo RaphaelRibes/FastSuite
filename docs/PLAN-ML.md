@@ -383,15 +383,22 @@ default and refuses to run without a model file.
 
 ## 5. Cluster execution
 
+**Io-specific mapping — partitions, accounts, env strategy, staging commands,
+measured resource requests and the submit-for-confirmation block — is in
+`docs/DEPLOY-IO.md`. It was written against the `novaseq-bench` deployment that
+already works on Io, not from assumptions.**
+
 * **Never compute on the login node** (submission only: `sbatch`, `squeue`,
   `sacct`). Everything below is submitted.
 * Snakemake + the SLURM executor plugin, or, if the plugin is unavailable,
   `sbatch --array=1-5700%200` driving `run_dataset.sh` with an index file.
   Arrays are the right primitive: thousands of tiny, independent, 2-minute
   tasks.
-* Resources: 1 task = 1 dataset, **1 core**, 2 GB, 30 min walltime (measured
-  200 configs × 1.57 core-s ≈ 5 min, so 30 min is a 6× margin). `-j4` is a
-  latency lever: 2.4× less wall for +50 % core-hours. The sweep is
+* Resources per cell: **1 core, 256 MB** (measured peaks: fastprep 29.5 MB,
+  fastcheck 10.7 MB, fastsim 46.5 MB — a large `--mem` trips the group quota and
+  parks jobs in PENDING), flat 48 h walltime per the standing over-request
+  policy. Packing: 10 datasets per job → 570 jobs of ~52 min; `-j 100` ≈ 5.5 h
+  wall, `-j 200` ≈ 3 h. The sweep is
   embarrassingly parallel; the only shared resource is scratch I/O, so keep
   concurrent readers bounded (`%200`) and stage per-dataset work inside
   `$SCRATCH` (never `$HOME`).
