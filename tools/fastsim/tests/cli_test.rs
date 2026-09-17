@@ -65,7 +65,7 @@ fn smoke_run_produces_three_files() {
     let gt_text = std::fs::read_to_string(&gt).unwrap();
     assert_eq!(gt_text.lines().count(), 1001);
     let header = gt_text.lines().next().unwrap();
-    assert_eq!(header, "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tfull_flag\tis_dup");
+    assert_eq!(header, "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup");
 
     // Cleanup.
     std::fs::remove_dir_all(&dir).unwrap();
@@ -244,7 +244,7 @@ fn dup_rate_reproduces_and_dups_copy_a_stored_template() {
     let mut nd = 0u64;
     for line in gt.lines().skip(1) {
         n += 1;
-        let dup: u8 = line.split('\t').nth(7).unwrap().parse().unwrap();
+        let dup: u8 = line.split('\t').nth(9).unwrap().parse().unwrap();
         nd += u64::from(dup);
     }
     let rate = nd as f64 / n as f64;
@@ -264,7 +264,7 @@ fn dup_rate_reproduces_and_dups_copy_a_stored_template() {
     let mut dup_copies = 0usize;
     let mut matched = 0usize;
     for (i, line) in gt.lines().skip(1).enumerate() {
-        let is_dup = line.split('\t').nth(7) == Some("1");
+        let is_dup = line.split('\t').nth(9) == Some("1");
         let s = seqs[i].as_bytes();
         if is_dup {
             dup_copies += 1;

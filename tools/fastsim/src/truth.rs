@@ -46,8 +46,8 @@ impl GtWriter<BufWriter<std::fs::File>> {
             read_len,
         };
         w.out.write_all(
-            b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tfull_flag\tis_dup\n",
-        )?;
+                    b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\n",
+                )?;
         Ok(w)
     }
 }
@@ -66,13 +66,15 @@ impl<W: Write> GtWriter<W> {
         let full = u8::from(a.full);
         let dup = u8::from(is_dup);
         writeln!(
-            self.out,
-            "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{full}\t{dup}",
-            a.h1.min(l),
-            a.t1.min(l),
-            a.h2.min(l),
-            a.t2.min(l)
-        )?;
+                    self.out,
+                    "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}",
+                    a.h1.min(l),
+                    a.t1.min(l),
+                    a.h2.min(l),
+                    a.t2.min(l),
+                    a.a1.min(l),
+                    a.a2.min(l)
+                )?;
         Ok(())
     }
 
@@ -92,6 +94,8 @@ mod tests {
             t1,
             h2,
             t2,
+            a1: 0,
+            a2: 0,
             full,
         }
     }
@@ -111,10 +115,10 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(
             lines[0],
-            "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tfull_flag\tis_dup"
+            "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup"
         );
-        assert_eq!(lines[1], "7\t300\t2\t5\t0\t3\t0\t0");
-        assert_eq!(lines[2], "8\t120\t0\t0\t0\t0\t1\t1");
+        assert_eq!(lines[1], "7\t300\t2\t5\t0\t3\t0\t0\t0\t0");
+        assert_eq!(lines[2], "8\t120\t0\t0\t0\t0\t0\t0\t1\t1");
     }
 
     #[test]
@@ -127,7 +131,7 @@ mod tests {
         w.finish().unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(s.lines().nth(1).unwrap(), "0\t300\t0\t150\t0\t150\t1\t0");
+        assert_eq!(s.lines().nth(1).unwrap(), "0\t300\t0\t150\t0\t150\t0\t0\t1\t0");
     }
 
     #[test]

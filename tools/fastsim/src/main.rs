@@ -154,14 +154,17 @@ fn run(cfg: &cli::Config) -> Result<()> {
         // 2. Artefact decision (correlated tails, heads, full spike).
         // Drawn fresh even for duplicates: dropout is a per-cluster failure,
         // so a copy gets its own polyG runs, exactly like the measured data.
-        let a = decide(&profile, &mut rng);
+        let mut a = decide(&profile, &mut rng);
         if a.full {
             n_full += 1;
         }
 
         // 3. Build reads.
         let r1 = build_read(&profile, &insert, insert_len, Mate::R1, &a, &mut rng);
-        let r2 = build_read(&profile, &insert, insert_len, Mate::R2, &a, &mut rng);
+                let r2 = build_read(&profile, &insert, insert_len, Mate::R2, &a, &mut rng);
+                // Record where the adapter actually landed, so the GT labels it explicitly.
+                a.a1 = r1.adapter_len;
+                a.a2 = r2.adapter_len;
         // Sequencer output is always exactly read_len bases — every branch
         // of build_read pads to L (adapter readthrough or Ns). This is the
         // contract the bench relies on, so assert it per pair.

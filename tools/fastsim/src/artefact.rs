@@ -25,6 +25,11 @@ pub struct Artefact {
     pub t1: u32,
     pub h2: u32,
     pub t2: u32,
+    /// adapter readthrough length per mate (0 = no adapter on that read).
+    /// Filled in by the caller after build_read; the GT writer reports it so
+    /// "where is the adapter" is explicit, not derived.
+    pub a1: u32,
+    pub a2: u32,
     /// Entirely-artefact pair (full-length spike or biology window < 1 bp):
     /// the correct answer for a trimmer is to DROP the pair.
     pub full: bool,
@@ -74,13 +79,15 @@ pub fn decide<R: Rng + ?Sized>(p: &Profile, rng: &mut R) -> Artefact {
     // 2. Near-full: biology window collapsed to < 1 bp -> drop class.
     let full = h1 + t1 >= l || h2 + t2 >= l;
     Artefact {
-        h1,
-        t1,
-        h2,
-        t2,
-        full,
+            h1,
+            t1,
+            h2,
+            t2,
+            a1: 0,
+            a2: 0,
+            full,
+        }
     }
-}
 
 /// Build one mate's read from the insert.
 ///
@@ -272,6 +279,8 @@ mod tests {
             t1: 5,
             h2: 0,
             t2: 5,
+            a1: 0,
+            a2: 0,
             full: false,
         };
         let r1 = build_read(&p, &insert, 300, Mate::R1, &a, &mut rng);
@@ -394,6 +403,8 @@ mod tests {
             t1: 60,
             h2: 0,
             t2: 0,
+            a1: 0,
+            a2: 0,
             full: false,
         };
         let mut rng = rng();
@@ -503,6 +514,8 @@ mod tests {
             t1: 5,
             h2: 0,
             t2: 5,
+            a1: 0,
+            a2: 0,
             full: false,
         };
         let r1 = build_read(&p, &insert, 200, Mate::R1, &a, &mut rng);
