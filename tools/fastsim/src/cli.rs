@@ -47,6 +47,9 @@ pub struct Config {
     pub threads: usize,
     /// Optional FastSuite report (schema v1) destination.
     pub json: Option<String>,
+    /// Single-end mode: one read per fragment (no mate 2, no insert-size
+    /// geometry; adapter readthrough still lands at the read's 3′ end).
+    pub single: bool,
 }
 
 impl Default for Config {
@@ -70,6 +73,7 @@ impl Default for Config {
             drop_min_len: 100,
             threads: 1,
             json: None,
+            single: false,
         }
     }
 }
@@ -107,6 +111,7 @@ pub fn parse(args: &[String]) -> Result<Config> {
                 cfg.adapter_seq = Some(String::new()); // empty = disabled
             }
             "--no-gzip" => cfg.gzip = false,
+            "--single" => cfg.single = true,
             "--dup-rate" => cfg.dup_rate = next(&mut i)?.parse()?,
             "--dup-pool" => cfg.dup_pool = next(&mut i)?.parse()?,
             "--drop-rate" => cfg.drop_rate = next(&mut i)?.parse()?,

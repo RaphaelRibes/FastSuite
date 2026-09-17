@@ -35,19 +35,31 @@ use crate::artefact::Artefact;
 pub struct GtWriter<W: Write> {
     out: W,
     read_len: u32,
+    single: bool,
 }
 
 impl GtWriter<BufWriter<std::fs::File>> {
     pub fn open(path: &Path, read_len: u32) -> Result<Self> {
+        Self::open_with(path, read_len, false)
+    }
+
+    pub fn open_single(path: &Path, read_len: u32) -> Result<Self> {
+        Self::open_with(path, read_len, true)
+    }
+
+    fn open_with(path: &Path, read_len: u32, single: bool) -> Result<Self> {
         let f =
             std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
         let mut w = GtWriter {
             out: BufWriter::new(f),
             read_len,
+            single,
         };
-        w.out.write_all(
-                    b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\n",
-                )?;
+        w.out.write_all(if single {
+            b"pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\n"
+        } else {
+            b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\n"
+        })?;
         Ok(w)
     }
 }
@@ -65,16 +77,26 @@ impl<W: Write> GtWriter<W> {
         let l = self.read_len;
         let full = u8::from(a.full);
         let dup = u8::from(is_dup);
-        writeln!(
-                    self.out,
-                    "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}",
-                    a.h1.min(l),
-                    a.t1.min(l),
-                    a.h2.min(l),
-                    a.t2.min(l),
-                    a.a1.min(l),
-                    a.a2.min(l)
-                )?;
+        if self.single {
+                    writeln!(
+                        self.out,
+                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{full}\t{dup}",
+                        a.h1.min(l),
+                        a.t1.min(l),
+                        a.a1.min(l)
+                    )?;
+                } else {
+                    writeln!(
+                        self.out,
+                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}",
+                        a.h1.min(l),
+                        a.t1.min(l),
+                        a.h2.min(l),
+                        a.t2.min(l),
+                        a.a1.min(l),
+                        a.a2.min(l)
+                    )?;
+                }
         Ok(())
     }
 

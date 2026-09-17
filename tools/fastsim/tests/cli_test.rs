@@ -68,8 +68,49 @@ fn smoke_run_produces_three_files() {
     assert_eq!(header, "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup");
 
     // Cleanup.
-    std::fs::remove_dir_all(&dir).unwrap();
-}
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn single_end_writes_one_fastq_and_single_read_gt() {
+        let dir = std::env::temp_dir().join(format!("fastsim_se_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = write_test_profile(&dir);
+        let out = dir.join("se");
+        let status = Command::new(env!("CARGO_BIN_EXE_fastsim"))
+            .args([
+                "--pairs", "500", "--profile", profile.to_str().unwrap(),
+                "--out", out.to_str().unwrap(), "--single", "--no-gzip",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        // Only R1 is written; no R2.
+        assert!(dir.join("se_R1.fastq").exists(), "R1 missing");
+        assert!(!dir.join("se_R2.fastq").exists(), "R2 must not exist in single-end");
+
+        // GT uses the single-read schema and has 500 rows + header.
+        let gt = std::fs::read_to_string(dir.join("se.gt.tsv")).unwrap();
+        let lines: Vec<&str> = gt.lines().collect();
+        assert_eq!(lines.len(), 501);
+        assert_eq!(
+            lines[0],
+            "pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup"
+        );
+        // every row has 7 fields
+        assert!(lines[1..].iter().all(|l| l.split('\t').count() == 7));
+
+        // Adapter readthrough is labelled: some rows carry a nonzero r1_adapter
+        // (the test profile has readthrough mode and short inserts).
+        let with_adapter = lines[1..]
+            .iter()
+            .filter(|l| l.split('\t').nth(4).unwrap().parse::<u32>().unwrap() > 0)
+            .count();
+        assert!(with_adapter > 0, "no adapter-labelled rows in single-end GT");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
 #[test]
 fn gt_and_fastq_agree_on_full_flag_rate() {

@@ -73,12 +73,18 @@ fn run(cfg: &cli::Config) -> Result<()> {
     } else {
         FastqWriter::open_plain(Path::new(&r1_path))?
     };
-    let mut w2 = if cfg.gzip {
-        FastqWriter::open_gz(Path::new(&r2_path))?
+    let mut w2 = if cfg.single {
+        None
+    } else if cfg.gzip {
+        Some(FastqWriter::open_gz(Path::new(&r2_path))?)
     } else {
-        FastqWriter::open_plain(Path::new(&r2_path))?
+        Some(FastqWriter::open_plain(Path::new(&r2_path))?)
     };
-    let mut gt = GtWriter::open(Path::new(&gt_path), profile.read_len)?;
+    let mut gt = if cfg.single {
+        GtWriter::open_single(Path::new(&gt_path), profile.read_len)?
+    } else {
+        GtWriter::open(Path::new(&gt_path), profile.read_len)?
+    };
 
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
 
@@ -161,31 +167,41 @@ fn run(cfg: &cli::Config) -> Result<()> {
 
         // 3. Build reads.
         let r1 = build_read(&profile, &insert, insert_len, Mate::R1, &a, &mut rng);
-                let r2 = build_read(&profile, &insert, insert_len, Mate::R2, &a, &mut rng);
-                // Record where the adapter actually landed, so the GT labels it explicitly.
-                a.a1 = r1.adapter_len;
-                a.a2 = r2.adapter_len;
+        let r2 = if cfg.single {
+            None
+        } else {
+            Some(build_read(&profile, &insert, insert_len, Mate::R2, &a, &mut rng))
+        };
+        // Record where the adapter actually landed, so the GT labels it explicitly.
+        a.a1 = r1.adapter_len;
+        a.a2 = r2.as_ref().map_or(0, |r| r.adapter_len);
         // Sequencer output is always exactly read_len bases — every branch
         // of build_read pads to L (adapter readthrough or Ns). This is the
         // contract the bench relies on, so assert it per pair.
         debug_assert_eq!(r1.seq.len() as u32, profile.read_len, "R1 length");
-        debug_assert_eq!(r2.seq.len() as u32, profile.read_len, "R2 length");
+        if let Some(r2) = &r2 {
+            debug_assert_eq!(r2.seq.len() as u32, profile.read_len, "R2 length");
+        }
         if r1.adapter_len > 0 {
             n_adapter += 1;
         }
 
         // 4. Quality + errors.
         let m1 = qualify(&profile, Mate::R1, &r1, &mut rng);
-        let m2 = qualify(&profile, Mate::R2, &r2, &mut rng);
+        let m2 = r2.as_ref().map(|r| qualify(&profile, Mate::R2, r, &mut rng));
 
         // 5. Write.
         w1.write_record(&w1.header(pair_idx, 1), &m1)?;
-        w2.write_record(&w2.header(pair_idx, 2), &m2)?;
+        if let (Some(w2), Some(m2)) = (w2.as_mut(), m2.as_ref()) {
+            w2.write_record(&w2.header(pair_idx, 2), m2)?;
+        }
         gt.write_pair(pair_idx, insert_len, &a, is_dup)?;
     }
 
     w1.finish().context("finish R1")?;
-    w2.finish().context("finish R2")?;
+    if let Some(w2) = w2 {
+        w2.finish().context("finish R2")?;
+    }
     gt.finish().context("finish GT")?;
 
     eprintln!(
@@ -210,7 +226,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             "tool": "fastsim",
             "tool_version": env!("CARGO_PKG_VERSION"),
             "command": std::env::args().collect::<Vec<_>>().join(" "),
-            "mode": "paired",
+            "mode": if cfg.single { "single" } else { "paired" },
             "dry_run": false,
             "inputs": { "profile": cfg.profile },
             "outputs": {
