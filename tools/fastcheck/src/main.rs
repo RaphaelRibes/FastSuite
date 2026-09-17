@@ -8,6 +8,7 @@
 
 mod accum;
 mod cli;
+mod html;
 mod insert;
 mod reader;
 mod report;
@@ -123,6 +124,10 @@ fn main() -> Result<()> {
             cli.positions_tsv.as_deref(),
             insert.as_ref().map(|h| (h, total.reads / 2)),
         )?;
+    }
+    if let Some(p) = &cli.html {
+        html::write_html(p, &reports, &total, verdict.offset, elapsed,
+                         insert.as_ref().map(|h| (h, cli.insert_pairs)))?;
     }
     if let Some(p) = &cli.positions_tsv {
         report::write_positions_tsv(p, &total, verdict.offset)?;

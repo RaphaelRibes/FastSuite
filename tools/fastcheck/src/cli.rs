@@ -16,6 +16,9 @@ pub struct Cli {
     /// Write the machine-readable report (fastsuite.report.v1) to PATH.
     #[arg(long, value_name = "PATH")]
     pub json: Option<PathBuf>,
+    /// Write a FastQC-style HTML report (exact counts, inline SVG, no JS).
+    #[arg(long, value_name = "PATH")]
+    pub html: Option<PathBuf>,
 
     /// Write the per-position matrices to PATH (TSV, 1-based positions).
     #[arg(long, value_name = "PATH")]

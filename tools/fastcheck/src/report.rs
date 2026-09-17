@@ -15,12 +15,12 @@ pub struct FileReport {
 }
 
 /// Total bases that are neither A, C, G nor T.
-fn bases_other(a: &Accum) -> u64 {
+pub(crate) fn bases_other(a: &Accum) -> u64 {
     let acgt: u64 = (0..a.acgt_hist.len()).map(|i| i as u64 * a.acgt_hist[i]).sum();
     a.bases - acgt
 }
 
-fn gc_fraction(a: &Accum) -> f64 {
+pub(crate) fn gc_fraction(a: &Accum) -> f64 {
     let acgt: u64 = (0..a.acgt_hist.len()).map(|i| i as u64 * a.acgt_hist[i]).sum();
     if acgt == 0 {
         return 0.0;
@@ -29,7 +29,7 @@ fn gc_fraction(a: &Accum) -> f64 {
     gc as f64 / acgt as f64
 }
 
-fn mean_len(a: &Accum) -> f64 {
+pub(crate) fn mean_len(a: &Accum) -> f64 {
     if a.reads == 0 {
         0.0
     } else {
@@ -40,7 +40,7 @@ fn mean_len(a: &Accum) -> f64 {
 /// Mean over reads of the per-read mean quality. Exact: the per-read bin is
 /// the floor of the raw byte mean, and `floor(x) - k == floor(x - k)` for an
 /// integer offset `k`.
-fn mean_read_mean_q(a: &Accum, offset: u8) -> f64 {
+pub(crate) fn mean_read_mean_q(a: &Accum, offset: u8) -> f64 {
     if a.reads == 0 {
         return 0.0;
     }
@@ -82,7 +82,7 @@ fn byte_range(census: &[u64; QBINS]) -> (u64, u64) {
 }
 
 /// Per-position quality summary from the exact histogram at that position.
-fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) {
+pub(crate) fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) {
     let depth: u64 = row.iter().sum();
     if depth == 0 {
         return (0.0, 0.0, 0.0, 0.0);

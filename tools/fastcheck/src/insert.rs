@@ -94,12 +94,12 @@ fn verify(s1: &[u8], s2: &[u8], o: usize) -> bool {
 #[derive(Clone, Debug)]
 pub struct InsertHist {
     /// Inserts measured from an overlap (inserts above the read length).
-    bins: Vec<u64>,
+    pub(crate) bins: Vec<u64>,
     /// Inserts measured from the adapter boundary (inserts at or below the read
     /// length), only when `--adapter-seq` was given. Kept apart from `bins`
     /// because the two regimes are measured by different means, and their biases
     /// are not the same.
-    bins_adapter: Vec<u64>,
+    pub(crate) bins_adapter: Vec<u64>,
     /// Adapter sequences to look for; empty disables the short-insert regime.
     adapters: Vec<Vec<u8>>,
     pub measured: u64,
@@ -290,6 +290,48 @@ impl InsertHist {
 
     pub fn sd_all(&self) -> f64 {
         Self::sd_of(&self.union())
+    }
+
+    /// Insert-size deciles from the observed (both-regime) distribution. Only
+    /// the deciles that the measurement can actually reach are returned: upper
+    /// deciles that sit in the censored-above mass are reported by
+    /// `censored_deciles()` instead of being invented. No mean-and-sd shape is
+    /// assumed — a heavy-tailed library is kept heavy-tailed.
+    pub fn deciles(&self) -> Vec<(&'static str, f64)> {
+        const LABELS: [&str; 9] = [
+            "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80", "p90",
+        ];
+        let u = self.union();
+        let total: u64 = u.iter().sum();
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(9);
+        let mut seen: u64 = 0;
+        let mut qi = 0usize;
+        for (i, &c) in u.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            seen += c;
+            let frac = seen as f64 / total as f64;
+            while qi < 9 && frac >= (qi as f64 + 1.0) * 0.1 {
+                out.push((LABELS[qi], i as f64));
+                qi += 1;
+            }
+        }
+        out
+    }
+
+    /// The decile labels that `deciles()` could not reach because the pairs sit
+    /// above the measurement resolution (the censored-above mass).
+    pub fn censored_deciles(&self) -> Vec<&'static str> {
+        const LABELS: [&str; 9] = [
+            "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80", "p90",
+        ];
+        let seen: std::collections::BTreeSet<&'static str> =
+            self.deciles().into_iter().map(|(l, _)| l).collect();
+        LABELS.into_iter().filter(|l| !seen.contains(l)).collect()
     }
 
     pub fn mean_overlap(&self) -> f64 {
