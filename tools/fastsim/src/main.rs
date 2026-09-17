@@ -16,7 +16,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use fastsim::artefact::{build_read, decide};
-use fastsim::biology::{insert_from_reference, random_dna, read_fasta, sample_insert_len, History};
+use fastsim::biology::{insert_from_reference, random_dna, read_fasta, History};
 use fastsim::fastq::FastqWriter;
 use fastsim::profile::{AdapterMode, Mate, Profile};
 use fastsim::quality::qualify;
@@ -108,7 +108,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 Some(ins) => (ins.to_vec(), ins.len() as u32),
                 None => {
                     // Pool not primed yet (first pairs): emit fresh instead.
-                    let l = sample_insert_len(
+                    let l = profile.sample_insert(
                         cfg.insert_mean,
                         cfg.insert_sd,
                         cfg.insert_min,
@@ -131,7 +131,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             };
             (i, l)
         } else {
-            let l = sample_insert_len(
+            let l = profile.sample_insert(
                 cfg.insert_mean,
                 cfg.insert_sd,
                 cfg.insert_min,

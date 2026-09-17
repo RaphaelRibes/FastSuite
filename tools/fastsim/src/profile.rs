@@ -54,6 +54,17 @@ pub struct Cdf {
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub read_len: u32,
+    /// Insert-length histogram `{len: count}`, measured by `fastcheck
+    /// --insert-hist`. When present it replaces the mean/sd model, because real
+    /// insert distributions are not Gaussian: a tagmentation library is broad
+    /// and heavy-tailed, and the spread is what sets the readthrough rate.
+    ///
+    /// Lengths above the measurement's resolution go in ONE saturated bin (the
+    /// profile builder uses 2*read_len+1). That is not a modelling choice: for a
+    /// read shorter than the insert, every such length produces the same reads —
+    /// no adapter, no overlap — so a bin is exactly as faithful as a fitted tail
+    /// and does not invent a shape the data cannot show.
+    pub insert: Option<Cdf>,
     pub gc: f64,
     pub geometry: String,
     /// per-base Gaussian noise sd added before integer rounding (Phred).
@@ -165,6 +176,22 @@ impl Cdf {
 }
 
 impl Profile {
+    /// Insert length for the next pair. The profile's measured distribution wins
+    /// when it has one; the CLI's Gaussian is the fallback for profiles fitted
+    /// before the insert module existed.
+    pub fn sample_insert<R: rand::Rng + ?Sized>(
+        &self,
+        mean: f64,
+        sd: f64,
+        floor: u32,
+        rng: &mut R,
+    ) -> u32 {
+        match &self.insert {
+            Some(cdf) => crate::randutil::sample_cdf(cdf, rng),
+            None => crate::biology::sample_insert_len(mean, sd, floor, rng),
+        }
+    }
+
     /// Load and validate a profile JSON.
     pub fn from_json(path: &Path) -> Result<Self> {
         let raw: RawProfile = serde_json::from_slice(
@@ -264,11 +291,17 @@ impl Profile {
             Some(other) => bail!("unknown adapter mode {other:?}"),
         };
 
+        let insert = match &raw.insert {
+            Some(m) => Some(Cdf::from_map(m)?),
+            None => None,
+        };
+
         Ok(Profile {
             read_len: raw.read_len,
             gc: raw.gc,
             geometry: raw.geometry,
             qual_noise: raw.qual_noise,
+            insert,
             head,
             tail,
             joint_tail: JointCdf { cum },
@@ -380,6 +413,10 @@ pub struct RawProfile {
     pub full_length_q: RawMateU8s,
     #[serde(default)]
     pub adapter: RawAdapter,
+    /// measured insert-length histogram; absent in profiles fitted before the
+    /// insert module existed, and then `--insert-mean/--insert-sd` are used
+    #[serde(default)]
+    pub insert: Option<BTreeMap<String, u64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,6 +518,29 @@ mod tests {
     fn test_profile() -> Profile {
         let raw: RawProfile = serde_json::from_str(&sample_profile_json()).unwrap();
         Profile::from_raw(raw).unwrap()
+    }
+
+    #[test]
+    fn a_profile_insert_distribution_replaces_the_gaussian() {
+        use rand::SeedableRng as _;
+        // all mass at 40: every draw must be 40, whatever the CLI says
+        let mut raw: RawProfile = serde_json::from_str(&sample_profile_json()).unwrap();
+        raw.insert = Some(BTreeMap::from([("40".into(), 100u64)]));
+        let p = Profile::from_raw(raw).unwrap();
+        // a real RNG: StepRng's counter lands on the CDF's empty low bins at
+        // r = 0, which is a property of the mock, not of the sampler
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..200 {
+            assert_eq!(p.sample_insert(300.0, 50.0, 150, &mut rng), 40);
+        }
+
+        // and with no distribution it falls back to the Gaussian around the mean
+        let raw: RawProfile = serde_json::from_str(&sample_profile_json()).unwrap();
+        let p = Profile::from_raw(raw).unwrap();
+        assert!(p.insert.is_none());
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let l = p.sample_insert(300.0, 50.0, 150, &mut rng);
+        assert!((150..=450).contains(&l), "gaussian draw {l} out of range");
     }
 
     #[test]
