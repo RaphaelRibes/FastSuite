@@ -73,6 +73,9 @@ pub struct Profile {
     /// biases (a 5′ dropout that starts mid-read, an enriched position) that a
     /// G-run-length head model cannot express.
     pub head_bias: Vec<[f32; 4]>,
+    /// per-position [a,c,g,t] composition at the fragment 3′ end, in the
+    /// fragment's own 5′→3′ frame (R2's measured head, reverse-complemented).
+    pub tail_bias: Vec<[f32; 4]>,
     /// per-base Gaussian noise sd added before integer rounding (Phred).
     /// Without it, rounding the per-position mean biases emitted bases.
     pub qual_noise: f64,
@@ -312,12 +315,26 @@ impl Profile {
             }).collect(),
             None => Vec::new(),
         };
+        // R2 shows the fragment's 3′ end reverse-complemented, so its head
+        // composition becomes the fragment tail after A<->T, C<->G.
+        let tail_bias: Vec<[f32; 4]> = match &raw.base {
+            Some(b) => b.get("R2").cloned().unwrap_or_default().into_iter().map(|v| {
+                let mut a = [0.0f32; 4];
+                for (i, x) in v.iter().take(4).enumerate() { if x.is_finite() && *x >= 0.0 { a[i] = *x; } }
+                let s: f32 = a.iter().sum();
+                if s > 0.0 { for x in a.iter_mut() { *x /= s; } } else { a = [0.25; 4]; }
+                // revcomp: A<->T (0<->3), C<->G (1<->2)
+                [a[3], a[2], a[1], a[0]]
+            }).collect(),
+            None => Vec::new(),
+        };
 
         Ok(Profile {
             read_len: raw.read_len,
             gc: raw.gc,
             geometry: raw.geometry,
             head_bias,
+            tail_bias,
             qual_noise: raw.qual_noise,
             insert,
             head,

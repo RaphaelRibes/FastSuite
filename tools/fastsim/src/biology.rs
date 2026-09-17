@@ -39,18 +39,34 @@ pub fn random_dna<R: Rng + ?Sized>(len: usize, gc: f64, rng: &mut R) -> Vec<u8> 
 }
 
 /// DNA where the 5′-most `head.len()` bases are sampled from a per-position
-/// `[a, c, g, t]` composition instead of uniform GC. This is how a *located*
-/// base bias — a 5′ dropout that starts mid-read, an enriched position — is
-/// reproduced: a run-length model cannot, a per-position composition can.
+/// `[a, c, g, t]` composition and the 3′-most `tail.len()` bases from `tail`
+/// (mirrored from the 3′ end), instead of uniform GC. This is how *located*
+/// base biases — a 5′ dropout that starts mid-read, a polyG tail, an enriched
+/// position — are reproduced: a run-length model cannot, a per-position
+/// composition can. `tail` is in the fragment's own 5′→3′ frame, so the caller
+/// reverse-complements R2's measured head before passing it.
 pub fn random_dna_bias<R: Rng + ?Sized>(
     len: usize,
     gc: f64,
     head: Option<&[[f32; 4]]>,
+    tail: Option<&[[f32; 4]]>,
     rng: &mut R,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
-        if let Some(pr) = head.and_then(|v| v.get(i)) {
+        // 3′ end: position i is `len-1-i` from the 3′ edge; the tail window
+                // covers only the last `tail.len()` positions.
+                let pr = head
+                    .and_then(|v| v.get(i))
+                    .or_else(|| {
+                        let d = len - 1 - i;
+                        if d < tail.map_or(0, |v| v.len()) {
+                            tail.and_then(|v| v.get(d))
+                        } else {
+                            None
+                        }
+                    });
+        if let Some(pr) = pr {
             let u: f32 = rng.gen();
             let a = pr[0];
             if u < a {
@@ -244,7 +260,7 @@ mod tests {
         ];
         let n_reads = 10_000usize;
         let read_len = 8usize;
-        let seq: Vec<u8> = (0..n_reads).flat_map(|_| random_dna_bias(read_len, 0.30, Some(&head), &mut rng)).collect();
+        let seq: Vec<u8> = (0..n_reads).flat_map(|_| random_dna_bias(read_len, 0.30, Some(&head), None, &mut rng)).collect();
         let g = |i: usize| seq.iter().skip(i).step_by(read_len).filter(|&&b| b == b'G').count() as f64 / n_reads as f64;
         assert!(g(2) > 0.95, "position 2 should be ~G, got {:.3}", g(2));
         assert!(g(0) < 0.05 && g(1) < 0.05, "positions 0/1 should avoid G: {} {}",
