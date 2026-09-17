@@ -12,9 +12,10 @@
 //!   the overlap reveals both the insert size and the adapter boundaries
 //!   without needing to know the adapter sequence.
 //!
-//! Auto-detection samples the first 10 k reads (buffered in the pipeline),
-//! counts 12-mers at the 3′ end, and uses the top candidates as adapters
-//! for subsequent sequence matching.
+//! Auto-detection samples the first 10 k reads, counts catalogue 12-mers at
+//! every offset (not just the 3′ end — a read that runs through the adapter into
+//! the primer has no adapter at its terminus), and uses the top candidates as
+//! adapters for subsequent sequence matching.
 
 use memchr::memmem;
 use std::collections::HashMap;
@@ -242,15 +243,35 @@ pub fn catalogue() -> Vec<Adapter> {
 // `adapter[12:24]`, and trimming from its match position removed 12 of the 24
 // adapter bases and left the other 12 behind. It only lined up when the
 // insert happened to be exactly L - k.
+//
+// That first fix matched the fingerprint anywhere *inside the catalogue*, but
+// still only COUNTED the terminal k-mer — which fails on the ordinary case of a
+// read that runs through the adapter and continues into the downstream primer.
+// Measured on ERR10123282 (MiSeq 2x251, Nextera): 26.9% of reads carry the full
+// 19-base adapter, but only 3.05% end inside it, and those are spread over ~19
+// distinct terminal k-mers (one per insert length), so no single one reaches the
+// 1% threshold and nothing is detected. The library with the most readthrough
+// was the one detection could not see.
+//
+// So fingerprints are now counted at EVERY offset, restricted to 12-mers that
+// occur in the catalogue. Restricting to the catalogue keeps the counter bounded
+// by the catalogue rather than by the read count (16.7M possible 12-mers would
+// otherwise need a large table) and admits no non-catalogue noise, which is what
+// the frequency threshold is guarding against.
 // ---------------------------------------------------------------------------
 
-/// Length of the terminal k-mer used as a fingerprint. It only has to name an
+/// Length of the k-mer used as a fingerprint. It only has to name an
 /// adapter unambiguously, not to trim with, so 12 is ample: a given 12-mer
 /// occurs in random sequence about once per 1.7e7 bases.
 const DETECT_K: usize = 12;
 
 /// A fingerprint must appear in at least this fraction of sampled reads.
 const DETECT_MIN_FREQ: f64 = 0.01;
+
+/// Distinct fingerprints counted per read. An adapter normally contributes one
+/// or two; the cap bounds the work on a pathological read (a tandem repeat of a
+/// catalogue sequence) without needing an allocation per read.
+const DETECT_MAX_HITS_PER_READ: usize = 8;
 
 /// What auto-detection concluded.
 ///
@@ -266,8 +287,25 @@ pub struct Detection {
     pub sampled: usize,
 }
 
-/// Identify adapters by fingerprinting the terminal k-mer of sampled reads
-/// against [`catalogue`].
+/// Every [`DETECT_K`]-mer occurring anywhere in the catalogue.
+fn catalogue_fingerprints(cat: &[Adapter]) -> std::collections::HashSet<[u8; DETECT_K]> {
+    let mut set = std::collections::HashSet::new();
+    for a in cat {
+        if a.seq.len() < DETECT_K {
+            continue;
+        }
+        for w in a.seq.windows(DETECT_K) {
+            set.insert(w.try_into().unwrap());
+        }
+    }
+    set
+}
+
+/// Identify adapters by fingerprinting sampled reads against [`catalogue`].
+///
+/// A read contributes each catalogue fingerprint it contains **once**, at any
+/// offset, so the evidence count stays "reads containing this fingerprint" —
+/// which is what the caller reports as a percentage of the sample.
 ///
 /// Returns empty `adapters` when nothing is recognised; the caller decides
 /// whether that is fatal. Never guesses a sequence.
@@ -277,13 +315,33 @@ pub fn identify_from_reads(reads: &[&[u8]]) -> Detection {
         return det;
     }
 
+    let cat = catalogue();
+    let fingerprints = catalogue_fingerprints(&cat);
+    if fingerprints.is_empty() {
+        return det;
+    }
+
     let mut counts: HashMap<[u8; DETECT_K], usize> = HashMap::new();
     for read in reads {
         if read.len() < DETECT_K {
             continue;
         }
-        let kmer: [u8; DETECT_K] = read[read.len() - DETECT_K..].try_into().unwrap();
-        *counts.entry(kmer).or_insert(0) += 1;
+        let mut hits = [[0u8; DETECT_K]; DETECT_MAX_HITS_PER_READ];
+        let mut n = 0usize;
+        for w in read.windows(DETECT_K) {
+            let kmer: [u8; DETECT_K] = w.try_into().unwrap();
+            if !fingerprints.contains(&kmer) || hits[..n].contains(&kmer) {
+                continue;
+            }
+            if n == DETECT_MAX_HITS_PER_READ {
+                break;
+            }
+            hits[n] = kmer;
+            n += 1;
+        }
+        for kmer in &hits[..n] {
+            *counts.entry(*kmer).or_insert(0) += 1;
+        }
     }
 
     let min_count = ((reads.len() as f64) * DETECT_MIN_FREQ).ceil() as usize;
@@ -291,7 +349,6 @@ pub fn identify_from_reads(reads: &[&[u8]]) -> Detection {
         counts.into_iter().filter(|(_, c)| *c >= min_count).collect();
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-    let cat = catalogue();
     for (kmer, count) in candidates {
         // The fingerprint sits at an offset inside the adapter that depends
         // on the insert size, so match anywhere in the sequence, not at its
@@ -880,6 +937,44 @@ mod tests {
         assert_eq!(det.evidence.len(), 1);
         assert_eq!(det.evidence[0].1, 500);
         assert_eq!(det.sampled, 500);
+    }
+
+    /// The case measured on ERR10123282 (MiSeq 2x251, Nextera): the read runs
+    /// THROUGH the adapter and continues into the downstream primer, so its
+    /// terminal k-mer is primer sequence and the adapter is only visible further
+    /// in. Insert lengths vary across reads, so the terminal k-mer differs per
+    /// read and no single one reaches the frequency threshold.
+    ///
+    /// Counted at the 3' terminus only, this detects nothing — on a library where
+    /// 26.9% of reads carried the full 19-base adapter and 3.05% ended inside it,
+    /// spread over ~19 distinct terminal k-mers.
+    #[test]
+    fn detection_finds_an_adapter_followed_by_primer_sequence() {
+        let ad = b"CTGTCTCTTATACACATCT"; // Nextera, 19 bases
+        let primer = b"CCGAGCCCA"; // as observed after the adapter in the real reads
+        let reads: Vec<Vec<u8>> = (0..500)
+            .map(|i| {
+                let insert = 200 + (i % 20) as usize; // 20 offsets, ~5% of reads each
+                let mut r: Vec<u8> =
+                    (0..insert).map(|j| b"ACGT"[((i + j) % 4) as usize]).collect();
+                r.extend_from_slice(ad);
+                r.extend_from_slice(primer);
+                r
+            })
+            .collect();
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let det = identify_from_reads(&refs);
+        assert!(
+            det.adapters.iter().any(|a| a.name == "Nextera"),
+            "adapter followed by primer sequence was not detected: {:?}",
+            det.adapters
+        );
+        // and the evidence must be strong, not a marginal hit
+        assert!(
+            det.evidence.iter().any(|(_, c)| *c >= 100),
+            "expected a strong fingerprint, got {:?}",
+            det.evidence
+        );
     }
 
     #[test]
