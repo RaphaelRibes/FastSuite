@@ -16,7 +16,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use fastsim::artefact::{build_read, decide};
-use fastsim::biology::{insert_from_reference, random_dna, read_fasta, History};
+use fastsim::biology::{insert_from_reference, random_dna_bias, read_fasta, History};
 use fastsim::fastq::FastqWriter;
 use fastsim::profile::{AdapterMode, Mate, Profile};
 use fastsim::quality::qualify;
@@ -116,7 +116,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
                     );
                     let i = match &contigs {
                         Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
-                        None => random_dna(l as usize, cfg.gc, &mut rng),
+                        None => random_dna_bias(l as usize, cfg.gc, Some(&profile.head_bias), &mut rng),
                     };
                     (i, l)
                 }
@@ -127,7 +127,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             let l = rng.gen_range(1..=cfg.drop_min_len.saturating_sub(1).max(1));
             let i = match &contigs {
                 Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
-                None => random_dna(l as usize, cfg.gc, &mut rng),
+                None => random_dna_bias(l as usize, cfg.gc, Some(&profile.head_bias), &mut rng),
             };
             (i, l)
         } else {
@@ -139,7 +139,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             );
             let i = match &contigs {
                 Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
-                None => random_dna(l as usize, cfg.gc, &mut rng),
+                None => random_dna_bias(l as usize, cfg.gc, Some(&profile.head_bias), &mut rng),
             };
             hist.push(i.clone());
             (i, l)

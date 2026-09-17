@@ -118,6 +118,23 @@ fn write_out(path: &Path, body: &str) -> Result<()> {
     Ok(())
 }
 
+fn base_position_json(a: &Accum) -> serde_json::Value {
+    let n = a.covered_positions();
+    let mut rows = serde_json::Map::with_capacity(n);
+    for pos in 0..n {
+        rows.insert(
+            (pos + 1).to_string(),
+            serde_json::json!([
+                a.base_at(pos, 0),   // A
+                a.base_at(pos, 1),   // C
+                a.base_at(pos, 2),   // G
+                a.base_at(pos, 3),   // T
+            ]),
+        );
+    }
+    serde_json::Value::Object(rows)
+}
+
 pub fn write_report(
     path: &Path,
     files: &[FileReport],
@@ -258,6 +275,7 @@ pub fn write_report(
         "assumptions": assumptions,
         "per_file": per_file,
         "base_composition": serde_json::Value::Object(composition),
+        "base_position": base_position_json(total),
         "insert_hist": match &insert {
             Some((h, pairs)) => {
                 // The sample is a fraction of the input, so the histogram is

@@ -67,6 +67,12 @@ pub struct Profile {
     pub insert: Option<Cdf>,
     pub gc: f64,
     pub geometry: String,
+    /// per-position [a,c,g,t] composition at the fragment 5′ end (from
+    /// fastcheck `base_position`). When non-empty, the fragment's leading bases
+    /// are sampled from this instead of uniform GC, reproducing *located* base
+    /// biases (a 5′ dropout that starts mid-read, an enriched position) that a
+    /// G-run-length head model cannot express.
+    pub head_bias: Vec<[f32; 4]>,
     /// per-base Gaussian noise sd added before integer rounding (Phred).
     /// Without it, rounding the per-position mean biases emitted bases.
     pub qual_noise: f64,
@@ -295,11 +301,23 @@ impl Profile {
             Some(m) => Some(Cdf::from_map(m)?),
             None => None,
         };
+        // R1 shows the fragment's 5′ end, so its head composition anchors the fragment head.
+        let head_bias: Vec<[f32; 4]> = match &raw.base {
+            Some(b) => b.get("R1").cloned().unwrap_or_default().into_iter().map(|v| {
+                let mut a = [0.0f32; 4];
+                for (i, x) in v.iter().take(4).enumerate() { if x.is_finite() && *x >= 0.0 { a[i] = *x; } }
+                let s: f32 = a.iter().sum();
+                if s > 0.0 { for x in a.iter_mut() { *x /= s; } } else { a = [0.25; 4]; }
+                a
+            }).collect(),
+            None => Vec::new(),
+        };
 
         Ok(Profile {
             read_len: raw.read_len,
             gc: raw.gc,
             geometry: raw.geometry,
+            head_bias,
             qual_noise: raw.qual_noise,
             insert,
             head,
@@ -417,6 +435,9 @@ pub struct RawProfile {
     /// insert module existed, and then `--insert-mean/--insert-sd` are used
     #[serde(default)]
     pub insert: Option<BTreeMap<String, u64>>,
+    /// per-position [a,c,g,t] fractions per mate (fastcheck `base_position`)
+    #[serde(default)]
+    pub base: Option<std::collections::HashMap<String, Vec<Vec<f32>>>>,
 }
 
 #[derive(Debug, Deserialize)]
