@@ -42,7 +42,7 @@ pub struct ScanResult {
 /// Counts bytes pulled from the underlying file, shared with the decoder so
 /// the budget can be enforced mid-stream.
 #[derive(Clone)]
-struct ByteCounter(Arc<AtomicU64>);
+pub(crate) struct ByteCounter(Arc<AtomicU64>);
 
 struct Counting<R> {
     inner: R,
@@ -90,7 +90,10 @@ fn peek<R: Read>(rdr: &mut R, n: usize) -> io::Result<Vec<u8>> {
 }
 
 /// Open a plain or `.gz` FASTQ, from a file or from stdin (`-`).
-fn open(
+///
+/// `pub(crate)` so the insert-size pass reads through the same decompression
+/// path (BGZF block-parallel included) instead of duplicating it.
+pub(crate) fn open(
     path: &Path,
     gz_threads: usize,
 ) -> Result<(Box<dyn BufRead + Send>, ByteCounter, &'static str)> {
@@ -147,7 +150,7 @@ fn open(
     }
 }
 
-fn read_line(rdr: &mut dyn BufRead, out: &mut Vec<u8>) -> io::Result<usize> {
+pub(crate) fn read_line(rdr: &mut dyn BufRead, out: &mut Vec<u8>) -> io::Result<usize> {
     out.clear();
     let n = rdr.read_until(b'\n', out)?;
     while matches!(out.last(), Some(b'\n') | Some(b'\r')) {

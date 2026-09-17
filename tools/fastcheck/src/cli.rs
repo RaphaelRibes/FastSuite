@@ -45,6 +45,25 @@ pub struct Cli {
     #[arg(long, default_value_t = 1000, value_name = "N")]
     pub max_read_len: usize,
 
+    /// Estimate the insert-size distribution from paired-end overlap (requires
+    /// exactly two input files). The per-pair measurement is exact; the pass
+    /// samples, because a distribution needs statistics rather than every pair.
+    /// Adds an `insert_hist` block to the report — this is the measurement a
+    /// simulator needs, since fragment length is not recoverable from the reads.
+    #[arg(long)]
+    pub insert_hist: bool,
+
+    /// Adapter sequence for --insert-hist, repeatable. With it, inserts at or
+    /// below the read length are measured from the adapter boundary instead of
+    /// being counted as unmeasurable — the regime where the reads run into
+    /// adapter and the overlap is broken by it rather than by length.
+    #[arg(long, value_name = "SEQ")]
+    pub adapter_seq: Vec<String>,
+
+    /// Pairs to sample for --insert-hist (default 20000).
+    #[arg(long, default_value_t = 20000, value_name = "N")]
+    pub insert_pairs: u64,
+
     /// Suppress the end-of-run summary line.
     #[arg(short = 'q', long)]
     pub quiet: bool,

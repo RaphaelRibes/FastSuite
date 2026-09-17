@@ -8,6 +8,7 @@
 
 mod accum;
 mod cli;
+mod insert;
 mod reader;
 mod report;
 
@@ -85,6 +86,29 @@ fn main() -> Result<()> {
         cli.max_read_len
     );
 
+    // Insert size is a property of a PAIR, and the main path scans files
+    // independently, so this is a separate opt-in lockstep pass over a sample.
+    let insert = if cli.insert_hist {
+        if files.len() != 2 {
+            anyhow::bail!(
+                "--insert-hist needs exactly two input files (got {}): paired-end overlap is \
+                 what makes the insert measurable",
+                files.len()
+            );
+        }
+        let h = insert::scan_pair(
+            &files[0],
+            &files[1],
+            threads.max(1),
+            cli.insert_pairs,
+            cli.max_read_len * 2,
+            cli.adapter_seq.iter().map(|s| s.as_bytes().to_ascii_uppercase()).collect(),
+        )?;
+        Some(h)
+    } else {
+        None
+    };
+
     let verdict = offset_verdict(&total.qual_byte, requested_offset);
     let elapsed = started.elapsed().as_secs_f64();
 
@@ -97,6 +121,7 @@ fn main() -> Result<()> {
             elapsed,
             stopped,
             cli.positions_tsv.as_deref(),
+            insert.as_ref().map(|h| (h, total.reads / 2)),
         )?;
     }
     if let Some(p) = &cli.positions_tsv {

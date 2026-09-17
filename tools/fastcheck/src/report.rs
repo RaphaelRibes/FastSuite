@@ -126,6 +126,7 @@ pub fn write_report(
     elapsed_s: f64,
     partial: Option<&str>,
     positions_tsv: Option<&Path>,
+    insert: Option<(&crate::insert::InsertHist, u64)>,
 ) -> Result<()> {
     let offset = verdict.offset;
     let (byte_min, byte_max) = byte_range(&total.qual_byte);
@@ -205,6 +206,16 @@ pub fn write_report(
     put("partial", json!(if partial.is_some() { 1 } else { 0 }));
     put("bytes_read", json!(bytes_read));
     put("elapsed_s", json!(elapsed_s));
+    // Only when --insert-hist ran: a consumer must never read an absent metric
+    // as a measured zero.
+    if let Some((h, _)) = &insert {
+        put("insert_measured_pairs", json!(h.measured));
+        put("insert_censored_below_read_len", json!(h.censored_below));
+        put("insert_censored_no_overlap", json!(h.censored_above));
+        put("insert_mean", json!(h.mean()));
+        put("insert_sd", json!(h.sd()));
+        put("insert_p50", json!(h.quantile_public(0.50)));
+    }
 
     let mut composition = serde_json::Map::new();
     for (k, idx) in [("a", 0usize), ("c", 1), ("g", 2), ("t", 3), ("other", 4)] {
@@ -247,6 +258,17 @@ pub fn write_report(
         "assumptions": assumptions,
         "per_file": per_file,
         "base_composition": serde_json::Value::Object(composition),
+        "insert_hist": match &insert {
+            Some((h, pairs)) => {
+                // The sample is a fraction of the input, so the histogram is
+                // rescaled to the input's pair count and the factor is stated.
+                let scale = if h.pairs_sampled > 0 {
+                    Some(*pairs as f64 / h.pairs_sampled as f64)
+                } else { None };
+                h.to_json(Some(*pairs), scale)
+            }
+            None => serde_json::Value::Null,
+        },
         "read_length_hist": hist_json(&total.len_hist),
         "read_mean_q_hist": serde_json::Value::Object(meanq_json),
         "partial": {
