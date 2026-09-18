@@ -110,21 +110,21 @@ pub struct Cli {
 
 
     /// Maximum mismatch rate for adapter sequence matching [0, 1].
-    #[arg(long, default_value_t = 0.1, value_name = "FLOAT", help_heading = "Adapter Trimming")]
+    #[arg(long, default_value_t = 0.2, value_name = "FLOAT", help_heading = "Adapter Trimming")]
     pub adapter_error_rate: f64,
 
     /// Minimum adapter overlap for SE / PE-fallback sequence matching.
     /// 8 (was 4): a 4-base window at 10% error tolerates 1 mismatch on 4
     /// bases — any read ending in "AGAT" (adapter prefix) was falsely
     /// trimmed (~10% of clean reads measured on the benchmark QC set).
-    #[arg(long, default_value_t = 8, value_name = "N", help_heading = "Adapter Trimming")]
+    #[arg(long, default_value_t = 14, value_name = "N", help_heading = "Adapter Trimming")]
     pub min_adapter_overlap: usize,
 
 
     // -------------------------------------------------------- PolyX trimming
     /// Minimum post-trim read length. Integer N (bases) or fraction FL
     /// (e.g. `0.6L`). Reads below this after trimming are dropped.
-    #[arg(long, value_name = "N|FL", default_value = "0.6L", help_heading = "PolyX Trimming")]
+    #[arg(long, value_name = "N|FL", default_value = "0.9L", help_heading = "PolyX Trimming")]
     pub min_len: MinLen,
 
     /// Mercy budget Δ_m: cumulative gap tolerated before declaring end-of-run.
@@ -148,13 +148,13 @@ pub struct Cli {
     pub mismatch_strength: f64,
 
     /// Minimum homopolymer length m_h.
-    #[arg(long, default_value_t = 6, value_name = "N", help_heading = "PolyX Trimming")]
+    #[arg(long, default_value_t = 12, value_name = "N", help_heading = "PolyX Trimming")]
     pub min_run: usize,
 
     /// Trim the NovaSeq first-cycle 5′ G-dropout: a short (1..=N) leading
     /// G-run with normal quality is removed exactly, no quality gate.
     /// Must be < --min-run so the scan stays in charge of long runs.
-    #[arg(long, value_name = "N", help_heading = "PolyX Trimming")]
+    #[arg(long, value_name = "N", default_value = "4", help_heading = "PolyX Trimming")]
     pub head_dropout: Option<usize>,
 
     /// Target letter for anchored mode (repeatable, max 5 distinct).
@@ -170,9 +170,14 @@ pub struct Cli {
     #[arg(long, help_heading = "PolyX Trimming")]
     pub no_3: bool,
 
-    /// Disable the interior scan.
-    #[arg(long, help_heading = "PolyX Trimming")]
+    /// Disable the interior scan (the shipped default: the interior scan is OFF).
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
+          action = clap::ArgAction::Set, help_heading = "PolyX Trimming")]
     pub no_interior: bool,
+
+    /// Re-enable the interior scan (off by default in the shipped config).
+    #[arg(long = "interior", overrides_with = "no_interior", help_heading = "PolyX Trimming")]
+    pub interior: bool,
 
     /// Single-end: scan 3′→5′ instead of 5′→3′.
     #[arg(long, conflicts_with_all = ["r1_scan_reverse", "r2_scan_reverse"], help_heading = "PolyX Trimming")]
@@ -189,8 +194,12 @@ pub struct Cli {
 
     // ------------------------------------------------------- Quality filtering
     /// Minimum whole-read mean Phred quality (raw, not ASCII offset).
-    #[arg(long, value_name = "FLOAT", help_heading = "Quality Filtering")]
+    #[arg(long, value_name = "FLOAT", default_value = "25", help_heading = "Quality Filtering")]
     pub mean_q: Option<f64>,
+
+    /// Disable the mean-quality filter (the shipped default is 25).
+    #[arg(long = "no-mean-q", help_heading = "Quality Filtering")]
+    pub no_mean_q: bool,
 
     /// ASCII offset used to decode FASTQ quality scores.
     /// 33 for modern Illumina; 64 for legacy Illumina 1.3/1.5.
@@ -201,8 +210,13 @@ pub struct Cli {
 
     /// Auto-detect Phred quality offset from the first 1000 reads of the
     /// input. Mutually exclusive with --phred-offset.
-    #[arg(long, help_heading = "Quality Filtering")]
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
+          action = clap::ArgAction::Set, help_heading = "Quality Filtering")]
     pub auto_phred: bool,
+
+    /// Disable Phred-offset auto-detection (the shipped default is on).
+    #[arg(long = "no-auto-phred", help_heading = "Quality Filtering")]
+    pub no_auto_phred: bool,
 
     // -----------------------------------------------------------------Runtime
     /// Unconditionally trim N bases from the 5′ end (before any scan).
@@ -243,8 +257,13 @@ pub struct Cli {
     /// reads, roughly 4.6 GB at 3e8 reads with 64-bit fingerprints. The
     /// projected size is checked against the enforced memory limit before
     /// anything is allocated.
-    #[arg(long, help_heading = "Deduplication")]
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
+          action = clap::ArgAction::Set, help_heading = "Deduplication")]
     pub dedup: bool,
+
+    /// Disable deduplication (the shipped default: on).
+    #[arg(long = "no-dedup", overrides_with = "dedup", help_heading = "Deduplication")]
+    pub no_dedup: bool,
 
     /// Fingerprint width in bits. Wider means fewer collisions and twice the
     /// memory. Default picks the narrowest width whose collision probability
@@ -557,9 +576,9 @@ impl Cli {
             rule,
             scan_5: !self.no_5,
             scan_3: !self.no_3,
-            scan_interior: !self.no_interior,
+            scan_interior: self.interior || !self.no_interior,
             direction: Direction::Forward,
-            mean_q: self.mean_q,
+            mean_q: if self.no_mean_q { None } else { self.mean_q },
             trim_5: self.trim_5,
             trim_3: self.trim_3,
             adapter: match &adapter_source {
@@ -574,7 +593,7 @@ impl Cli {
 
         // Deduplication. Resolved here so the run refuses before allocating
         // rather than after filling the table.
-        let dedup = if !self.dedup {
+        let dedup = if !(self.dedup && !self.no_dedup) {
             None
         } else {
             let read_len = peek_sequences(&self.in1, 1)?
@@ -664,7 +683,7 @@ impl Cli {
                 gz_threads: self.gz_threads.unwrap_or((self.threads / 2).max(1)),
             },
             phred_offset,
-            phred_auto: self.auto_phred,
+            phred_auto: self.auto_phred && !self.no_auto_phred,
             metadata: self.metadata,
             json: self.json,
             adapter_source,
@@ -697,6 +716,7 @@ fn build_match_rule(letters: &[char]) -> Result<MatchRule> {
 
 #[cfg(test)]
 mod tests {
+    use crate::algorithm::MinLen;
     use super::*;
 
     #[test]
@@ -721,5 +741,36 @@ mod tests {
     fn build_rule_rejects_duplicates() {
         assert!(build_match_rule(&['A', 'A']).is_err());
         assert!(build_match_rule(&['A', 'a']).is_err());
+    }
+
+    #[test]
+    fn shipped_defaults_are_the_swept_winner() {
+        // The 90-dataset campaign found one configuration best everywhere; it
+        // is what a bare invocation must do. Lock it so a future edit cannot
+        // silently drift the default away from the validated configuration.
+        use clap::Parser;
+        let cli = Cli::parse_from(["fastprep", "-1", "in.fq", "-o", "out.fq"]);
+        assert_eq!(cli.adapter_error_rate, 0.2, "--adapter-error-rate");
+        assert_eq!(cli.min_adapter_overlap, 14, "--min-adapter-overlap");
+        assert_eq!(cli.min_run, 12, "--min-run");
+        assert_eq!(cli.head_dropout, Some(4), "--head-dropout");
+        assert_eq!(cli.mean_q, Some(25.0), "--mean-q");
+        assert!(matches!(cli.min_len, MinLen::Frac(f) if (f - 0.9).abs() < 1e-9), "--min-len");
+        assert!(cli.dedup, "--dedup ships on");
+        assert!(cli.auto_phred, "--auto-phred ships on");
+        assert!(cli.no_interior, "the interior scan ships OFF");
+    }
+
+    #[test]
+    fn negation_flags_restore_the_old_behaviour() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["fastprep", "-1", "in.fq", "-o", "out.fq",
+                                   "--no-mean-q", "--no-dedup", "--no-auto-phred", "--interior"]);
+        // The negations are applied when the params are built (finalize), so
+        // assert the parsed flags that carry them.
+        assert!(cli.no_mean_q);
+        assert!(cli.no_dedup);
+        assert!(cli.no_auto_phred);
+        assert!(cli.interior);
     }
 }  
