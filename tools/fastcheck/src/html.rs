@@ -194,19 +194,22 @@ fn labeled_bar_chart(bars: &[(String, f64)], y_label: &str) -> String {
 /// mechanism MultiQC uses). The first tab is active by default.
 fn tabs(prefix: &str, panels: &[(&str, String)]) -> String {
     let mut s = String::new();
-    let _ = write!(s, r#"<div class="tabs" id="tabs-{prefix}">"#);
+    let _ = write!(s, r#"<div class="tabs" id="tabs-{prefix}" role="tablist" aria-label="{prefix}" aria-orientation="horizontal">"#);
     for (i, (label, _)) in panels.iter().enumerate() {
+        let sel = i == 0;
         let _ = write!(
             s,
-            r#"<button type="button" class="tab{}" data-panel="p{prefix}-{i}">{}</button>"#,
-            if i == 0 { " active" } else { "" },
+            r#"<button type="button" role="tab" id="tab-{prefix}-{i}" class="tab{}" aria-selected="{}" aria-controls="p{prefix}-{i}" tabindex="{}">{}</button>"#,
+            if sel { " active" } else { "" },
+            if sel { "true" } else { "false" },
+            if sel { 0 } else { -1 },
             esc(label)
         );
     }
     for (i, (_, content)) in panels.iter().enumerate() {
         let _ = write!(
             s,
-            r#"<div class="tabpanel{}" id="p{prefix}-{i}">{content}</div>"#,
+            r#"<div role="tabpanel" id="p{prefix}-{i}" class="tabpanel{}" aria-labelledby="tab-{prefix}-{i}">{content}</div>"#,
             if i == 0 { " active" } else { "" }
         );
     }
@@ -327,6 +330,23 @@ h3 { font-size:13.5px; margin:16px 0 6px; color:var(--ink); }
 .card { border:1px solid var(--rule); border-radius:6px; padding:10px 12px 4px; background:#fff; }
 .card-title { font-size:12.5px; font-weight:600; color:var(--ink); margin-bottom:2px; }
 .grid2 .card { height:100%; }
+.skip-link { position:absolute; left:-9999px; top:0; z-index:100; background:#fff; color:var(--accent); padding:8px 12px; }
+.skip-link:focus { left:8px; top:8px; outline:2px solid var(--accent); }
+html { scroll-behavior:smooth; }
+@media (prefers-reduced-motion: reduce){ html { scroll-behavior:auto; } }
+details.module { border:1px solid var(--rule); border-radius:6px; margin:0 0 18px; background:#fff; }
+details.module > summary { cursor:pointer; list-style:none; padding:10px 14px; user-select:none; }
+details.module > summary::-webkit-details-marker { display:none; }
+details.module > summary h2 { display:inline-block; margin:0; border:none; padding:0; scroll-margin-top:60px; }
+details.module > summary:hover { background:#f7f9fb; }
+details.module[open] > summary { border-bottom:1px solid var(--rule); }
+details.module > .body { padding:14px; }
+nav.nav a { padding:4px 2px; }
+nav.nav a[aria-current="true"] { color:var(--ink); border-bottom:2px solid var(--accent); }
+button:focus-visible, a:focus-visible, summary:focus-visible { outline:2px solid #1a5fb4; outline-offset:2px; }
+table.files caption { text-align:left; font-weight:600; color:var(--muted); font-size:13px; margin-bottom:4px; }
+table.files thead th { border-bottom:2px solid var(--rule); }
+table.files tbody tr:hover { background:#fff8e1; }
 "#;
 
 /// Write the report. `insert` is present when `--insert-hist` ran.
@@ -359,7 +379,7 @@ pub fn write_html(
             acc.base_at(pos, 0) + acc.base_at(pos, 1) + acc.base_at(pos, 2) + acc.base_at(pos, 3) + acc.base_at(pos, 4)
         };
         let mut seq = Vec::new();
-        for (code, name, colour) in [(0usize, "A", "#2e7d5b"), (1, "C", "#2f6f9f"), (2, "G", "#c98a1a"), (3, "T", "#b23a48")] {
+        for (code, name, colour) in [(0usize, "A", "#0072b2"), (1, "C", "#e69f00"), (2, "G", "#009e73"), (3, "T", "#d55e00")] {
             let mut pts = Vec::new();
             for pos in 0..n_pos {
                 let d = depth_at(pos);
@@ -661,9 +681,9 @@ pub fn write_html(
     for f in files {
         let _ = write!(
             file_rows,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.2}</td><td>{}</td></tr>",
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2}%</td><td>{:.2}</td><td>{}</td></tr>",
             esc(&f.path.file_name().unwrap_or_default().to_string_lossy()),
-            f.acc.reads, f.acc.bases, gc_fraction(&f.acc), mean_read_mean_q(&f.acc, offset),
+            f.acc.reads, f.acc.bases, gc_fraction(&f.acc) * 100.0, mean_read_mean_q(&f.acc, offset),
             esc(&f.scan.decompress)
         );
     }
@@ -671,19 +691,28 @@ pub fn write_html(
     // ---- assemble the page ---------------------------------------------------
     let mut h = String::with_capacity(64 * 1024);
     h.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
-    let _ = write!(h, "<title>fastcheck report — {} file(s)</title><style>{STYLE}</style></head><body>", files.len());
+    let _ = write!(h, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>fastcheck report — {} file(s)</title><style>{STYLE}</style></head><body>", files.len());
+    h.push_str(r##"<a class="skip-link" href="#main">Skip to report content</a>"##);
     let _ = write!(h, "<h1>fastcheck report</h1><div class=\"sub\">{} file(s) · {} reads · {} bases · \
                        {:.2} s · Phred+{offset} · exact counts, no sampling</div>",
                    files.len(), total.reads, total.bases, elapsed_s);
 
-    // nav (MultiQC-style anchor links)
-    h.push_str(r##"<nav class="nav"><a href="#summary">Summary</a><a href="#seq">Per-base content</a><a href="#n">N content</a><a href="#q">Quality</a><a href="#dist">Distributions</a><a href="#polyx">polyX</a><a href="#repeats">Repeats</a><a href="#heatmap">Heatmap</a>"##);
+    // nav: sticky section links, scrollspy-highlighted
+    h.push_str(r##"<nav class="nav" aria-label="Report sections"><a href="#stats">General stats</a><a href="#summary">Summary</a><a href="#seq">Per-base content</a><a href="#n">N content</a><a href="#q">Quality</a><a href="#dist">Distributions</a><a href="#polyx">polyX</a><a href="#repeats">Repeats</a><a href="#heatmap">Heatmap</a>"##);
     if processed.is_some() {
         h.push_str(r##"<a href="#compare">Before / After</a>"##);
     }
-    h.push_str("</nav>");
+    h.push_str(r##"<a href="#obs">Observations</a></nav>"##);
 
-    h.push_str("<h2 id=\"summary\">Summary</h2><div class=\"grid2\"><div>");
+    // MultiQC-style glance: General statistics table at the very top.
+    h.push_str(r##"<section class="module" aria-labelledby="stats"><h2 id="stats">General statistics</h2>
+                  <table class="files"><caption>Per-file metrics</caption><thead><tr><th scope="col">file</th><th scope="col">reads</th><th scope="col">bases</th><th scope="col">%GC</th><th scope="col">mean Q</th><th scope="col">decompression</th></tr></thead><tbody>"##);
+    h.push_str(&file_rows);
+    h.push_str("</tbody></table></section>");
+
+    h.push_str("<main id=\"main\">");
+
+    h.push_str(r##"<details class="module" open><summary><h2 id="summary">Summary</h2></summary><div class="body"><div class="grid2"><div>"##);
     h.push_str(&table(&[
         ("reads", format!("{}", total.reads)),
         ("bases", format!("{}", total.bases)),
@@ -703,81 +732,132 @@ pub fn write_html(
             .into_iter().collect::<Vec<_>>().join(", "))),
         ("insert sizes", if insert.is_some() { "measured".into() } else { "not measured (use --insert-hist)".to_string() }),
     ]));
-    h.push_str("</div></div>");
+    h.push_str("</div></div></div></details>");
 
-    h.push_str("<table class=\"files\"><tr><th>file</th><th>reads</th><th>bases</th><th>%GC</th><th>mean Q</th><th>decompression</th></tr>");
-    h.push_str(&file_rows);
-    h.push_str("</table>");
-
-    h.push_str("<h2 id=\"seq\">Per-base sequence content</h2>");
+    h.push_str(r##"<details class="module" open><summary><h2 id="seq">Per-base sequence content</h2></summary><div class="body">"##);
     let _ = write!(h, "{seq_chart}");
-    h.push_str("<div class=\"note\">Base composition at each position. Use the R1 / R2 / both tabs to view a single mate or the merged library.</div>");
+    h.push_str("<div class=\"note\">Base composition at each position. Use the R1 / R2 / both tabs to view a single mate or the merged library.</div></div></details>");
 
-    h.push_str("<h2 id=\"n\">N content by position</h2>");
+    h.push_str(r##"<details class="module" open><summary><h2 id="n">N content by position</h2></summary><div class="body">"##);
     let _ = write!(h, "{n_chart}");
+    h.push_str("</div></details>");
 
-    h.push_str("<h2 id=\"q\">Per-base quality</h2>");
+    h.push_str(r##"<details class="module" open><summary><h2 id="q">Per-base quality</h2></summary><div class="body">"##);
     let _ = write!(h, "{q_chart}");
-    h.push_str("<div class=\"note\">Mean quality by position with the 10th and 90th percentiles — a widening spread is quality falling off unevenly between reads, not just a lower mean.</div>");
+    h.push_str("<div class=\"note\">Mean quality by position with the 10th and 90th percentiles — a widening spread is quality falling off unevenly between reads, not just a lower mean.</div></div></details>");
 
-    h.push_str("<h2 id=\"dist\">Distributions</h2>");
-    h.push_str("<div class=\"grid2\">");
+    h.push_str(r##"<details class="module" open><summary><h2 id="dist">Distributions</h2></summary><div class="body"><div class="grid2">"##);
     let _ = write!(h, "{}{}", chart_card("Read length", &len_chart), chart_card("Mean read quality", &mq_chart));
     let _ = write!(h, "{}{}", chart_card("G+C content", &gc_chart),
                    if insert.is_some() { chart_card("Insert size", &insert_chart) }
                    else { chart_card_note("Insert size", "not measured — run with --insert-hist") });
-    h.push_str("</div>");
+    h.push_str("</div></div></details>");
 
     if insert.is_some() {
-        h.push_str("<h2>Insert sizes</h2>");
+        h.push_str(r##"<details class="module" open><summary><h2 id="insert">Insert sizes</h2></summary><div class="body">"##);
         h.push_str(&insert_table);
         let _ = write!(h, "<div class=\"grid2\"><div>{insert_chart}</div><div></div></div>");
+        h.push_str("</div></details>");
     }
 
-    h.push_str("<h2 id=\"polyx\">polyX run lengths</h2>");
+    h.push_str(r##"<details class="module" open><summary><h2 id="polyx">polyX run lengths</h2></summary><div class="body">"##);
     h.push_str(&polyx_section);
+    h.push_str("</div></details>");
 
-    h.push_str("<h2 id=\"repeats\">Repeated sequences</h2>");
+    h.push_str(r##"<details class="module" open><summary><h2 id="repeats">Repeated sequences</h2></summary><div class="body">"##);
     h.push_str(&repeats_section);
+    h.push_str("</div></details>");
 
-    h.push_str("<h2 id=\"heatmap\">Heatmap</h2>");
+    h.push_str(r##"<details class="module" open><summary><h2 id="heatmap">Heatmap</h2></summary><div class="body">"##);
     h.push_str(&heatmap_section);
+    h.push_str("</div></details>");
 
     if processed.is_some() {
-        h.push_str("<h2 id=\"compare\">Before / After</h2>");
+        h.push_str(r##"<details class="module" open><summary><h2 id="compare">Before / After</h2></summary><div class="body">"##);
         h.push_str(&compare_section);
+        h.push_str("</div></details>");
     }
 
-    h.push_str("<h2>Observations</h2><ul class=\"obs\">");
+    h.push_str(r##"<details class="module" open><summary><h2 id="obs">Observations</h2></summary><div class="body"><ul class="obs">"##);
     for o in &obs {
         let _ = write!(h, "<li>{o}</li>");
     }
-    h.push_str("</ul>");
+    h.push_str("</ul></div></details>");
+
+    h.push_str("</main>");
     let _ = write!(h, "<footer>fastcheck</footer>");
-    // The only script in the report: tab switching. Everything else is static
-    // SVG, so the report still opens offline.
+    // The only script in the report: tab switching (ARIA + keyboard) and the
+    // sticky-nav scrollspy. Everything else is static inline SVG, so the
+    // report still opens offline.
     h.push_str(
         r##"<script>
-// Tab switching, index-based: the i-th tab of a container shows the i-th
-// panel of the SAME container. No id lookup, so duplicate ids (the
-// before/after reuses the main chart HTML) can never resolve to the wrong
-// panel. The tabs() helper emits all buttons first, then all panels, both in
-// document order, so the indices line up.
-document.querySelectorAll('.tabs').forEach(function(t){
-  var tabs = Array.prototype.slice.call(t.querySelectorAll('.tab'));
-  var panels = Array.prototype.slice.call(t.querySelectorAll('.tabpanel'));
-  tabs.forEach(function(b, i){
-    b.addEventListener('click', function(){
-      tabs.forEach(function(x){ x.classList.remove('active'); });
-      panels.forEach(function(p){ p.classList.remove('active'); });
-      b.classList.add('active');
-      if (i < panels.length) { panels[i].classList.add('active'); }
-    });
+// Tabs: delegated, index-based. The i-th tab of a container shows the i-th
+// panel of the SAME container, so duplicate panel ids (the before/after
+// reuses the main chart HTML) can never resolve to the wrong panel.
+function activateTab(list, i){
+  var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
+  var panels = Array.prototype.slice.call(list.querySelectorAll('[role="tabpanel"]'));
+  tabs.forEach(function(b, j){
+    var on = (j === i);
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+    b.tabIndex = on ? 0 : -1;
   });
+  panels.forEach(function(p, j){ p.classList.toggle('active', j === i); });
+}
+document.addEventListener('click', function(e){
+  var el = e.target.closest ? e.target.closest('[role="tab"]') : null;
+  if (!el) return;
+  var list = el.closest('[role="tablist"]');
+  if (!list) return;
+  activateTab(list, Array.prototype.indexOf.call(list.querySelectorAll('[role="tab"]'), el));
 });
+document.addEventListener('keydown', function(e){
+  if (!/^(ArrowLeft|ArrowRight|Home|End)$/.test(e.key)) return;
+  var el = e.target.closest ? e.target.closest('[role="tab"]') : null;
+  if (!el || !el.parentElement) return;
+  var list = el.parentElement;
+  if (list.getAttribute('role') !== 'tablist') return;
+  e.preventDefault();
+  var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
+  var i = tabs.indexOf(el);
+  if (e.key === 'ArrowRight') i = (i + 1) % tabs.length;
+  else if (e.key === 'ArrowLeft') i = (i - 1 + tabs.length) % tabs.length;
+  else if (e.key === 'Home') i = 0;
+  else if (e.key === 'End') i = tabs.length - 1;
+  tabs[i].focus();
+  activateTab(list, i);
+});
+// Scrollspy: mark the nav link of the section currently in view.
+(function(){
+  var links = {};
+  Array.prototype.forEach.call(document.querySelectorAll('nav.nav a'), function(a){
+    var id = (a.getAttribute('href') || '').slice(1);
+    if (id) links[id] = a;
+  });
+  function set(spyId){
+    Array.prototype.forEach.call(document.querySelectorAll('nav.nav a'), function(a){
+      var on = (a.getAttribute('href') || '').slice(1) === spyId;
+      if (on) a.setAttribute('aria-current', 'true');
+      else a.removeAttribute('aria-current');
+    });
+  }
+  var spy;
+  if ('IntersectionObserver' in window) {
+    spy = new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if (en.isIntersecting) set(en.target.id);
+      });
+    }, { rootMargin: '-40% 0px -55% 0px', threshold: 0 });
+    Array.prototype.forEach.call(document.querySelectorAll('section.module h2[id], details.module h2[id]'), function(h2){
+      spy.observe(h2);
+    });
+  }
+})();
 </script>"##,
     );
     h.push_str("</body></html>\n");
+
 
     let mut fh = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     std::io::Write::write_all(&mut fh, h.as_bytes())?;
