@@ -438,6 +438,8 @@ mod tests {
             t1: 5,
             h2: 0,
             t2: 3,
+            a1: 0,
+            a2: 0,
             full: false,
         };
         let r1 = build_read(&p, &insert, 300, Mate::R1, &a, &mut rng);

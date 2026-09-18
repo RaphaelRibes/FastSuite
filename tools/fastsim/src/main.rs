@@ -40,10 +40,18 @@ fn run(cfg: &cli::Config) -> Result<()> {
             profile.adapter.mode = AdapterMode::Readthrough;
         }
     }
-    if cfg.read_len != profile.read_len {
+    // The profile is the authority on read length: an explicit --read-len that
+    // disagrees is a user error worth refusing, but omitting it must just work,
+    // so a profile goes straight in.
+    if let Some(l) = cfg.read_len {
+        if l != profile.read_len {
+            bail!("--read-len {} does not match profile read_len {}", l, profile.read_len);
+        }
+    }
+    if cfg.insert_min > profile.read_len {
         bail!(
-            "--read-len {} does not match profile read_len {}",
-            cfg.read_len,
+            "--insert-min ({}) should be <= the profile read_len ({})",
+            cfg.insert_min,
             profile.read_len
         );
     }

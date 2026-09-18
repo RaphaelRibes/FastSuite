@@ -22,7 +22,9 @@ pub struct Config {
     pub profile: String,
     pub out: String,
     pub seed: u64,
-    pub read_len: u32,
+    /// Read length. `None` (the default) takes it from the profile, so a
+    /// profile can be fed straight in; an explicit value must match the profile.
+    pub read_len: Option<u32>,
     pub insert_mean: f64,
     pub insert_sd: f64,
     pub insert_min: u32,
@@ -59,7 +61,7 @@ impl Default for Config {
             profile: String::new(),
             out: String::new(),
             seed: 42,
-            read_len: 150,
+            read_len: None,
             insert_mean: 300.0,
             insert_sd: 50.0,
             insert_min: 150,
@@ -100,7 +102,7 @@ pub fn parse(args: &[String]) -> Result<Config> {
             }
             "--json" => cfg.json = Some(next(&mut i)?),
             "--seed" => cfg.seed = next(&mut i)?.parse()?,
-            "--read-len" => cfg.read_len = next(&mut i)?.parse()?,
+            "--read-len" => cfg.read_len = Some(next(&mut i)?.parse()?),
             "--insert-mean" => cfg.insert_mean = next(&mut i)?.parse()?,
             "--insert-sd" => cfg.insert_sd = next(&mut i)?.parse()?,
             "--insert-min" => cfg.insert_min = next(&mut i)?.parse()?,
@@ -161,12 +163,10 @@ pub fn parse(args: &[String]) -> Result<Config> {
     if cfg.drop_min_len == 0 {
         bail!("--drop-min-len must be >= 1");
     }
-    if cfg.insert_min > cfg.read_len {
-        bail!(
-            "--insert-min ({}) should be <= read-len ({})",
-            cfg.insert_min,
-            cfg.read_len
-        );
+    if let Some(l) = cfg.read_len {
+        if cfg.insert_min > l {
+            bail!("--insert-min ({}) should be <= read-len ({})", cfg.insert_min, l);
+        }
     }
     Ok(cfg)
 }
