@@ -116,3 +116,37 @@ Sample naming: a report file's stem is the sample name, unless the stem is a
 generic report name (`heatmap`, `fastprep`, `report`, …) — then the nearest
 non-generic parent directory is used. So
 `runs/demo/E94/maps/heatmap.json` is correctly attributed to `E94`.
+
+## fastcheck rich report (v1, additive)
+
+fastcheck emits the QC metrics plus four tool-specific blocks and three extra
+per-position columns. All are additive (minor): consumers that ignore unknown
+keys are unaffected, and every numeric metric flows through `fasthelper
+concatenate report` with no adapter change.
+
+### New `metrics` (all numeric)
+
+`polyx3_max`, `polyx5_max`, `polyx3_frac_gt_5`, `polyx5_frac_gt_1`,
+`head_g_frac` (position-1 G fraction), `head_dropout` (library G baseline minus
+position-1 G fraction; >0 = 2-colour first-cycle dropout), `repeated_seq_count`,
+`repeated_seq_frac`, `distinct_seqs`, `duplication_level` (1 - distinct/reads),
+`kmer_top_count`, `kmer_top_frac`, `heatmap_peak`, `heatmap_peak_x`,
+`heatmap_peak_y`.
+
+### New tool-specific blocks (outside `metrics`)
+
+| block | shape |
+|---|---|
+| `polyx` | `{3p: {A|C|G|T: {len: count}}, 5p: {A|C|G|T: {len: count}}}` — homopolymer run lengths |
+| `repeated_sequences` | `[{seq, count, frac}]` — over-represented full sequences (>= max(10, 0.1% of reads)) |
+| `kmer_spectrum` | `[{kmer, count, frac}]` — top 12-mers |
+| `heatmap` | `{size, counts}` — the 256x256 grid, row-major `y*size+x`, `x = #(T+C)`, `y = #(T+G)` (same encoding as fastmaps) |
+| `processed` | `null`, or a mirror of the above for the `--processed-*` reads (before/after) |
+
+### New positions TSV columns
+
+`g_frac` (per-position G fraction), `polyx3_frac` (fraction of reads whose
+trailing run reaches this position), `polyx5_frac` (fraction whose leading run
+reaches this position). `fasthelper concatenate --positions` reads the header
+at runtime, so these become matrix metrics automatically (`--metric g_frac`, or
+`--all-metrics`).

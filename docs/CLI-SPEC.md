@@ -151,3 +151,23 @@ Ordered by user-visible value:
 * `--json` payload: see `REPORT-SCHEMA.md` for the versioning rule.
 * Exit codes: `0` success, `1` input/usage error, `2` (target) "ran fine but a
   threshold tripped", `>2` reserved. Today only 0/1 are used.
+
+## fastcheck
+
+`fastcheck [FILES...] [--json PATH] [--html PATH] [--positions-tsv PATH]
+[--profile PATH] [--insert-hist] [--processed-1 FQ] [--processed-2 FQ]`
+
+* `--json PATH` — the `fastsuite.report.v1` QC report (metrics + rich blocks).
+* `--html PATH` — a self-contained FastQC-style report (inline SVG, no JS):
+  per-base content/quality/N, distributions, insert sizes, polyX run lengths
+  (4 base tabs), repeated sequences + 12-mer spectrum, and the heatmap.
+* `--positions-tsv PATH` — per-position matrix (base counts, quality, `g_frac`,
+  `polyx3_frac`, `polyx5_frac`) for `fasthelper concatenate --positions`.
+* `--profile PATH` — a fastsim profile fitted directly from this run (no Python
+  fit step); `--insert-hist` makes its insert distribution measured.
+* `--processed-1/--processed-2 FQ` — optional processed files; the report then
+  carries a `processed` block and the HTML gains a Before/After section.
+* `--insert-hist` — the paired lockstep pass that measures insert sizes.
+
+Compare two runs side by side with `fasthelper compare --before <set>
+--after <set> -o out/`.
