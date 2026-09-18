@@ -360,3 +360,29 @@ fn rich_report_has_polyx_repeats_and_heatmap() {
     assert!(m["repeated_seq_count"].is_u64());
     assert!(m["polyx5_max"].as_u64().unwrap() >= 4);
 }
+
+
+#[test]
+fn processed_files_produce_a_before_after_report() {
+    let d = tmpdir("cmp");
+    let fq = write_fixture(&d);
+    let html = d.join("c.html");
+    let json = d.join("c.json");
+    let (_, _, code) = run(
+        &d,
+        &[
+            fq.to_str().unwrap(),
+            "--processed-1", fq.to_str().unwrap(),
+            "--html", html.to_str().unwrap(),
+            "--json", json.to_str().unwrap(),
+            "-q",
+        ],
+    );
+    assert_eq!(code, 0);
+    let j = read_json(&json);
+    assert!(j.get("processed").is_some() && j["processed"].is_object(), "processed block missing");
+    assert_eq!(j["processed"]["reads"].as_u64().unwrap(), 6);
+    let h = std::fs::read_to_string(&html).unwrap();
+    assert!(h.contains("Before / After"), "missing Before/After section");
+    assert!(h.contains("tabs-cmp"), "missing compare tabs");
+}

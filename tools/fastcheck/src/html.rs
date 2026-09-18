@@ -279,6 +279,7 @@ pub fn write_html(
     offset: u8,
     elapsed_s: f64,
     insert: Option<(&InsertHist, u64)>,
+    processed: Option<&Accum>,
 ) -> Result<()> {
     let n_pos = total.covered_positions();
     let gc = gc_fraction(total);
@@ -443,6 +444,41 @@ pub fn write_html(
         heatmap_svg(total)
     );
 
+    // ---- before/after, when processed files were given ------------------------
+    let compare_section = match processed {
+        Some(pa) => {
+            let reads = total.reads.max(1) as f64;
+            let reads_p = pa.reads.max(1) as f64;
+            let row = |label: &str, b: f64, a: f64, unit: &str| {
+                let d = a - b;
+                let sign = if d > 0.0 { "+" } else { "" };
+                format!(
+                    "<tr><th>{label}</th><td>{:.3}{unit}</td><td>{:.3}{unit}</td><td>{sign}{:.3}{unit}</td></tr>",
+                    b, a, d
+                )
+            };
+            let mut rows = String::new();
+            rows.push_str(&row("reads", reads, reads_p, ""));
+            rows.push_str(&row("%GC", gc_fraction(total) * 100.0, gc_fraction(pa) * 100.0, "%"));
+            rows.push_str(&row("mean read Q", mean_read_mean_q(total, offset), mean_read_mean_q(pa, offset), ""));
+            let (_hg, hd) = crate::rich::head_dropout(total);
+            let (_phg, phd) = crate::rich::head_dropout(pa);
+            rows.push_str(&row("head dropout (G)", hd * 100.0, phd * 100.0, "%"));
+            let heat_tabs = tabs(
+                "cmp",
+                &[
+                    ("side by side", format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div>"#, heatmap_svg(total), heatmap_svg(pa))),
+                    ("full", format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div>"#, heatmap_svg(total), heatmap_svg(pa))),
+                ],
+            );
+            format!(
+                r#"<table class="rep"><tr><th>metric</th><th>before</th><th>after</th><th>delta</th></tr>{rows}</table>
+                   <h3>Heatmap</h3>{heat_tabs}"#
+            )
+        }
+        None => String::new(),
+    };
+
     // ---- observations: numbers, not verdicts --------------------------------
     let mut obs: Vec<String> = Vec::new();
     if n_pos > 0 {
@@ -552,6 +588,11 @@ pub fn write_html(
 
     h.push_str("<h2>Heatmap</h2>");
     h.push_str(&heatmap_section);
+
+    if processed.is_some() {
+        h.push_str("<h2>Before / After</h2>");
+        h.push_str(&compare_section);
+    }
 
     if insert.is_some() {
         h.push_str("<h2>Insert sizes</h2>");

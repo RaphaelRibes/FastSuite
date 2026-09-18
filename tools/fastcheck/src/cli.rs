@@ -12,6 +12,14 @@ pub struct Cli {
     /// Input FASTQ files (plain or .gz; BGZF is decoded in parallel).
     #[arg(required = true, value_name = "FILE")]
     pub files: Vec<PathBuf>,
+    /// Optional processed (e.g. trimmed) files to compare against the raw ones:
+    /// the report then shows a before/after side-by-side. One file for
+    /// single-end, two for paired-end.
+    #[arg(long, value_name = "PATH")]
+    pub processed_1: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub processed_2: Option<PathBuf>,
+
 
     /// Write the machine-readable report (fastsuite.report.v1) to PATH.
     #[arg(long, value_name = "PATH")]

@@ -149,6 +149,7 @@ pub fn write_report(
     partial: Option<&str>,
     positions_tsv: Option<&Path>,
     insert: Option<(&crate::insert::InsertHist, u64)>,
+    processed: Option<&Accum>,
 ) -> Result<()> {
     let offset = verdict.offset;
     let (byte_min, byte_max) = byte_range(&total.qual_byte);
@@ -297,6 +298,33 @@ pub fn write_report(
         "repeated_sequences": rep_block,
         "kmer_spectrum": kmer_block,
         "heatmap": hm_block,
+        "processed": match processed {
+            Some(pa) => {
+                let (pm, pb) = rich::polyx_metrics(pa);
+                let (phg, phd) = rich::head_dropout(pa);
+                let (prm, prb) = rich::repeated_metrics(pa);
+                let (pkm, pkb) = rich::kmer_metrics(pa);
+                let (phm, phb) = rich::heatmap_metrics(pa);
+                let mut pm = pm;
+                pm.insert("head_g_frac".into(), json!(r4(phg)));
+                pm.insert("head_dropout".into(), json!(r4(phd)));
+                for (k, v) in [prm, pkm, phm].into_iter().flatten() {
+                    pm.insert(k, v);
+                }
+                json!({
+                    "reads": pa.reads,
+                    "bases": pa.bases,
+                    "gc_fraction": gc_fraction(pa),
+                    "mean_read_mean_q": mean_read_mean_q(pa, offset),
+                    "metrics": pm,
+                    "polyx": pb,
+                    "repeated_sequences": prb,
+                    "kmer_spectrum": pkb,
+                    "heatmap": phb,
+                })
+            }
+            None => serde_json::Value::Null,
+        },
         "insert_hist": match &insert {
             Some((h, pairs)) => {
                 // The sample is a fraction of the input, so the histogram is

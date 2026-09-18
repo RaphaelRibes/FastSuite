@@ -125,6 +125,23 @@ fn main() -> Result<()> {
         None
     };
 
+    // Optional processed files: a second scan whose results are stored as the
+    // "after" side of a before/after comparison.
+    let mut processed_reports: Vec<FileReport> = Vec::new();
+    let mut processed_total = Accum::new(cli.max_read_len);
+    if let Some(p1) = &cli.processed_1 {
+        let mut pfiles = vec![p1.clone()];
+        if let Some(p2) = &cli.processed_2 {
+            pfiles.push(p2.clone());
+        }
+        for path in &pfiles {
+            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile)?);
+        }
+        for r in &processed_reports {
+            processed_total.merge(&r.acc);
+        }
+    }
+
     let verdict = offset_verdict(&total.qual_byte, requested_offset);
     let elapsed = started.elapsed().as_secs_f64();
 
@@ -138,11 +155,13 @@ fn main() -> Result<()> {
             stopped,
             cli.positions_tsv.as_deref(),
             insert.as_ref().map(|h| (h, total.reads / 2)),
+            if processed_reports.is_empty() { None } else { Some(&processed_total) },
         )?;
     }
     if let Some(p) = &cli.html {
         html::write_html(p, &reports, &total, verdict.offset, elapsed,
-                         insert.as_ref().map(|h| (h, cli.insert_pairs)))?;
+                         insert.as_ref().map(|h| (h, cli.insert_pairs)),
+                         if processed_reports.is_empty() { None } else { Some(&processed_total) })?;
     }
     if let Some(p) = &cli.positions_tsv {
         report::write_positions_tsv(p, &total, verdict.offset)?;
