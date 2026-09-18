@@ -158,6 +158,41 @@ fn bar_chart(points: &[(f64, f64)], x_label: &str, y_label: &str, highlight: Opt
     out
 }
 
+/// A bar chart with a text label under each bar (for k-mers and other
+/// categorical x-axes). Labels are rotated 45° and truncated to fit.
+fn labeled_bar_chart(bars: &[(String, f64)], y_label: &str) -> String {
+    let (pad_l, pad_r, pad_t, pad_b) = (66.0, 16.0, 14.0, 46.0);
+    let (x0, y0) = (pad_l, CH - pad_b);
+    let (x1, y1) = (CW - pad_r, pad_t);
+    let n = bars.len().max(1);
+    let y_max = bars.iter().map(|(_, v)| *v).fold(1.0_f64, f64::max).max(1.0);
+    let bw = ((x1 - x0) / n as f64 * 0.7).max(1.0);
+    let mut out = format!(r#"<svg viewBox="0 0 {CW} {CH}" class="chart" role="img">"#);
+    out.push_str(&axes(x0, y0, x1, y1, n as f64, y_max, "", y_label));
+    for (i, (label, v)) in bars.iter().enumerate() {
+        let cx = x0 + (i as f64 + 0.5) * (x1 - x0) / n as f64;
+        let h = (v / y_max) * (y0 - y1);
+        let _ = write!(
+            out,
+            r#"<rect x="{:.1}" y="{:.1}" width="{bw:.1}" height="{:.1}" class="bar"/>"#,
+            cx - bw / 2.0,
+            y0 - h,
+            h
+        );
+        // label under the bar, rotated and truncated
+        let short: String = label.chars().take(8).collect();
+        let _ = write!(
+            out,
+            r#"<text x="{cx:.1}" y="{:.1}" class="tick" text-anchor="end" transform="rotate(-45 {cx:.1} {:.1})">{}</text>"#,
+            y0 + 14.0,
+            y0 + 14.0,
+            esc(&short)
+        );
+    }
+    out.push_str("</svg>");
+    out
+}
+
 /// No-JS tabs: hidden radio inputs + labels in a row, panels shown by
 /// `:checked ~ #panel`. The per-tab rules are emitted inline, scoped by prefix.
 fn tabs(prefix: &str, panels: &[(&str, String)]) -> String {
@@ -179,8 +214,8 @@ fn tabs(prefix: &str, panels: &[(&str, String)]) -> String {
             esc(label)
         );
     }
-    for (_, content) in panels {
-        let _ = write!(s, r#"<div class="tabpanel">{content}</div>"#);
+    for (i, (_, content)) in panels.iter().enumerate() {
+        let _ = write!(s, r#"<div class="tabpanel" id="p{prefix}-{i}">{content}</div>"#);
     }
     s.push_str("</div>");
     s
@@ -202,15 +237,17 @@ fn heatmap_svg(acc: &Accum) -> String {
                 continue;
             }
             let t = (1.0 + c as f64).ln() / log_peak;
-            let v = (t * 200.0) as i32;
+            // A blue gradient from near-white to deep blue, with a stronger
+            // ramp so sparse cells are visible and the peak is clearly hot.
+            let v = (t * 255.0) as i32;
             let _ = write!(
                 s,
                 r#"<rect x="{:.1}" y="{:.1}" width="{cell}" height="{cell}" fill="rgb({},{},{})"/>"#,
                 x as f64 * cell,
                 y as f64 * cell,
-                240 - v,
-                240 - v,
-                255 - (v / 3)
+                245 - v / 2,
+                245 - v / 2,
+                255 - v
             );
         }
     }
@@ -231,24 +268,24 @@ const STYLE: &str = r#"
 :root { --ink:#1d2530; --muted:#6b7580; --rule:#dde4ea; --accent:#2f6f9f; }
 * { box-sizing: border-box; }
 body { margin:0; padding:28px 34px 60px; color:var(--ink); background:#fff;
-       font:14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-h1 { font-size:23px; margin:0 0 2px; color:var(--accent); }
-h2 { font-size:15px; margin:30px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--rule); }
-.sub { color:var(--muted); font-size:13px; margin-bottom:20px; }
+       font:15px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+h1 { font-size:25px; margin:0 0 2px; color:var(--accent); }
+h2 { font-size:17px; margin:30px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--rule); }
+.sub { color:var(--muted); font-size:14px; margin-bottom:20px; }
 .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:22px; }
 .chart { width:100%; height:auto; background:#fbfcfd; border:1px solid var(--rule); border-radius:4px; }
 .ax { stroke:#9aa4ad; stroke-width:1; }
 .grid { stroke:#eef2f5; stroke-width:1; }
-.tick { fill:var(--muted); font-size:11px; }
+.tick { fill:#4a5560; font-size:12px; }
 .tick.end { text-anchor:end; }
-.axis-label { fill:var(--muted); font-size:11.5px; }
+.axis-label { fill:#4a5560; font-size:12.5px; }
 .ln { fill:none; stroke-width:1.8; }
 .bar { fill:var(--accent); }
 .vband { fill:#e8d6d6; opacity:.55; }
 table.kv { border-collapse:collapse; width:100%; }
 table.kv th { text-align:left; font-weight:600; color:var(--muted); padding:3px 12px 3px 0; white-space:nowrap; vertical-align:top; }
 table.kv td { padding:3px 0; }
-table.files { border-collapse:collapse; width:100%; font-size:13px; }
+table.files { border-collapse:collapse; width:100%; font-size:14px; }
 table.files th, table.files td { text-align:right; padding:4px 10px 4px 0; border-bottom:1px solid var(--rule); }
 table.files th:first-child, table.files td:first-child { text-align:left; }
 ul.obs { margin:6px 0 0 18px; padding:0; }
@@ -328,8 +365,10 @@ pub fn write_html(
             n_pts.push(((pos + 1) as f64, 100.0 * total.base_at(pos, 4) as f64 / d as f64));
         }
     }
+    let n_max = n_pts.iter().map(|p| p.1).fold(0.0_f64, f64::max);
+    let n_scale = (n_max * 2.0).max(5.0);
     let n_chart = line_chart(&[Series { name: "N", colour: "#6b7580", points: n_pts }],
-                             5.0, "position in read (bp)", "% N at this position");
+                             n_scale, "position in read (bp)", "% N at this position");
 
     // ---- distributions: length, per-read mean quality, per-read GC -----------
     let len_bars: Vec<(f64, f64)> = total.len_hist.iter().enumerate()
@@ -423,9 +462,13 @@ pub fn write_html(
         )
     };
     let kmers = total.kmer_counts.report(min_count);
-    let kmer_bars: Vec<(f64, f64)> = kmers.iter().take(20)
-        .map(|(k, c)| (crate::repeated::unpack_kmer(*k, 12).len() as f64, *c as f64)).collect();
-    let kmer_chart = bar_chart(&kmer_bars, "top 12-mer (by length of its name)", "count", None);
+    let kmer_bars: Vec<(String, f64)> = kmers.iter().take(20)
+        .map(|(k, c)| (crate::repeated::unpack_kmer(*k, 12), *c as f64)).collect();
+    let kmer_chart = if kmer_bars.is_empty() {
+        "<p class=\"note\">No 12-mer appears more than 0.1% of reads.</p>".to_string()
+    } else {
+        labeled_bar_chart(&kmer_bars, "count")
+    };
     let dup = 1.0 - total.distinct_seqs as f64 / reads;
     let repeats_section = format!(
         r#"<div class="grid2"><div><h3>Over-represented full sequences</h3>{rep_table}</div>
@@ -578,7 +621,8 @@ pub fn write_html(
     h.push_str("<h2>Distributions</h2>");
     let _ = write!(h, "<div class=\"grid2\"><div>{len_chart}</div><div>{mq_chart}</div></div>");
     let _ = write!(h, "<div class=\"grid2\"><div>{gc_chart}</div><div>{}</div></div>",
-                   if insert.is_some() { insert_chart.clone() } else { String::new() });
+                   if insert.is_some() { insert_chart.clone() }
+                   else { "<div class=\"note\">Insert sizes not measured — run with --insert-hist to see the insert distribution here.</div>".to_string() });
 
     h.push_str("<h2>polyX run lengths</h2>");
     h.push_str(&polyx_section);
