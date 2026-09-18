@@ -88,6 +88,10 @@ pub struct Accum {
     pub distinct_seqs: u64,
 }
 
+/// Reads over which over-represented sequences and k-mers are counted. A
+/// 1 M-read sample is representative for a QC report and bounds the work.
+pub const COUNT_LIMIT: u64 = 100_000;
+
 /// Adapter prefixes the fitter's readthrough scan looks for.
 pub const ADAPTER_PREFIXES: [(&str, &str); 2] =
     [("TruSeq", "AGATCGGAAGAGC"), ("Nextera", "CTGTCTCTTATA")];
@@ -242,13 +246,19 @@ impl Accum {
         let (hx, hy) = heatmap::encode(seq);
         self.heatmap[heatmap::index(hx, hy)] += 1;
 
-        // Over-represented sequences + 12-mer spectrum.
-        self.seq_counts.insert(seq.to_vec());
-        self.distinct_seqs += 1;
-        if seq.len() >= 12 {
-            for w in seq.windows(12) {
-                if let Some(pk) = repeated::pack_kmer(w) {
-                    self.kmer_counts.insert(pk);
+        // Over-represented sequences + 12-mer spectrum, bounded to the first
+        // COUNT_LIMIT reads. Counting every read of a 50 M-read file would
+        // fill the map to the cap and then re-scan it on every insert (O(n^2));
+        // a 1 M-read sample is representative for a QC report and costs the
+        // same regardless of file size.
+        if self.reads <= COUNT_LIMIT {
+            self.seq_counts.insert(seq.to_vec());
+            self.distinct_seqs += 1;
+            if seq.len() >= 12 {
+                for w in seq.windows(12) {
+                    if let Some(pk) = repeated::pack_kmer(w) {
+                        self.kmer_counts.insert(pk);
+                    }
                 }
             }
         }
