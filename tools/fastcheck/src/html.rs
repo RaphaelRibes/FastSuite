@@ -758,19 +758,20 @@ pub fn write_html(
     // SVG, so the report still opens offline.
     h.push_str(
         r##"<script>
+// Tab switching, index-based: the i-th tab of a container shows the i-th
+// panel of the SAME container. No id lookup, so duplicate ids (the
+// before/after reuses the main chart HTML) can never resolve to the wrong
+// panel. The tabs() helper emits all buttons first, then all panels, both in
+// document order, so the indices line up.
 document.querySelectorAll('.tabs').forEach(function(t){
-  var tabs = t.querySelectorAll('.tab');
-  var panels = t.querySelectorAll('.tabpanel');
-  tabs.forEach(function(b){
+  var tabs = Array.prototype.slice.call(t.querySelectorAll('.tab'));
+  var panels = Array.prototype.slice.call(t.querySelectorAll('.tabpanel'));
+  tabs.forEach(function(b, i){
     b.addEventListener('click', function(){
       tabs.forEach(function(x){ x.classList.remove('active'); });
       panels.forEach(function(p){ p.classList.remove('active'); });
       b.classList.add('active');
-      // Scope the panel lookup to THIS tabs container: the before/after
-      // section reuses the same chart HTML, so panel ids appear twice in the
-      // document and document.getElementById would hit the wrong (first) one.
-      var p = t.querySelector('#' + b.dataset.panel);
-      if (p) { p.classList.add('active'); }
+      if (i < panels.length) { panels[i].classList.add('active'); }
     });
   });
 });
