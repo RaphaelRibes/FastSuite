@@ -211,8 +211,12 @@ impl Profile {
     }
 
     pub fn from_raw(raw: RawProfile) -> Result<Self> {
-        let head = [Cdf::from_map(&raw.head.R1)?, Cdf::from_map(&raw.head.R2)?];
-        let tail = [Cdf::from_map(&raw.tail.R1)?, Cdf::from_map(&raw.tail.R2)?];
+        // SE profiles omit R2: mirror R1 so the parser accepts them (in --single
+        // mode the simulator only ever reads R1).
+        let r2_head = if raw.head.R2.is_empty() { &raw.head.R1 } else { &raw.head.R2 };
+        let head = [Cdf::from_map(&raw.head.R1)?, Cdf::from_map(r2_head)?];
+        let r2_tail = if raw.tail.R2.is_empty() { &raw.tail.R1 } else { &raw.tail.R2 };
+        let tail = [Cdf::from_map(&raw.tail.R1)?, Cdf::from_map(r2_tail)?];
 
         // Joint: parse "r1,r2" -> count, cap at JOINT_CAP, build flat cumulative.
         let mut grid = vec![0f64; JointCdf::N * JointCdf::N];
@@ -239,7 +243,8 @@ impl Profile {
         cum[n - 1] = 1.0;
 
         let read_len = raw.read_len as usize;
-        if raw.pos_q.R1.len() != read_len || raw.pos_q.R2.len() != read_len {
+        let r2_posq = if raw.pos_q.R2.is_empty() { raw.pos_q.R1.clone() } else { raw.pos_q.R2.clone() };
+        if raw.pos_q.R1.len() != read_len || r2_posq.len() != read_len {
             bail!(
                 "pos_q length {} must equal read_len {}",
                 raw.pos_q.R1.len(),
@@ -248,14 +253,14 @@ impl Profile {
         }
         // Measured per-position means are fractional; keep them fractional —
         // rounding the curve here would bias every emitted base.
-        let pos_q = [raw.pos_q.R1.clone(), raw.pos_q.R2.clone()];
+        let pos_q = [raw.pos_q.R1.clone(), r2_posq];
 
         // Unconditional (measured) per-position curve. Profiles built before
         // the deconvolution (build_profile.py) lack pos_q_uncond: fall back
         // to pos_q itself (then out-of-run == unconditional, correct for
         // reads without tails).
         let pos_q_uncond = match raw.pos_q_uncond {
-            Some(u) => [u.R1.clone(), u.R2.clone()],
+            Some(u) => [u.R1.clone(), if u.R2.is_empty() { u.R1.clone() } else { u.R2.clone() }],
             None => pos_q.clone(),
         };
 
@@ -269,8 +274,9 @@ impl Profile {
                         .tail
                         .unwrap_or_else(|| mean_of(&pos_q[0]) - raw.tail_q_collapse.R1),
                     rm.R2
-                        .tail
-                        .unwrap_or_else(|| mean_of(&pos_q[1]) - raw.tail_q_collapse.R2),
+                        .as_ref()
+                        .and_then(|m| m.tail)
+                        .unwrap_or_else(|| mean_of(&pos_q[1]) - raw.tail_q_collapse.R2.unwrap_or(raw.tail_q_collapse.R1)),
                 ],
                 [
                     raw.deep_head_q
@@ -280,15 +286,15 @@ impl Profile {
                         .unwrap_or_else(|| mean_of(&pos_q[0])),
                     raw.deep_head_q
                         .as_ref()
-                        .map(|d| d.R2)
-                        .or(rm.R2.head)
+                        .and_then(|d| d.R2)
+                        .or_else(|| rm.R2.as_ref().and_then(|m| m.head))
                         .unwrap_or_else(|| mean_of(&pos_q[1])),
                 ],
             ),
             None => (
                 [
                     mean_of(&pos_q[0]) - raw.tail_q_collapse.R1,
-                    mean_of(&pos_q[1]) - raw.tail_q_collapse.R2,
+                    mean_of(&pos_q[1]) - raw.tail_q_collapse.R2.unwrap_or(raw.tail_q_collapse.R1),
                 ],
                 [mean_of(&pos_q[0]), mean_of(&pos_q[1])],
             ),
@@ -340,19 +346,21 @@ impl Profile {
             head,
             tail,
             joint_tail: JointCdf { cum },
-            tail_q_collapse: [raw.tail_q_collapse.R1, raw.tail_q_collapse.R2],
+            tail_q_collapse: [raw.tail_q_collapse.R1,
+                              raw.tail_q_collapse.R2.unwrap_or(raw.tail_q_collapse.R1)],
             pos_q,
             pos_q_uncond,
             tail_q_mean,
             head_q_mean,
             read_meanq: [
                 Cdf::from_map(&raw.read_meanq.R1)?,
-                Cdf::from_map(&raw.read_meanq.R2)?,
+                Cdf::from_map(if raw.read_meanq.R2.is_empty() { &raw.read_meanq.R1 } else { &raw.read_meanq.R2 })?,
             ],
             full_length_rate: raw.full_length_rate,
             full_length_q: [
                 raw.full_length_q.R1.round().clamp(0.0, 41.0) as u8,
-                raw.full_length_q.R2.round().clamp(0.0, 41.0) as u8,
+                if raw.full_length_q.R2 > 0.0 { raw.full_length_q.R2 } else { raw.full_length_q.R1 }
+                    .round().clamp(0.0, 41.0) as u8,
             ],
             adapter: Adapter {
                 seq: raw.adapter.seq.into_bytes(),
@@ -461,7 +469,8 @@ pub struct RawProfile {
 #[allow(non_snake_case)] // field names mirror the JSON keys (R1/R2)
 pub struct RawRunQMean {
     pub R1: RawRunQMeanMate,
-    pub R2: RawRunQMeanMate,
+    #[serde(default)]
+    pub R2: Option<RawRunQMeanMate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,6 +483,8 @@ pub struct RawRunQMeanMate {
 #[allow(non_snake_case)] // field names mirror the JSON keys (R1/R2)
 pub struct RawMateHists {
     pub R1: BTreeMap<String, u64>,
+    /// absent for a single-end profile; the parser mirrors R1
+    #[serde(default)]
     pub R2: BTreeMap<String, u64>,
 }
 
@@ -481,13 +492,16 @@ pub struct RawMateHists {
 #[allow(non_snake_case)]
 pub struct RawMateFloats {
     pub R1: f64,
-    pub R2: f64,
+    #[serde(default)]
+    pub R2: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(non_snake_case)]
 pub struct RawMatePosQ {
     pub R1: Vec<f64>,
+    /// absent for a single-end profile; the parser mirrors R1
+    #[serde(default)]
     pub R2: Vec<f64>,
 }
 
