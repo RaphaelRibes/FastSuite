@@ -319,3 +319,44 @@ fn fasta_input_fails_loudly() {
     assert_ne!(code, 0);
     assert!(stderr.contains("FASTA"), "{stderr}");
 }
+
+
+#[test]
+fn rich_report_has_polyx_repeats_and_heatmap() {
+    let d = tmpdir("rich");
+    let fq = write_fixture(&d);
+    let html = d.join("r.html");
+    let json = d.join("r.json");
+    let (_, _, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--html", html.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0);
+    let h = std::fs::read_to_string(&html).unwrap();
+    for sec in [
+        "polyX run lengths",
+        "Repeated sequences",
+        "Heatmap",
+        "tabs-polyx",
+        "class=\"heatmap\"",
+    ] {
+        assert!(h.contains(sec), "HTML missing section: {sec}");
+    }
+    let j = read_json(&json);
+    let m = &j["metrics"];
+    for k in [
+        "polyx3_max", "polyx5_max", "head_g_frac", "head_dropout",
+        "repeated_seq_count", "distinct_seqs", "duplication_level",
+        "kmer_top_count", "heatmap_peak",
+    ] {
+        assert!(m.get(k).is_some(), "missing metric {k}");
+    }
+    for b in ["polyx", "repeated_sequences", "kmer_spectrum", "heatmap"] {
+        assert!(j.get(b).is_some(), "missing block {b}");
+    }
+    // The 10-copy floor means a 6-read fixture cannot trigger a repeat; the
+    // over-representation logic is unit-tested in repeated.rs. But the polyX
+    // measurement is exact: r4 = GGGGCCCCGG has a leading G run of 4.
+    assert!(m["repeated_seq_count"].is_u64());
+    assert!(m["polyx5_max"].as_u64().unwrap() >= 4);
+}

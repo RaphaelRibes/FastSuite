@@ -158,6 +158,66 @@ fn bar_chart(points: &[(f64, f64)], x_label: &str, y_label: &str, highlight: Opt
     out
 }
 
+/// No-JS tabs: hidden radio inputs + labels in a row, panels shown by
+/// `:checked ~ #panel`. The per-tab rules are emitted inline, scoped by prefix.
+fn tabs(prefix: &str, panels: &[(&str, String)]) -> String {
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        r#"<style>.tabs-{prefix} input{{display:none}}.tabs-{prefix} .tabpanel{{display:none}}"#
+    );
+    for (i, _) in panels.iter().enumerate() {
+        let _ = write!(s, r#".tabs-{prefix} #t{prefix}-{i}:checked ~ #p{prefix}-{i}{{display:block}}"#);
+    }
+    s.push_str("</style>");
+    let _ = write!(s, r#"<div class="tabs tabs-{prefix}">"#);
+    for (i, (label, _)) in panels.iter().enumerate() {
+        let _ = write!(
+            s,
+            r#"<input type="radio" name="t{prefix}" id="t{prefix}-{i}"{}><label for="t{prefix}-{i}">{}</label>"#,
+            if i == 0 { " checked" } else { "" },
+            esc(label)
+        );
+    }
+    for (_, content) in panels {
+        let _ = write!(s, r#"<div class="tabpanel">{content}</div>"#);
+    }
+    s.push_str("</div>");
+    s
+}
+
+/// The 256x256 heatmap as inline SVG, log-scaled so the peak does not wash out
+/// the rest. Only non-empty cells are emitted.
+fn heatmap_svg(acc: &Accum) -> String {
+    let size = crate::heatmap::SIZE;
+    let cell = 2.0;
+    let w = size as f64 * cell;
+    let peak = acc.heatmap.iter().copied().max().unwrap_or(1).max(1);
+    let log_peak = (1.0 + peak as f64).ln();
+    let mut s = format!(r#"<svg viewBox="0 0 {w} {w}" class="heatmap" role="img">"#);
+    for y in 0..size {
+        for x in 0..size {
+            let c = acc.heatmap[y * size + x];
+            if c == 0 {
+                continue;
+            }
+            let t = (1.0 + c as f64).ln() / log_peak;
+            let v = (t * 200.0) as i32;
+            let _ = write!(
+                s,
+                r#"<rect x="{:.1}" y="{:.1}" width="{cell}" height="{cell}" fill="rgb({},{},{})"/>"#,
+                x as f64 * cell,
+                y as f64 * cell,
+                240 - v,
+                240 - v,
+                255 - (v / 3)
+            );
+        }
+    }
+    s.push_str("</svg>");
+    s
+}
+
 fn table(rows: &[(&str, String)]) -> String {
     let mut s = String::from("<table class=\"kv\">");
     for (k, v) in rows {
@@ -196,6 +256,19 @@ ul.obs li { margin:3px 0; }
 .note { background:#f7f9fb; border-left:3px solid var(--accent); padding:9px 12px; font-size:13px; color:#333; }
 code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px; }
 footer { margin-top:34px; color:var(--muted); font-size:12px; border-top:1px solid var(--rule); padding-top:8px; }
+.tabs { margin:8px 0 12px; }
+.tabs input { display:none; }
+.tabs label { display:inline-block; padding:5px 16px; margin-right:4px; border:1px solid var(--rule);
+              border-bottom:none; border-radius:4px 4px 0 0; cursor:pointer; font-size:13px;
+              color:var(--muted); background:#f7f9fb; }
+.tabs input:checked + label { background:#fff; color:var(--accent); font-weight:600; border-color:var(--accent); }
+.tabs .tabpanel { display:none; border:1px solid var(--rule); border-radius:0 4px 4px 4px; padding:12px; background:#fff; }
+.heatmap { width:100%; height:auto; background:#fff; border:1px solid var(--rule); border-radius:4px; }
+table.rep { border-collapse:collapse; width:100%; font-size:12.5px; }
+table.rep th, table.rep td { text-align:right; padding:3px 10px 3px 0; border-bottom:1px solid var(--rule); }
+table.rep th:first-child, table.rep td:first-child { text-align:left; }
+table.rep code { font-size:11.5px; }
+.callout { background:#f7f9fb; border-left:3px solid var(--accent); padding:9px 12px; font-size:13px; color:#333; margin:10px 0; }
 "#;
 
 /// Write the report. `insert` is present when `--insert-hist` ran.
@@ -305,6 +378,71 @@ pub fn write_html(
         None => (String::new(), String::new()),
     };
 
+    // ---- polyX: 4 base tabs, each with the 3' and 5' run-length distributions --
+    let base_names = ["A", "C", "G", "T"];
+    let mut polyx_panels: Vec<(&str, String)> = Vec::new();
+    for (bi, name) in base_names.iter().enumerate() {
+        let b3: Vec<(f64, f64)> = total.polyx3[bi].iter().enumerate()
+            .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+        let b5: Vec<(f64, f64)> = total.polyx5[bi].iter().enumerate()
+            .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+        let c3 = bar_chart(&b3, "3' run length (bp)", "reads", None);
+        let c5 = bar_chart(&b5, "5' run length (bp)", "reads", None);
+        polyx_panels.push((name, format!(r#"<div class="grid2"><div>{c3}</div><div>{c5}</div></div>"#)));
+    }
+    let (hg, hd) = crate::rich::head_dropout(total);
+    let polyx_section = format!(
+        "{}{}",
+        tabs("polyx", &polyx_panels),
+        format!(
+            r#"<div class="callout">First base is G in {:.2}% of reads against {:.2}% for the library
+                (head dropout {:.2} points) — a positive dropout is the 2-colour first-cycle G
+                signature. The 5' tab for G shows the run-length distribution of that head.</div>"#,
+            hg * 100.0, (hg + hd) * 100.0, hd * 100.0
+        )
+    );
+
+    // ---- repeated sequences: full sequences + 12-mer spectrum -----------------
+    let reads = total.reads.max(1) as f64;
+    let min_count = (reads * 0.001).max(10.0) as u32;
+    let seqs = total.seq_counts.report(min_count);
+    let mut rep_rows = String::new();
+    for (s, c) in seqs.iter().take(20) {
+        let _ = write!(
+            rep_rows,
+            "<tr><td><code>{}</code></td><td>{}</td><td>{:.3}%</td></tr>",
+            esc(&String::from_utf8_lossy(s)), c, 100.0 * *c as f64 / reads
+        );
+    }
+    let rep_table = if seqs.is_empty() {
+        "<p class=\"note\">No sequence appears more than 0.1% of reads — the library is not dominated by a repeated sequence.</p>".to_string()
+    } else {
+        format!(
+            "<table class=\"rep\"><tr><th>sequence</th><th>count</th><th>% of reads</th></tr>{rep_rows}</table>"
+        )
+    };
+    let kmers = total.kmer_counts.report(min_count);
+    let kmer_bars: Vec<(f64, f64)> = kmers.iter().take(20)
+        .map(|(k, c)| (crate::repeated::unpack_kmer(*k, 12).len() as f64, *c as f64)).collect();
+    let kmer_chart = bar_chart(&kmer_bars, "top 12-mer (by length of its name)", "count", None);
+    let dup = 1.0 - total.distinct_seqs as f64 / reads;
+    let repeats_section = format!(
+        r#"<div class="grid2"><div><h3>Over-represented full sequences</h3>{rep_table}</div>
+           <div><h3>Top 12-mers</h3>{kmer_chart}</div></div>
+           <div class="callout">{} distinct sequences of {reads:.0} reads — duplication level {:.2}%.</div>"#,
+        total.distinct_seqs, dup * 100.0
+    );
+
+    // ---- heatmap: full view (side-by-side arrives with --processed-*) ---------
+    let heatmap_section = format!(
+        r#"<div class="callout">Each read is one cell at (T+C, T+G). A tight cluster is a uniform
+           composition; a spread or a second cluster is a sub-population (e.g. adapter-dimers or a
+           contaminant). Peak at ({}, {}).</div>{}"#,
+        crate::rich::heatmap_metrics(total).0.get("heatmap_peak_x").map(|v| v.to_string()).unwrap_or_default(),
+        crate::rich::heatmap_metrics(total).0.get("heatmap_peak_y").map(|v| v.to_string()).unwrap_or_default(),
+        heatmap_svg(total)
+    );
+
     // ---- observations: numbers, not verdicts --------------------------------
     let mut obs: Vec<String> = Vec::new();
     if n_pos > 0 {
@@ -405,6 +543,15 @@ pub fn write_html(
     let _ = write!(h, "<div class=\"grid2\"><div>{len_chart}</div><div>{mq_chart}</div></div>");
     let _ = write!(h, "<div class=\"grid2\"><div>{gc_chart}</div><div>{}</div></div>",
                    if insert.is_some() { insert_chart.clone() } else { String::new() });
+
+    h.push_str("<h2>polyX run lengths</h2>");
+    h.push_str(&polyx_section);
+
+    h.push_str("<h2>Repeated sequences</h2>");
+    h.push_str(&repeats_section);
+
+    h.push_str("<h2>Heatmap</h2>");
+    h.push_str(&heatmap_section);
 
     if insert.is_some() {
         h.push_str("<h2>Insert sizes</h2>");
