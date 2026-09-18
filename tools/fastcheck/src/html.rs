@@ -193,29 +193,25 @@ fn labeled_bar_chart(bars: &[(String, f64)], y_label: &str) -> String {
     out
 }
 
-/// No-JS tabs: hidden radio inputs + labels in a row, panels shown by
-/// `:checked ~ #panel`. The per-tab rules are emitted inline, scoped by prefix.
+/// Tabs: buttons in a row, panels shown by a small JS handler (the same
+/// mechanism MultiQC uses). The first tab is active by default.
 fn tabs(prefix: &str, panels: &[(&str, String)]) -> String {
     let mut s = String::new();
-    let _ = write!(
-        s,
-        r#"<style>.tabs-{prefix} input{{display:none}}.tabs-{prefix} .tabpanel{{display:none}}"#
-    );
-    for (i, _) in panels.iter().enumerate() {
-        let _ = write!(s, r#".tabs-{prefix} #t{prefix}-{i}:checked ~ #p{prefix}-{i}{{display:block}}"#);
-    }
-    s.push_str("</style>");
-    let _ = write!(s, r#"<div class="tabs tabs-{prefix}">"#);
+    let _ = write!(s, r#"<div class="tabs" id="tabs-{prefix}">"#);
     for (i, (label, _)) in panels.iter().enumerate() {
         let _ = write!(
             s,
-            r#"<input type="radio" name="t{prefix}" id="t{prefix}-{i}"{}><label for="t{prefix}-{i}">{}</label>"#,
-            if i == 0 { " checked" } else { "" },
+            r#"<button type="button" class="tab{}" data-panel="p{prefix}-{i}">{}</button>"#,
+            if i == 0 { " active" } else { "" },
             esc(label)
         );
     }
     for (i, (_, content)) in panels.iter().enumerate() {
-        let _ = write!(s, r#"<div class="tabpanel" id="p{prefix}-{i}">{content}</div>"#);
+        let _ = write!(
+            s,
+            r#"<div class="tabpanel{}" id="p{prefix}-{i}">{content}</div>"#,
+            if i == 0 { " active" } else { "" }
+        );
     }
     s.push_str("</div>");
     s
@@ -257,6 +253,24 @@ fn heatmap_svg(acc: &Accum) -> String {
     s
 }
 
+/// A titled card around a chart, so sections read as labelled panels rather
+/// than bare SVGs floating in a grid.
+fn chart_card(title: &str, chart: &str) -> String {
+    format!(
+        r#"<div class="card"><div class="card-title">{}</div>{chart}</div>"#,
+        esc(title)
+    )
+}
+
+/// A titled card holding a note instead of a chart.
+fn chart_card_note(title: &str, note: &str) -> String {
+    format!(
+        r#"<div class="card"><div class="card-title">{}</div><div class="note">{}</div></div>"#,
+        esc(title),
+        esc(note)
+    )
+}
+
 fn table(rows: &[(&str, String)]) -> String {
     let mut s = String::from("<table class=\"kv\">");
     for (k, v) in rows {
@@ -296,12 +310,12 @@ ul.obs li { margin:3px 0; }
 code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12.5px; }
 footer { margin-top:34px; color:var(--muted); font-size:12px; border-top:1px solid var(--rule); padding-top:8px; }
 .tabs { margin:8px 0 12px; }
-.tabs input { display:none; }
-.tabs label { display:inline-block; padding:5px 16px; margin-right:4px; border:1px solid var(--rule);
-              border-bottom:none; border-radius:4px 4px 0 0; cursor:pointer; font-size:13px;
-              color:var(--muted); background:#f7f9fb; }
-.tabs input:checked + label { background:#fff; color:var(--accent); font-weight:600; border-color:var(--accent); }
+.tabs .tab { display:inline-block; padding:5px 16px; margin-right:4px; border:1px solid var(--rule);
+             border-bottom:none; border-radius:4px 4px 0 0; cursor:pointer; font-size:13px;
+             color:var(--muted); background:#f7f9fb; font-family:inherit; }
+.tabs .tab.active { background:#fff; color:var(--accent); font-weight:600; border-color:var(--accent); }
 .tabs .tabpanel { display:none; border:1px solid var(--rule); border-radius:0 4px 4px 4px; padding:12px; background:#fff; }
+.tabs .tabpanel.active { display:block; }
 .heatmap { width:100%; height:auto; background:#fff; border:1px solid var(--rule); border-radius:4px; }
 table.rep { border-collapse:collapse; width:100%; font-size:12.5px; }
 table.rep th, table.rep td { text-align:right; padding:3px 10px 3px 0; border-bottom:1px solid var(--rule); }
@@ -313,6 +327,9 @@ nav.nav a { display:inline-block; margin-right:14px; color:var(--accent); text-d
 nav.nav a:hover { text-decoration:underline; }
 .ba-label { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }
 h3 { font-size:13.5px; margin:16px 0 6px; color:var(--ink); }
+.card { border:1px solid var(--rule); border-radius:6px; padding:10px 12px 4px; background:#fff; }
+.card-title { font-size:12.5px; font-weight:600; color:var(--ink); margin-bottom:2px; }
+.grid2 .card { height:100%; }
 "#;
 
 /// Write the report. `insert` is present when `--insert-hist` ran.
@@ -707,10 +724,12 @@ pub fn write_html(
     h.push_str("<div class=\"note\">Mean quality by position with the 10th and 90th percentiles — a widening spread is quality falling off unevenly between reads, not just a lower mean.</div>");
 
     h.push_str("<h2 id=\"dist\">Distributions</h2>");
-    let _ = write!(h, "<div class=\"grid2\"><div>{len_chart}</div><div>{mq_chart}</div></div>");
-    let _ = write!(h, "<div class=\"grid2\"><div>{gc_chart}</div><div>{}</div></div>",
-                   if insert.is_some() { insert_chart.clone() }
-                   else { "<div class=\"note\">Insert sizes not measured — run with --insert-hist to see the insert distribution here.</div>".to_string() });
+    h.push_str("<div class=\"grid2\">");
+    let _ = write!(h, "{}{}", chart_card("Read length", &len_chart), chart_card("Mean read quality", &mq_chart));
+    let _ = write!(h, "{}{}", chart_card("G+C content", &gc_chart),
+                   if insert.is_some() { chart_card("Insert size", &insert_chart) }
+                   else { chart_card_note("Insert size", "not measured — run with --insert-hist") });
+    h.push_str("</div>");
 
     if insert.is_some() {
         h.push_str("<h2>Insert sizes</h2>");
@@ -738,6 +757,25 @@ pub fn write_html(
     }
     h.push_str("</ul>");
     let _ = write!(h, "<footer>fastcheck</footer>");
+    // The only script in the report: tab switching. Everything else is static
+    // SVG, so the report still opens offline.
+    h.push_str(
+        r##"<script>
+document.querySelectorAll('.tabs').forEach(function(t){
+  var tabs = t.querySelectorAll('.tab');
+  var panels = t.querySelectorAll('.tabpanel');
+  tabs.forEach(function(b){
+    b.addEventListener('click', function(){
+      tabs.forEach(function(x){ x.classList.remove('active'); });
+      panels.forEach(function(p){ p.classList.remove('active'); });
+      b.classList.add('active');
+      var p = document.getElementById(b.dataset.panel);
+      if (p) { p.classList.add('active'); }
+    });
+  });
+});
+</script>"##,
+    );
     h.push_str("</body></html>\n");
 
     let mut fh = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
