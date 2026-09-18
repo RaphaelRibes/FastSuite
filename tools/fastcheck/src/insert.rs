@@ -278,7 +278,7 @@ impl InsertHist {
 
     /// The full observed insert distribution: both regimes, as far as they are
     /// observable. This is the distribution a simulator should be fitted to.
-    fn union(&self) -> Vec<u64> {
+    pub fn union(&self) -> Vec<u64> {
         let mut v = self.bins.clone();
         Self::merge_bins(&mut v, &self.bins_adapter);
         v

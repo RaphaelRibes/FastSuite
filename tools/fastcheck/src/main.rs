@@ -9,6 +9,7 @@
 mod accum;
 mod cli;
 mod html;
+mod profile;
 mod insert;
 mod reader;
 mod report;
@@ -33,16 +34,26 @@ fn main() -> Result<()> {
         max_bytes: cli.bytes,
     };
 
+    if cli.profile.is_some() && !(1..=2).contains(&cli.files.len()) {
+        anyhow::bail!(
+            "--profile needs one input file (single-end) or two (paired-end), got {}",
+            cli.files.len()
+        );
+    }
+
     let started = Instant::now();
     let files: Vec<PathBuf> = cli.files.clone();
     let max_pos = cli.max_read_len;
+    // The per-read profile scan (adapter prefix + fragment GC) is only paid for
+    // when a profile was asked for.
+    let track_profile = cli.profile.is_some();
 
     // A single file already has all the parallelism it can use inside the
     // BGZF inflate pool; several files are scanned concurrently.
     let reports: Vec<FileReport> = if files.len() == 1 || threads <= 1 {
         let mut out = Vec::with_capacity(files.len());
         for path in &files {
-            out.push(scan_one(path, threads.max(1), limits, max_pos)?);
+            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile)?);
         }
         out
     } else {
@@ -55,7 +66,7 @@ fn main() -> Result<()> {
             handles.push(std::thread::spawn(move || -> Result<Vec<FileReport>> {
                 let mut out = Vec::with_capacity(chunk.len());
                 for path in &chunk {
-                    out.push(scan_one(path, per_worker_threads, limits, max_pos)?);
+                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile)?);
                 }
                 Ok(out)
             }));
@@ -132,6 +143,16 @@ fn main() -> Result<()> {
     if let Some(p) = &cli.positions_tsv {
         report::write_positions_tsv(p, &total, verdict.offset)?;
     }
+    if let Some(p) = &cli.profile {
+        let name = files
+            .first()
+            .and_then(|f| f.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "input".to_string());
+        let accs: Vec<&Accum> = reports.iter().map(|r| &r.acc).collect();
+        profile::write_profile(p, &name, &accs, verdict.offset, insert.as_ref())?;
+        eprintln!("fastcheck: wrote fastsim profile to {}", p.display());
+    }
 
     if !cli.quiet {
         let gc = 100.0 * report_gc(&total);
@@ -165,8 +186,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn scan_one(path: &PathBuf, gz_threads: usize, limits: Limits, max_pos: usize) -> Result<FileReport> {
+fn scan_one(
+    path: &PathBuf,
+    gz_threads: usize,
+    limits: Limits,
+    max_pos: usize,
+    track_profile: bool,
+) -> Result<FileReport> {
     let mut acc = Accum::new(max_pos);
+    acc.track_profile = track_profile;
     let scan = reader::scan_file(path, gz_threads, limits, &mut acc)?;
     Ok(FileReport {
         path: path.clone(),

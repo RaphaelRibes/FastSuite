@@ -60,6 +60,29 @@ pub struct Accum {
     pub base_pos: Vec<[u64; NT]>,
     /// `qual_pos[pos][byte]`, position-major.
     pub qual_pos: Vec<[u64; QBINS]>,
+    /// Adapter-prefix hits per catalogue entry (TruSeq, Nextera), and the G+C of
+    /// the adapter-free reads with the 5' G-run stripped. Both feed the fitter's
+    /// readthrough rate and FRAGMENT gc; they are only tracked when a profile is
+    /// requested, so the common path pays nothing.
+    pub adapter_hits: [u64; 2],
+    pub frag_gc: u64,
+    pub frag_bases: u64,
+    /// Whether the per-read profile scan (adapter prefix + fragment GC) runs.
+    pub track_profile: bool,
+}
+
+/// Adapter prefixes the fitter's readthrough scan looks for.
+pub const ADAPTER_PREFIXES: [(&str, &str); 2] =
+    [("TruSeq", "AGATCGGAAGAGC"), ("Nextera", "CTGTCTCTTATA")];
+
+/// Case-insensitive substring search (the adapter prefix in a read).
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| {
+        w.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+    })
 }
 
 impl Accum {
@@ -77,6 +100,10 @@ impl Accum {
             qual_byte: [0; QBINS],
             base_pos: Vec::new(),
             qual_pos: Vec::new(),
+            adapter_hits: [0; 2],
+            frag_gc: 0,
+            frag_bases: 0,
+            track_profile: false,
         }
     }
 
@@ -150,6 +177,32 @@ impl Accum {
             (qsum / qual.len() as u64) as usize
         };
         self.meanq_raw_hist[raw_mean.min(QBINS - 1)] += 1;
+
+        // Profile extras (only when a profile was requested): the adapter
+        // readthrough rate and the FRAGMENT gc. Readthrough is the adapter
+        // prefix appearing anywhere in the read; the fragment gc is taken from
+        // reads WITHOUT one, with the 5' G-run stripped — those are pure
+        // fragment, while adapter-carrying reads are exactly the short-insert
+        // ones and would weight the estimate by short-fragment composition.
+        if self.track_profile {
+            let mut hit = false;
+            for (i, (_, pat)) in ADAPTER_PREFIXES.iter().enumerate() {
+                if contains_ci(seq, pat.as_bytes()) {
+                    self.adapter_hits[i] += 1;
+                    hit = true;
+                }
+            }
+            if !hit {
+                let start = seq.iter().position(|&b| b.to_ascii_uppercase() != b'G').unwrap_or(seq.len());
+                for &b in &seq[start..] {
+                    match b.to_ascii_uppercase() {
+                        b'G' | b'C' => { self.frag_gc += 1; self.frag_bases += 1; }
+                        b'A' | b'T' => { self.frag_bases += 1; }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     /// Exact sum of two accumulators.
@@ -159,6 +212,10 @@ impl Accum {
         self.bases += o.bases;
         self.reads_with_n += o.reads_with_n;
         self.reads_over_max_len += o.reads_over_max_len;
+        self.adapter_hits[0] += o.adapter_hits[0];
+        self.adapter_hits[1] += o.adapter_hits[1];
+        self.frag_gc += o.frag_gc;
+        self.frag_bases += o.frag_bases;
         add_hist(&mut self.len_hist, &o.len_hist);
         add_hist(&mut self.acgt_hist, &o.acgt_hist);
         add_hist(&mut self.gc_hist, &o.gc_hist);

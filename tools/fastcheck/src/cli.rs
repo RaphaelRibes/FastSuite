@@ -16,6 +16,11 @@ pub struct Cli {
     /// Write the machine-readable report (fastsuite.report.v1) to PATH.
     #[arg(long, value_name = "PATH")]
     pub json: Option<PathBuf>,
+    /// Write a fastsim profile directly, fitted from this run's measurements:
+    /// the file `fastsim --profile FILE` consumes, with no separate fit step.
+    #[arg(long, value_name = "PATH")]
+    pub profile: Option<PathBuf>,
+
     /// Write a FastQC-style HTML report (exact counts, inline SVG, no JS).
     #[arg(long, value_name = "PATH")]
     pub html: Option<PathBuf>,
