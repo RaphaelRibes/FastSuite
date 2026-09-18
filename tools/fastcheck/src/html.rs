@@ -79,14 +79,11 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
-fn line_chart(series: &[Series], y_max: f64, x_label: &str, y_label: &str) -> String {
+fn line_chart(series: &[Series], y_max: f64, x_max: f64, x_label: &str, y_label: &str) -> String {
     let (pad_l, pad_r, pad_t, pad_b) = (66.0, 16.0, 14.0, 36.0);
     let (x0, y0) = (pad_l, CH - pad_b);
     let (x1, y1) = (CW - pad_r, pad_t);
-    let x_max = series
-        .iter()
-        .filter_map(|s| s.points.last().map(|p| p.0))
-        .fold(1.0_f64, f64::max);
+    let x_max = x_max.max(1.0);
     let sx = |x: f64| x0 + (x / x_max) * (x1 - x0);
     let sy = |y: f64| y0 - (y.min(y_max) / y_max) * (y0 - y1);
 
@@ -409,17 +406,17 @@ pub fn write_html(
         let chart = |acc: &Accum| -> String {
             let (seq, n_pts, q_pts, q_lo, q_hi) = pos_series(acc, n_pos, offset);
             match kind {
-                0 => line_chart(&seq, y_max, x_label, y_label),
+                0 => line_chart(&seq, y_max, n_pos as f64, x_label, y_label),
                 1 => {
                     let n_max = n_pts.iter().map(|p| p.1).fold(0.0_f64, f64::max);
                     let scale = (n_max * 2.0).max(5.0);
-                    line_chart(&[Series { name: "N", colour: "#6b7580", points: n_pts }], scale, x_label, y_label)
+                    line_chart(&[Series { name: "N", colour: "#6b7580", points: n_pts }], scale, n_pos as f64, x_label, y_label)
                 }
                 _ => line_chart(
                     &[Series { name: "p90", colour: "#a9c4d9", points: q_hi },
                       Series { name: "mean", colour: "#2f6f9f", points: q_pts },
                       Series { name: "p10", colour: "#a9c4d9", points: q_lo }],
-                    y_max, x_label, y_label,
+                    y_max, n_pos as f64, x_label, y_label,
                 ),
             }
         };
