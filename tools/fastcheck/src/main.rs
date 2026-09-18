@@ -8,8 +8,11 @@
 
 mod accum;
 mod cli;
+mod heatmap;
 mod html;
+mod polyx;
 mod profile;
+mod repeated;
 mod insert;
 mod reader;
 mod report;

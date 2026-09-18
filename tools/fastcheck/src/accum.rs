@@ -34,6 +34,11 @@ fn grow<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
 // [u64; 256] has no `Default`, so rows are grown with an explicit literal.
 const QUAL_ROW: [u64; QBINS] = [0; QBINS];
 
+
+use crate::heatmap;
+use crate::polyx;
+use crate::repeated;
+use crate::repeated::RepeatedCounter;
 #[derive(Clone)]
 pub struct Accum {
     /// Position rows are grown to the longest read seen; reads longer than
@@ -69,6 +74,18 @@ pub struct Accum {
     pub frag_bases: u64,
     /// Whether the per-read profile scan (adapter prefix + fragment GC) runs.
     pub track_profile: bool,
+    /// polyX run-length histograms: `polyx3[base][len]` (trailing 3′ run) and
+    /// `polyx5[base][len]` (leading 5′ run), base 0=A 1=C 2=G 3=T.
+    pub polyx3: [Vec<u64>; 4],
+    pub polyx5: [Vec<u64>; 4],
+    /// The fastmaps-style heatmap grid (SIZE*SIZE, row-major y*SIZE+x).
+    pub heatmap: Vec<u64>,
+    /// Bounded over-represented full-sequence counter.
+    pub seq_counts: RepeatedCounter<Vec<u8>>,
+    /// Bounded 12-mer counter (packed u64 keys).
+    pub kmer_counts: RepeatedCounter<u64>,
+    /// Distinct full sequences seen (for the duplication level).
+    pub distinct_seqs: u64,
 }
 
 /// Adapter prefixes the fitter's readthrough scan looks for.
@@ -104,6 +121,12 @@ impl Accum {
             frag_gc: 0,
             frag_bases: 0,
             track_profile: false,
+            polyx3: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            polyx5: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            heatmap: vec![0; heatmap::SIZE * heatmap::SIZE],
+            seq_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
+            kmer_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
+            distinct_seqs: 0,
         }
     }
 
@@ -203,6 +226,32 @@ impl Accum {
                 }
             }
         }
+
+        // polyX run lengths (always: cheap, and the report always wants them).
+        let (lb, ll, tb, tl) = polyx::measure_polyx(seq);
+        if lb != usize::MAX {
+            grow(&mut self.polyx5[lb], ll + 1);
+            self.polyx5[lb][ll] += 1;
+        }
+        if tb != usize::MAX {
+            grow(&mut self.polyx3[tb], tl + 1);
+            self.polyx3[tb][tl] += 1;
+        }
+
+        // Heatmap cell.
+        let (hx, hy) = heatmap::encode(seq);
+        self.heatmap[heatmap::index(hx, hy)] += 1;
+
+        // Over-represented sequences + 12-mer spectrum.
+        self.seq_counts.insert(seq.to_vec());
+        self.distinct_seqs += 1;
+        if seq.len() >= 12 {
+            for w in seq.windows(12) {
+                if let Some(pk) = repeated::pack_kmer(w) {
+                    self.kmer_counts.insert(pk);
+                }
+            }
+        }
     }
 
     /// Exact sum of two accumulators.
@@ -216,6 +265,16 @@ impl Accum {
         self.adapter_hits[1] += o.adapter_hits[1];
         self.frag_gc += o.frag_gc;
         self.frag_bases += o.frag_bases;
+        for b in 0..4 {
+            add_hist(&mut self.polyx3[b], &o.polyx3[b]);
+            add_hist(&mut self.polyx5[b], &o.polyx5[b]);
+        }
+        for (i, &c) in o.heatmap.iter().enumerate() {
+            self.heatmap[i] += c;
+        }
+        // The bounded counters are not merged (they are per-file approximations);
+        // distinct_seqs is summed so the duplication level stays meaningful.
+        self.distinct_seqs += o.distinct_seqs;
         add_hist(&mut self.len_hist, &o.len_hist);
         add_hist(&mut self.acgt_hist, &o.acgt_hist);
         add_hist(&mut self.gc_hist, &o.gc_hist);
