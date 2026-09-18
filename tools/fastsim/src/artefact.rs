@@ -160,16 +160,18 @@ pub fn build_read<R: Rng + ?Sized>(
     seq.extend(std::iter::repeat_n(b'G', t as usize));
 
     // Boundary rule: make the measured G-runs exactly h and t.
-    // - 5′: base at index h (first biology/adapter base) must be non-G.
-    // - 3′: base at index L−t−1 (last base before the tail) must be non-G.
-    // This includes t=0 / h=0: the measured run must be exactly the sampled
-    // length, so a read with t=0 must not end in G either.
+    // - 5′: base at index h (first base after the head) must be non-G, so the
+    //   head run is exactly h and does not merge with a biological G.
+    // - 3′: base at index L−t−1 (last base before the tail) must be non-G, so
+    //   the tail run is exactly t and does not merge with a biological G.
+    // The 5′ rule applies ONLY when h > 0 (there is a real head run to bound).
+    // When h = 0 there is no head, so the first base is free to be whatever the
+    // biology gives — including G. Forcing it non-G suppressed the natural
+    // position-1 G of a library with no head artefact (real libraries are ~21%
+    // G at position 1; the simulator produced ~0.01%).
     // Replace with a random non-G when biology happens to start/end in G.
     let non_g = *b"ACT";
-    // 5': base at index h (first base after the head; index 0 when h=0)
-    // must be non-G, so a read sampled with h=0 never starts with a
-    // biological G (otherwise the measured head rate inflates by ~GC/2).
-    if (h as usize) < l {
+    if h > 0 && (h as usize) < l {
         let i = h as usize;
         if seq[i] == b'G' {
             seq[i] = non_g[rng.gen_range(0..3)];
@@ -344,17 +346,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_head_read_never_starts_with_g() {
-        // Regression: the 5' boundary rule used to skip h=0 reads, so a read
-        // sampled with h=0 could start with a biological G, inflating the
-        // measured head rate by ~GC/2. The base at index 0 must be non-G.
+    fn zero_head_read_keeps_the_biological_first_base() {
+        // A read with h=0 has no head artefact, so its first base is the
+        // biology's — including G. Forcing it non-G suppressed the natural
+        // position-1 G of a library with no head (real ~21% G, sim ~0.01%).
         let p = fixed_joint_profile(&[(0, 0, 100)]);
         let mut rng = rng();
         let insert: Vec<u8> = vec![b'G'; 300]; // biology starts with G
         let a = decide(&p, &mut rng);
         assert_eq!((a.h1, a.t1), (0, 0));
         let r1 = build_read(&p, &insert, 300, Mate::R1, &a, &mut rng);
-        assert!(r1.seq[0] != b'G', "h=0 read must not start with G");
+        assert_eq!(r1.seq[0], b'G', "h=0 read keeps the biological first base");
     }
 
     #[test]
