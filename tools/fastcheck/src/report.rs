@@ -1,6 +1,7 @@
 //! Output: `fastsuite.report.v1` JSON, per-position TSV, and the summary line.
 
 use std::path::{Path, PathBuf};
+use crate::rich;
 
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -15,6 +16,10 @@ pub struct FileReport {
 }
 
 /// Total bases that are neither A, C, G nor T.
+pub(crate) fn r4(x: f64) -> f64 {
+    (x * 10000.0).round() / 10000.0
+}
+
 pub(crate) fn bases_other(a: &Accum) -> u64 {
     let acgt: u64 = (0..a.acgt_hist.len()).map(|i| i as u64 * a.acgt_hist[i]).sum();
     a.bases - acgt
@@ -65,7 +70,7 @@ fn frac_reads_at_least(a: &Accum, offset: u8, min_q: i64) -> f64 {
     n as f64 / a.reads as f64
 }
 
-fn hist_json(hist: &[u64]) -> serde_json::Value {
+pub(crate) fn hist_json(hist: &[u64]) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     for (i, &c) in hist.iter().enumerate() {
         if c > 0 {
@@ -234,6 +239,18 @@ pub fn write_report(
         put("insert_p50", json!(h.quantile_public(0.50)));
     }
 
+    // Rich-report metrics (polyX, head dropout, repeats, k-mers, heatmap).
+    let (polyx_m, polyx_block) = rich::polyx_metrics(total);
+    let (hg, hd) = rich::head_dropout(total);
+    let (rep_m, rep_block) = rich::repeated_metrics(total);
+    let (kmer_m, kmer_block) = rich::kmer_metrics(total);
+    let (hm_m, hm_block) = rich::heatmap_metrics(total);
+    for (k, v) in [polyx_m, rep_m, kmer_m, hm_m].into_iter().flatten() {
+        put(&k, v);
+    }
+    put("head_g_frac", json!(r4(hg)));
+    put("head_dropout", json!(r4(hd)));
+
     let mut composition = serde_json::Map::new();
     for (k, idx) in [("a", 0usize), ("c", 1), ("g", 2), ("t", 3), ("other", 4)] {
         let n: u64 = (0..total.max_pos).map(|p| total.base_at(p, idx)).sum();
@@ -276,6 +293,10 @@ pub fn write_report(
         "per_file": per_file,
         "base_composition": serde_json::Value::Object(composition),
         "base_position": base_position_json(total),
+        "polyx": polyx_block,
+        "repeated_sequences": rep_block,
+        "kmer_spectrum": kmer_block,
+        "heatmap": hm_block,
         "insert_hist": match &insert {
             Some((h, pairs)) => {
                 // The sample is a fraction of the input, so the histogram is
@@ -304,14 +325,44 @@ pub fn write_report(
 
 pub fn write_positions_tsv(path: &Path, total: &Accum, offset: u8) -> Result<()> {
     let n_pos = total.covered_positions();
+    let reads = total.reads.max(1) as f64;
+    // Per-position polyX reach: the fraction of reads whose trailing (3') or
+    // leading (5') homopolymer run reaches this position, summed over bases.
+    let mut p3_reach = vec![0u64; n_pos];
+    let mut p5_reach = vec![0u64; n_pos];
+    for b in 0..4 {
+        for (len, &c) in total.polyx3[b].iter().enumerate() {
+            if c == 0 || len == 0 {
+                continue;
+            }
+            for p in 0..len.min(n_pos) {
+                p3_reach[n_pos - 1 - p] += c;
+            }
+        }
+        for (len, &c) in total.polyx5[b].iter().enumerate() {
+            if c == 0 || len == 0 {
+                continue;
+            }
+            for p in 0..len.min(n_pos) {
+                p5_reach[p] += c;
+            }
+        }
+    }
     let mut out = String::with_capacity(64 * (n_pos + 1));
-    out.push_str("pos\ta\tc\tg\tt\tn\tdepth\tmean_q\tq10\tq50\tq90\n");
+    out.push_str(
+        "pos\ta\tc\tg\tt\tn\tdepth\tmean_q\tq10\tq50\tq90\tg_frac\tpolyx3_frac\tpolyx5_frac\n",
+    );
     for pos in 0..n_pos {
         let row = total.qual_at(pos);
         let depth: u64 = row.iter().sum();
         let (mean, q10, q50, q90) = pos_stats(&row, offset);
+        let g_frac = if depth > 0 {
+            total.base_at(pos, 2) as f64 / depth as f64
+        } else {
+            0.0
+        };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.0}\t{:.0}\t{:.0}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.0}\t{:.0}\t{:.0}\t{:.4}\t{:.4}\t{:.4}\n",
             pos + 1,
             total.base_at(pos, 0),
             total.base_at(pos, 1),
@@ -322,7 +373,10 @@ pub fn write_positions_tsv(path: &Path, total: &Accum, offset: u8) -> Result<()>
             mean,
             q10,
             q50,
-            q90
+            q90,
+            g_frac,
+            p3_reach[pos] as f64 / reads,
+            p5_reach[pos] as f64 / reads,
         ));
     }
     write_out(path, &out)?;

@@ -163,7 +163,7 @@ fn positions_tsv_has_one_row_per_position_and_exact_depths() {
     let text = std::fs::read_to_string(&tsv).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 11, "header + 10 positions");
-    assert_eq!(lines[0], "pos\ta\tc\tg\tt\tn\tdepth\tmean_q\tq10\tq50\tq90");
+    assert_eq!(lines[0], "pos\ta\tc\tg\tt\tn\tdepth\tmean_q\tq10\tq50\tq90\tg_frac\tpolyx3_frac\tpolyx5_frac");
     assert!(lines[1].starts_with("1\t"), "1-based positions");
     // every position is covered by all 6 reads
     for l in &lines[1..] {

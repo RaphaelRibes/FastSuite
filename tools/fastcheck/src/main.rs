@@ -13,6 +13,7 @@ mod html;
 mod polyx;
 mod profile;
 mod repeated;
+mod rich;
 mod insert;
 mod reader;
 mod report;

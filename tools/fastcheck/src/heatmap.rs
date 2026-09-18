@@ -3,9 +3,11 @@
 //! the same encoding fastmaps uses (`encode.rs`), so the two tools' heatmaps
 //! are directly comparable.
 
-/// Grid edge length. 64 matches fastmaps' default and keeps the JSON small
-/// (~32 KB per mate).
-pub const SIZE: usize = 64;
+/// Grid edge length. 256 covers the short-read domain (reads up to 255 bp)
+/// without saturating the corner the way a 64 grid does on 151 bp reads
+/// (x = T+C and y = T+G both reach ~75). fastmaps sizes its grid to the read
+/// length; a fixed 256 is the equivalent for uniform-length short reads.
+pub const SIZE: usize = 256;
 
 /// Encode a read as `(x, y)` where `x = #(T+C)` and `y = #(T+G)`.
 /// Non-ACGT characters (e.g. N) are ignored, matching fastmaps.
