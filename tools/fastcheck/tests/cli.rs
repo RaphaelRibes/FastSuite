@@ -384,5 +384,6 @@ fn processed_files_produce_a_before_after_report() {
     assert_eq!(j["processed"]["reads"].as_u64().unwrap(), 6);
     let h = std::fs::read_to_string(&html).unwrap();
     assert!(h.contains("Before / After"), "missing Before/After section");
-    assert!(h.contains("tabs-cmp"), "missing compare tabs");
+    assert!(h.contains("Per-base sequence content"), "missing per-base section");
+    assert!(h.contains("ppolyx"), "missing processed polyX tabs");
 }

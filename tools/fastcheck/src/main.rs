@@ -161,7 +161,8 @@ fn main() -> Result<()> {
     if let Some(p) = &cli.html {
         html::write_html(p, &reports, &total, verdict.offset, elapsed,
                          insert.as_ref().map(|h| (h, cli.insert_pairs)),
-                         if processed_reports.is_empty() { None } else { Some(&processed_total) })?;
+                         if processed_reports.is_empty() { None }
+                         else { Some((&processed_reports, &processed_total)) })?;
     }
     if let Some(p) = &cli.positions_tsv {
         report::write_positions_tsv(p, &total, verdict.offset)?;

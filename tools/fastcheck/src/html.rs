@@ -237,17 +237,19 @@ fn heatmap_svg(acc: &Accum) -> String {
                 continue;
             }
             let t = (1.0 + c as f64).ln() / log_peak;
-            // A blue gradient from near-white to deep blue, with a stronger
-            // ramp so sparse cells are visible and the peak is clearly hot.
-            let v = (t * 255.0) as i32;
+            // A viridis-like palette (dark purple -> teal -> yellow), so even
+            // sparse cells are clearly visible against the white background.
+            const PALETTE: [(u8, u8, u8); 8] = [
+                (68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98),
+                (253, 231, 37), (240, 180, 20), (220, 120, 10), (180, 60, 5),
+            ];
+            let idx = (t * (PALETTE.len() - 1) as f64).round() as usize;
+            let (r, g, b) = PALETTE[idx.min(PALETTE.len() - 1)];
             let _ = write!(
                 s,
-                r#"<rect x="{:.1}" y="{:.1}" width="{cell}" height="{cell}" fill="rgb({},{},{})"/>"#,
+                r#"<rect x="{:.1}" y="{:.1}" width="{cell}" height="{cell}" fill="rgb({r},{g},{b})"/>"#,
                 x as f64 * cell,
-                y as f64 * cell,
-                245 - v / 2,
-                245 - v / 2,
-                255 - v
+                y as f64 * cell
             );
         }
     }
@@ -306,6 +308,11 @@ table.rep th, table.rep td { text-align:right; padding:3px 10px 3px 0; border-bo
 table.rep th:first-child, table.rep td:first-child { text-align:left; }
 table.rep code { font-size:11.5px; }
 .callout { background:#f7f9fb; border-left:3px solid var(--accent); padding:9px 12px; font-size:13px; color:#333; margin:10px 0; }
+nav.nav { position:sticky; top:0; background:#fff; border-bottom:1px solid var(--rule); padding:8px 0; margin-bottom:18px; z-index:10; }
+nav.nav a { display:inline-block; margin-right:14px; color:var(--accent); text-decoration:none; font-size:13px; font-weight:600; }
+nav.nav a:hover { text-decoration:underline; }
+.ba-label { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }
+h3 { font-size:13.5px; margin:16px 0 6px; color:var(--ink); }
 "#;
 
 /// Write the report. `insert` is present when `--insert-hist` ran.
@@ -316,70 +323,112 @@ pub fn write_html(
     offset: u8,
     elapsed_s: f64,
     insert: Option<(&InsertHist, u64)>,
-    processed: Option<&Accum>,
+    processed: Option<(&[FileReport], &Accum)>,
 ) -> Result<()> {
     let n_pos = total.covered_positions();
     let gc = gc_fraction(total);
     let depth_at = |pos: usize| -> u64 { total.base_at(pos, 0) + total.base_at(pos, 1) + total.base_at(pos, 2) + total.base_at(pos, 3) + total.base_at(pos, 4) };
 
-    // ---- per-base sequence content (FastQC's signature plot) -----------------
-    let mut seq_series = Vec::new();
-    for (code, name, colour) in [(0usize, "A", "#2e7d5b"), (1, "C", "#2f6f9f"), (2, "G", "#c98a1a"), (3, "T", "#b23a48")] {
-        let mut pts = Vec::with_capacity(n_pos);
+    // Per-mate accumulators (R1, R2) and the processed side, when present.
+    let r1 = files.first().map(|f| &f.acc);
+    let r2 = files.get(1).map(|f| &f.acc);
+    let (p_files, p_total) = match processed {
+        Some((pf, pt)) => (Some(pf), Some(pt)),
+        None => (None, None),
+    };
+    let pr1 = p_files.and_then(|pf| pf.first()).map(|f| &f.acc);
+    let pr2 = p_files.and_then(|pf| pf.get(1)).map(|f| &f.acc);
+
+    // Per-position series for one mate: (seq A/C/G/T, N, quality mean/lo/hi).
+    fn pos_series(acc: &Accum, n_pos: usize, offset: u8) -> (Vec<Series<'static>>, Vec<(f64, f64)>, Vec<(f64, f64)>, Vec<(f64, f64)>, Vec<(f64, f64)>) {
+        let depth_at = |pos: usize| -> u64 {
+            acc.base_at(pos, 0) + acc.base_at(pos, 1) + acc.base_at(pos, 2) + acc.base_at(pos, 3) + acc.base_at(pos, 4)
+        };
+        let mut seq = Vec::new();
+        for (code, name, colour) in [(0usize, "A", "#2e7d5b"), (1, "C", "#2f6f9f"), (2, "G", "#c98a1a"), (3, "T", "#b23a48")] {
+            let mut pts = Vec::new();
+            for pos in 0..n_pos {
+                let d = depth_at(pos);
+                if d > 0 {
+                    pts.push(((pos + 1) as f64, 100.0 * acc.base_at(pos, code) as f64 / d as f64));
+                }
+            }
+            seq.push(Series { name, colour, points: pts });
+        }
+        let mut n_pts = Vec::new();
         for pos in 0..n_pos {
             let d = depth_at(pos);
             if d > 0 {
-                pts.push(((pos + 1) as f64, 100.0 * total.base_at(pos, code) as f64 / d as f64));
+                n_pts.push(((pos + 1) as f64, 100.0 * acc.base_at(pos, 4) as f64 / d as f64));
             }
         }
-        seq_series.push(Series { name, colour, points: pts });
-    }
-    let seq_chart = line_chart(&seq_series, 100.0, "position in read (bp)", "% of bases at this position");
-
-    // ---- per-base quality, with the 10th and 90th percentiles ----------------
-    let mut q_pts = Vec::with_capacity(n_pos);
-    let mut q_lo = Vec::with_capacity(n_pos);
-    let mut q_hi = Vec::with_capacity(n_pos);
-    for pos in 0..n_pos {
-        let row = total.qual_at(pos);
-        if row.iter().sum::<u64>() == 0 {
-            continue;
+        let (mut q_pts, mut q_lo, mut q_hi) = (Vec::new(), Vec::new(), Vec::new());
+        for pos in 0..n_pos {
+            let row = acc.qual_at(pos);
+            if row.iter().sum::<u64>() == 0 {
+                continue;
+            }
+            let (mean, q10, _q50, q90) = pos_stats(&row, offset);
+            q_pts.push(((pos + 1) as f64, mean));
+            q_lo.push(((pos + 1) as f64, q10));
+            q_hi.push(((pos + 1) as f64, q90));
         }
-        let (mean, q10, _q50, q90) = pos_stats(&row, offset);
-        q_pts.push(((pos + 1) as f64, mean));
-        q_lo.push(((pos + 1) as f64, q10));
-        q_hi.push(((pos + 1) as f64, q90));
+        (seq, n_pts, q_pts, q_lo, q_hi)
     }
-    let q_chart = line_chart(
-        &[Series { name: "p90", colour: "#a9c4d9", points: q_hi },
-          Series { name: "mean", colour: "#2f6f9f", points: q_pts },
-          Series { name: "p10", colour: "#a9c4d9", points: q_lo }],
-        40.0, "position in read (bp)", "Phred quality",
-    );
 
-    // ---- per-base N content --------------------------------------------------
-    let mut n_pts = Vec::with_capacity(n_pos);
-    for pos in 0..n_pos {
-        let d = depth_at(pos);
-        if d > 0 {
-            n_pts.push(((pos + 1) as f64, 100.0 * total.base_at(pos, 4) as f64 / d as f64));
+    // Render a per-position plot with R1 / R2 / both tabs (SE: no tabs).
+    fn mate_plot(
+        prefix: &str,
+        r1: Option<&Accum>,
+        r2: Option<&Accum>,
+        both: &Accum,
+        n_pos: usize,
+        offset: u8,
+        y_max: f64,
+        x_label: &str,
+        y_label: &str,
+        kind: u8, // 0 = seq, 1 = N, 2 = quality
+    ) -> String {
+        let chart = |acc: &Accum| -> String {
+            let (seq, n_pts, q_pts, q_lo, q_hi) = pos_series(acc, n_pos, offset);
+            match kind {
+                0 => line_chart(&seq, y_max, x_label, y_label),
+                1 => {
+                    let n_max = n_pts.iter().map(|p| p.1).fold(0.0_f64, f64::max);
+                    let scale = (n_max * 2.0).max(5.0);
+                    line_chart(&[Series { name: "N", colour: "#6b7580", points: n_pts }], scale, x_label, y_label)
+                }
+                _ => line_chart(
+                    &[Series { name: "p90", colour: "#a9c4d9", points: q_hi },
+                      Series { name: "mean", colour: "#2f6f9f", points: q_pts },
+                      Series { name: "p10", colour: "#a9c4d9", points: q_lo }],
+                    y_max, x_label, y_label,
+                ),
+            }
+        };
+        match (r1, r2) {
+            (Some(a), Some(b)) => tabs(
+                prefix,
+                &[("R1", chart(a)), ("R2", chart(b)), ("both", chart(both))],
+            ),
+            (Some(a), None) => chart(a),
+            _ => chart(both),
         }
     }
-    let n_max = n_pts.iter().map(|p| p.1).fold(0.0_f64, f64::max);
-    let n_scale = (n_max * 2.0).max(5.0);
-    let n_chart = line_chart(&[Series { name: "N", colour: "#6b7580", points: n_pts }],
-                             n_scale, "position in read (bp)", "% N at this position");
+
+    // ---- per-position plots (R1 / R2 / both) --------------------------------
+    let seq_chart = mate_plot("seq", r1, r2, total, n_pos, offset, 100.0, "position in read (bp)", "% of bases at this position", 0);
+    let n_chart = mate_plot("n", r1, r2, total, n_pos, offset, 5.0, "position in read (bp)", "% N at this position", 1);
+    let q_chart = mate_plot("q", r1, r2, total, n_pos, offset, 40.0, "position in read (bp)", "Phred quality", 2);
 
     // ---- distributions: length, per-read mean quality, per-read GC -----------
     let len_bars: Vec<(f64, f64)> = total.len_hist.iter().enumerate()
         .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
     let len_chart = bar_chart(&len_bars, "read length (bp)", "reads", None);
-
     let mq_bars: Vec<(f64, f64)> = total.meanq_raw_hist.iter().enumerate()
         .filter(|(_, &c)| c > 0)
         .map(|(i, &c)| (i as f64 - offset as f64, c as f64)).collect();
     let mq_chart = bar_chart(&mq_bars, "mean Phred quality of a read", "reads", None);
-
     let gc_bars: Vec<(f64, f64)> = total.gc_hist.iter().enumerate()
         .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
     let gc_chart = bar_chart(&gc_bars, "G+C bases in the read", "reads", None);
@@ -477,21 +526,49 @@ pub fn write_html(
         total.distinct_seqs, dup * 100.0
     );
 
-    // ---- heatmap: full view (side-by-side arrives with --processed-*) ---------
+    // ---- heatmap: full view ---------------------------------------------------
+    let (hm_m, _) = crate::rich::heatmap_metrics(total);
     let heatmap_section = format!(
         r#"<div class="callout">Each read is one cell at (T+C, T+G). A tight cluster is a uniform
            composition; a spread or a second cluster is a sub-population (e.g. adapter-dimers or a
            contaminant). Peak at ({}, {}).</div>{}"#,
-        crate::rich::heatmap_metrics(total).0.get("heatmap_peak_x").map(|v| v.to_string()).unwrap_or_default(),
-        crate::rich::heatmap_metrics(total).0.get("heatmap_peak_y").map(|v| v.to_string()).unwrap_or_default(),
+        hm_m.get("heatmap_peak_x").map(|v| v.to_string()).unwrap_or_default(),
+        hm_m.get("heatmap_peak_y").map(|v| v.to_string()).unwrap_or_default(),
         heatmap_svg(total)
     );
 
-    // ---- before/after, when processed files were given ------------------------
-    let compare_section = match processed {
-        Some(pa) => {
-            let reads = total.reads.max(1) as f64;
-            let reads_p = pa.reads.max(1) as f64;
+    // ---- before/after: every section side by side, when processed is present --
+    let compare_section = match (p_total, pr1, pr2) {
+        (Some(pt), _, _) => {
+            let ba = |before: String, after: String| -> String {
+                format!(
+                    r#"<div class="grid2"><div><div class="ba-label">before</div>{before}</div><div><div class="ba-label">after</div>{after}</div></div>"#
+                )
+            };
+            let pn = pt.covered_positions();
+            let p_seq = mate_plot("pseq", pr1, pr2, pt, pn, offset, 100.0, "position in read (bp)", "% of bases at this position", 0);
+            let p_n = mate_plot("pn", pr1, pr2, pt, pn, offset, 5.0, "position in read (bp)", "% N at this position", 1);
+            let p_q = mate_plot("pq", pr1, pr2, pt, pn, offset, 40.0, "position in read (bp)", "Phred quality", 2);
+            let p_len: Vec<(f64, f64)> = pt.len_hist.iter().enumerate()
+                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+            let p_mq: Vec<(f64, f64)> = pt.meanq_raw_hist.iter().enumerate()
+                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64 - offset as f64, c as f64)).collect();
+            let p_gc: Vec<(f64, f64)> = pt.gc_hist.iter().enumerate()
+                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+            let p_polyx = {
+                let mut panels: Vec<(&str, String)> = Vec::new();
+                for (bi, name) in base_names.iter().enumerate() {
+                    let b3: Vec<(f64, f64)> = pt.polyx3[bi].iter().enumerate()
+                        .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+                    let b5: Vec<(f64, f64)> = pt.polyx5[bi].iter().enumerate()
+                        .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+                    panels.push((name, format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div>"#, bar_chart(&b3, "3' run (bp)", "reads", None), bar_chart(&b5, "5' run (bp)", "reads", None))));
+                }
+                tabs("ppolyx", &panels)
+            };
+            let p_hm = heatmap_svg(pt);
+            let reads_b = total.reads.max(1) as f64;
+            let reads_a = pt.reads.max(1) as f64;
             let row = |label: &str, b: f64, a: f64, unit: &str| {
                 let d = a - b;
                 let sign = if d > 0.0 { "+" } else { "" };
@@ -501,25 +578,30 @@ pub fn write_html(
                 )
             };
             let mut rows = String::new();
-            rows.push_str(&row("reads", reads, reads_p, ""));
-            rows.push_str(&row("%GC", gc_fraction(total) * 100.0, gc_fraction(pa) * 100.0, "%"));
-            rows.push_str(&row("mean read Q", mean_read_mean_q(total, offset), mean_read_mean_q(pa, offset), ""));
+            rows.push_str(&row("reads", reads_b, reads_a, ""));
+            rows.push_str(&row("%GC", gc_fraction(total) * 100.0, gc_fraction(pt) * 100.0, "%"));
+            rows.push_str(&row("mean read Q", mean_read_mean_q(total, offset), mean_read_mean_q(pt, offset), ""));
             let (_hg, hd) = crate::rich::head_dropout(total);
-            let (_phg, phd) = crate::rich::head_dropout(pa);
+            let (_phg, phd) = crate::rich::head_dropout(pt);
             rows.push_str(&row("head dropout (G)", hd * 100.0, phd * 100.0, "%"));
-            let heat_tabs = tabs(
-                "cmp",
-                &[
-                    ("side by side", format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div>"#, heatmap_svg(total), heatmap_svg(pa))),
-                    ("full", format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div>"#, heatmap_svg(total), heatmap_svg(pa))),
-                ],
-            );
             format!(
                 r#"<table class="rep"><tr><th>metric</th><th>before</th><th>after</th><th>delta</th></tr>{rows}</table>
-                   <h3>Heatmap</h3>{heat_tabs}"#
+                   <h3>Per-base sequence content</h3>{}
+                   <h3>N content by position</h3>{}
+                   <h3>Per-base quality</h3>{}
+                   <h3>Distributions</h3>{}
+                   <h3>polyX run lengths</h3>{}
+                   <h3>Heatmap</h3>{}"#,
+                ba(seq_chart.clone(), p_seq),
+                ba(n_chart.clone(), p_n),
+                ba(q_chart.clone(), p_q),
+                ba(format!(r#"<div class="grid2"><div>{len_chart}</div><div>{mq_chart}</div></div><div class="grid2"><div>{gc_chart}</div><div></div></div>"#),
+                   format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div><div class="grid2"><div>{}</div><div></div></div>"#, bar_chart(&p_len, "read length (bp)", "reads", None), bar_chart(&p_mq, "mean Phred quality", "reads", None), bar_chart(&p_gc, "G+C bases", "reads", None))),
+                ba(polyx_section.clone(), p_polyx),
+                ba(heatmap_section.clone(), p_hm),
             )
         }
-        None => String::new(),
+        _ => String::new(),
     };
 
     // ---- observations: numbers, not verdicts --------------------------------
@@ -531,8 +613,7 @@ pub fn write_html(
             let g_all = 100.0 * (0..n_pos).map(|p| total.base_at(p, 2)).sum::<u64>() as f64
                 / (0..n_pos).map(depth_at).sum::<u64>().max(1) as f64;
             obs.push(format!(
-                "first base is G in {g0:.2}% of reads against {g_all:.2}% for the library as a whole — \
-                 a first-cycle G dropout shows up as the first being far higher"));
+                "first base is G in {g0:.2}% of reads against {g_all:.2}% for the library as a whole —                  a first-cycle G dropout shows up as the first being far higher"));
         }
         if n_pos >= 2 {
             let d_last = depth_at(n_pos - 1);
@@ -541,8 +622,7 @@ pub fn write_html(
                 let d_mid = depth_at(n_pos / 2);
                 let g_mid = if d_mid > 0 { 100.0 * total.base_at(n_pos / 2, 2) as f64 / d_mid as f64 } else { 0.0 };
                 obs.push(format!(
-                    "last base is G in {g_last:.2}% against {g_mid:.2}% mid-read — a polyG tail is the usual cause \
-                     when the end is far higher"));
+                    "last base is G in {g_last:.2}% against {g_mid:.2}% mid-read — a polyG tail is the usual cause                      when the end is far higher"));
             }
         }
         let max_n = (0..n_pos).map(|p| {
@@ -558,8 +638,7 @@ pub fn write_html(
     ));
     if total.reads_over_max_len > 0 {
         obs.push(format!(
-            "{} reads exceed --max-read-len and are counted in the summary but excluded from the \
-             per-position charts", total.reads_over_max_len));
+            "{} reads exceed --max-read-len and are counted in the summary but excluded from the              per-position charts", total.reads_over_max_len));
     }
     obs.push("every count in this report is exact: no sampling, no read was skipped".to_string());
 
@@ -575,15 +654,22 @@ pub fn write_html(
         );
     }
 
+    // ---- assemble the page ---------------------------------------------------
     let mut h = String::with_capacity(64 * 1024);
     h.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
-    let _ = write!(h, "<title>fastcheck report — {} file(s)</title><style>{STYLE}</style></head><body>",
-                   files.len());
+    let _ = write!(h, "<title>fastcheck report — {} file(s)</title><style>{STYLE}</style></head><body>", files.len());
     let _ = write!(h, "<h1>fastcheck report</h1><div class=\"sub\">{} file(s) · {} reads · {} bases · \
                        {:.2} s · Phred+{offset} · exact counts, no sampling</div>",
                    files.len(), total.reads, total.bases, elapsed_s);
 
-    h.push_str("<h2>Summary</h2><div class=\"grid2\"><div>");
+    // nav (MultiQC-style anchor links)
+    h.push_str(r##"<nav class="nav"><a href="#summary">Summary</a><a href="#seq">Per-base content</a><a href="#n">N content</a><a href="#q">Quality</a><a href="#dist">Distributions</a><a href="#polyx">polyX</a><a href="#repeats">Repeats</a><a href="#heatmap">Heatmap</a>"##);
+    if processed.is_some() {
+        h.push_str(r##"<a href="#compare">Before / After</a>"##);
+    }
+    h.push_str("</nav>");
+
+    h.push_str("<h2 id=\"summary\">Summary</h2><div class=\"grid2\"><div>");
     h.push_str(&table(&[
         ("reads", format!("{}", total.reads)),
         ("bases", format!("{}", total.bases)),
@@ -609,39 +695,41 @@ pub fn write_html(
     h.push_str(&file_rows);
     h.push_str("</table>");
 
-    h.push_str("<h2>Per-base sequence content</h2>");
-    let _ = write!(h, "<div class=\"grid2\"><div>{seq_chart}</div><div>{q_chart}</div></div>");
-    h.push_str("<div class=\"note\">Left: the base composition at each position of the read. Right: \
-                quality by position, with the 10th and 90th percentiles shaded by the same colour — \
-                a widening spread is quality falling off unevenly between reads, not just a lower mean.</div>");
+    h.push_str("<h2 id=\"seq\">Per-base sequence content</h2>");
+    let _ = write!(h, "{seq_chart}");
+    h.push_str("<div class=\"note\">Base composition at each position. Use the R1 / R2 / both tabs to view a single mate or the merged library.</div>");
 
-    h.push_str("<h2>N content by position</h2>");
+    h.push_str("<h2 id=\"n\">N content by position</h2>");
     let _ = write!(h, "{n_chart}");
 
-    h.push_str("<h2>Distributions</h2>");
+    h.push_str("<h2 id=\"q\">Per-base quality</h2>");
+    let _ = write!(h, "{q_chart}");
+    h.push_str("<div class=\"note\">Mean quality by position with the 10th and 90th percentiles — a widening spread is quality falling off unevenly between reads, not just a lower mean.</div>");
+
+    h.push_str("<h2 id=\"dist\">Distributions</h2>");
     let _ = write!(h, "<div class=\"grid2\"><div>{len_chart}</div><div>{mq_chart}</div></div>");
     let _ = write!(h, "<div class=\"grid2\"><div>{gc_chart}</div><div>{}</div></div>",
                    if insert.is_some() { insert_chart.clone() }
                    else { "<div class=\"note\">Insert sizes not measured — run with --insert-hist to see the insert distribution here.</div>".to_string() });
 
-    h.push_str("<h2>polyX run lengths</h2>");
-    h.push_str(&polyx_section);
-
-    h.push_str("<h2>Repeated sequences</h2>");
-    h.push_str(&repeats_section);
-
-    h.push_str("<h2>Heatmap</h2>");
-    h.push_str(&heatmap_section);
-
-    if processed.is_some() {
-        h.push_str("<h2>Before / After</h2>");
-        h.push_str(&compare_section);
-    }
-
     if insert.is_some() {
         h.push_str("<h2>Insert sizes</h2>");
         h.push_str(&insert_table);
         let _ = write!(h, "<div class=\"grid2\"><div>{insert_chart}</div><div></div></div>");
+    }
+
+    h.push_str("<h2 id=\"polyx\">polyX run lengths</h2>");
+    h.push_str(&polyx_section);
+
+    h.push_str("<h2 id=\"repeats\">Repeated sequences</h2>");
+    h.push_str(&repeats_section);
+
+    h.push_str("<h2 id=\"heatmap\">Heatmap</h2>");
+    h.push_str(&heatmap_section);
+
+    if processed.is_some() {
+        h.push_str("<h2 id=\"compare\">Before / After</h2>");
+        h.push_str(&compare_section);
     }
 
     h.push_str("<h2>Observations</h2><ul class=\"obs\">");
