@@ -320,6 +320,7 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
     let mut reader = needletail::parse_fastx_file(path)
         .with_context(|| format!("auto-detecting Phred offset from {}", path.display()))?;
     let mut min_q = u8::MAX;
+    let mut max_q = 0u8;
     let mut n = 0usize;
     while n < 1000 {
         match reader.next() {
@@ -331,6 +332,9 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
                         if b < min_q {
                             min_q = b;
                         }
+                        if b > max_q {
+                            max_q = b;
+                        }
                     }
                 }
                 n += 1;
@@ -340,7 +344,23 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
     if n == 0 || min_q == u8::MAX {
         return Ok(33); // FASTA or empty file: default
     }
-    Ok(if min_q < 64 { 33 } else { 64 })
+    // A byte below 64 cannot occur under Phred+64, so its presence PROVES
+    // Phred+33. Its absence proves nothing: a Phred+33 file whose lowest
+    // quality is Q31 also sits entirely at or above 64. The old code took that
+    // silence as evidence for 64 — which subtracts 31 from every quality and,
+    // combined with a --mean-q filter, silently drops the entire file (seen on
+    // a high-quality library where no base fell below Q31). Ask for positive
+    // evidence of +64 instead: a byte above 74 is Q>41 under +33, which is not
+    // produced in practice. Otherwise default to 33, the modern standard —
+    // the same call fastcheck::accum::offset_verdict makes (it reports the
+    // ambiguous case rather than guessing).
+    Ok(if min_q < 64 {
+        33
+    } else if max_q > 74 {
+        64
+    } else {
+        33
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,5 +1339,38 @@ mod tests {
         assert_eq!(stats.reads_dropped, 1);
         std::fs::remove_file(&inp).ok();
         std::fs::remove_file(&out).ok();
+    }
+
+    // ------- Phred-offset auto-detection ---------------------------------
+
+    #[test]
+    fn auto_phred_high_quality_only_is_33_not_64() {
+        // Regression: a Phred+33 file whose lowest quality is Q35 ('D' = 68) has
+        // every byte at or above 64. The old rule `min < 64 ? 33 : 64` read that
+        // as Phred+64, subtracting 31 from every quality — and a --mean-q filter
+        // then dropped the entire file. The absence of a sub-64 byte is not
+        // evidence for +64.
+        let inp = tmp_path("hq.fq");
+        write_plain(&inp, "@r\nACGT\n+\nDDDD\n@r\nACGT\n+\nDDDD\n");
+        assert_eq!(detect_phred_offset(&inp).unwrap(), 33);
+        std::fs::remove_file(&inp).ok();
+    }
+
+    #[test]
+    fn auto_phred_byte_above_74_is_64() {
+        // Positive evidence of Phred+64: a byte above 74 is Q>41 under +33.
+        let inp = tmp_path("p64.fq");
+        write_plain(&inp, "@r\nACGT\n+\nhhhh\n@r\nACGT\n+\nhhhh\n"); // 'h' = 104
+        assert_eq!(detect_phred_offset(&inp).unwrap(), 64);
+        std::fs::remove_file(&inp).ok();
+    }
+
+    #[test]
+    fn auto_phred_sub_64_byte_proves_33() {
+        // A byte below 64 cannot occur under Phred+64, so its presence proves +33.
+        let inp = tmp_path("mix.fq");
+        write_plain(&inp, "@r\nACGT\n+\n#DDD\n@r\nACGT\n+\nDDDD\n"); // '#' = 35
+        assert_eq!(detect_phred_offset(&inp).unwrap(), 33);
+        std::fs::remove_file(&inp).ok();
     }
 }
