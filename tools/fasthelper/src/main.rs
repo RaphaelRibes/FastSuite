@@ -30,6 +30,7 @@ fn main() -> Result<()> {
                 report::cmd_concatenate(&a)
             }
         }
+        cli::Cmd::Compare(a) => fasthelper::compare::cmd_compare(&a.before, &a.after, &a.outdir),
         cli::Cmd::Doctor(a) => runner::doctor(&a),
         cli::Cmd::Schema => {
             print!("{}", report::SCHEMA_DOC);

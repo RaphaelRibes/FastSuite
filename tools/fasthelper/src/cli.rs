@@ -29,6 +29,8 @@ pub enum Cmd {
     /// discovery, normalisation, html/tsv/md/json.
     #[command(visible_alias = "report")]
     Concatenate(ReportArgs),
+    /// Compare two report sets (e.g. raw vs processed) side by side.
+    Compare(CompareArgs),
     /// Check that the FastSuite binaries are found and runnable.
     Doctor(DoctorArgs),
     /// Print the report schema (version, fields, how each tool contributes).
@@ -97,6 +99,21 @@ pub struct ReportArgs {
     /// Print the aggregated table to stdout.
     #[arg(long)]
     pub stdout: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CompareArgs {
+    /// Before (e.g. raw) report files or directories to scan for *.json.
+    #[arg(long, required = true)]
+    pub before: Vec<PathBuf>,
+
+    /// After (e.g. processed) report files or directories to scan for *.json.
+    #[arg(long, required = true)]
+    pub after: Vec<PathBuf>,
+
+    /// Output directory for compare.{tsv,html}.
+    #[arg(short = 'o', long, default_value = ".")]
+    pub outdir: PathBuf,
 }
 
 #[derive(Args, Debug)]
