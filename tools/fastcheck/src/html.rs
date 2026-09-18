@@ -766,7 +766,10 @@ document.querySelectorAll('.tabs').forEach(function(t){
       tabs.forEach(function(x){ x.classList.remove('active'); });
       panels.forEach(function(p){ p.classList.remove('active'); });
       b.classList.add('active');
-      var p = document.getElementById(b.dataset.panel);
+      // Scope the panel lookup to THIS tabs container: the before/after
+      // section reuses the same chart HTML, so panel ids appear twice in the
+      // document and document.getElementById would hit the wrong (first) one.
+      var p = t.querySelector('#' + b.dataset.panel);
       if (p) { p.classList.add('active'); }
     });
   });
