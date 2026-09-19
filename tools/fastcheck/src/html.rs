@@ -450,22 +450,69 @@ pub fn write_html(
         }
     }
 
-    // ---- per-position plots (R1 / R2 / both) --------------------------------
-    let seq_chart = mate_plot("seq", r1, r2, total, n_pos, offset, 100.0, "position in read (bp)", "% of bases at this position", 0);
-    let n_chart = mate_plot("n", r1, r2, total, n_pos, offset, 5.0, "position in read (bp)", "% N at this position", 1);
-    let q_chart = mate_plot("q", r1, r2, total, n_pos, offset, 40.0, "position in read (bp)", "Phred quality", 2);
+    // ---- per-position plots (R1 / R2 / both), nested in before/after ---------
+    let has_ba = p_total.is_some();
+    let pn = p_total.map(|pt| pt.covered_positions());
+    // mate_plot returns R1/R2/both tabs; when processed data is present we wrap
+    // that whole tab group in a before/after toggle so each graph appears once.
+    let seq_chart = if has_ba {
+        let (pt, pn) = (p_total.unwrap(), pn.unwrap());
+        tabs("seqba", &[
+            ("before", mate_plot("seqb", r1, r2, total, n_pos, offset, 100.0, "position in read (bp)", "% of bases at this position", 0)),
+            ("after", mate_plot("seqa", pr1, pr2, pt, pn, offset, 100.0, "position in read (bp)", "% of bases at this position", 0)),
+        ])
+    } else {
+        mate_plot("seq", r1, r2, total, n_pos, offset, 100.0, "position in read (bp)", "% of bases at this position", 0)
+    };
+    let n_chart = if has_ba {
+        let (pt, pn) = (p_total.unwrap(), pn.unwrap());
+        tabs("nba", &[
+            ("before", mate_plot("nb", r1, r2, total, n_pos, offset, 5.0, "position in read (bp)", "% N at this position", 1)),
+            ("after", mate_plot("na", pr1, pr2, pt, pn, offset, 5.0, "position in read (bp)", "% N at this position", 1)),
+        ])
+    } else {
+        mate_plot("n", r1, r2, total, n_pos, offset, 5.0, "position in read (bp)", "% N at this position", 1)
+    };
+    let q_chart = if has_ba {
+        let (pt, pn) = (p_total.unwrap(), pn.unwrap());
+        tabs("qba", &[
+            ("before", mate_plot("qb", r1, r2, total, n_pos, offset, 40.0, "position in read (bp)", "Phred quality", 2)),
+            ("after", mate_plot("qa", pr1, pr2, pt, pn, offset, 40.0, "position in read (bp)", "Phred quality", 2)),
+        ])
+    } else {
+        mate_plot("q", r1, r2, total, n_pos, offset, 40.0, "position in read (bp)", "Phred quality", 2)
+    };
 
-    // ---- distributions: length, per-read mean quality, per-read GC -----------
-    let len_bars: Vec<(f64, f64)> = total.len_hist.iter().enumerate()
-        .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-    let len_chart = bar_chart(&len_bars, "read length (bp)", "reads", None);
-    let mq_bars: Vec<(f64, f64)> = total.meanq_raw_hist.iter().enumerate()
-        .filter(|(_, &c)| c > 0)
-        .map(|(i, &c)| (i as f64 - offset as f64, c as f64)).collect();
-    let mq_chart = bar_chart(&mq_bars, "mean Phred quality of a read", "reads", None);
-    let gc_bars: Vec<(f64, f64)> = total.gc_hist.iter().enumerate()
-        .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-    let gc_chart = bar_chart(&gc_bars, "G+C bases in the read", "reads", None);
+    // ---- distributions (read length / mean Q / GC), before/after ------------
+    fn dist_for(acc: &Accum, offset: u8, note_insert: String) -> String {
+        let lens: Vec<(f64, f64)> = acc.len_hist.iter().enumerate()
+            .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+        let mqs: Vec<(f64, f64)> = acc.meanq_raw_hist.iter().enumerate()
+            .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64 - offset as f64, c as f64)).collect();
+        let gcs: Vec<(f64, f64)> = acc.gc_hist.iter().enumerate()
+            .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+        format!(
+            r#"<div class="grid2"><div>{}</div><div>{}</div></div><div class="grid2"><div>{}</div><div>{}</div></div>"#,
+            chart_card("Read length", &bar_chart(&lens, "read length (bp)", "reads", None)),
+            chart_card("Mean read quality", &bar_chart(&mqs, "mean Phred quality of a read", "reads", None)),
+            chart_card("G+C content", &bar_chart(&gcs, "G+C bases in the read", "reads", None)),
+            chart_card_note("Insert size", &note_insert),
+        )
+    }
+    let insert_note = if insert.is_some() {
+        "measured — see the Insert sizes section below.".to_string()
+    } else {
+        "not measured — run with --insert-hist".to_string()
+    };
+    let dist_before = dist_for(total, offset, insert_note.clone());
+    let dist_section = if let Some(pt) = p_total {
+        tabs("distba", &[
+            ("before", dist_before.into()),
+            ("after", dist_for(pt, offset, insert_note).into()),
+        ])
+    } else {
+        dist_before
+    };
 
     // ---- insert sizes, when they were measured ------------------------------
     let (insert_chart, insert_table) = match insert {
@@ -501,108 +548,105 @@ pub fn write_html(
         None => (String::new(), String::new()),
     };
 
-    // ---- polyX: 4 base tabs, each with the 3' and 5' run-length distributions --
-    let base_names = ["A", "C", "G", "T"];
-    let mut polyx_panels: Vec<(&str, String)> = Vec::new();
-    for (bi, name) in base_names.iter().enumerate() {
-        let b3: Vec<(f64, f64)> = total.polyx3[bi].iter().enumerate()
-            .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-        let b5: Vec<(f64, f64)> = total.polyx5[bi].iter().enumerate()
-            .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-        let c3 = bar_chart(&b3, "3' run length (bp)", "reads", None);
-        let c5 = bar_chart(&b5, "5' run length (bp)", "reads", None);
-        polyx_panels.push((name, format!(r#"<div class="grid2"><div>{c3}</div><div>{c5}</div></div>"#)));
+    // ---- polyX: 4 base tabs, each with 3'/5' run-length distributions --------
+    fn polyx_for(acc: &Accum, inner_prefix: &str) -> String {
+        let mut panels: Vec<(&str, String)> = Vec::new();
+        for (bi, name) in ["A", "C", "G", "T"].iter().enumerate() {
+            let b3: Vec<(f64, f64)> = acc.polyx3[bi].iter().enumerate()
+                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+            let b5: Vec<(f64, f64)> = acc.polyx5[bi].iter().enumerate()
+                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
+            panels.push((name, format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div>"#,
+                bar_chart(&b3, "3' run length (bp)", "reads", None), bar_chart(&b5, "5' run length (bp)", "reads", None))));
+        }
+        tabs(inner_prefix, &panels)
     }
+    let polyx_before = polyx_for(total, "polyxb");
     let (hg, hd) = crate::rich::head_dropout(total);
-    let polyx_section = format!(
-        "{}{}",
-        tabs("polyx", &polyx_panels),
-        format!(
-            r#"<div class="callout">First base is G in {:.2}% of reads against {:.2}% for the library
-                (head dropout {:.2} points) — a positive dropout is the 2-colour first-cycle G
-                signature. The 5' tab for G shows the run-length distribution of that head.</div>"#,
-            hg * 100.0, (hg + hd) * 100.0, hd * 100.0
-        )
+    let polyx_callout = format!(
+        r#"<div class="callout">First base is G in {:.2}% of reads against {:.2}% for the library
+            (head dropout {:.2} points) — a positive dropout is the 2-colour first-cycle G
+            signature. The 5' tab for G shows the run-length distribution of that head.</div>"#,
+        hg * 100.0, (hg + hd) * 100.0, hd * 100.0
     );
+    let polyx_section = if let Some(pt) = p_total {
+        tabs("polyxba", &[
+            ("before", polyx_before),
+            ("after", polyx_for(pt, "polyxa")),
+        ]) + &polyx_callout
+    } else {
+        polyx_before + &polyx_callout
+    };
 
-    // ---- repeated sequences: full sequences + 12-mer spectrum -----------------
-    let reads = total.reads.max(1) as f64;
-    let min_count = (reads * 0.001).max(10.0) as u32;
-    let seqs = total.seq_counts.report(min_count);
-    let mut rep_rows = String::new();
-    for (s, c) in seqs.iter().take(20) {
-        let _ = write!(
-            rep_rows,
-            "<tr><td><code>{}</code></td><td>{}</td><td>{:.3}%</td></tr>",
-            esc(&String::from_utf8_lossy(s)), c, 100.0 * *c as f64 / reads
-        );
+    // ---- repeated sequences: full sequences + 12-mer spectrum ----------------
+    fn repeats_for(acc: &Accum) -> String {
+        let reads = acc.reads.max(1) as f64;
+        let min_count = (reads * 0.001).max(10.0) as u32;
+        let seqs = acc.seq_counts.report(min_count);
+        let mut rep_rows = String::new();
+        for (s, c) in seqs.iter().take(20) {
+            let _ = write!(
+                rep_rows,
+                "<tr><td><code>{}</code></td><td>{}</td><td>{:.3}%</td></tr>",
+                esc(&String::from_utf8_lossy(s)), c, 100.0 * *c as f64 / reads
+            );
+        }
+        let rep_table = if seqs.is_empty() {
+            "<p class=\"note\">No sequence appears more than 0.1% of reads — the library is not dominated by a repeated sequence.</p>".to_string()
+        } else {
+            format!(
+                "<table class=\"rep\"><tr><th>sequence</th><th>count</th><th>% of reads</th></tr>{rep_rows}</table>"
+            )
+        };
+        let kmers = acc.kmer_counts.report(min_count);
+        let kmer_bars: Vec<(String, f64)> = kmers.iter().take(20)
+            .map(|(k, c)| (crate::repeated::unpack_kmer(*k, 12), *c as f64)).collect();
+        let kmer_chart = if kmer_bars.is_empty() {
+            "<p class=\"note\">No 12-mer appears more than 0.1% of reads.</p>".to_string()
+        } else {
+            labeled_bar_chart(&kmer_bars, "count")
+        };
+        let dup = 1.0 - acc.distinct_seqs as f64 / reads;
+        format!(
+            r#"<div class="grid2"><div><h3>Over-represented full sequences</h3>{rep_table}</div>
+               <div><h3>Top 12-mers</h3>{kmer_chart}</div></div>
+               <div class="callout">{} distinct sequences of {reads:.0} reads — duplication level {:.2}%.</div>"#,
+            acc.distinct_seqs, dup * 100.0
+        )
     }
-    let rep_table = if seqs.is_empty() {
-        "<p class=\"note\">No sequence appears more than 0.1% of reads — the library is not dominated by a repeated sequence.</p>".to_string()
+    let repeats_before = repeats_for(total);
+    let repeats_section = if let Some(pt) = p_total {
+        tabs("repba", &[
+            ("before", repeats_before),
+            ("after", repeats_for(pt)),
+        ])
     } else {
-        format!(
-            "<table class=\"rep\"><tr><th>sequence</th><th>count</th><th>% of reads</th></tr>{rep_rows}</table>"
-        )
+        repeats_before
     };
-    let kmers = total.kmer_counts.report(min_count);
-    let kmer_bars: Vec<(String, f64)> = kmers.iter().take(20)
-        .map(|(k, c)| (crate::repeated::unpack_kmer(*k, 12), *c as f64)).collect();
-    let kmer_chart = if kmer_bars.is_empty() {
-        "<p class=\"note\">No 12-mer appears more than 0.1% of reads.</p>".to_string()
-    } else {
-        labeled_bar_chart(&kmer_bars, "count")
-    };
-    let dup = 1.0 - total.distinct_seqs as f64 / reads;
-    let repeats_section = format!(
-        r#"<div class="grid2"><div><h3>Over-represented full sequences</h3>{rep_table}</div>
-           <div><h3>Top 12-mers</h3>{kmer_chart}</div></div>
-           <div class="callout">{} distinct sequences of {reads:.0} reads — duplication level {:.2}%.</div>"#,
-        total.distinct_seqs, dup * 100.0
-    );
 
-    // ---- heatmap: full view ---------------------------------------------------
+    // ---- heatmap -------------------------------------------------------------
     let (hm_m, _) = crate::rich::heatmap_metrics(total);
-    let heatmap_section = format!(
+    let hm_callout = format!(
         r#"<div class="callout">Each read is one cell at (T+C, T+G). A tight cluster is a uniform
            composition; a spread or a second cluster is a sub-population (e.g. adapter-dimers or a
-           contaminant). Peak at ({}, {}).</div>{}"#,
+           contaminant). Peak at ({}, {}).</div>"#,
         hm_m.get("heatmap_peak_x").map(|v| v.to_string()).unwrap_or_default(),
         hm_m.get("heatmap_peak_y").map(|v| v.to_string()).unwrap_or_default(),
-        heatmap_svg(total)
     );
+    let heatmap_section = if let Some(pt) = p_total {
+        tabs("hmba", &[
+            ("before", (hm_callout.clone() + &heatmap_svg(total))),
+            ("after", (hm_callout + &heatmap_svg(pt))),
+        ])
+    } else {
+        hm_callout + &heatmap_svg(total)
+    };
 
-    // ---- before/after: every section side by side, when processed is present --
-    let compare_section = match (p_total, pr1, pr2) {
-        (Some(pt), _, _) => {
-            let ba = |before: String, after: String| -> String {
-                format!(
-                    r#"<div class="grid2"><div><div class="ba-label">before</div>{before}</div><div><div class="ba-label">after</div>{after}</div></div>"#
-                )
-            };
-            let pn = pt.covered_positions();
-            let p_seq = mate_plot("pseq", pr1, pr2, pt, pn, offset, 100.0, "position in read (bp)", "% of bases at this position", 0);
-            let p_n = mate_plot("pn", pr1, pr2, pt, pn, offset, 5.0, "position in read (bp)", "% N at this position", 1);
-            let p_q = mate_plot("pq", pr1, pr2, pt, pn, offset, 40.0, "position in read (bp)", "Phred quality", 2);
-            let p_len: Vec<(f64, f64)> = pt.len_hist.iter().enumerate()
-                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-            let p_mq: Vec<(f64, f64)> = pt.meanq_raw_hist.iter().enumerate()
-                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64 - offset as f64, c as f64)).collect();
-            let p_gc: Vec<(f64, f64)> = pt.gc_hist.iter().enumerate()
-                .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-            let p_polyx = {
-                let mut panels: Vec<(&str, String)> = Vec::new();
-                for (bi, name) in base_names.iter().enumerate() {
-                    let b3: Vec<(f64, f64)> = pt.polyx3[bi].iter().enumerate()
-                        .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-                    let b5: Vec<(f64, f64)> = pt.polyx5[bi].iter().enumerate()
-                        .filter(|(_, &c)| c > 0).map(|(i, &c)| (i as f64, c as f64)).collect();
-                    panels.push((name, format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div>"#, bar_chart(&b3, "3' run (bp)", "reads", None), bar_chart(&b5, "5' run (bp)", "reads", None))));
-                }
-                tabs("ppolyx", &panels)
-            };
-            let p_hm = heatmap_svg(pt);
-            let reads_b = total.reads.max(1) as f64;
-            let reads_a = pt.reads.max(1) as f64;
+    // ---- before/after delta: a compact number table only (no repeated charts) --
+    let compare_table = match p_total {
+        Some(pt) => {
+            let rows_b = total.reads.max(1) as f64;
+            let rows_a = pt.reads.max(1) as f64;
             let row = |label: &str, b: f64, a: f64, unit: &str| {
                 let d = a - b;
                 let sign = if d > 0.0 { "+" } else { "" };
@@ -612,27 +656,14 @@ pub fn write_html(
                 )
             };
             let mut rows = String::new();
-            rows.push_str(&row("reads", reads_b, reads_a, ""));
+            rows.push_str(&row("reads", rows_b, rows_a, ""));
             rows.push_str(&row("%GC", gc_fraction(total) * 100.0, gc_fraction(pt) * 100.0, "%"));
             rows.push_str(&row("mean read Q", mean_read_mean_q(total, offset), mean_read_mean_q(pt, offset), ""));
             let (_hg, hd) = crate::rich::head_dropout(total);
             let (_phg, phd) = crate::rich::head_dropout(pt);
             rows.push_str(&row("head dropout (G)", hd * 100.0, phd * 100.0, "%"));
             format!(
-                r#"<table class="rep"><tr><th>metric</th><th>before</th><th>after</th><th>delta</th></tr>{rows}</table>
-                   <h3>Per-base sequence content</h3>{}
-                   <h3>N content by position</h3>{}
-                   <h3>Per-base quality</h3>{}
-                   <h3>Distributions</h3>{}
-                   <h3>polyX run lengths</h3>{}
-                   <h3>Heatmap</h3>{}"#,
-                ba(seq_chart.clone(), p_seq),
-                ba(n_chart.clone(), p_n),
-                ba(q_chart.clone(), p_q),
-                ba(format!(r#"<div class="grid2"><div>{len_chart}</div><div>{mq_chart}</div></div><div class="grid2"><div>{gc_chart}</div><div></div></div>"#),
-                   format!(r#"<div class="grid2"><div>{}</div><div>{}</div></div><div class="grid2"><div>{}</div><div></div></div>"#, bar_chart(&p_len, "read length (bp)", "reads", None), bar_chart(&p_mq, "mean Phred quality", "reads", None), bar_chart(&p_gc, "G+C bases", "reads", None))),
-                ba(polyx_section.clone(), p_polyx),
-                ba(heatmap_section.clone(), p_hm),
+                r#"<table class="rep"><tr><th>metric</th><th>before</th><th>after</th><th>delta</th></tr>{rows}</table>"#
             )
         }
         _ => String::new(),
@@ -746,12 +777,9 @@ pub fn write_html(
     let _ = write!(h, "{q_chart}");
     h.push_str("<div class=\"note\">Mean quality by position with the 10th and 90th percentiles — a widening spread is quality falling off unevenly between reads, not just a lower mean.</div></div></details>");
 
-    h.push_str(r##"<details class="module" open><summary><h2 id="dist">Distributions</h2></summary><div class="body"><div class="grid2">"##);
-    let _ = write!(h, "{}{}", chart_card("Read length", &len_chart), chart_card("Mean read quality", &mq_chart));
-    let _ = write!(h, "{}{}", chart_card("G+C content", &gc_chart),
-                   if insert.is_some() { chart_card("Insert size", &insert_chart) }
-                   else { chart_card_note("Insert size", "not measured — run with --insert-hist") });
-    h.push_str("</div></div></details>");
+    h.push_str(r##"<details class="module" open><summary><h2 id="dist">Distributions</h2></summary><div class="body">"##);
+    let _ = write!(h, "{dist_section}");
+    h.push_str("</div></details>");
 
     if insert.is_some() {
         h.push_str(r##"<details class="module" open><summary><h2 id="insert">Insert sizes</h2></summary><div class="body">"##);
@@ -774,7 +802,8 @@ pub fn write_html(
 
     if processed.is_some() {
         h.push_str(r##"<details class="module" open><summary><h2 id="compare">Before / After</h2></summary><div class="body">"##);
-        h.push_str(&compare_section);
+        h.push_str(&compare_table);
+        h.push_str("<p class=\"note\">The per-graph before/after comparison is available as a tab in each module above.</p>");
         h.push_str("</div></details>");
     }
 
@@ -792,11 +821,13 @@ pub fn write_html(
     h.push_str(
         r##"<script>
 // Tabs: delegated, index-based. The i-th tab of a container shows the i-th
-// panel of the SAME container, so duplicate panel ids (the before/after
-// reuses the main chart HTML) can never resolve to the wrong panel.
+// panel of the SAME container. Only direct children count (:scope > ...), so
+// nested tablists (e.g. R1/R2/both inside a before/after tab) never bleed
+// into an outer container's indices, and duplicate panel ids from a
+// before/after reuse can never resolve to the wrong panel.
 function activateTab(list, i){
-  var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
-  var panels = Array.prototype.slice.call(list.querySelectorAll('[role="tabpanel"]'));
+  var tabs = Array.prototype.slice.call(list.querySelectorAll(':scope > [role="tab"]'));
+  var panels = Array.prototype.slice.call(list.querySelectorAll(':scope > [role="tabpanel"]'));
   tabs.forEach(function(b, j){
     var on = (j === i);
     b.classList.toggle('active', on);
@@ -819,7 +850,7 @@ document.addEventListener('keydown', function(e){
   var list = el.parentElement;
   if (list.getAttribute('role') !== 'tablist') return;
   e.preventDefault();
-  var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
+  var tabs = Array.prototype.slice.call(list.querySelectorAll(':scope > [role="tab"]'));
   var i = tabs.indexOf(el);
   if (e.key === 'ArrowRight') i = (i + 1) % tabs.length;
   else if (e.key === 'ArrowLeft') i = (i - 1 + tabs.length) % tabs.length;
