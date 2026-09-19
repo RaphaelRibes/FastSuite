@@ -707,12 +707,21 @@ pub fn write_html(
     }
     obs.push("every count in this report is exact: no sampling, no read was skipped".to_string());
 
-    // ---- per-file table ------------------------------------------------------
+    // ---- per-file table (raw files, then processed files when present) -------
     let mut file_rows = String::new();
     for f in files {
         let _ = write!(
             file_rows,
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2}%</td><td>{:.2}</td><td>{}</td></tr>",
+            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{:.2}%</td><td>{:.2}</td><td>{}</td></tr>",
+            esc(&f.path.file_name().unwrap_or_default().to_string_lossy()),
+            f.acc.reads, f.acc.bases, gc_fraction(&f.acc) * 100.0, mean_read_mean_q(&f.acc, offset),
+            esc(&f.scan.decompress)
+        );
+    }
+    for f in p_files.unwrap_or_default() {
+        let _ = write!(
+            file_rows,
+            "<tr><td><code>{} (processed)</code></td><td>{}</td><td>{}</td><td>{:.2}%</td><td>{:.2}</td><td>{}</td></tr>",
             esc(&f.path.file_name().unwrap_or_default().to_string_lossy()),
             f.acc.reads, f.acc.bases, gc_fraction(&f.acc) * 100.0, mean_read_mean_q(&f.acc, offset),
             esc(&f.scan.decompress)
@@ -765,6 +774,13 @@ pub fn write_html(
     ]));
     h.push_str("</div></div></div></details>");
 
+    if processed.is_some() {
+        h.push_str(r##"<details class="module" open><summary><h2 id="compare">Before / After</h2></summary><div class="body">"##);
+        h.push_str(&compare_table);
+        h.push_str("<p class=\"note\">The per-graph before/after comparison is available as a tab in each module above.</p>");
+        h.push_str("</div></details>");
+    }
+
     h.push_str(r##"<details class="module" open><summary><h2 id="seq">Per-base sequence content</h2></summary><div class="body">"##);
     let _ = write!(h, "{seq_chart}");
     h.push_str("<div class=\"note\">Base composition at each position. Use the R1 / R2 / both tabs to view a single mate or the merged library.</div></div></details>");
@@ -799,13 +815,6 @@ pub fn write_html(
     h.push_str(r##"<details class="module" open><summary><h2 id="heatmap">Heatmap</h2></summary><div class="body">"##);
     h.push_str(&heatmap_section);
     h.push_str("</div></details>");
-
-    if processed.is_some() {
-        h.push_str(r##"<details class="module" open><summary><h2 id="compare">Before / After</h2></summary><div class="body">"##);
-        h.push_str(&compare_table);
-        h.push_str("<p class=\"note\">The per-graph before/after comparison is available as a tab in each module above.</p>");
-        h.push_str("</div></details>");
-    }
 
     h.push_str(r##"<details class="module" open><summary><h2 id="obs">Observations</h2></summary><div class="body"><ul class="obs">"##);
     for o in &obs {
