@@ -61,6 +61,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 1000, value_name = "N")]
     pub max_read_len: usize,
 
+    /// Refuse to start if the projected fingerprint table exceeds this many megabytes.
+    /// Defaults to the enforced memory limit of the process (cgroup v2/v1, SLURM,
+    /// RLIMIT_AS, then MemAvailable — the minimum of them, per tools/fastprep's model).
+    #[arg(long, value_name = "MB")]
+    pub max_mem: Option<u64>,
+
     /// Estimate the insert-size distribution from paired-end overlap (requires
     /// exactly two input files). The per-pair measurement is exact; the pass
     /// samples, because a distribution needs statistics rather than every pair.

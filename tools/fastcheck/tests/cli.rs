@@ -363,6 +363,25 @@ fn rich_report_has_polyx_repeats_and_heatmap() {
 
 
 #[test]
+fn max_mem_flag_is_accepted_and_the_projection_is_printed_before_the_scan() {
+    let d = tmpdir("maxmem");
+    let fq = write_fixture(&d);
+    let (_, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--max-mem", "4096", "-q"],
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    // The projection line must appear, and must name the fingerprint table.
+    let proj = stderr
+        .lines()
+        .find(|l| l.contains("fingerprint table"))
+        .unwrap_or_else(|| panic!("no projection line in stderr:\n{stderr}"));
+    assert!(proj.contains("MB"), "{proj}");
+    // The existing accumulator-state line is untouched.
+    assert!(stderr.contains("accumulator state"), "{stderr}");
+}
+
+#[test]
 fn processed_files_produce_a_before_after_report() {
     let d = tmpdir("cmp");
     let fq = write_fixture(&d);

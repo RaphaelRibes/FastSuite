@@ -22,7 +22,7 @@ mod report;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use accum::{offset_verdict, Accum};
@@ -52,6 +52,45 @@ fn main() -> Result<()> {
     // The per-read profile scan (adapter prefix + fragment GC) is only paid for
     // when a profile was asked for.
     let track_profile = cli.profile.is_some();
+
+    // The duplication fingerprint set is the only state whose size is a function of the
+    // dataset, so it is projected and admission-checked before the scan starts. The
+    // estimate is deliberately conservative on compressed input (a 4x ratio under-counts,
+    // so the table is under-sized and grows rather than over-allocating): getting it wrong
+    // costs a rehash, not correctness. Copied from fastprep's estimate_records (D-1).
+    let est_records: usize = cli
+        .files
+        .iter()
+        .map(|p| {
+            // `-` is stdin, whose size is unknowable before reading; the estimate then
+            // floors at the clamp minimum and the table simply grows as reads arrive.
+            let bytes = if p.as_os_str() == "-" {
+                0
+            } else {
+                std::fs::metadata(p)
+                    .with_context(|| format!("sizing {}", p.display()))?
+                    .len()
+            };
+            // Read length comes from the profile fit's own length histogram later; 150 is
+            // the short-read default and only scales the estimate.
+            let per_record = (150u64 * 2 + 50).max(1);
+            let compressed = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e, "gz" | "zst" | "zstd" | "bz2" | "xz"));
+            let raw = if compressed { bytes.saturating_mul(4) } else { bytes };
+            Ok::<usize, anyhow::Error>((raw / per_record) as usize)
+        })
+        .sum::<anyhow::Result<usize>>()?;
+    let fp_capacity = est_records.clamp(1, memory::MAX_PREALLOC_ENTRIES);
+    let fp_proj = memory::project(fp_capacity, 8); // 64-bit fingerprints
+    eprintln!(
+        "fastcheck: duplication fingerprint table projected at {:.1} MB for ~{} reads \
+         ({} buckets, 64-bit fingerprints)",
+        memory::mib(fp_proj.bytes),
+        fp_capacity,
+        fp_proj.buckets,
+    );
 
     // A single file already has all the parallelism it can use inside the
     // BGZF inflate pool; several files are scanned concurrently.
