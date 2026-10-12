@@ -27,20 +27,25 @@ explicitly marked as a gap with the phase that closes it.
 |---|---|---|
 | per-base sequence composition | `fastmaps` — reads placed in a `(T+C, T+G)` plane | ✅ but **not the same view**: FastQC plots per-position base fractions; fastmaps plots whole-read composition. The library-level questions (polyX contamination, R1/R2 asymmetry, off-composition mass) are answered in one image, the position-level questions are not |
 | polyX/polyG contamination detection | `fastmaps` `polyG_frac`, `r2_polyG_frac` | ✅ arguably clearer than FastQC's per-base plot for this specific failure |
-| per-base quality | not implemented | ⚠ gap, phase 4 — needs per-position accumulation; `fastsim` already models the quality curves it would be compared against |
-| per-sequence quality / GC distribution | not implemented (GC implicit in the composition plane) | ⚠ gap, phase 4 |
+| per-base quality | `fastcheck` — exact per-position quality matrices + quantiles from the histogram | ✅ implemented (`--positions-tsv`, `mean_q/q10/q50/q90` columns) |
+| per-sequence quality / GC distribution | `fastcheck` — `read_mean_q_hist`, `read_length_hist`, per-read GC (`gc_fraction`, `gc_hist`) | ✅ implemented |
 | adapter content module | implicit: `fastprep`'s adapter stats | partial |
 | duplication levels | `fastdedup` exact rate (not FastQC's estimate) | ✅ better: exact, no sampling |
-| overrepresented sequences | not implemented | ⚠ gap, phase 4 (cheap once fastdedup's fingerprint table is reused) |
-| k-mer content | not implemented | ⚠ gap, low priority |
+| overrepresented sequences | `fastcheck` bounded counters (singleton eviction, top-20 above `max(10, 0.1%)`) | ⚠ **partial**: bounded approximate (a sequence whose first occurrence is evicted loses 1 count — documented). Exact modes (`--overrep-mode fingerprint|second-pass|table`) are planned — see `docs/plans/2026-10-12_fastcheck-exactness.md` |
+| k-mer content | `fastcheck` bounded 12-mer spectrum (top-20) | ⚠ **partial**: bounded approximate for the same reason; per-position exact k-mer (`kmer_pos[p][kmer]`) is planned in the same fastcheck plan |
 | per-sample HTML/zip report | `fasthelper concatenate` → `report.html` | ✅ different shape (multi-sample, one file, no zip) |
 | multi-file / batch QC | `fasthelper run` | ✅ one config, N samples |
 
-Honest summary: **fastmaps is not a drop-in FastQC replacement yet.** It replaces
-the parts that matter for this pipeline (composition, polyX, duplication) and
-beats FastQC on them, but per-base quality and k-mer modules are not there. The
-phase-4 tasks in `PLAN.md` are what close it; until then the replacement claim
-is "FastQC's composition modules, replaced and extended", not "all of FastQC".
+Honest summary: **fastmaps alone is not a drop-in FastQC replacement — but
+`fastcheck` is what closes the gap.** fastmaps replaces the composition
+modules (and beats FastQC on the polyX/R1-R2 view); fastcheck adds exact
+per-base quality, per-sequence quality, GC, length distributions and
+duplication levels. What is still missing from the FastQC slot: per-tile
+modules (planned, default off), exact (non-sampled) over-representation
+modes, and per-position k-mer content. The replacement claim is therefore
+"FastQC's modules, replaced and extended, minus per-tile and exact
+over-representation — see `docs/plans/2026-10-12_fastcheck-exactness.md`",
+not "all of FastQC".
 
 ## MultiQC → fasthelper
 

@@ -182,8 +182,9 @@ phase 2.5 — the replacement map is written to survive scrutiny.
 
 ## Current state (what is already true, verified)
 
-* The five binaries build in this tree; `cargo test` green: fastprep 102,
-  fastdedup 87, fastsim 51, fastmaps 27, fasthelper 5 — 272 tests, 0 failures.
+* The six binaries build in this tree; `cargo test` green: fastprep 110,
+  fastdedup 87, fastsim 54, fastcheck 54, fastmaps 27, fasthelper 13 —
+  345 tests, 0 failures.
 * `fasthelper run -c examples/fastsuite.toml` executes
   `fastsim → fastdedup → fastprep → fastmaps`, records a manifest with argv,
   exit codes and wall times, and aggregates four reports into
@@ -191,7 +192,8 @@ phase 2.5 — the replacement map is written to survive scrutiny.
 * The fastmaps corner adapter is verified against a hand-built ground truth
   (3 polyT + 2 polyG + 5 random reads → `polyT_frac 0.30`, `polyG_frac 0.20`).
 * Score against the CLI spec: fastdedup ~95%, fastsim ~80%, fastprep ~70%,
-  fastmaps ~65% (gap list in `docs/CLI-SPEC.md` §4).
+  fastmaps ~65% (gap list in `docs/CLI-SPEC.md` §4). The CLI-convergence
+  plans under `docs/plans/2026-10-12_*.md` close those gaps task by task.
 
 ## Risks
 

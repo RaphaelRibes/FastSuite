@@ -14,6 +14,19 @@ zipped HTML bundle.
 
 ## 0. Phase 1–2 status: implemented, measured (`tools/fastcheck`)
 
+**Update 2026-10-12 — what shipped after this plan was written:** the rich
+report (polyX run-length distributions per base, bounded repeated-sequence
+and 12-mer k-mer counters, the 64×64 composition heatmap, and before/after
+side-by-side via `--processed-1/--processed-2`), the `--profile` fitter (a
+fastsim profile written directly from the run's measurements — the QC→sim
+coupling this plan's §6 anticipated, now in Rust with no Python fit step),
+and the MultiQC-style HTML report (inline SVG, no JS, accessible tabs).
+fastcheck now has 54 tests plus the Python differential harness below.
+**What remains is phases 3–5 of this document** — `--overrep-mode`,
+`--max-mem` admission, adapter-per-position, per-tile modules, `--only`
+gating and the ground-truth recovery test — now written up as TDD tasks in
+`docs/plans/2026-10-12_fastcheck-exactness.md`.
+
 Built: one-pass reader (plain / `.gz` / BGZF block-parallel via `gzp`), exact
 integer counters, basic statistics, per-position base + N + quality matrices,
 per-read mean-Q and length histograms, exact quality-byte census with an

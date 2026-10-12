@@ -15,9 +15,22 @@ reproduce that dataset's QC closely enough that sweeping it means something.
 
 | step | artefact | acceptance test |
 |---|---|---|
-| **A1** `[next]` write `bench/scripts/qc_to_profile.py`: `fastcheck --json` + `--positions-tsv` → a fastsim profile + its CLI knobs | `qc_to_profile.py` | runs on the last fastcheck report without error |
+| **A1** `[done]` write `bench/scripts/qc_to_profile.py`: `fastcheck --json` + `--positions-tsv` → a fastsim profile + its CLI knobs | `qc_to_profile.py` | runs on the last fastcheck report without error |
 | **A2** `[next]` **recovery test, local and free of downloads**: profile the *known* `synthetic_novaseq.json` dataset, fit it back, and compare the fitted profile to the one that generated it | test in `bench/tests/` | head CDF recovered within 3 % per level; quality curve within 0.5 Q; GC within 0.005; tail run lengths within one level |
 | **A3** `[next]` round-trip test: simulate from the *fitted* profile, run fastcheck on the simulation, compare to the original QC | test | per-position G fraction within 0.02; mean Q within 0.5; GC within 0.01; duplicate rate within 2× |
+
+> **A1 is done, in Rust.** `fastcheck --profile p.json` fits and writes the
+> profile `fastsim --profile p.json` consumes — the same artefact this Python
+> step was to produce, with no fit step in between (verified 2026-10-12: a
+> measured 104-entry insert CDF flows from `fastcheck --insert-hist` into a
+> fastsim run). `--profile` implies the readthrough + fragment-GC scan;
+> `--insert-hist` makes the profile's insert distribution measured rather
+> than invented. The fit report (`p.fit_report.json`) records what was
+> measured, estimated and invented — an ESTIMATED (head/tail G-runs) or
+> INVENTED (insert shape, mate tail correlation) value is never a
+> measurement. The Python `qc_to_profile.py` is therefore **not** written;
+> do not build it. The suite plan's Phase A (docs/plans/
+> 2026-10-12_suite-status-ml-distribution.md) turns A2/A3 into TDD tasks.
 | **A4** `[ ]` ensemble for the non-identifiable fields: 2–3 variants per dataset (insert shape, adapter-vs-short-insert split), bounded and documented | `--variants N` flag | variants differ only in the non-identifiable fields; all load in fastsim |
 | **A5** `[ ]` unit tests for the mapping (G-run extraction from the position matrix, quality curve, GC, length) | tests | green |
 
