@@ -87,9 +87,9 @@ Legend: **✓** already conforms · **+** added in this reorganisation ·
 | `--gz-level` | → | added `--compression` alias |
 | `--json` | ✓ | writes the legacy stats object; wrapper pending (§4) |
 | `--temp-dir` | gap | uses its own chunking, no spill flag |
-| `--force` | gap | currently overwrites silently |
-| `--dry-run` | gap | no stats-only mode |
-| `-q --quiet` | gap | everything already goes to stderr as progress |
+| `--force -f` | ✓ | refuses to clobber an existing `-o`/`-p` (and `--metadata`/`--json`/`--singletons*`), naming the file |
+| `--dry-run` | ✓ | every counter computed, nothing written; the report is still emitted |
+| `-q --quiet` | ✓ | suppresses the summary stream; warnings and errors still print |
 | tool-local | `--metadata`, `--singletons1/2`, `--adapter-preset`, `--adapters`, `--no-adapter`, `--min-len`, `--mercy`, `--phred-sat`, `--gate-shape`, `--match-leniency`, `--mismatch-strength`, `--min-run`, `--head-dropout`, `--min-adapter-overlap`, `--adapter-error-rate`, `--mean-q`, `--phred-offset`, `--auto-phred`, `--trim-5/3`, `--chunk`, `--zst-level`, `--gz-threads`, `--dedup*` | |
 
 ### fastsim (ex-novaseq-sim)
@@ -135,10 +135,12 @@ Ordered by user-visible value:
 1. `--json` wrapper (`fastsuite.report.v1`) for **fastprep** — today it emits the
    legacy stats object; `fasthelper` adapts it, but new consumers should not
    have to.
-2. `--force` + `--dry-run` in **fastprep**.
+2. ~~`--force` + `--dry-run` in **fastprep**.~~ **Done 2026-10-12** (per-tool
+   commits; `--force`/`-f`, `--dry-run`).
 3. `--json <PATH>` and `-j/--threads` in **fastmaps**.
 4. `--threads 0 = all cores` in **fastprep** and **fastmaps**.
-5. `--quiet` in **fastprep**/**fastmaps**.
+5. ~~`--quiet` in **fastprep**/**fastmaps**.~~ fastprep done 2026-10-12
+   (`-q`/`--quiet`); **fastmaps** still to do.
 6. `FASTSUITE_THREADS` honoured as a default by all four binaries.
 7. `-`/stdin-stdout support (streaming mode) — needed to compete with
    `fastp`'s pipe usage; blocked on the reader architecture in fastprep.
