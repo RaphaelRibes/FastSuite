@@ -1,4 +1,12 @@
-# FastSuite
+# FastSuite — Work In Progress
+
+> **This is work in progress: nothing works yet.** The tools build, the tests
+> pass and the demo chain runs, but the suite is pre-release, the CLI is still
+> converging (see `docs/CLI-SPEC.md` §4) and every tool is WIP. Do not use it
+> in production. The goal and the design are settled; the implementations are
+> not.
+
+## What this is
 
 Rust tools for FASTQ quality control and preprocessing, built as one suite:
 **one flag grammar, one report format, one config, one command.**
@@ -9,16 +17,14 @@ of merely coexisting in a pipeline. The suite is a **naming scheme, not an
 architecture** (decision D-1): the tools are independent binaries with no
 shared crate, kept consistent by tests rather than by a compiler.
 
-## The tools
-
 | tool | replaces | what it does | maturity |
 |---|---|---|---|
-| **fastdedup** | `fastp --dedup` (and `seqkit rmdup`, `prinseq++`) | exact PCR-duplicate removal by 64/128-bit fingerprint; O(N) memory, no Bloom-filter false positives | v1.3.0, **stable** |
-| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, optional dedup | v0.1.0, beta |
-| **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data or fitted by `fastcheck` | v0.1.0, beta |
-| **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | v0.1.0, beta |
-| **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, polyX runs, bounded repeated-sequence and k-mer counters, insert-size histogram — no sampling, no verdicts, memory printed before the run. `--profile` writes a fastsim profile directly | v0.1.0, beta |
-| **fasthelper** | MultiQC (+ workflow glue) | a toolbox: `run` (the chain from one TOML config, with a provenance manifest), `concatenate` (per-sample reports → one table/report), `compare` (raw vs processed side by side), `doctor`, `schema` — owns the report schema | v0.1.0, beta |
+| **fastdedup** | `fastp --dedup` (and `seqkit rmdup`, `prinseq++`) | exact PCR-duplicate removal by 64/128-bit fingerprint; O(N) memory, no Bloom-filter false positives | v1.3.0, WIP |
+| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, optional dedup | v0.1.0, WIP |
+| **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data or fitted by `fastcheck` | v0.1.0, WIP |
+| **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | v0.1.0, WIP |
+| **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, polyX runs, bounded repeated-sequence and k-mer counters, insert-size histogram — no sampling, no verdicts, memory printed before the run. `--profile` writes a fastsim profile directly | v0.1.0, WIP |
+| **fasthelper** | MultiQC (+ workflow glue) | a toolbox: `run` (the chain from one TOML config, with a provenance manifest), `concatenate` (per-sample reports → one table/report), `compare` (raw vs processed side by side), `doctor`, `schema` — owns the report schema | v0.1.0, WIP |
 
 Release history and per-tool maturity: `docs/RELEASES.md`.
 What the suite replaces today, feature by feature, honestly: `docs/REPLACEMENT-MAP.md`.

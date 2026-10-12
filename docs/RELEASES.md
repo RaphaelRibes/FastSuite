@@ -4,7 +4,7 @@ Per **D-2** (versioning, forced by bioconda): one semver per tool, plus this
 suite release train. bioconda recipes are per-package, so each tool carries
 its own version and its own `meta.yaml`; this file records which tool
 versions made up each "FastSuite N" release, with each tool's maturity
-(`stable` / `beta`).
+(`WIP`).
 
 Attribution (**D-9**): **fastprep and fastdedup belong to the Mandrillus
 Project** — they carry the project, ISDM/ISEM and Céline Mandier /
@@ -17,12 +17,12 @@ fasthelper) is Raphaël Ribes' own work. See each tool's `CITATION.cff`.
 
 | tool | version | maturity | notes |
 |---|---|---|---|
-| fastdedup | 1.3.0 | **stable** | exact PCR-dedup by 64/128-bit fingerprints; published (bioRxiv 2026.04.29.721745) |
-| fastprep | 0.1.0 | beta | swept-winner default configuration shipped (validated on 90/90 datasets) |
-| fastsim | 0.1.0 | beta | measured insert CDF from the profile; single-end mode; ground-truth TSV |
-| fastcheck | 0.1.0 | beta | exact one-pass QC; the Python differential harness; `--profile` fitter |
-| fastmaps | 0.1.0 | beta | composition plane; `-j/--threads` added in this release |
-| fasthelper | 0.1.0 | beta | run / concatenate / compare / doctor / schema |
+| fastdedup | 1.3.0 | **WIP** | exact PCR-dedup by 64/128-bit fingerprints; published (bioRxiv 2026.04.29.721745) |
+| fastprep | 0.1.0 | WIP | swept-winner default configuration shipped (validated on 90/90 datasets) |
+| fastsim | 0.1.0 | WIP | measured insert CDF from the profile; single-end mode; ground-truth TSV |
+| fastcheck | 0.1.0 | WIP | exact one-pass QC; the Python differential harness; `--profile` fitter |
+| fastmaps | 0.1.0 | WIP | composition plane; `-j/--threads` added in this release |
+| fasthelper | 0.1.0 | WIP | run / concatenate / compare / doctor / schema |
 
 Suite-level work in this release: the six tools converge on the canonical
 CLI option set (gaps tracked in `docs/CLI-SPEC.md` §4, closed by the plans

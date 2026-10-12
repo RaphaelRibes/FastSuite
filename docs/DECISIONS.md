@@ -28,7 +28,7 @@ payload — nothing else.
 **One semver per tool, plus a suite release train.** bioconda recipes are
 per-package, so each tool carries its own version and its own `meta.yaml`.
 A `docs/RELEASES.md` lists which tool versions made up each "FastSuite N"
-release, together with each tool's maturity (`stable` / `beta`).
+release, together with each tool's maturity (`WIP`).
 
 ---
 
