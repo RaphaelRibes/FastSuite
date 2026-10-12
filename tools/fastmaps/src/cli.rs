@@ -69,6 +69,11 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub json: Option<std::path::PathBuf>,
 
+    /// Suppress the end-of-run summary lines on stdout.
+    /// Progress and warnings still go to stderr.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+
     /// Refuse to overwrite an output directory that already contains
     /// fastmaps outputs; without this flag the run exits 1 naming the file.
     #[arg(long, short = 'f')]
@@ -146,5 +151,16 @@ mod tests {
     fn test_force_short_and_long() {
         assert!(Args::parse_from(["fastmaps", "a.fq", "--force"]).force);
         assert!(Args::parse_from(["fastmaps", "a.fq", "-f"]).force);
+    }
+
+    #[test]
+    fn test_quiet_default_false() {
+        assert!(!Args::parse_from(["fastmaps", "a.fq"]).quiet);
+    }
+
+    #[test]
+    fn test_quiet_short_and_long() {
+        assert!(Args::parse_from(["fastmaps", "a.fq", "-q"]).quiet);
+        assert!(Args::parse_from(["fastmaps", "a.fq", "--quiet"]).quiet);
     }
 }

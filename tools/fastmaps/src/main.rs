@@ -237,11 +237,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!(
-        "{} unique coordinates, {} total reads",
-        state.counts.len(),
-        state.total_reads
-    );
+    if !args.quiet {
+        println!(
+            "{} unique coordinates, {} total reads",
+            state.counts.len(),
+            state.total_reads
+        );
+    }
     // Citation request (MIT stays permissive; this is the community-norm ask).
     eprintln!(
         "If you use fastmaps in published research, please cite: \
@@ -259,16 +261,17 @@ fn main() {
         state, &files, &file_kinds, args.preview_reads, &output_dir, &json_path,
         with_wrapper,
         started.elapsed().as_secs_f64(),
+        args.quiet,
     ) {
         eprintln!("Error writing heatmap files: {e}");
         std::process::exit(1);
     }
 
-    write_png(&counts_u32, &output_dir);
-    write_html(&counts_u32, &output_dir);
+    write_png(&counts_u32, &output_dir, args.quiet);
+    write_html(&counts_u32, &output_dir, args.quiet);
 
     if args.svg {
-        write_svg(&counts_u32, &output_dir);
+        write_svg(&counts_u32, &output_dir, args.quiet);
     }
 
     // Report corner extraction counts.
@@ -279,7 +282,9 @@ fn main() {
             .map(|(_, (c, _))| c)
             .sum();
         let fname = corners_filename(((ce.x1, ce.y1), (ce.x2, ce.y2)));
-        println!("Saved {fname}  ({n} reads extracted)");
+        if !args.quiet {
+            println!("Saved {fname}  ({n} reads extracted)");
+        }
     }
 
     // Best-effort temp dir cleanup (only removes when empty, which it is on success).

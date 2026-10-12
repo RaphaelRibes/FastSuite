@@ -26,7 +26,7 @@ fn heat_color(t: f64) -> [u8; 3] {
     ]
 }
 
-pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path) {
+pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
     let w = max_x + 1;
@@ -144,9 +144,11 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path) {
     f.write_all(b"</svg>\n").unwrap();
     f.flush().unwrap();
 
-    println!("Saved heatmap.svg  ({}x{} cells, {} unique)", w, h, counts.len());
+    if !quiet {
+        println!("Saved heatmap.svg  ({}x{} cells, {} unique)", w, h, counts.len());
+    }
 }
-pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path) {
+pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
     let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
@@ -171,12 +173,14 @@ pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path) {
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(&rgb).unwrap();
-    println!("Saved heatmap.png  ({w}×{h} px)");
+    if !quiet {
+        println!("Saved heatmap.png  ({w}×{h} px)");
+    }
 }
 
 /// Write an interactive Plotly 3-D scatter HTML to `output_dir/heatmap_3d.html`.
 /// z = mean Phred quality, colour = log(count).
-pub fn write_html(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path) {
+pub fn write_html(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
     let max_count = counts.values().map(|(c, _)| *c).max().unwrap() as f64;
     let total: u64 = counts.values().map(|(c, _)| c).sum();
 
@@ -243,5 +247,7 @@ Plotly.newPlot('plot', [trace], layout, {{responsive: true}});
 
     let mut f = File::create(output_dir.join("heatmap_3d.html")).unwrap();
     f.write_all(html.as_bytes()).unwrap();
-    println!("Saved heatmap_3d.html");
+    if !quiet {
+        println!("Saved heatmap_3d.html");
+    }
 }

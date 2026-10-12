@@ -141,6 +141,7 @@ pub fn write_format(
     json_path: &Path,
     with_wrapper: bool,
     elapsed_s: f64,
+    quiet: bool,
 ) -> std::io::Result<()> {
     let size = (state.max_seq_len + 1) as usize;
     if size > u16::MAX as usize {
@@ -294,13 +295,15 @@ pub fn write_format(
         }
     }
 
-    println!(
-        "Saved heatmap.data ({data_written} B), \
-         heatmap.preview ({preview_written} B), \
-         heatmap.json (size={size}, {} reads){}",
-        state.total_reads,
-        wrapper_suffix,
-    );
+    if !quiet {
+        println!(
+            "Saved heatmap.data ({data_written} B), \
+             heatmap.preview ({preview_written} B), \
+             heatmap.json (size={size}, {} reads){}",
+            state.total_reads,
+            wrapper_suffix,
+        );
+    }
     Ok(())
 }
 
