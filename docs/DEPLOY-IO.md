@@ -1,3 +1,9 @@
+> **HISTORICAL — Io access ended 2026-10-12.** This document describes a
+> working SLURM deployment on the ISDM-MESO cluster that is no longer
+> available. It is kept for reference: the cell/manifest/idempotency design
+> is reusable. The current execution plan is **`docs/PLAN-ML-LOCAL.md`**
+> (desktop-only benchmarks, queue-file coordination, no scheduler).
+
 # Running PLAN-ML on Io (the HPC)
 
 Companion to `PLAN-ML.md`. Everything here was verified against the cluster

@@ -108,10 +108,20 @@ no doc claims a gap that a shipped feature contradicts.
 
 ---
 
-## Phase A — The ML campaign chain (the research plan, ~local first)
+## Phase A — The ML campaign chain (the research plan)
 
-> PLAN-ML-STEPS.md is the authoritative breakdown. This phase exists in the
-> suite plan only to sequence it against everything else.
+> **Io is gone (2026-10-12).** The cluster plan in `PLAN-ML-STEPS.md` is
+> superseded by **`docs/PLAN-ML-LOCAL.md`**: all benchmark compute runs on
+> the desktop (16 cores, 48 GB), the laptop stays interactive-only. The
+> SLURM scripts under `deploy/io/` and `docs/DEPLOY-IO.md` are historical.
+> The science is unchanged — A2/A3 first, GATE 2 before the full run — and
+> the honest cost of the full 500-dataset sweep is **~5–7 days of continuous
+> desktop running**, with 100 datasets (~a weekend) as the legitimate
+> smaller target decided at GATE 2.
+
+> PLAN-ML-STEPS.md is the historical breakdown; PLAN-ML-LOCAL.md is the
+> execution plan. The decisive first steps are identical: the recovery test
+> and the round-trip test, both free and local.
 
 ### Task A1: the recovery test (A2 in PLAN-ML-STEPS) — LOCAL, FREE, FIRST
 
@@ -169,27 +179,29 @@ and **no raw file left on scratch** (D-11: never ship data — the bench
 directory holds manifests and code, never reads).
 
 **Gate:** confirm the pilot subject (30 datasets: 10 generalised, 10 human
-gut, 10 virome proposed) before running anything on Io.
+gut, 10 virome proposed) before the pilot runs on the desktop.
 
 **Note:** `deploy/io/corpus-manifest.tsv` already exists with 19 rows — use
-it as the shape reference, extend per domain. `deploy/io/` already has
-`stage-to-io.sh`, `pilot.sbatch`, `sweep-cell.sbatch`, `dispatch.sbatch` —
-reuse, do not reinvent.
+it as the shape reference, extend per domain (its SLURM wiring is
+historical; the manifest format is not).
 
-### Task A4: pilot (Phase C) — GATE 2, ~2.5 core-h on Io
+### Task A4: pilot (Phase C) — GATE 2, ~3 h on the desktop
 
 Full chain on 30 datasets × 60 configs × 3 variants, closed-loop check on
 real data (the go/no-go), fastp comparison, decision memo `bench/PILOT.md`.
+Runs entirely on the desktop via the queue-file worker in `PLAN-ML-LOCAL.md`.
 
 **Gate 2:** if the closed loop fails, Phase D does not run — the fix is in
-the fitter.
+the fitter. The pilot's measured cell cost also picks the Phase D corpus
+size (500 ≈ 5–7 days, 100 ≈ a weekend).
 
-### Task A5: full run (Phase D) — GATE 3, ~153 core-h on Io
+### Task A5: full run (Phase D) — GATE 3, 5–7 days on the desktop
 
-300 000 exact evaluations. Per the standing rule: partition `cpu-dedicated`,
-accounts `dedicated-cpu@cirad-normal` (cells) / `@cirad-long` (dispatcher),
-`mem=256M`, throttled at 100 cores, dispatcher 7 days — all four values
-confirmed before submission.
+300 000 exact evaluations (or the smaller corpus GATE 2 picked). The
+desktop is the only benchmark machine: 16 cores, 48 GB (fastprep's dedup
+admission never refuses, bwa-mem2 indexes a human reference panel). No
+scheduler, no accounts, no SLURM — the queue-file coordination in
+`PLAN-ML-LOCAL.md` is the whole mechanism.
 
 ### Task A6: labels + models (Phases E–F) — LOCAL
 
@@ -256,14 +268,14 @@ each tool's maturity (stable/beta) — per D-2.
 
 ---
 
-## Phase B — Benchmarks and the public claim (PLAN phase 6) — 2 days on Io
+## Phase B — Benchmarks and the public claim (PLAN phase 6) — a week on the desktop
 
 1. Refresh/regenerate the fastsim profile from the mandrill data (real
    profiles live OUTSIDE the repo, D-11:
    `~/hermes_scratch/fastsuite-local-artifacts/profiles/`).
-2. Head-to-head on Io: fastdedup/fastprep vs fastp, fastmaps/fastcheck vs
-   FastQC/Falco, fasthelper vs MultiQC — same data, same threads, wall + peak
-   RSS, three reps.
+2. Head-to-head on the desktop: fastdedup/fastprep vs fastp, fastmaps/fastcheck
+   vs FastQC/Falco, fasthelper vs MultiQC — same data, same threads, wall +
+   peak RSS, three reps.
 3. Accuracy on ground truth: retention, retention of must-drop reads,
    adapter false-positive rate (use `fastsim`'s `PREFIX.gt.tsv`).
 4. `docs/BENCHMARKS.md` with the raw matrix and caveats; store under `bench/`.

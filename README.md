@@ -98,9 +98,10 @@ FastSuite/
 │   ├── REPLACEMENT-MAP.md FastQC/Falco/MultiQC/fastp → FastSuite, feature by feature
 │   ├── PLAN.md            phased plan to full compatibility
 │   ├── PLAN-QC.md         fastcheck module design
-│   ├── PLAN-ML.md         the parameter-recommendation research plan
-│   ├── PLAN-ML-STEPS.md   the runnable breakdown, with acceptance tests
-│   ├── DEPLOY-IO.md       running the campaign on the Io cluster
+│   ├── PLAN-ML.md         the parameter-recommendation research plan (design)
+│   ├── PLAN-ML-STEPS.md   the runnable breakdown, with acceptance tests (historical — Io-era)
+│   ├── PLAN-ML-LOCAL.md   the current ML execution plan: desktop-only benchmarks
+│   ├── DEPLOY-IO.md       running the campaign on the Io cluster (historical — access ended 2026-10-12)
 │   ├── RELEASES.md        release train + per-tool maturity
 │   └── plans/             per-tool implementation plans (bite-sized TDD)
 ├── examples/              fastsuite.toml + demo.sh (synthetic control)
