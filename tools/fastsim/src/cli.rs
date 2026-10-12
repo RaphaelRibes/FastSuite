@@ -82,6 +82,19 @@ impl Default for Config {
 
 pub fn parse(args: &[String]) -> Result<Config> {
     let mut cfg = Config::default();
+    // FASTSUITE_THREADS is the suite-wide default when -j/--threads is absent
+    // (CLI-SPEC §1, gap #6). fastsim is single-threaded so the value is only
+    // reported-and-ignored, but the contract must hold for the suite.
+    let threads_given = args.iter().any(|a| a == "-j" || a == "--threads");
+    if !threads_given {
+        if let Some(n) = std::env::var("FASTSUITE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            cfg.threads = n;
+        }
+    }
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
