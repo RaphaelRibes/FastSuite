@@ -28,6 +28,8 @@ fn esc(s: &str) -> String {
 
 /// Write `compare.tsv` and `compare.html` to `outdir`.
 pub fn cmd_compare(before: &[PathBuf], after: &[PathBuf], outdir: &Path) -> Result<()> {
+    std::fs::create_dir_all(outdir)
+        .with_context(|| format!("creating {}", outdir.display()))?;
     let b = collect(before, None)?;
     let a = collect(after, None)?;
     if b.is_empty() || a.is_empty() {

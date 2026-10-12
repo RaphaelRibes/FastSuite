@@ -32,6 +32,34 @@ fn write_report(dir: &Path, name: &str, reads: u64, gc: f64) -> PathBuf {
     p
 }
 
+#[test]
+fn compare_creates_a_missing_output_directory() {
+    // Regression: `compare -o out` used to fail with 'No such file or
+    // directory' when out/ did not exist yet, while concatenate created it.
+    let d = tmpdir("compare_mkdir");
+    let before = d.join("before");
+    let after = d.join("after");
+    std::fs::create_dir_all(&before).unwrap();
+    std::fs::create_dir_all(&after).unwrap();
+    write_report(&before, "raw.json", 100, 0.41);
+    write_report(&after, "clean.json", 90, 0.42);
+    let out = d.join("does").join("not").join("exist");
+
+    let (_, stderr, code) = run(&[
+        "compare",
+        "--before",
+        before.to_str().unwrap(),
+        "--after",
+        after.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+
+    assert_eq!(code, 0, "compare must succeed: {stderr}");
+    assert!(out.join("compare.tsv").is_file());
+    assert!(out.join("compare.html").is_file());
+}
+
 fn run(args: &[&str]) -> (String, String, i32) {
     let out = Command::new(fasthelper()).args(args).output().expect("spawn fasthelper");
     (

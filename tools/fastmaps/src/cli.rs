@@ -60,6 +60,11 @@ pub struct Args {
     /// Default: *R2*
     #[arg(long, value_name = "GLOB", action = clap::ArgAction::Append)]
     pub r2_pattern: Vec<String>,
+
+    /// Number of worker threads to use. Defaults to the number of available
+    /// CPU cores (bounded by the file count). Pass 0 or omit for auto.
+    #[arg(short = 'j', long, default_value_t = 0)]
+    pub threads: usize,
 }
 
 /// Parse "x1,y1:x2,y2" into normalised corners `((min_x,min_y),(max_x,max_y))`.

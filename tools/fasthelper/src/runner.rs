@@ -22,6 +22,7 @@ use crate::config::Config;
 use crate::report;
 
 pub struct ToolSet {
+    pub check: Option<PathBuf>,
     pub dedup: Option<PathBuf>,
     pub prep: Option<PathBuf>,
     pub maps: Option<PathBuf>,
@@ -31,6 +32,7 @@ pub struct ToolSet {
 impl ToolSet {
     pub fn get(&self, tool: &str) -> Option<&PathBuf> {
         match tool {
+            "fastcheck" => self.check.as_ref(),
             "fastdedup" => self.dedup.as_ref(),
             "fastprep" => self.prep.as_ref(),
             "fastmaps" => self.maps.as_ref(),
@@ -76,6 +78,7 @@ pub fn resolve(tool: &str, tools_dir: Option<&Path>) -> Option<PathBuf> {
 pub fn toolset(tools_dir: Option<PathBuf>) -> ToolSet {
     let d = tools_dir.as_deref();
     ToolSet {
+        check: resolve("fastcheck", d),
         dedup: resolve("fastdedup", d),
         prep: resolve("fastprep", d),
         maps: resolve("fastmaps", d),
@@ -421,6 +424,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
             "gz_level": cfg.run.gz_level,
             "steps": cfg.run.steps,
             "tools": {
+                "fastcheck": ts.check.as_ref().map(|p| s(p)),
                 "fastdedup": ts.dedup.as_ref().map(|p| s(p)),
                 "fastprep": ts.prep.as_ref().map(|p| s(p)),
                 "fastmaps": ts.maps.as_ref().map(|p| s(p)),
@@ -479,7 +483,14 @@ pub fn doctor(args: &DoctorArgs) -> Result<()> {
             .unwrap_or_else(|| "(none: $PATH only)".into())
     );
     let mut table: BTreeMap<&str, (String, String)> = BTreeMap::new();
-    for tool in ["fastdedup", "fastprep", "fastmaps", "fastsim", "fasthelper"] {
+    for tool in [
+        "fastcheck",
+        "fastdedup",
+        "fastprep",
+        "fastmaps",
+        "fastsim",
+        "fasthelper",
+    ] {
         let bin = ts.get(tool).cloned().or_else(|| resolve(tool, None)).or_else(|| {
             // fasthelper is the binary running right now.
             if tool == "fasthelper" {
@@ -516,7 +527,7 @@ pub fn doctor(args: &DoctorArgs) -> Result<()> {
         .collect();
     if !missing.is_empty() {
         println!(
-            "\nmissing: {}\nbuild with: for t in fastdedup fastprep fastmaps fastsim; do (cd tools/$t && cargo build --release); done",
+            "\nmissing: {}\nbuild with: for t in fastcheck fastdedup fastprep fastmaps fastsim; do (cd tools/$t && cargo build --release); done",
             missing.join(", ")
         );
     }

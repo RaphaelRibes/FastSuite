@@ -110,10 +110,16 @@ fn main() {
         .collect();
 
     // ── Worker configuration ──────────────────────────────────────────────
-    let num_workers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(total_files);
+    // -j/--threads overrides auto-detect; 0 (none given) = available cores,
+    // always bounded by the file count (no point in workers with no files).
+    let num_workers = if args.threads > 0 {
+        args.threads
+    } else {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    }
+    .min(total_files);
 
     let threshold_bytes = (args.buffer_mb * 1024 * 1024) / num_workers.max(1);
 
