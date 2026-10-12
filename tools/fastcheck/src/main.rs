@@ -206,6 +206,11 @@ fn main() -> Result<()> {
         } else {
             println!("{line}");
         }
+        // Citation request (MIT stays permissive; this is the community-norm ask).
+        eprintln!(
+            "If you use fastcheck in published research, please cite: \
+             Ribes R. FastSuite — fastcheck. https://github.com/RaphaelRibes/FastSuite"
+        );
     }
     Ok(())
 }

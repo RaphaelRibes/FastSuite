@@ -457,6 +457,12 @@ pub fn run(args: &RunArgs) -> Result<()> {
     if !failed.is_empty() {
         bail!("{} step(s) failed: {}", failed.len(), failed.join(", "));
     }
+    // Citation request (MIT stays permissive; this is the community-norm ask).
+    eprintln!(
+        "If you use FastSuite in published research, please cite: \
+         Ribes R. FastSuite. https://github.com/RaphaelRibes/FastSuite \
+         (fastprep and fastdedup: Mandrillus Project; bioRxiv 2026, doi:10.64898/2026.04.29.721745)"
+    );
     Ok(())
 }
 

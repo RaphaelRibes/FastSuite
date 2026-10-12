@@ -225,6 +225,11 @@ fn run(cfg: &cli::Config) -> Result<()> {
         n_drop,
         n_drop as f64 / cfg.pairs as f64 * 100.0,
     );
+    // Citation request (MIT stays permissive; this is the community-norm ask).
+    eprintln!(
+        "If you use fastsim in published research, please cite: \
+         Ribes R. FastSuite — fastsim. https://github.com/RaphaelRibes/FastSuite"
+    );
 
     // FastSuite report (schema v1) so the synthetic control is aggregatable
     // alongside the real samples.

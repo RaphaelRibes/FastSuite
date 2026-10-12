@@ -119,11 +119,15 @@ end
 
 ## Citing
 
-Each tool is independently citable via its `CITATION.cff`. **fastdedup** and
-**fastprep** belong to the Mandrillus Project and carry the ISDM/ISEM and
-Céline Mandier / Alice Baniel credits; fastdedup is published
-([Ribes, Mandier & Baniel, bioRxiv 2026](https://www.biorxiv.org/content/10.64898/2026.04.29.721745v1)).
+Each tool prints a one-line citation request at the end of every run and is
+independently citable via its `CITATION.cff` (GitHub renders these
+automatically). **fastdedup** and **fastprep** belong to the Mandrillus
+Project and carry the ISDM/ISEM and Céline Mandier / Alice Baniel credits;
+fastdedup is published as [Ribes, Mandier & Baniel, bioRxiv 2026](https://www.biorxiv.org/content/10.64898/2026.04.29.721745v1).
 Everything else is [Raphaël Ribes](https://www.raphaelrib.es)'s own work.
+
+The license stays **MIT** (bioconda requires an OSI-approved license) with a
+citation request appended as etiquette, not a condition — see `LICENSE`.
 
 ## Out of scope (deliberately)
 
@@ -134,4 +138,6 @@ for now. Each with its reason: `docs/DECISIONS.md` D-12.
 ## License
 
 MIT — see [LICENSE](LICENSE). `tools/fastprep/LICENSE` carries the
-Mandrillus Project attribution.
+Mandrillus Project attribution. Every LICENSE carries the same citation
+request: asked for, not enforced — that is what keeps the tools OSI-compatible
+for bioconda (D-3) while making the ask visible on every run.

@@ -190,6 +190,17 @@ pub fn report_runtime(elapsed: Duration, total_reads: u64) {
         secs,
         if secs > 0.0 { format!("{:.0}", total_reads as f64 / secs) } else { "—".to_string() }
     );
+    cite();
+}
+
+/// The one-line citation request, printed at the end of every run (not under -q).
+/// fastprep belongs to the Mandrillus Project (DECISIONS D-9).
+pub fn cite() {
+    eprintln!(
+        "If you use fastprep in published research, please cite: \
+         Ribes R., Mandier C., Baniel A. FastSuite. https://github.com/RaphaelRibes/FastSuite \
+         (fastprep and fastdedup: Mandrillus Project; bioRxiv 2026, doi:10.64898/2026.04.29.721745)"
+    );
 }
 
 pub fn pct(num: u64, den: u64) -> String {

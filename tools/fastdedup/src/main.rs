@@ -375,6 +375,12 @@ fn main() -> Result<()> {
             args.threads,
             elapsed
         );
+        // Citation request (MIT stays permissive; this is the community-norm ask).
+        eprintln!(
+            "If you use fastdedup in published research, please cite: \
+             Ribes R., Mandier C., Baniel A. FastDedup: a fast and memory-efficient tool for \
+             read deduplication. bioRxiv 2026, doi:10.64898/2026.04.29.721745"
+        );
     }
 
     if let Some(path) = &args.json {

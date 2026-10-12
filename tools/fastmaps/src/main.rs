@@ -202,6 +202,11 @@ fn main() {
         state.counts.len(),
         state.total_reads
     );
+    // Citation request (MIT stays permissive; this is the community-norm ask).
+    eprintln!(
+        "If you use fastmaps in published research, please cite: \
+         Ribes R. FastSuite — fastmaps. https://github.com/RaphaelRibes/FastSuite"
+    );
 
     // Build u32-keyed map for PNG/HTML before write_format consumes state.
     let counts_u32: HashMap<(u32, u32), (u64, f64)> = state
