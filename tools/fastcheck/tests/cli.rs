@@ -382,6 +382,24 @@ fn max_mem_flag_is_accepted_and_the_projection_is_printed_before_the_scan() {
 }
 
 #[test]
+fn a_projection_above_max_mem_refuses_before_reading() {
+    let d = tmpdir("refuse");
+    let fq = write_fixture(&d);
+    // 1 MB ceiling against a ~6 MB projection on the 6-read fixture: it must refuse.
+    let (stdout, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--max-mem", "1", "-q"],
+    );
+    assert_ne!(code, 0, "must refuse: {stdout}{stderr}");
+    assert!(stdout.is_empty(), "no report may be written on refusal: {stdout}");
+    assert!(stderr.contains("fingerprint table"), "{stderr}");
+    assert!(stderr.contains("limited to"), "{stderr}");
+    assert!(stderr.contains("--overrep-mode none"), "{stderr}"); // a way out
+    // The refusal must happen before any numbers are printed.
+    assert!(!stderr.contains("accumulator state"), "{stderr}");
+}
+
+#[test]
 fn processed_files_produce_a_before_after_report() {
     let d = tmpdir("cmp");
     let fq = write_fixture(&d);

@@ -92,6 +92,44 @@ fn main() -> Result<()> {
         fp_proj.buckets,
     );
 
+    // An explicit --max-mem overrides discovery, but only DOWNWARDS: it cannot authorise
+    // exceeding a cgroup limit. (fastprep's rule, D-1 copy.)
+    let discovered = memory::discover();
+    let limit_bytes = cli
+        .max_mem
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .into_iter()
+        .chain(discovered.as_ref().map(|l| l.bytes))
+        .min();
+    let limit = limit_bytes.map(|bytes| memory::Limit {
+        bytes,
+        source: discovered
+            .as_ref()
+            .filter(|l| l.bytes == bytes)
+            .map(|l| l.source.clone())
+            .unwrap_or(memory::LimitSource::RlimitAs), // an explicit --max-mem is a soft cap
+    });
+
+    match memory::admit(fp_proj.bytes, limit.as_ref()) {
+        memory::Admission::Refuse { projected, limit, source } => anyhow::bail!(
+            "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
+             but this process is limited to {:.1} MB ({})\n\
+             --max-mem <MB>           raise the ceiling (it cannot exceed the cgroup limit)\n\
+             --overrep-mode none      run without the duplication table entirely\n\
+             reread the file with a smaller --reads budget to bound the estimate",
+            memory::mib(projected),
+            fp_proj.buckets,
+            memory::mib(limit),
+            source,
+        ),
+        memory::Admission::ProceedWithWarning { headroom_bytes } => eprintln!(
+            "fastcheck: warning: fingerprint table projected at {:.1} MB, leaving only {:.1} MB headroom",
+            memory::mib(fp_proj.bytes),
+            memory::mib(headroom_bytes),
+        ),
+        memory::Admission::Proceed => {}
+    }
+
     // A single file already has all the parallelism it can use inside the
     // BGZF inflate pool; several files are scanned concurrently.
     let reports: Vec<FileReport> = if files.len() == 1 || threads <= 1 {
