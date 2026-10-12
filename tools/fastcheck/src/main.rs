@@ -15,6 +15,7 @@ mod profile;
 mod repeated;
 mod rich;
 mod insert;
+mod memory;
 mod reader;
 mod report;
 
