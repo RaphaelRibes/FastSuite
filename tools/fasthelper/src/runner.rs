@@ -152,6 +152,9 @@ fn argv_for(
     gz: u8,
     extra: &[String],
     maps_dir: &Path,
+    simulate: Option<&crate::config::Simulate>,
+    sim_prefix: &Path,
+    config_dir: &Path,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     match tool {
@@ -203,6 +206,37 @@ fn argv_for(
                 a.push(s(r2));
             }
         }
+        "fastcheck" => {
+            // fastcheck takes positional FASTQ files, never -1/-2/-o; it
+            // writes only reports. --json is mandatory so the run directory
+            // always carries a fastsuite.report.v1 for the aggregator.
+            a.push(s(in1));
+            if let Some(r2) = in2 {
+                a.push(s(r2));
+            }
+            a.push("--json".into());
+            a.push(s(json));
+        }
+        "fastsim" => {
+            // simulate-only: the generated FASTQs are inputs, not outputs.
+            if let Some(sim) = simulate {
+                a.push("--pairs".into());
+                a.push(sim.pairs.to_string());
+                a.push("--out".into());
+                a.push(s(&sim_prefix));
+                a.push("--json".into());
+                a.push(s(json));
+                if let Some(prof) = &sim.profile {
+                    a.push("--profile".into());
+                    a.push(s(&resolve_rel(prof, config_dir)));
+                }
+                if let Some(seed) = sim.seed {
+                    a.push("--seed".into());
+                    a.push(seed.to_string());
+                }
+                a.extend(sim.args.iter().cloned());
+            }
+        }
         _ => {}
     }
     a.extend(extra.iter().cloned());
@@ -242,6 +276,15 @@ pub fn run(args: &RunArgs) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     let mut samples = cfg.samples.clone();
+    // sim_prefix is only meaningful when fastsim is a step; the argv builder
+    // needs it in scope either way. fastsim does not create its own output
+    // directory, so when it runs as a step the runner must make it first.
+    let sim_prefix = outdir.join(&cfg.simulate.name).join("sim");
+    if cfg.run.steps.iter().any(|s| s == "fastsim") {
+        if let Some(dir) = sim_prefix.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
 
     // Optional synthetic control: generate a known-truth sample and push it
     // through the same chain.
@@ -345,6 +388,18 @@ pub fn run(args: &RunArgs) -> Result<()> {
                     work.join("maps").join("heatmap.json"),
                     work.join("maps"),
                 ),
+                "fastcheck" => (
+                    PathBuf::new(), // no FASTQ output
+                    None,
+                    work.join("fastcheck.json"),
+                    work.join("maps"), // unused; the aggregator reads the JSON
+                ),
+                "fastsim" => (
+                    PathBuf::new(), // simulate-only: the generated FASTQs are inputs
+                    None,
+                    work.join("fastsim.json"),
+                    work.join("maps"), // unused
+                ),
                 other => {
                     eprintln!("fasthelper: unsupported step '{other}' — skipped");
                     continue;
@@ -361,6 +416,13 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 cfg.run.gz_level,
                 &step.args,
                 &maps_dir,
+                if tool == "fastsim" {
+                    Some(&cfg.simulate)
+                } else {
+                    None
+                },
+                &sim_prefix,
+                &config_dir,
             );
             let log = logs.join(format!("{}.{}.log", sample.name, tool));
             let outcome = run_step(tool, &bin, &argv, &log, args.dry_run, None)?;

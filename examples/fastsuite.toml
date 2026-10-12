@@ -49,3 +49,9 @@ args = ["--adapter-preset", "nextera", "--r2-scan-reverse", "--min-len", "0.6L",
 
 [steps.fastdedup]
 args = ["--pre-count"]
+
+# fastcheck is the terminal QC step: it reads the chain's current FASTQs and
+# writes fastsuite.report.v1 + a fastsim profile, never a new FASTQ. It has no
+# output to feed a later step, so list it last. Extra flags go here too.
+# [steps.fastcheck]
+# args = ["--insert-hist", "--max-read-len", "300"]

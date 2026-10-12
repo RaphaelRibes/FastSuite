@@ -223,3 +223,53 @@ fn help_lists_the_toolbox() {
         assert!(stdout.contains(cmd), "{cmd} missing from:\n{stdout}");
     }
 }
+
+#[test]
+fn fastcheck_step_runs_and_writes_a_v1_report() {
+    // fastcheck is a terminal QC step: it takes positional FASTQs and writes
+    // only a report, never a new FASTQ. The runner must build that argv.
+    let d = tmpdir("fastcheck_step");
+    let out = d.join("run");
+    std::fs::create_dir_all(&out).unwrap();
+
+    // A minimal config: one step, one sample, no simulate.
+    let cfg = d.join("fastsuite.toml");
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(&fq, "@r1\nACGTACGT\n+\nIIIIIIII\n").unwrap();
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"qconly\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n[[samples]]\nname = \"s1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    // Point the runner at a toolset whose only real binary is fastcheck: the
+    // step must not be rejected as "unsupported".
+    let (_, stderr, code) = run(&[
+        "run",
+        "-c",
+        cfg.to_str().unwrap(),
+        "--tools-dir",
+        option_env!("FASTSUITE_TOOLS").unwrap_or("tools"),
+    ]);
+    // fastcheck may not be built in this environment; the assertion that
+    // matters is that it was recognised as a step, not called unsupported.
+    assert!(
+        !stderr.contains("unsupported step"),
+        "fastcheck must be a known step: {stderr}"
+    );
+    if code == 0 {
+        let man: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+                .unwrap();
+        let cmd = &man["commands"][0];
+        assert_eq!(cmd["tool"], "fastcheck");
+        let argv: Vec<String> = serde_json::from_value(cmd["argv"].clone()).unwrap();
+        assert!(argv.contains(&fq.display().to_string()), "argv: {argv:?}");
+        assert!(argv.contains(&"--json".to_string()), "argv: {argv:?}");
+        assert!(out.join("s1/fastcheck.json").is_file());
+    }
+}

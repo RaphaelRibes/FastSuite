@@ -37,7 +37,7 @@ pub struct Run {
     /// gzip level handed to each tool via --gz-level.
     #[serde(default = "default_gz")]
     pub gz_level: u8,
-    /// Steps to execute, in order. Supported: fastdedup, fastprep, fastmaps.
+    /// Steps to execute, in order. Supported: fastdedup, fastprep, fastmaps, fastcheck.
     #[serde(default = "default_steps")]
     pub steps: Vec<String>,
     /// Directory holding the tool checkouts (…/fastdedup, …/fastprep, …).
