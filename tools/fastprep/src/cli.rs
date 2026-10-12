@@ -108,6 +108,24 @@ pub struct Cli {
     #[arg(long, help_heading = "Runtime")]
     pub strict: bool,
 
+    /// Overwrite an existing -o/-p (and --metadata/--json/--singletons*)
+    /// instead of refusing. Without it fastprep exits 1 naming the file
+    /// that is in the way, so a re-run cannot silently destroy a finished
+    /// result.
+    #[arg(long, short = 'f', help_heading = "Runtime")]
+    pub force: bool,
+
+    /// Compute every counter, read the input, and write nothing: no output
+    /// FASTQ, no metadata, no --json report. The summary still goes to
+    /// stderr, so a dry run is exactly what a real run would have reported.
+    #[arg(long, help_heading = "Runtime")]
+    pub dry_run: bool,
+
+    /// Suppress the progress and end-of-run summary stream. Warnings and
+    /// errors still print: -q never hides a reason a run went wrong.
+    #[arg(long, short = 'q', help_heading = "Runtime")]
+    pub quiet: bool,
+
 
     /// Maximum mismatch rate for adapter sequence matching [0, 1].
     #[arg(long, default_value_t = 0.2, value_name = "FLOAT", help_heading = "Adapter Trimming")]
@@ -420,6 +438,19 @@ fn peek_sequences(path: &Path, n: usize) -> Result<Vec<Vec<u8>>> {
 }
 
 impl Cli {
+    /// Every path this run would create or replace, in the order they are
+    /// committed. Used by the `--force` clobber check: refusing on the first
+    /// one that exists is what makes the message name a real file.
+    fn out_paths(&self) -> Vec<PathBuf> {
+        let mut v = vec![self.out1.clone()];
+        if let Some(p) = &self.out2 { v.push(p.clone()); }
+        if let Some(p) = &self.singletons1 { v.push(p.clone()); }
+        if let Some(p) = &self.singletons2 { v.push(p.clone()); }
+        if let Some(p) = &self.metadata { v.push(p.clone()); }
+        if let Some(p) = &self.json { v.push(p.clone()); }
+        v
+    }
+
     pub fn finalize(self) -> Result<(Mode, Runtime)> {
         // Paired-end consistency.
         let paired = self.in2.is_some();
@@ -472,6 +503,21 @@ impl Cli {
 
         if self.target.len() > 5 { bail!("--target may be given at most 5 times"); }
         let rule = build_match_rule(&self.target)?;
+
+        // --force: refuse to clobber any existing output. A dry run writes
+        // nothing, so it never has to refuse (CLI-SPEC §1).
+        if !self.force && !self.dry_run {
+            for p in self
+                .out_paths()
+                .iter()
+                .filter(|p| p.as_path().exists())
+            {
+                bail!(
+                    "{} already exists; pass --force (-f) to overwrite it",
+                    p.display()
+                );
+            }
+        }
 
         // Build adapter source.
         let adapter_source = if self.no_adapter {
