@@ -225,6 +225,44 @@ fn help_lists_the_toolbox() {
 }
 
 #[test]
+fn check_rejects_unknown_step_and_missing_input() {
+    let d = tmpdir("check");
+    let cfg = d.join("bad.toml");
+    std::fs::write(
+        &cfg,
+        "[run]\nsteps = [\"fastnope\"]\n\n[[samples]]\nname = \"s1\"\nr1 = \"nope_R1.fastq\"\n",
+    )
+    .unwrap();
+    let (_, stderr, code) = run(&["check", "-c", cfg.to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("fastnope"), "must name the bad step: {stderr}");
+    assert!(stderr.contains("nope_R1.fastq"), "must name the missing input: {stderr}");
+
+    let ok_cfg = d.join("ok.toml");
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(&fq, "@r1\nACGT\n+\nIIII\n").unwrap();
+    std::fs::write(
+        &ok_cfg,
+        format!(
+            "[run]\nsteps = [\"fastcheck\"]\n\n[[samples]]\nname = \"s1\"\nr1 = \"{}\"\n",
+            fq.display()
+        ),
+    )
+    .unwrap();
+    // tools-dir pointing at the repo root: fastcheck may or may not resolve,
+    // so accept either a clean pass or a clean "binary not found" refusal —
+    // never a crash.
+    let (_, stderr2, code2) = run(&[
+        "check",
+        "-c",
+        ok_cfg.to_str().unwrap(),
+        "--tools-dir",
+        &std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()),
+    ]);
+    assert!(code2 == 0 || stderr2.contains("not found"), "{code2} {stderr2}");
+}
+
+#[test]
 fn fastcheck_step_runs_and_writes_a_v1_report() {
     // fastcheck is a terminal QC step: it takes positional FASTQs and writes
     // only a report, never a new FASTQ. The runner must build that argv.

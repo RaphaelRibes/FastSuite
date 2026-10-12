@@ -10,3 +10,4 @@ pub mod positions;
 pub mod compare;
 pub mod report;
 pub mod runner;
+pub mod check;

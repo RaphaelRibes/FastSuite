@@ -33,6 +33,8 @@ pub enum Cmd {
     Compare(CompareArgs),
     /// Check that the FastSuite binaries are found and runnable.
     Doctor(DoctorArgs),
+    /// Validate a run config: inputs exist, tools resolve, steps and flags are known.
+    Check(CheckArgs),
     /// Print the report schema (version, fields, how each tool contributes).
     Schema,
 }
@@ -118,6 +120,16 @@ pub struct CompareArgs {
 
 #[derive(Args, Debug)]
 pub struct DoctorArgs {
+    /// Directory holding the tool checkouts (default: this crate's parent, then $FASTSUITE_TOOLS_DIR).
+    #[arg(long, env = "FASTSUITE_TOOLS_DIR")]
+    pub tools_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct CheckArgs {
+    /// Path to the run config (TOML).
+    #[arg(short = 'c', long)]
+    pub config: PathBuf,
     /// Directory holding the tool checkouts (default: this crate's parent, then $FASTSUITE_TOOLS_DIR).
     #[arg(long, env = "FASTSUITE_TOOLS_DIR")]
     pub tools_dir: Option<PathBuf>,

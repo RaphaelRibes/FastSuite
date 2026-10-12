@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         }
         cli::Cmd::Compare(a) => fasthelper::compare::cmd_compare(&a.before, &a.after, &a.outdir),
         cli::Cmd::Doctor(a) => runner::doctor(&a),
+        cli::Cmd::Check(a) => fasthelper::check::cmd_check(&a),
         cli::Cmd::Schema => {
             print!("{}", report::SCHEMA_DOC);
             Ok(())
