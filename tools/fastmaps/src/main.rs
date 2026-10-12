@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use clap::Parser;
 
@@ -26,6 +27,7 @@ use spiller::spiller_thread;
 use worker::{flush_local, CornerExtractor, SpillerMsg, WorkerCfg, WorkerLocal};
 
 fn main() {
+    let started = Instant::now();
     let args = Args::parse();
 
     // ── Validate --preview-reads ──────────────────────────────────────────
@@ -58,6 +60,11 @@ fn main() {
         eprintln!("Cannot create output dir {}: {e}", output_dir.display());
         std::process::exit(1);
     });
+
+    // Grid JSON destination: --json redirects it (and adds the v1 wrapper
+    // next to it); otherwise the historical <output-dir>/heatmap.json.
+    let with_wrapper = args.json.is_some();
+    let json_path = args.json.clone().unwrap_or_else(|| output_dir.join("heatmap.json"));
 
     // ── Temp directory ────────────────────────────────────────────────────
     let temp_dir: PathBuf = args.temp_dir.unwrap_or_else(|| {
@@ -234,7 +241,11 @@ fn main() {
         .map(|(&(x, y), &v)| ((x as u32, y as u32), v))
         .collect();
 
-    if let Err(e) = write_format(state, &files, &file_kinds, args.preview_reads, &output_dir) {
+    if let Err(e) = write_format(
+        state, &files, &file_kinds, args.preview_reads, &output_dir, &json_path,
+        with_wrapper,
+        started.elapsed().as_secs_f64(),
+    ) {
         eprintln!("Error writing heatmap files: {e}");
         std::process::exit(1);
     }

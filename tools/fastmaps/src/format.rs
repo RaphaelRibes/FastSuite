@@ -138,6 +138,9 @@ pub fn write_format(
     file_kinds: &[FileKind],
     preview_n: usize,
     output_dir: &Path,
+    json_path: &Path,
+    with_wrapper: bool,
+    elapsed_s: f64,
 ) -> std::io::Result<()> {
     let size = (state.max_seq_len + 1) as usize;
     if size > u16::MAX as usize {
@@ -208,7 +211,11 @@ pub fn write_format(
         counts_r2_arr[y as usize * size + x as usize] = c;
     }
 
-    // Per-file counts, ordered by file index.
+    // Corner metrics (formerly derived by fasthelper from this very file).
+    let metrics = crate::report::corner_metrics(
+        size as u32,
+        &[("", &counts_arr), ("r1", &counts_r1_arr), ("r2", &counts_r2_arr)],
+    );
     let per_file_json = (0..files.len())
         .map(|i| {
             state
@@ -261,15 +268,38 @@ pub fn write_format(
         poff      = preview_offsets.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(","),
     );
 
-    let mut jf = BufWriter::new(File::create(output_dir.join("heatmap.json"))?);
+    let mut jf = BufWriter::new(File::create(json_path)?);
     jf.write_all(json.as_bytes())?;
     jf.flush()?;
+
+    // The v1 wrapper lands next to the grid JSON as <stem>.report.json —
+    // only when --json redirected the grid (the historical
+    // <output-dir>/heatmap.json default keeps its bare, wrapper-free shape).
+    let stem = json_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "heatmap".into());
+    let mut wrapper_suffix = String::new();
+    if with_wrapper {
+        if let Some(parent) = json_path.parent() {
+            let wrapper = parent.join(format!("{stem}.report.json"));
+            crate::report::write_report_v1(
+                &wrapper,
+                &std::env::args().collect::<Vec<_>>().join(" "),
+                elapsed_s,
+                files,
+                &metrics,
+            )?;
+            wrapper_suffix = format!(" + {stem}.report.json");
+        }
+    }
 
     println!(
         "Saved heatmap.data ({data_written} B), \
          heatmap.preview ({preview_written} B), \
-         heatmap.json (size={size}, {} reads)",
-        state.total_reads
+         heatmap.json (size={size}, {} reads){}",
+        state.total_reads,
+        wrapper_suffix,
     );
     Ok(())
 }
