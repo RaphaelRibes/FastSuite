@@ -652,6 +652,108 @@ pub fn write_reports(
     Ok(written)
 }
 
+/// One `metric OP value` threshold, e.g. `polyG_frac>0.05`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    Gt,
+    Lt,
+    Ge,
+    Le,
+    Eq,
+    Ne,
+}
+
+impl Op {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Op::Gt => ">",
+            Op::Lt => "<",
+            Op::Ge => ">=",
+            Op::Le => "<=",
+            Op::Eq => "==",
+            Op::Ne => "!=",
+        }
+    }
+}
+
+/// One `metric OP value` threshold, e.g. `polyG_frac>0.05`.
+#[derive(Debug, Clone)]
+pub struct Threshold {
+    pub metric: String,
+    pub op: Op,
+    pub value: f64,
+}
+
+impl Threshold {
+    /// Parse `metric>0.05` / `reads<=100` / ... Ops: > < >= <= == !=.
+    pub fn parse(expr: &str) -> Result<Self> {
+        // Two-char operators first, so `>=` is never read as `>`.
+        const OPS: &[(&str, Op)] = &[
+            (">=", Op::Ge),
+            ("<=", Op::Le),
+            ("==", Op::Eq),
+            ("!=", Op::Ne),
+            (">", Op::Gt),
+            ("<", Op::Lt),
+        ];
+        for (op, kind) in OPS {
+            if let Some(i) = expr.find(op) {
+                let metric = expr[..i].trim().to_string();
+                let value: f64 = expr[i + op.len()..]
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("parsing threshold '{expr}': value is not a number"))?;
+                if metric.is_empty() {
+                    anyhow::bail!("threshold '{expr}' has no metric name");
+                }
+                return Ok(Threshold {
+                    metric,
+                    op: kind.clone(),
+                    value,
+                });
+            }
+        }
+        anyhow::bail!("threshold '{expr}' is not METRIC OP VALUE (ops: > < >= <= == !=)");
+    }
+
+    pub fn tripped(&self, actual: f64) -> bool {
+        match self.op {
+            Op::Gt => actual > self.value,
+            Op::Lt => actual < self.value,
+            Op::Ge => actual >= self.value,
+            Op::Le => actual <= self.value,
+            Op::Eq => (actual - self.value).abs() < 1e-12,
+            Op::Ne => (actual - self.value).abs() >= 1e-12,
+        }
+    }
+}
+
+/// Evaluate thresholds against the aggregated metrics (last value wins).
+/// Returns the tripped descriptions, e.g. `polyG_frac=0.12 > 0.05`.
+pub fn evaluate_thresholds(reports: &[ToolReport], thresholds: &[Threshold]) -> Vec<String> {
+    let mut values: BTreeMap<String, f64> = BTreeMap::new();
+    for r in reports {
+        for (k, v) in &r.metrics {
+            values.insert(k.clone(), *v);
+        }
+    }
+    let mut out = Vec::new();
+    for t in thresholds {
+        if let Some(actual) = values.get(&t.metric) {
+            if t.tripped(*actual) {
+                out.push(format!(
+                    "{}={} {} {}",
+                    t.metric,
+                    actual,
+                    t.op.as_str(),
+                    t.value
+                ));
+            }
+        }
+    }
+    out
+}
+
 pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
     let reports = collect(&a.inputs, a.sample.as_deref())?;
     if reports.is_empty() {
@@ -667,6 +769,24 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
     let formats: Vec<String> = a.format.split(',').map(|s| s.trim().to_string()).collect();
     let title = "FastSuite report";
     let written = write_reports(title, &reports, &a.outdir, &formats)?;
+    if !a.fail_on.is_empty() {
+        let thresholds: Vec<Threshold> = a
+            .fail_on
+            .iter()
+            .map(|s| Threshold::parse(s))
+            .collect::<Result<Vec<_>>>()?;
+        let tripped = evaluate_thresholds(&reports, &thresholds);
+        if !tripped.is_empty() {
+            for t in &tripped {
+                eprintln!("fasthelper: threshold tripped: {t}");
+            }
+            eprintln!(
+                "fasthelper: {} threshold(s) tripped — report written, exiting 2",
+                tripped.len()
+            );
+            std::process::exit(2);
+        }
+    }
     if a.stdout {
         print!("{}", matrix_tsv(&build_matrix(&reports)));
     }

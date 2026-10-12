@@ -101,6 +101,11 @@ pub struct ReportArgs {
     /// Print the aggregated table to stdout.
     #[arg(long)]
     pub stdout: bool,
+
+    /// Fail (exit 2) when a metric breaks the rule, e.g. --fail-on polyG_frac>0.05.
+    /// Repeatable. Exit 2 = "ran fine, but a threshold tripped" (CLI-SPEC §5).
+    #[arg(long = "fail-on", value_name = "METRIC>OP>VALUE")]
+    pub fail_on: Vec<String>,
 }
 
 #[derive(Args, Debug)]

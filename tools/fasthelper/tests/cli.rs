@@ -225,6 +225,33 @@ fn help_lists_the_toolbox() {
 }
 
 #[test]
+fn fail_on_trips_exit_2_and_names_the_metric() {
+    let d = tmpdir("failon");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    write_report(&reports, "sampleA.json", 100, 0.60); // gc_fraction 0.60
+
+    let (_, stderr, code) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "--fail-on",
+        "gc_fraction>0.5",
+    ]);
+    assert_eq!(code, 2, "threshold tripped must be exit 2: {stderr}");
+    assert!(stderr.contains("gc_fraction"), "must name the metric: {stderr}");
+    // The report is still written before the exit.
+    assert!(d.join("report.tsv").is_file() || Path::new("report.tsv").is_file());
+
+    let (_, _, ok) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "--fail-on",
+        "gc_fraction>0.9",
+    ]);
+    assert_eq!(ok, 0, "a satisfied threshold must stay exit 0");
+}
+
+#[test]
 fn check_rejects_unknown_step_and_missing_input() {
     let d = tmpdir("check");
     let cfg = d.join("bad.toml");
