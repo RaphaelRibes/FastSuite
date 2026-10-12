@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "fastcheck: exact one-pass FASTQ quality control"
+abstract: "Every FastQC question answered exactly, in one pass: per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, polyX run lengths, over-represented sequences, k-mer content — no sampling, no hidden thresholds, no verdicts."
+authors:
+  - family-names: Ribes
+    given-names: Raphaël
+    affiliation: "ISDM, Université de Montpellier, CIRAD, INSERM, Montpellier, France"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+date-released: "2026-10-12"
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/RaphaelRibes/FastSuite"
+keywords:
+  - fastq
+  - quality control
+  - fastqc
+  - per-base-quality
+  - duplication

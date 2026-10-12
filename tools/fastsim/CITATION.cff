@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "fastsim: NovaSeq-like paired-end read simulator with exact ground truth"
+abstract: "Generates synthetic NovaSeq-like sequencing reads with artefact CDFs, per-position quality curves, adapter readthrough, PCR duplicates and a must-drop class, driven by a profile measured from real data or fitted by fastcheck — the ground truth that makes trimming benchmarks exact."
+authors:
+  - family-names: Ribes
+    given-names: Raphaël
+    affiliation: "ISDM, Université de Montpellier, CIRAD, INSERM, Montpellier, France"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+date-released: "2026-10-12"
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/RaphaelRibes/FastSuite"
+keywords:
+  - read-simulator
+  - benchmark
+  - ground-truth
+  - novaseq
+  - polyg

@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "fastprep: asymmetric quality-weighted polyX trimming for FASTQ/FASTA reads"
+abstract: "Quality-weighted adapter and polyX trimming at 5', 3' and in the interior of reads, with quality filtering, hard trimming, length filtering and optional PCR deduplication, in a single pass."
+authors:
+  - family-names: Ribes
+    given-names: Raphaël
+    affiliation: "ISDM, Université de Montpellier, CIRAD, INSERM, Montpellier, France"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+  - family-names: Mandier
+    given-names: Céline
+    affiliation: "ISDM, Université de Montpellier, CIRAD, INSERM, Montpellier, France"
+  - family-names: Baniel
+    given-names: Alice
+    affiliation: "ISEM, Université de Montpellier, CNRS, IRD, Montpellier, France"
+date-released: "2026-10-12"
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/RaphaelRibes/FastSuite"
+keywords:
+  - fastq
+  - trimming
+  - adapter
+  - polyg
+  - quality control
+  - preprocessing

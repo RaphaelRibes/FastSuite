@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "FastDedup: a fast and memory-efficient tool for read deduplication"
+abstract: "Exact PCR-duplicate removal from FASTQ/FASTA reads using deterministic 64/128-bit fingerprints: O(N) memory, no Bloom-filter false positives."
+authors:
+  - family-names: Ribes
+    given-names: Raphaël
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+    affiliation: "ISDM, Université de Montpellier, CIRAD, INSERM, Montpellier, France"
+  - family-names: Mandier
+    given-names: Céline
+    affiliation: "ISDM, Université de Montpellier, CIRAD, INSERM, Montpellier, France"
+  - family-names: Baniel
+    given-names: Alice
+    affiliation: "ISEM, Université de Montpellier, CNRS, IRD, Montpellier, France"
+date-released: "2026-04-29"
+version: 1.3.0
+license: MIT
+repository-code: "https://github.com/RaphaelRibes/FastDedup"
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Ribes
+      given-names: Raphaël
+    - family-names: Mandier
+      given-names: Céline
+    - family-names: Baniel
+      given-names: Alice
+  title: "FastDedup: a fast and memory-efficient tool for read deduplication"
+  journal: "bioRxiv"
+  year: 2026
+  doi: "10.64898/2026.04.29.721745"
+  url: "https://www.biorxiv.org/content/10.64898/2026.04.29.721745v1"
