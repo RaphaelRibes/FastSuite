@@ -35,7 +35,7 @@ def main() -> int:
             check=True,
         )
         mine = json.loads(js.read_text())
-        got_rows = [l.split("\t") for l in tsv.read_text().splitlines()[1:]]
+        got_rows = [l.split("\t") for l in tsv.read_text().splitlines()]
 
     ref = json.loads(
         subprocess.run(
@@ -73,24 +73,33 @@ def main() -> int:
                 if a.get(k) != b.get(k):
                     failures.append(f"{block}[{k}]: fastcheck={a.get(k)} reference={b.get(k)}")
 
-    # 3. Per-position table, every column.
+    # 3. Per-position table, every column, read BY NAME from the header so adding a
+    #    column (g_frac, polyx3_frac, ...) cannot break the comparison.
     ref_rows = ref["positions"]
-    if len(got_rows) != len(ref_rows):
-        failures.append(f"positions: fastcheck has {len(got_rows)} rows, reference {len(ref_rows)}")
-    else:
-        for gr, rr in zip(got_rows, ref_rows):
-            pos, a, c, g, t, n, depth, mean_q, q10, q50, q90 = gr
-            for name, got, want in (
-                ("a", int(a), rr["a"]), ("c", int(c), rr["c"]), ("g", int(g), rr["g"]),
-                ("t", int(t), rr["t"]), ("n", int(n), rr["n"]), ("depth", int(depth), rr["depth"]),
-            ):
-                if got != want:
-                    failures.append(f"pos {pos} {name}: fastcheck={got} reference={want}")
-            if abs(float(mean_q) - rr["mean_q"]) > 1e-3:
-                failures.append(f"pos {pos} mean_q: fastcheck={mean_q} reference={rr['mean_q']:.6f}")
-            for name, got in (("q10", q10), ("q50", q50), ("q90", q90)):
-                if abs(float(got) - rr[name]) > 1e-9:
-                    failures.append(f"pos {pos} {name}: fastcheck={got} reference={rr[name]}")
+    header = got_rows[0]
+    col = {name: i for i, name in enumerate(header)}
+    need = ["pos", "a", "c", "g", "t", "n", "depth", "mean_q", "q10", "q50", "q90"]
+    missing = [n for n in need if n not in col]
+    if missing:
+        failures.append(f"positions TSV missing columns: {missing}")
+    if len(got_rows) - 1 != len(ref_rows):
+        failures.append(
+            f"positions: fastcheck has {len(got_rows) - 1} rows, reference {len(ref_rows)}"
+        )
+    elif not missing:
+        for gr, rr in zip(got_rows[1:], ref_rows):
+            g = lambda name: gr[col[name]]
+            for name in ("a", "c", "g", "t", "n", "depth"):
+                got_i, want_i = int(g(name)), rr[name]
+                if got_i != want_i:
+                    failures.append(f"pos {g('pos')} {name}: fastcheck={got_i} reference={want_i}")
+            if abs(float(g("mean_q")) - rr["mean_q"]) > 1e-3:
+                failures.append(
+                    f"pos {g('pos')} mean_q: fastcheck={g('mean_q')} reference={rr['mean_q']:.6f}"
+                )
+            for name in ("q10", "q50", "q90"):
+                if abs(float(g(name)) - rr[name]) > 1e-9:
+                    failures.append(f"pos {g('pos')} {name}: fastcheck={g(name)} reference={rr[name]}")
 
     if failures:
         print(f"DIFFERENTIAL FAILED ({len(failures)} differences) on {args.path}")
