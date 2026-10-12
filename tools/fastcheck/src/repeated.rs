@@ -5,6 +5,12 @@
 //! over-represented, and losing its first occurrence costs at most 1 of a count
 //! that must reach a large threshold to be reported, so memory stays bounded on
 //! 50 M-read files while the frequent sequences are counted exactly.
+//!
+//! SCOPE (as of the exactness work): this counter is used for the **k-mer spectrum only**.
+//! Full-sequence duplication and over-representation moved to the exact fingerprint table
+//! (`crate::fingerprint`) and the packed sequence table (`crate::overrep`), because a
+//! fingerprint is 8 B where a sequence is 46 B and the exactness is affordable. The
+//! approximation that remains is labelled in the report (`kmer_spectrum.approximate`).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -127,5 +133,36 @@ mod tests {
         assert_eq!(v, 0b00011011, "A=00 C=01 G=10 T=11 -> 0b00011011");
         assert_eq!(unpack_kmer(v, 4), "ACGT");
         assert_eq!(pack_kmer(b"ACGN"), None, "N cannot be packed");
+    }
+
+    /// The approximation, stated as a bound rather than hidden: a singleton evicted before
+    /// its second occurrence costs exactly 1 count. This is why the counter is only used
+    /// below the 0.1% reporting threshold, where 1 count cannot change a verdict.
+    #[test]
+    fn eviction_costs_at_most_one_count_per_evicted_singleton() {
+        let mut c = RepeatedCounter::new(4);
+        // 4 distinct singletons fill the cap; the 5th distinct key triggers an eviction
+        // that removes all four.
+        for i in 0..4u8 {
+            c.insert(vec![i]);
+        }
+        assert_eq!(c.len(), 4);
+        c.insert(vec![9]); // over the cap -> retain(count > 1) drops all four singletons
+        // The new key is itself a singleton, so the eviction takes it too: the map is
+        // empty, not "the just-inserted key survives". The bound is on the COST, not on
+        // which key is kept — each evicted singleton had exactly one occurrence.
+        assert_eq!(c.len(), 0, "every key was a singleton, so all are evicted");
+        // The frequent key is counted exactly once it clears 1.
+        let mut c = RepeatedCounter::new(4);
+        for _ in 0..3 {
+            c.insert(b"ACGT".to_vec());
+        }
+        for i in 0..4u8 {
+            c.insert(vec![i]);
+        }
+        c.insert(vec![9]);
+        let rep = c.report(2);
+        assert_eq!(rep.len(), 1);
+        assert_eq!(rep[0].1, 3, "the frequent key survives with its exact count");
     }
 }

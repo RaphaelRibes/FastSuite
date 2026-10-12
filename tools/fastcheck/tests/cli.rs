@@ -400,6 +400,20 @@ fn a_projection_above_max_mem_refuses_before_reading() {
 }
 
 #[test]
+fn the_kmer_spectrum_is_labelled_approximate_because_its_counter_evicts() {
+    let d = tmpdir("kmer_approx");
+    let fq = write_fixture(&d);
+    let json = d.join("k.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
+    let v = read_json(&json);
+    assert_eq!(v["kmer_spectrum"]["approximate"], true);
+    // The approximation and its bound must be stated, not implied.
+    let note = v["kmer_spectrum"]["approximation"].as_str().unwrap();
+    assert!(note.contains("singleton"), "{note}");
+    assert!(note.contains("evict"), "{note}");
+}
+
+#[test]
 fn processed_files_produce_a_before_after_report() {
     let d = tmpdir("cmp");
     let fq = write_fixture(&d);

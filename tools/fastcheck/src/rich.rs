@@ -124,7 +124,19 @@ pub fn kmer_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
             })
         })
         .collect();
-    (m, json!(list))
+    (
+        m,
+        json!({
+            "approximate": true,
+            "approximation": "the 12-mer counter is bounded at 1e6 distinct keys and evicts \
+                              singletons when it overflows: a k-mer whose every occurrence \
+                              was evicted loses its count entirely, and one whose first \
+                              occurrence was evicted loses exactly 1. Counts are exact for \
+                              k-mers above the 0.1% reporting threshold; below it the number \
+                              is a lower bound.",
+            "top": list,
+        }),
+    )
 }
 
 /// Heatmap: metrics (peak + its cell) + the grid block.
