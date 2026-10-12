@@ -1,13 +1,15 @@
 #!/bin/bash
 # Local parse check: the REAL measured mandril profile against the fixed binary.
 set -e
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 
 # pull the real profile from the cluster
-timeout 60 scp -q -o BatchMode=yes Io:/scratch/users/ribesr/novaseq-sim/profiles/mandril_E.json profiles/mandril_E.json
+timeout 60 scp -q -o BatchMode=yes Io:/scratch/users/$USER/FastSuite/tools/fastsim/profiles/mandril_E.json profiles/mandril_E.json
 
 echo "=== parse + small run with the real profile ==="
-./target/release/novaseq-sim \
+./target/release/fastsim \
   --pairs 100000 \
   --profile profiles/mandril_E.json \
   --out /tmp/nvsq_real \
@@ -17,7 +19,9 @@ echo "=== parse + small run with the real profile ==="
 echo "=== sanity: tail rate from GT ==="
 python3 - <<'EOF'
 import json
-prof = json.load(open("/home/raphael/hermes_scratch/novaseq-sim/profiles/mandril_E.json"))
+import os
+ROOT = os.environ.get("FASTSUITE_ROOT", "/scratch/users/ribesr/FastSuite")
+prof = json.load(open(f"{ROOT}/tools/fastsim/profiles/mandril_E.json"))
 total = sum(prof["tail"]["R1"].values())
 rate = sum(v for k, v in prof["tail"]["R1"].items() if int(k) >= 1) / total
 print(f"profile R1 tail rate (>=1): {rate:.4f}")

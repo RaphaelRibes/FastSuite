@@ -2,7 +2,9 @@
 # Rebuild profile with first-base-aware head deconvolution + qual_noise,
 # rebuild binary, resim 20M, validate.
 set -e
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 python3 scripts/build_profile.py local_work/stats profiles/mandril_E.json
 echo "PROFILE_REBUILT"
 cargo fmt

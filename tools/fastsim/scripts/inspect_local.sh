@@ -1,7 +1,9 @@
 #!/bin/bash
 # Inspect local_work state and run validation if sim files exist.
 set -e
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 echo "--- local_work tree ---"
 ls local_work/
 echo "--- venv? ---"

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=novaseq-validate
+#SBATCH --job-name=fastsim-validate
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
@@ -10,10 +10,13 @@
 #SBATCH --error=logs/validate_%j.err
 
 set -e
-cd /scratch/users/ribesr/novaseq-sim
+# Cluster-side: no $HOME here, so the root is the Io scratch checkout
+# (override with FASTSUITE_ROOT if the checkout lives elsewhere).
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-/scratch/users/$USER/FastSuite}"
+cd "$FASTSUITE_ROOT/tools/fastsim"
 mkdir -p logs profiles validation
 
-BIN=bin/novaseq-sim
+BIN="$FASTSUITE_ROOT/tools/fastsim/target/release/fastsim"
 PROFILE=profiles/mandril_E.json
 OUT=validation/sim_mandril
 

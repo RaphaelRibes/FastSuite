@@ -1,6 +1,8 @@
 #!/bin/bash
 # Validate the 20M sim (plain FASTQ) against the deconvolved profile.
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 PY=""
 for py in /usr/bin/python3 "$HOME/.pixi/bin/python" python3; do
   if [ -x "$py" ]; then

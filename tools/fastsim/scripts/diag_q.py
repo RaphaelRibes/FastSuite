@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Diagnose per-position Q diff: where is the max? Tail/head run fractions."""
 import json
+import os
 
-sim = json.load(open("/scratch/users/ribesr/novaseq-sim/validation/sim_profiled.json"))
-prof = json.load(open("/scratch/users/ribesr/novaseq-sim/profiles/mandril_E.json"))
+# Cluster-side checkout: resolve the root from the env with the literal
+# fallback. Path indirection only — no logic change.
+ROOT = os.environ.get("FASTSUITE_ROOT", "/scratch/users/ribesr/FastSuite")
+sim = json.load(open(f"{ROOT}/tools/fastsim/validation/sim_profiled.json"))
+prof = json.load(open(f"{ROOT}/tools/fastsim/profiles/mandril_E.json"))
 
 for mate in ("R1", "R2"):
     s = sim[f"{mate.lower()}_stats"]

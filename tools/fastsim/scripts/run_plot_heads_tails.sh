@@ -1,7 +1,9 @@
 #!/bin/bash
 # Plot head and tail polyG CDFs from the sim GT vs the measured profile.
 # Usage: bash scripts/run_plot_heads_tails.sh [PROFILE_JSON] [SIM_GT] [OUT_PREFIX]
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 PROFILE="${1:-profiles/mandril_E.json}"
 GT="${2:-local_work/sim/sim.gt.tsv}"
 PREFIX="${3:-local_work/sim/ht}"

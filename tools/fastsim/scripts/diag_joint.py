@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Diagnose: joint_tail R1 marginal vs tail histogram in mandril_E.json."""
 import json
+import os
 
-prof = json.load(open("/scratch/users/ribesr/novaseq-sim/profiles/mandril_E.json"))
+# Cluster-side checkout: resolve the root from the env with the literal
+# fallback. Path indirection only — no logic change.
+ROOT = os.environ.get("FASTSUITE_ROOT", "/scratch/users/ribesr/FastSuite")
+prof = json.load(open(f"{ROOT}/tools/fastsim/profiles/mandril_E.json"))
 tail = prof["tail"]["R1"]
 ttot = sum(tail.values())
 jt = prof["joint_tail"]

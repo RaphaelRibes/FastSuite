@@ -1,7 +1,9 @@
 #!/bin/bash
 # List a few stats files, fetch 3, test build_profile.py locally.
 set -e
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 rm -rf /tmp/stats_test && mkdir -p /tmp/stats_test
 timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=15 Io 'ls /scratch/users/ribesr/mandril-polyg-2026/stats/ | head -6'
 echo "--- fetching ---"

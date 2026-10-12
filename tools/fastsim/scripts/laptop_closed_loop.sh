@@ -1,12 +1,14 @@
 #!/bin/bash
 # Run the ENTIRE closed loop on the laptop, working inside
-# ~/hermes_scratch/novaseq-sim/local_work/ (not /tmp):
+# ~/hermes_scratch/FastSuite/tools/fastsim/local_work/ (not /tmp):
 # 1. pull 700 stats JSONs from cluster (one-time, ~100MB)
 # 2. build_profile.py -> profiles/mandril_E.json (pure python, no numpy)
 # 3. simulate 20M pairs with the local release binary
 # 4. validate with validate_sim.py (needs numpy+matplotlib)
 set -e
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT/tools/fastsim"
 WORK=local_work
 
 # --- which python has numpy+matplotlib? ---

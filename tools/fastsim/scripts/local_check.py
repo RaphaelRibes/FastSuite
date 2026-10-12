@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Local sanity: compare GT and sequence-level tail rates vs profile."""
 import json
+import os
 
-prof = json.load(open("/home/raphael/hermes_scratch/novaseq-sim/profiles/mandril_E.json"))
+# The measured profile is not in the repo (it is built from the cluster
+# stats), so resolve the checkout root from the env with the cluster
+# literal as the fallback. Path indirection only — no logic change.
+ROOT = os.environ.get("FASTSUITE_ROOT", "/scratch/users/ribesr/FastSuite")
+prof = json.load(open(f"{ROOT}/tools/fastsim/profiles/mandril_E.json"))
 total = sum(prof["tail"]["R1"].values())
 rate = sum(v for k, v in prof["tail"]["R1"].items() if int(k) >= 1) / total
 print(f"profile R1 tail rate (>=1): {rate:.4f}")

@@ -1,6 +1,8 @@
 #!/bin/bash
 # Check sim output integrity + gzip stream completion.
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 echo "--- files ---"
 ls -la local_work/sim/
 echo "--- gzip integrity (gzip -t, may take a moment) ---"

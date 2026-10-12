@@ -1,7 +1,9 @@
 #!/bin/bash
 # Simulate 20M pairs WITHOUT gzip (fast), then validate (gzip.open handles plain).
 set -e
-cd /home/raphael/hermes_scratch/novaseq-sim
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT"
 ./target/release/fastsim --pairs 20000000 --profile profiles/mandril_E.json --out local_work/sim/sim --seed 7 --no-gzip
 echo "SIM_DONE"
 ls -la local_work/sim/

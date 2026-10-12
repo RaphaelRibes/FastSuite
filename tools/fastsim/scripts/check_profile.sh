@@ -1,8 +1,12 @@
 #!/bin/bash
 # Check profile rebuild status; run srun fallback if still pending/stale.
 set -e
-cd /home/raphael/hermes_scratch/novaseq-sim
-timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=15 Io 'cd /scratch/users/ribesr/novaseq-sim && squeue -u ribesr -j 9013030 -h -o "%T" 2>/dev/null | head -1; ls -la profiles/mandril_E.json; python3 -c "
+FASTSUITE_ROOT="${FASTSUITE_ROOT:-$HOME/hermes_scratch/FastSuite}"
+[ -d "$FASTSUITE_ROOT" ] || FASTSUITE_ROOT="/scratch/users/$USER/FastSuite"
+cd "$FASTSUITE_ROOT/tools/fastsim"
+# Cluster-side checkout: the ssh command runs on Io, where $HOME is the
+# cluster home, so the remote cd resolves its own $USER.
+timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=15 Io 'cd /scratch/users/$USER/FastSuite/tools/fastsim && squeue -u ribesr -j 9013030 -h -o "%T" 2>/dev/null | head -1; ls -la profiles/mandril_E.json; python3 -c "
 import json
 p = json.load(open(\"profiles/mandril_E.json\"))
 print(\"has pos_q_uncond:\", \"pos_q_uncond\" in p)

@@ -806,6 +806,8 @@ The three binary-name occurrences (`./target/release/novaseq-sim` in `local_clos
 
 Append the table above to `docs/plans/2026-10-12_fastsim-cli-convergence.md` (this file) — no code commit needed for the audit itself; proceed to Task 7.
 
+**Audit executed 2026-10-12 (final count):** the same grep returns **55 occurrences across 35 files** (the table above is the plan's estimate; the repo carries 25 `.sh` with the plain local `cd` rather than 24, because `check_profile.sh` and `laptop_closed_loop.sh` each carry that cd alongside a second novaseq path). The per-file shape matches the table exactly, so the substitution below covers every occurrence. `src/fastq.rs`'s `header_format_matches_novaseq_style` test name, `README.md`'s "(formerly novaseq-sim)" and `CITATION.cff`'s keywords are historical and stay untouched.
+
 ### Task 7: The `FASTSUITE_ROOT` two-liner
 
 **Objective:** every script resolves its checkout root once, local-first with the cluster fallback, and every `novaseq-sim` path string becomes `$FASTSUITE_ROOT` (or the renamed `fastsim`).
