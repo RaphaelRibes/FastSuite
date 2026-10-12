@@ -23,15 +23,22 @@ fn main() -> Result<()> {
             .ok(); // ignore error if already initialised
     }
 
+    // -q/--quiet gates the progress and end-of-run summary stream only.
+    // Warnings and errors are never gated (CLI-SPEC §1 rule 5), so the
+    // quiet flag is threaded only into the reporting below.
+    let quiet = rt.quiet;
+
     let start = Instant::now();
 
     match mode {
         Mode::Single { in1, out1, params } => {
             let s = run_single(&in1, &out1, &params, &rt)?;
             let elapsed = start.elapsed();
-            eprintln!("fastprep: single-end complete");
-            report("R1", &s);
-            report_runtime(elapsed, s.reads_in);
+            if !quiet {
+                eprintln!("fastprep: single-end complete");
+                report("R1", &s);
+                report_runtime(elapsed, s.reads_in);
+            }
             if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
                 std::fs::write(path, serde_json::to_string_pretty(&s)? + "\n")
                     .with_context(|| format!("writing JSON stats to {}", path.display()))?;
@@ -59,35 +66,37 @@ fn main() -> Result<()> {
                 &rt,
             )?;
             let elapsed = start.elapsed();
-            eprintln!("fastprep: paired-end complete");
-            report("R1", &s.r1);
-            report("R2", &s.r2);
-            eprintln!("  [pairs]");
-            eprintln!(
-                "    both kept:              {:>12}  ({})",
-                s.pairs_out,
-                pct(s.pairs_out, s.r1.reads_in)
-            );
-            eprintln!(
-                "    both dropped:           {:>12}  ({})",
-                s.pairs_dropped,
-                pct(s.pairs_dropped, s.r1.reads_in)
-            );
-            eprintln!("    singletons written (R1):{:>12}", s.singletons_r1);
-            eprintln!("    singletons written (R2):{:>12}", s.singletons_r2);
-            if s.discarded_singletons_r1 > 0 {
+            if !quiet {
+                eprintln!("fastprep: paired-end complete");
+                report("R1", &s.r1);
+                report("R2", &s.r2);
+                eprintln!("  [pairs]");
                 eprintln!(
-                    "    discarded R1 singletons:{:>12}  (pass --singletons1 to save)",
-                    s.discarded_singletons_r1
+                    "    both kept:              {:>12}  ({})",
+                    s.pairs_out,
+                    pct(s.pairs_out, s.r1.reads_in)
                 );
-            }
-            if s.discarded_singletons_r2 > 0 {
                 eprintln!(
-                    "    discarded R2 singletons:{:>12}  (pass --singletons2 to save)",
-                    s.discarded_singletons_r2
+                    "    both dropped:           {:>12}  ({})",
+                    s.pairs_dropped,
+                    pct(s.pairs_dropped, s.r1.reads_in)
                 );
+                eprintln!("    singletons written (R1):{:>12}", s.singletons_r1);
+                eprintln!("    singletons written (R2):{:>12}", s.singletons_r2);
+                if s.discarded_singletons_r1 > 0 {
+                    eprintln!(
+                        "    discarded R1 singletons:{:>12}  (pass --singletons1 to save)",
+                        s.discarded_singletons_r1
+                    );
+                }
+                if s.discarded_singletons_r2 > 0 {
+                    eprintln!(
+                        "    discarded R2 singletons:{:>12}  (pass --singletons2 to save)",
+                        s.discarded_singletons_r2
+                    );
+                }
+                report_runtime(elapsed, s.r1.reads_in + s.r2.reads_in);
             }
-            report_runtime(elapsed, s.r1.reads_in + s.r2.reads_in);
             if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
                 std::fs::write(path, serde_json::to_string_pretty(&s)? + "\n")
                     .with_context(|| format!("writing JSON stats to {}", path.display()))?;

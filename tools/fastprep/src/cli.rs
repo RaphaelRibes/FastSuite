@@ -382,6 +382,10 @@ pub struct Runtime {
     /// summary still goes to stderr, so a dry run reports exactly what a
     /// real run would have.
     pub dry_run: bool,
+    /// `-q/--quiet`: suppress the progress and end-of-run summary stream.
+    /// Warnings and errors still print — quiet never hides a reason a run
+    /// went wrong (CLI-SPEC §1 rule 5).
+    pub quiet: bool,
     pub adapter_source: AdapterSource,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
@@ -588,21 +592,23 @@ impl Cli {
                 AdapterSource::None
             } else {
                 // A run commits every read to this one decision, so say what it
-                // was and on what evidence.
-                eprintln!(
-                    "fastprep: adapter auto-detection ({} reads sampled)",
-                    det.sampled
-                );
-                for (kmer, count) in &det.evidence {
+                // was and on what evidence. Informational, so -q gates it.
+                if !self.quiet {
                     eprintln!(
-                        "  fingerprint {} in {} reads ({:.2}%)",
-                        String::from_utf8_lossy(kmer),
-                        count,
-                        100.0 * *count as f64 / det.sampled.max(1) as f64
+                        "fastprep: adapter auto-detection ({} reads sampled)",
+                        det.sampled
                     );
-                }
-                for a in &det.adapters {
-                    eprintln!("  using {} ({} bp)", a.name, a.seq.len());
+                    for (kmer, count) in &det.evidence {
+                        eprintln!(
+                            "  fingerprint {} in {} reads ({:.2}%)",
+                            String::from_utf8_lossy(kmer),
+                            count,
+                            100.0 * *count as f64 / det.sampled.max(1) as f64
+                        );
+                    }
+                    for a in &det.adapters {
+                        eprintln!("  using {} ({} bp)", a.name, a.seq.len());
+                    }
                 }
 
                 AdapterSource::Fixed(Arc::new(AdapterSet::new(
@@ -692,11 +698,13 @@ impl Cli {
                 crate::memory::Admission::Proceed => {}
             }
 
-            eprintln!(
-                "fastprep: deduplication on, {}-bit fingerprints, table pre-sized for \
-                 {} reads ({} buckets, {:.0} MB)",
-                bits, capacity, proj.buckets, crate::memory::mib(proj.bytes),
-            );
+            if !self.quiet {
+                eprintln!(
+                    "fastprep: deduplication on, {}-bit fingerprints, table pre-sized for \
+                     {} reads ({} buckets, {:.0} MB)",
+                    bits, capacity, proj.buckets, crate::memory::mib(proj.bytes),
+                );
+            }
 
             Some(DedupConfig { bits, capacity, read_len, ceiling: cap_bytes })
         };
@@ -737,6 +745,7 @@ impl Cli {
             metadata: self.metadata,
             json: self.json,
             dry_run: self.dry_run,
+            quiet: self.quiet,
             adapter_source,
             dedup,
             adapter_error_rate: self.adapter_error_rate,

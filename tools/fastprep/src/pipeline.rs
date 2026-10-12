@@ -483,7 +483,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 }
             }
             chunks_written += 1;
-            if stderr_is_tty && chunks_written % 100 == 0 {
+            if !rt.quiet && stderr_is_tty && chunks_written % 100 == 0 {
                 eprint!("\r  {} reads processed", stats.reads_in);
                 progress_shown = true;
             }
@@ -760,7 +760,7 @@ pub fn run_paired(
             )?;
 
             chunks_written += 1;
-            if stderr_is_tty && chunks_written % 100 == 0 {
+            if !rt.quiet && stderr_is_tty && chunks_written % 100 == 0 {
                 eprint!(
                     "\r  {} reads processed",
                     stats.r1.reads_in + stats.r2.reads_in
@@ -1062,6 +1062,7 @@ mod tests {
             metadata: None,
             json: None,
             dry_run: false,
+            quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
@@ -1319,6 +1320,7 @@ mod tests {
             metadata: None,
             json: None,
             dry_run: false,
+            quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
@@ -1342,6 +1344,7 @@ mod tests {
             metadata: None,
             json: None,
             dry_run: false,
+            quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
