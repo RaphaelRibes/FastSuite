@@ -29,6 +29,16 @@ fn main() -> Result<()> {
 }
 
 fn run(cfg: &cli::Config) -> Result<()> {
+    // --force: a generator always writes, so the clobber check is the whole
+    // safety net. Probe the artefacts the run will create.
+    if !cfg.force {
+        for suffix in [".gt.tsv", "_R1.fastq.gz", "_R2.fastq.gz", "_R1.fastq", "_R2.fastq"] {
+            let probe = format!("{}{}", cfg.out, suffix);
+            if std::path::Path::new(&probe).exists() {
+                bail!("{probe} exists; pass --force to overwrite");
+            }
+        }
+    }
     let t0 = std::time::Instant::now();
     // Load profile and apply CLI overrides.
     let mut profile = Profile::from_json(Path::new(&cfg.profile))?;
@@ -212,19 +222,21 @@ fn run(cfg: &cli::Config) -> Result<()> {
     }
     gt.finish().context("finish GT")?;
 
-    eprintln!(
-        "fastsim: {} pairs, read_len {}, full-artefact {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%)",
-        cfg.pairs,
-        profile.read_len,
-        n_full,
-        n_full as f64 / cfg.pairs as f64 * 100.0,
-        n_adapter,
-        n_adapter as f64 / cfg.pairs as f64 * 100.0,
-        n_dup,
-        n_dup as f64 / cfg.pairs as f64 * 100.0,
-        n_drop,
-        n_drop as f64 / cfg.pairs as f64 * 100.0,
-    );
+    if !cfg.quiet {
+        eprintln!(
+            "fastsim: {} pairs, read_len {}, full-artefact {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%)",
+            cfg.pairs,
+            profile.read_len,
+            n_full,
+            n_full as f64 / cfg.pairs as f64 * 100.0,
+            n_adapter,
+            n_adapter as f64 / cfg.pairs as f64 * 100.0,
+            n_dup,
+            n_dup as f64 / cfg.pairs as f64 * 100.0,
+            n_drop,
+            n_drop as f64 / cfg.pairs as f64 * 100.0,
+        );
+    }
     // Citation request (MIT stays permissive; this is the community-norm ask).
     eprintln!(
         "If you use fastsim in published research, please cite: \

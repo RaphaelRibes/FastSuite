@@ -52,6 +52,10 @@ pub struct Config {
     /// Single-end mode: one read per fragment (no mate 2, no insert-size
     /// geometry; adapter readthrough still lands at the read's 3′ end).
     pub single: bool,
+    /// Overwrite an existing output prefix instead of refusing.
+    pub force: bool,
+    /// Suppress the end-of-run summary line (warnings/errors still print).
+    pub quiet: bool,
 }
 
 impl Default for Config {
@@ -76,6 +80,8 @@ impl Default for Config {
             threads: 1,
             json: None,
             single: false,
+            force: false,
+            quiet: false,
         }
     }
 }
@@ -127,6 +133,8 @@ pub fn parse(args: &[String]) -> Result<Config> {
             }
             "--no-gzip" => cfg.gzip = false,
             "--single" => cfg.single = true,
+            "--force" | "-f" => cfg.force = true,
+            "-q" | "--quiet" => cfg.quiet = true,
             "--dup-rate" => cfg.dup_rate = next(&mut i)?.parse()?,
             "--dup-pool" => cfg.dup_pool = next(&mut i)?.parse()?,
             "--drop-rate" => cfg.drop_rate = next(&mut i)?.parse()?,
