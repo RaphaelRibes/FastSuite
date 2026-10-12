@@ -181,6 +181,7 @@ dependencies = [
  "clap",
  "flate2",
  "gzp",
+ "libc",
  "serde_json",
 ]
 
