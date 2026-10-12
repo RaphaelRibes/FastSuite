@@ -3,6 +3,7 @@ mod encode;
 mod file_kind;
 mod format;
 mod output;
+mod report;
 mod spiller;
 mod varint;
 mod worker;
