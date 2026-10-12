@@ -69,6 +69,11 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub json: Option<std::path::PathBuf>,
 
+    /// Refuse to overwrite an output directory that already contains
+    /// fastmaps outputs; without this flag the run exits 1 naming the file.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
     /// Number of worker threads to use. Defaults to the number of available
     /// CPU cores (bounded by the file count), or $FASTSUITE_THREADS when set.
     /// Pass 0 for auto.
@@ -129,5 +134,17 @@ mod tests {
     fn test_json_arg_parsed() {
         let a = Args::parse_from(["fastmaps", "a.fq", "--json", "/tmp/r.json"]);
         assert_eq!(a.json.as_deref(), Some("/tmp/r.json".as_ref()));
+    }
+
+    #[test]
+    fn test_force_default_false() {
+        let a = Args::parse_from(["fastmaps", "a.fq"]);
+        assert!(!a.force);
+    }
+
+    #[test]
+    fn test_force_short_and_long() {
+        assert!(Args::parse_from(["fastmaps", "a.fq", "--force"]).force);
+        assert!(Args::parse_from(["fastmaps", "a.fq", "-f"]).force);
     }
 }

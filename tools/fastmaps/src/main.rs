@@ -56,6 +56,20 @@ fn main() {
 
     // ── Output directory ──────────────────────────────────────────────────
     let output_dir = args.output_dir;
+    if !args.force && output_dir.exists() {
+        let existing = ["heatmap.json", "heatmap.png", "heatmap.data", "heatmap_3d.html"]
+            .iter()
+            .map(|f| output_dir.join(f))
+            .find(|p| p.exists());
+        if let Some(p) = existing {
+            eprintln!(
+                "Error: {} already exists in {}. Pass --force to overwrite.",
+                p.file_name().unwrap().to_string_lossy(),
+                output_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
     std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
         eprintln!("Cannot create output dir {}: {e}", output_dir.display());
         std::process::exit(1);
