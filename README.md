@@ -19,8 +19,8 @@ shared crate, kept consistent by tests rather than by a compiler.
 
 | tool | replaces | what it does | maturity |
 |---|---|---|---|
-| **fastdedup** | `fastp --dedup` (and `seqkit rmdup`, `prinseq++`) | exact PCR-duplicate removal by 64/128-bit fingerprint; O(N) memory, no Bloom-filter false positives | v1.3.0, WIP |
-| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, optional dedup | v0.1.0, WIP |
+| **fastdedup** | `fastp --dedup` as a separate step (and `seqkit rmdup`, `prinseq++`) | the same exact fingerprint dedup as `fastprep --dedup`, as a standalone pipeable binary — use it when dedup is its own pipeline step | v1.3.0, WIP (published: bioRxiv 2026.04.29.721745) |
+| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, **native deduplication** (`--dedup`, on by default — the same exact fingerprint model as fastdedup) | v0.1.0, WIP |
 | **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data or fitted by `fastcheck` | v0.1.0, WIP |
 | **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | v0.1.0, WIP |
 | **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, polyX runs, bounded repeated-sequence and k-mer counters, insert-size histogram — no sampling, no verdicts, memory printed before the run. `--profile` writes a fastsim profile directly | v0.1.0, WIP |
@@ -48,6 +48,7 @@ Then use it:
 
 ```fish
 # a whole run from one config: fastsim -> fastdedup -> fastprep -> fastmaps
+# (fastprep dedups natively too: drop the fastdedup step for the one-pass chain)
 ./tools/fasthelper/target/release/fasthelper run -c examples/fastsuite.toml --tools-dir tools
 
 # the closed loop: measure a dataset, then simulate it back
@@ -63,8 +64,10 @@ fasthelper compare --before raw/ --after processed/ -o cmp/    # before/after si
 Every tool is still a normal Unix filter:
 
 ```fish
+# dedup as its own pipeable step (same fingerprint model as fastprep's)
 fastdedup -1 R1.fq.gz -2 R2.fq.gz -o d1.fq.gz -p d2.fq.gz -j 16 --json dedup.json
-fastprep  -1 d1.fq.gz -2 d2.fq.gz -o c1.fq.gz -p c2.fq.gz -j 16 --gz-level 6 --json prep.json
+# ...or let fastprep do it in the same pass (--dedup is ON by default)
+fastprep  -1 R1.fq.gz -2 R2.fq.gz -o c1.fq.gz -p c2.fq.gz -j 16 --gz-level 6 --json prep.json
 fastcheck R1.fq.gz R2.fq.gz --json qc.json --html qc.html --positions-tsv pos.tsv
 fastmaps  -o maps/ c1.fq.gz c2.fq.gz
 ```

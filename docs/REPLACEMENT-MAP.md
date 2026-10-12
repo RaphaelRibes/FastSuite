@@ -14,7 +14,7 @@ explicitly marked as a gap with the phase that closes it.
 | quality filtering | `--mean-q` | ✅ |
 | hard trimming | `--trim-5`, `--trim-3` | ✅ |
 | length filtering | `--min-len N|0.6L` | ✅ |
-| PCR deduplication | `fastdedup` (separate binary) | ✅ and better: deterministic fingerprints, ~4.6 GB at 3e8 reads, no Bloom-filter false positives (`prinseq++` loses >90% of reads at that depth) |
+| PCR deduplication | `fastprep --dedup` (native, shipped ON) **or** the standalone `fastdedup` — same fingerprint model (64/128-bit, deterministic, ~4.6 GB at 3e8 reads, no Bloom-filter false positives — `prinseq++` loses >90% of reads at that depth). Use `fastprep --dedup` for the one-pass chain; use `fastdedup` when you need dedup as a separate, pipeable step | ✅ **two entry points, one implementation model** — fastprep's is the integrated one; fastdedup (v1.3.0, published) is the standalone one |
 | per-read metadata/traceability | `fastprep --metadata` (binary PXMT) + `fastprep-meta` reader | ✅ fastp has nothing equivalent |
 | PE overlap correction / merge | **not implemented** | ⚠ gap — deliberately removed from the polyx lineage (it doubled memory for <1% gain). Sequence-merging users are not served yet; phase 4 decides re-add vs. declare out of scope |
 | `-`/pipe in and out | not yet | ⚠ gap, phase 3 |
