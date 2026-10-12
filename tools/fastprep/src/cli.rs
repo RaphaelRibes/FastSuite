@@ -378,6 +378,10 @@ pub struct Runtime {
     /// If `Some`, machine-readable JSON statistics are written here after
     /// processing, in addition to the human-readable stderr output.
     pub json: Option<PathBuf>,
+    /// `--dry-run`: compute every counter and write nothing at all. The
+    /// summary still goes to stderr, so a dry run reports exactly what a
+    /// real run would have.
+    pub dry_run: bool,
     pub adapter_source: AdapterSource,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
@@ -732,6 +736,7 @@ impl Cli {
             phred_auto: self.auto_phred && !self.no_auto_phred,
             metadata: self.metadata,
             json: self.json,
+            dry_run: self.dry_run,
             adapter_source,
             dedup,
             adapter_error_rate: self.adapter_error_rate,

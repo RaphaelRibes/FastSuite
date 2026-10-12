@@ -379,14 +379,20 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
         .with_context(|| format!("opening input {}", in1.display()))?;
 
     // Open all outputs to `.part` paths; rename atomically on success.
+    // Under --dry-run no output is opened at all: every counter is still
+    // computed, nothing is written (CLI-SPEC §1).
     let tmp_out = part_path(out1);
     let guard_out = TmpFile::new(tmp_out.clone());
-    let mut writer = open_output_as(&tmp_out, out1, rt.compression)?;
+    let mut writer = if rt.dry_run {
+        None
+    } else {
+        Some(open_output_as(&tmp_out, out1, rt.compression)?)
+    };
 
     let tmp_meta_path = rt.metadata.as_deref().map(part_path);
     let guard_meta = tmp_meta_path.as_ref().map(|p| TmpFile::new(p.clone()));
     let mut meta = match (rt.metadata.as_deref(), tmp_meta_path.as_deref()) {
-        (Some(_), Some(tp)) => {
+        (Some(_), Some(tp)) if !rt.dry_run => {
             let mut w = open_output(tp, METADATA_COMPRESSION)?;
             metadata::write_file_header(&mut *w).context("writing metadata header")?;
             Some(w)
@@ -461,7 +467,9 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 };
                 stats.record(seq.len(), &result, p.output.adapter_name.as_deref());
                 if !dup {
-                    p.emit_to(&res_buf, &mut writer, phred_offset)?;
+                    if let Some(w) = writer.as_mut() {
+                        p.emit_to(&res_buf, w, phred_offset)?;
+                    }
                 }
                 if let Some(mw) = meta.as_mut() {
                     metadata::write_record(
@@ -497,7 +505,9 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 p.output.adapter_name.as_deref(),
             );
             if io_result.is_ok() {
-                let _ = p.emit_to(&res_buf, &mut writer, phred_offset);
+                if let Some(w) = writer.as_mut() {
+                    let _ = p.emit_to(&res_buf, w, phred_offset);
+                }
             }
         }
     }
@@ -517,8 +527,9 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
 
     // Flush and drop writers before rename (zstd auto_finish finalises the
     // frame on drop; rename must happen after the frame is closed).
-    writer.flush().ok();
-    drop(writer);
+    if let Some(mut w) = writer.take() {
+        w.flush().ok();
+    }
     if let Some(mut mw) = meta.take() {
         mw.flush().ok();
     }
@@ -526,13 +537,16 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
     io_result?;
 
     // Atomic rename: committed output replaces the destination path.
-    std::fs::rename(&tmp_out, out1)
-        .with_context(|| format!("committing {} → {}", tmp_out.display(), out1.display()))?;
-    guard_out.commit();
-    if let (Some(tp), Some(fp), Some(g)) = (tmp_meta_path, rt.metadata.as_deref(), guard_meta) {
-        std::fs::rename(&tp, fp)
-            .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
-        g.commit();
+    // A dry run never got here with a file to commit.
+    if !rt.dry_run {
+        std::fs::rename(&tmp_out, out1)
+            .with_context(|| format!("committing {} → {}", tmp_out.display(), out1.display()))?;
+        guard_out.commit();
+        if let (Some(tp), Some(fp), Some(g)) = (tmp_meta_path, rt.metadata.as_deref(), guard_meta) {
+            std::fs::rename(&tp, fp)
+                .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
+            g.commit();
+        }
     }
 
     Ok(stats)
@@ -592,32 +606,49 @@ pub fn run_paired(
         .with_context(|| format!("opening input {}", in2.display()))?;
 
     // Open all outputs to `.part` paths; rename atomically on success.
+    // Under --dry-run nothing is opened: every counter is still computed.
     let tmp_w1 = part_path(out1);
     let tmp_w2 = part_path(out2);
     let guard_w1 = TmpFile::new(tmp_w1.clone());
     let guard_w2 = TmpFile::new(tmp_w2.clone());
-    let mut w1 = open_output_as(&tmp_w1, out1, rt.compression)?;
-    let mut w2 = open_output_as(&tmp_w2, out2, rt.compression)?;
+    let mut w1 = if rt.dry_run {
+        None
+    } else {
+        Some(open_output_as(&tmp_w1, out1, rt.compression)?)
+    };
+    let mut w2 = if rt.dry_run {
+        None
+    } else {
+        Some(open_output_as(&tmp_w2, out2, rt.compression)?)
+    };
 
     let tmp_ws1 = singletons1.map(part_path);
     let tmp_ws2 = singletons2.map(part_path);
     let guard_ws1 = tmp_ws1.as_ref().map(|p| TmpFile::new(p.clone()));
     let guard_ws2 = tmp_ws2.as_ref().map(|p| TmpFile::new(p.clone()));
-    let mut ws1 = tmp_ws1
-        .as_deref()
-        .zip(singletons1)
-        .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
-        .transpose()?;
-    let mut ws2 = tmp_ws2
-        .as_deref()
-        .zip(singletons2)
-        .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
-        .transpose()?;
+    let mut ws1 = if rt.dry_run {
+        None
+    } else {
+        tmp_ws1
+            .as_deref()
+            .zip(singletons1)
+            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
+            .transpose()?
+    };
+    let mut ws2 = if rt.dry_run {
+        None
+    } else {
+        tmp_ws2
+            .as_deref()
+            .zip(singletons2)
+            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
+            .transpose()?
+    };
 
     let tmp_meta_path = rt.metadata.as_deref().map(part_path);
     let guard_meta = tmp_meta_path.as_ref().map(|p| TmpFile::new(p.clone()));
     let mut meta = match (rt.metadata.as_deref(), tmp_meta_path.as_deref()) {
-        (Some(_), Some(tp)) => {
+        (Some(_), Some(tp)) if !rt.dry_run => {
             let mut w = open_output(tp, METADATA_COMPRESSION)?;
             metadata::write_file_header(&mut *w).context("writing metadata header")?;
             Some(w)
@@ -776,10 +807,12 @@ pub fn run_paired(
         eprint!("\x1b[2K\r");
     }
 
-    w1.flush().ok();
-    drop(w1);
-    w2.flush().ok();
-    drop(w2);
+    if let Some(mut w) = w1.take() {
+        w.flush().ok();
+    }
+    if let Some(mut w) = w2.take() {
+        w.flush().ok();
+    }
     if let Some(mut w) = ws1.take() {
         w.flush().ok();
     }
@@ -792,27 +825,29 @@ pub fn run_paired(
 
     io_result?;
 
-    // Atomic renames.
-    std::fs::rename(&tmp_w1, out1)
-        .with_context(|| format!("committing {} → {}", tmp_w1.display(), out1.display()))?;
-    guard_w1.commit();
-    std::fs::rename(&tmp_w2, out2)
-        .with_context(|| format!("committing {} → {}", tmp_w2.display(), out2.display()))?;
-    guard_w2.commit();
-    if let (Some(tp), Some(fp), Some(g)) = (tmp_ws1, singletons1, guard_ws1) {
-        std::fs::rename(&tp, fp)
-            .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
-        g.commit();
-    }
-    if let (Some(tp), Some(fp), Some(g)) = (tmp_ws2, singletons2, guard_ws2) {
-        std::fs::rename(&tp, fp)
-            .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
-        g.commit();
-    }
-    if let (Some(tp), Some(fp), Some(g)) = (tmp_meta_path, rt.metadata.as_deref(), guard_meta) {
-        std::fs::rename(&tp, fp)
-            .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
-        g.commit();
+    // Atomic renames. A dry run wrote nothing, so it commits nothing.
+    if !rt.dry_run {
+        std::fs::rename(&tmp_w1, out1)
+            .with_context(|| format!("committing {} → {}", tmp_w1.display(), out1.display()))?;
+        guard_w1.commit();
+        std::fs::rename(&tmp_w2, out2)
+            .with_context(|| format!("committing {} → {}", tmp_w2.display(), out2.display()))?;
+        guard_w2.commit();
+        if let (Some(tp), Some(fp), Some(g)) = (tmp_ws1, singletons1, guard_ws1) {
+            std::fs::rename(&tp, fp)
+                .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
+            g.commit();
+        }
+        if let (Some(tp), Some(fp), Some(g)) = (tmp_ws2, singletons2, guard_ws2) {
+            std::fs::rename(&tp, fp)
+                .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
+            g.commit();
+        }
+        if let (Some(tp), Some(fp), Some(g)) = (tmp_meta_path, rt.metadata.as_deref(), guard_meta) {
+            std::fs::rename(&tp, fp)
+                .with_context(|| format!("committing {} → {}", tp.display(), fp.display()))?;
+            g.commit();
+        }
     }
 
     Ok(stats)
@@ -826,8 +861,8 @@ fn write_pairs(
     buf2: &ChunkBuf,
     pairs: Vec<ProcessedPair>,
     stats: &mut PairedStats,
-    w1: &mut OutputWriter,
-    w2: &mut OutputWriter,
+    w1: &mut Option<OutputWriter>,
+    w2: &mut Option<OutputWriter>,
     mut ws1: Option<&mut OutputWriter>,
     mut ws2: Option<&mut OutputWriter>,
     mut meta: Option<&mut OutputWriter>,
@@ -877,8 +912,10 @@ fn write_pairs(
         }
         match outcome(&res1, &res2) {
             PairOutcome::BothKept => {
-                pp.p1.emit_to(buf1, w1, phred_offset)?;
-                pp.p2.emit_to(buf2, w2, phred_offset)?;
+                if let (Some(w1), Some(w2)) = (w1.as_mut(), w2.as_mut()) {
+                    pp.p1.emit_to(buf1, w1, phred_offset)?;
+                    pp.p2.emit_to(buf2, w2, phred_offset)?;
+                }
                 stats.pairs_out += 1;
             }
             PairOutcome::BothDropped => {
@@ -1024,6 +1061,7 @@ mod tests {
             phred_auto: false,
             metadata: None,
             json: None,
+            dry_run: false,
             adapter_source: crate::cli::AdapterSource::None,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
@@ -1280,6 +1318,7 @@ mod tests {
             phred_auto: false,
             metadata: None,
             json: None,
+            dry_run: false,
             adapter_source: crate::cli::AdapterSource::None,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
@@ -1302,6 +1341,7 @@ mod tests {
             phred_auto: false,
             metadata: None,
             json: None,
+            dry_run: false,
             adapter_source: crate::cli::AdapterSource::None,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,

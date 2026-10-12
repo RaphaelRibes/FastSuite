@@ -32,7 +32,7 @@ fn main() -> Result<()> {
             eprintln!("fastprep: single-end complete");
             report("R1", &s);
             report_runtime(elapsed, s.reads_in);
-            if let Some(path) = &rt.json {
+            if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
                 std::fs::write(path, serde_json::to_string_pretty(&s)? + "\n")
                     .with_context(|| format!("writing JSON stats to {}", path.display()))?;
             }
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
                 );
             }
             report_runtime(elapsed, s.r1.reads_in + s.r2.reads_in);
-            if let Some(path) = &rt.json {
+            if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
                 std::fs::write(path, serde_json::to_string_pretty(&s)? + "\n")
                     .with_context(|| format!("writing JSON stats to {}", path.display()))?;
             }
