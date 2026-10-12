@@ -86,6 +86,32 @@ pub struct Args {
     pub threads: usize,
 }
 
+impl Args {
+    /// Effective worker count, mirroring fastsim's `FASTSUITE_THREADS`
+    /// contract (CLI-SPEC §1, gap #6) and fastdedup's `resolve_thread_count`.
+    ///
+    /// `-j N` (N > 0) wins outright; otherwise `$FASTSUITE_THREADS` is read
+    /// when set to a parseable non-zero value; otherwise all available cores.
+    /// `max` (the input file count) always clamps the result — there is no
+    /// point in workers with no files, exactly as before this env default.
+    pub fn resolved_threads(&self, max: usize) -> usize {
+        let base = if self.threads > 0 {
+            self.threads
+        } else {
+            std::env::var("FASTSUITE_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                })
+        };
+        base.min(max.max(1))
+    }
+}
+
 /// Parse "x1,y1:x2,y2" into normalised corners `((min_x,min_y),(max_x,max_y))`.
 pub fn parse_corners(s: &str) -> Option<((u32, u32), (u32, u32))> {
     let (a, b) = s.split_once(':')?;
@@ -162,5 +188,25 @@ mod tests {
     fn test_quiet_short_and_long() {
         assert!(Args::parse_from(["fastmaps", "a.fq", "-q"]).quiet);
         assert!(Args::parse_from(["fastmaps", "a.fq", "--quiet"]).quiet);
+    }
+
+    #[test]
+    fn test_resolved_threads_prefers_flag() {
+        let a = Args::parse_from(["fastmaps", "a.fq", "b.fq", "-j", "3"]);
+        assert_eq!(a.resolved_threads(4), 3);
+    }
+
+    #[test]
+    fn test_resolved_threads_flag_bounded_by_files() {
+        let a = Args::parse_from(["fastmaps", "a.fq", "b.fq", "-j", "8"]);
+        assert_eq!(a.resolved_threads(2), 2); // caller clamps by file count
+    }
+
+    #[test]
+    fn test_resolved_threads_zero_means_auto() {
+        let a = Args::parse_from(["fastmaps", "a.fq", "-j", "0"]);
+        // No env in tests: falls back to available cores, clamped by file count.
+        let n = a.resolved_threads(1);
+        assert!(n >= 1 && n <= 16, "got {n}");
     }
 }

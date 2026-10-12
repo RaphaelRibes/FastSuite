@@ -29,6 +29,10 @@ use worker::{flush_local, CornerExtractor, SpillerMsg, WorkerCfg, WorkerLocal};
 fn main() {
     let started = Instant::now();
     let args = Args::parse();
+    // Worker count is read up front: `args` is partially moved below (pattern
+    // vectors are consumed by the classifier), so the resolution must happen
+    // before those moves.
+    let num_workers = args.resolved_threads(args.files.len());
 
     // ── Validate --preview-reads ──────────────────────────────────────────
     if args.preview_reads > u8::MAX as usize {
@@ -150,16 +154,10 @@ fn main() {
         .collect();
 
     // ── Worker configuration ──────────────────────────────────────────────
-    // -j/--threads overrides auto-detect; 0 (none given) = available cores,
-    // always bounded by the file count (no point in workers with no files).
-    let num_workers = if args.threads > 0 {
-        args.threads
-    } else {
-        thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    }
-    .min(total_files);
+    // Resolved in main()'s prologue (see `num_workers` above): -j/--threads
+    // overrides everything; 0 (or absent) reads $FASTSUITE_THREADS, else all
+    // cores. Either way the pool never exceeds the file count (no point in
+    // workers with no files).
 
     let threshold_bytes = (args.buffer_mb * 1024 * 1024) / num_workers.max(1);
 
