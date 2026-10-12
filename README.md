@@ -105,7 +105,7 @@ FastSuite/
 │   ├── RELEASES.md        release train + per-tool maturity
 │   └── plans/             per-tool implementation plans (bite-sized TDD)
 ├── examples/              fastsuite.toml + demo.sh (synthetic control)
-├── deploy/io/             SLURM scripts for the campaign on Io
+├── deploy/io/             historical SLURM scripts (Io access ended 2026-10-12)
 └── tools/
     ├── fastcheck/         src, tests, CITATION.cff (incl. the Python differential harness)
     ├── fastdedup/         src, tests, benchmarks, paper/ (published)
