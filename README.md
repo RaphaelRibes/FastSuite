@@ -5,88 +5,61 @@ Rust tools for FASTQ quality control and preprocessing, built as one suite:
 
 The goal is to replace the `FastQC`/`Falco` + `MultiQC` + `fastp` trio with
 faster, single-binary, native-Rust components that share an interface instead
-of merely coexisting in a pipeline.
+of merely coexisting in a pipeline. The suite is a **naming scheme, not an
+architecture** (decision D-1): the tools are independent binaries with no
+shared crate, kept consistent by tests rather than by a compiler.
 
-| tool | replaces | what it does | status |
+## The tools
+
+| tool | replaces | what it does | maturity |
 |---|---|---|---|
-| **fastdedup** | `fastp --dedup` (and standalone `seqkit rmdup`, `prinseq++`) | exact PCR-duplicate removal by 64/128-bit fingerprint; O(N) memory, no Bloom-filter false positives | v1.3.0, shipped |
-| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, optional dedup | working (was `rpolyx`) |
-| **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data | working (was `novaseq-sim`) |
-| **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | working (was `fastmaps` in `heatmaps/`) |
-| **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, adapter content, k-mer content — no sampling, no verdicts, memory printed before the run | v0.1 working: statistics + per-position modules; duplication/adapters/k-mers next (`docs/PLAN-QC.md`) |
-| **fasthelper** | MultiQC (+ workflow glue) | a toolbox: `concatenate` (per-sample reports → one table/report), `run` (the chain from one TOML config), `doctor`, `schema` (json/tsv/md/html), checks the install, owns the report schema | new, this repo |
+| **fastdedup** | `fastp --dedup` (and `seqkit rmdup`, `prinseq++`) | exact PCR-duplicate removal by 64/128-bit fingerprint; O(N) memory, no Bloom-filter false positives | v1.3.0, **stable** |
+| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, optional dedup | v0.1.0, beta |
+| **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data or fitted by `fastcheck` | v0.1.0, beta |
+| **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | v0.1.0, beta |
+| **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, polyX runs, bounded repeated-sequence and k-mer counters, insert-size histogram — no sampling, no verdicts, memory printed before the run. `--profile` writes a fastsim profile directly | v0.1.0, beta |
+| **fasthelper** | MultiQC (+ workflow glue) | a toolbox: `run` (the chain from one TOML config, with a provenance manifest), `concatenate` (per-sample reports → one table/report), `compare` (raw vs processed side by side), `doctor`, `schema` — owns the report schema | v0.1.0, beta |
 
-Still outside the suite on purpose: `fastx-diff` (visual before/after
-inspection) and `gzippy` (compression engine) are natural candidates for
-`fastview` / a shared compression backend — see `docs/PLAN.md` phase 5.
+Release history and per-tool maturity: `docs/RELEASES.md`.
+What the suite replaces today, feature by feature, honestly: `docs/REPLACEMENT-MAP.md`.
 
-## Layout
-
-```
-FastSuite/
-├── README.md
-├── docs/
-│   ├── CLI-SPEC.md          the unified option grammar (the contract)
-│   ├── REPORT-SCHEMA.md     fastsuite.report.v1
-│   ├── RENAME-MAP.md        every old name → new name, and what changed in the code
-│   ├── REPLACEMENT-MAP.md   FastQC/Falco/MultiQC/fastp → FastSuite, feature by feature
-│   └── PLAN.md              phased plan to full compatibility, with estimates
-├── examples/
-│   ├── fastsuite.toml       a complete run config (synthetic control sample)
-│   └── demo.sh              end-to-end demo on generated data
-└── tools/
-    ├── fastcheck/           src, tests (incl. the Python differential harness)
-    ├── fastdedup/           src, tests, benchmarks, paper/
-    ├── fastprep/            src, paper/
-    ├── fastsim/             src, tests, profiles/, scripts/, validation/
-    ├── fastmaps/            src/
-    └── fasthelper/          src (new)
-```
-
-## Build
+## Quick start
 
 ```fish
+# build every tool (the registry cache has every dep, offline works)
 for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper
     cd tools/$t; and cargo build --release --offline; and cd ../..
 end
-```
 
-Then check the install:
-
-```fish
+# check the install
 ./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools
+
+# one command, the whole preprocessing chain (synthetic control sample)
+bash examples/demo.sh 20000
 ```
 
-## Use
-
-One command for a whole preprocessing run:
+Then use it:
 
 ```fish
+# a whole run from one config: fastsim -> fastdedup -> fastprep -> fastmaps
 ./tools/fasthelper/target/release/fasthelper run -c examples/fastsuite.toml --tools-dir tools
-```
 
-That writes `report.{json,tsv,md,html}`, `manifest.json` (every command, exit
-code and wall time) and per-step logs; intermediates are deleted once their
-last consumer has read them.
+# the closed loop: measure a dataset, then simulate it back
+fastcheck --insert-hist --profile profile.json R1.fq.gz R2.fq.gz
+fastsim --profile profile.json --pairs 20000 -o sim/
 
-Aggregate reports you already have (including from the pre-suite binaries):
-
-```fish
-# per-sample JSON reports -> one table (one row per sample, one column per metric)
+# aggregate reports you already have (the MultiQC slot)
 fasthelper concatenate runs/ -o report/ --format html,tsv
-
-# per-position tables (from `fastcheck --positions-tsv`) -> one positions x samples matrix
-fasthelper concatenate --positions runs/ -o matrix/                  # metric mean_q by default
-fasthelper concatenate --positions runs/ --metric depth --stdout     # any column of the table
-fasthelper concatenate --positions runs/ --all-metrics -o matrix/     # tidy: sample,pos,metric,value
+fasthelper concatenate --positions runs/ -o matrix/            # positions x samples matrix
+fasthelper compare --before raw/ --after processed/ -o cmp/    # before/after side by side
 ```
 
-Every tool is still a normal Unix filter — the suite adds an interface, it does
-not hide one:
+Every tool is still a normal Unix filter:
 
 ```fish
 fastdedup -1 R1.fq.gz -2 R2.fq.gz -o d1.fq.gz -p d2.fq.gz -j 16 --json dedup.json
 fastprep  -1 d1.fq.gz -2 d2.fq.gz -o c1.fq.gz -p c2.fq.gz -j 16 --gz-level 6 --json prep.json
+fastcheck R1.fq.gz R2.fq.gz --json qc.json --html qc.html --positions-tsv pos.tsv
 fastmaps  -o maps/ c1.fq.gz c2.fq.gz
 ```
 
@@ -94,8 +67,71 @@ fastmaps  -o maps/ c1.fq.gz c2.fq.gz
 
 * `-1/-2` inputs, `-o/-p` outputs, `-j/--threads`, `--gz-level`, `--json <PATH>`,
   `--force`, `--dry-run`, `-q/--quiet`, `-v/--verbose`, `-V/--version`.
-  Full spec: `docs/CLI-SPEC.md`.
-* Every tool writes the same report schema with `--json`; `fasthelper` reads it.
-  Full spec: `docs/REPORT-SCHEMA.md` (also `fasthelper schema`).
-* Long names win; the pre-rename spellings stay as aliases for one release, so
-  existing pipelines keep working.
+  Full spec: `docs/CLI-SPEC.md`; the remaining gaps and the plans that close
+  them: `docs/CLI-SPEC.md` §4 and `docs/plans/`.
+* Every tool writes the same report schema with `--json`; `fasthelper` reads
+  it. Spec: `docs/REPORT-SCHEMA.md` (also `fasthelper schema`).
+* Long names win; the pre-rename spellings stay as aliases for one release.
+* **Exact numbers, no verdicts.** Counts are integers read off the whole
+  file. No sampling presented as measurement, no PASS/FAIL from magic
+  constants — the decision is yours (`fasthelper` supports `--fail-on`).
+* **Never ship any data** (D-11): every public demo uses generated data
+  (`fastsim`) or hand-written fixtures. Real profiles live outside the repo.
+
+## Layout
+
+```
+FastSuite/
+├── README.md
+├── LICENSE                MIT — Copyright 2026 Raphaël Ribes
+├── docs/
+│   ├── CLI-SPEC.md        the unified option grammar (the contract)
+│   ├── REPORT-SCHEMA.md   fastsuite.report.v1
+│   ├── RENAME-MAP.md      every old name → new name, and what changed
+│   ├── DECISIONS.md       the decision log (D-1 … D-12)
+│   ├── REPLACEMENT-MAP.md FastQC/Falco/MultiQC/fastp → FastSuite, feature by feature
+│   ├── PLAN.md            phased plan to full compatibility
+│   ├── PLAN-QC.md         fastcheck module design
+│   ├── PLAN-ML.md         the parameter-recommendation research plan
+│   ├── PLAN-ML-STEPS.md   the runnable breakdown, with acceptance tests
+│   ├── DEPLOY-IO.md       running the campaign on the Io cluster
+│   ├── RELEASES.md        release train + per-tool maturity
+│   └── plans/             per-tool implementation plans (bite-sized TDD)
+├── examples/              fastsuite.toml + demo.sh (synthetic control)
+├── deploy/io/             SLURM scripts for the campaign on Io
+└── tools/
+    ├── fastcheck/         src, tests, CITATION.cff (incl. the Python differential harness)
+    ├── fastdedup/         src, tests, benchmarks, paper/ (published)
+    ├── fastprep/          src, tests, paper/
+    ├── fastsim/           src, tests, profiles/, scripts/
+    ├── fastmaps/          src/
+    └── fasthelper/        src, tests
+```
+
+## Testing
+
+```fish
+for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper
+    cd tools/$t; and cargo test --offline; and cd ../..
+end
+# 345 tests, 0 failures (as of the 2026-10-12 status)
+```
+
+## Citing
+
+Each tool is independently citable via its `CITATION.cff`. **fastdedup** and
+**fastprep** belong to the Mandrillus Project and carry the ISDM/ISEM and
+Céline Mandier / Alice Baniel credits; fastdedup is published
+([Ribes, Mandier & Baniel, bioRxiv 2026](https://www.biorxiv.org/content/10.64898/2026.04.29.721745v1)).
+Everything else is [Raphaël Ribes](https://www.raphaelrib.es)'s own work.
+
+## Out of scope (deliberately)
+
+PE overlap/merge, UMI handling, alignment-based QC, workflow-engine
+semantics (arrays, resume — that is Snakemake/Nextflow's job), long reads
+for now. Each with its reason: `docs/DECISIONS.md` D-12.
+
+## License
+
+MIT — see [LICENSE](LICENSE). `tools/fastprep/LICENSE` carries the
+Mandrillus Project attribution.
