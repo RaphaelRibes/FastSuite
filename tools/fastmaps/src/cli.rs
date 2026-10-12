@@ -61,8 +61,17 @@ pub struct Args {
     #[arg(long, value_name = "GLOB", action = clap::ArgAction::Append)]
     pub r2_pattern: Vec<String>,
 
+    /// Write the machine-readable FastSuite report (fastsuite.report.v1) to
+    /// PATH, alongside the grid JSON. The grid JSON keeps its default
+    /// location `<output-dir>/heatmap.json`; this flag only redirects it
+    /// and additionally writes the v1 wrapper. `-` is not accepted:
+    /// fastmaps is file-only (D-4).
+    #[arg(long, value_name = "PATH")]
+    pub json: Option<std::path::PathBuf>,
+
     /// Number of worker threads to use. Defaults to the number of available
-    /// CPU cores (bounded by the file count). Pass 0 or omit for auto.
+    /// CPU cores (bounded by the file count), or $FASTSUITE_THREADS when set.
+    /// Pass 0 for auto.
     #[arg(short = 'j', long, default_value_t = 0)]
     pub threads: usize,
 }
@@ -108,5 +117,17 @@ mod tests {
     #[test]
     fn test_corners_filename() {
         assert_eq!(corners_filename(((0, 140), (5, 150))), "corners_0_140_5_150.fq");
+    }
+
+    #[test]
+    fn test_json_arg_default_none() {
+        let a = Args::parse_from(["fastmaps", "a.fq"]);
+        assert_eq!(a.json, None);
+    }
+
+    #[test]
+    fn test_json_arg_parsed() {
+        let a = Args::parse_from(["fastmaps", "a.fq", "--json", "/tmp/r.json"]);
+        assert_eq!(a.json.as_deref(), Some("/tmp/r.json".as_ref()));
     }
 }

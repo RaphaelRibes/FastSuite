@@ -33,6 +33,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    // ── Validate --json parent directory ───────────────────────────────────
+    if let Some(p) = &args.json {
+        if p.as_os_str() == "-" {
+            eprintln!("Error: fastmaps is file-only (D-4); --json needs a PATH, not '-'");
+            std::process::exit(1);
+        }
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty());
+        if let Some(dir) = parent {
+            if !dir.exists() {
+                eprintln!(
+                    "Error: --json directory {} does not exist",
+                    dir.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // ── Output directory ──────────────────────────────────────────────────
     let output_dir = args.output_dir;
     std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
