@@ -106,7 +106,14 @@ do_run() {
     local t0 t1
     t0=$(date +%s)
 
-    mkdir -p "$UNITS/$domain"
+    # The unit dir must exist before any writer touches it. It normally already
+    # does (claim/skip-existing ran first), but the very first worker for a
+    # domain creates it, and a concurrent `rm -rf` of a stale domain dir would
+    # otherwise leave this worker writing into a path that no longer exists.
+    mkdir -p "$UNITS/$domain" || {
+        record "$domain" "$acc" "fail-mkdir" - - - - - - "$UNITS/$domain"
+        unclaim "$acc"; return 1
+    }
 
     # --- resumable: a sha256 beside the unit means this run is finished ---
     if [[ "$FORCE" -ne 1 && -s "$udir.sha256" ]]; then
