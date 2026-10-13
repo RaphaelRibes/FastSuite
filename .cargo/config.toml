@@ -1,15 +1,21 @@
 # FastSuite cargo configuration (repo-level, applies to every tool checkout).
 #
-# The conda sysroot pixi provides (sysroot_linux-64 2.28) ships a Scrt1.o that
-# references __libc_csu_init/__libc_csu_fini, symbols removed from glibc in
-# 2.34 and absent from that sysroot's libc.so — so linking a Rust binary with
-# the conda cc fails with "undefined symbol: __libc_csu_init". The system
-# toolchain (/usr/bin/cc, the distro's glibc) has them, so we link with it.
+# The conda toolchain pixi's env provides (sysroot_linux-64 2.28) ships a
+# Scrt1.o that references __libc_csu_init/__libc_csu_fini — symbols glibc
+# removed in 2.34 — and its cc driver links against that sysroot. On a
+# machine whose system glibc also lacks the symbols (Debian ≥ 2.34), linking
+# a Rust binary inside the pixi env fails with:
 #
-# Verified: fastdedup links and runs with this on a fresh desktop install
-# (fastdedup 1.3.0, --version OK).
+#   rust-lld: error: undefined symbol: __libc_csu_init
+#       >>> referenced by .../sysroot/usr/lib/../lib64/Scrt1.o:(_start)
 #
-# If you build outside pixi with a system rustc, this is a no-op.
+# The fix: link the FINAL Rust binary with the SYSTEM compiler (/usr/bin/cc)
+# and the system glibc. Cargo's build scripts (the cc crate, cmake for
+# zlib-ng/libdeflate/zstd) still use the conda toolchain via $CC — they work
+# fine; only the final link was broken.
+#
+# The only system dependency this creates is gcc (build-essential on Debian,
+# gcc on CachyOS). If /usr/bin/cc is missing, install it.
 
 [target.x86_64-unknown-linux-gnu]
 linker = "/usr/bin/cc"
