@@ -14,11 +14,15 @@ cmake = "*"       # flate2's zlib-ng builds from source
 zlib = "*"
 zstd = "*"
 
+# NOTE: pixi executes tasks with sh/bash, NOT fish — write plain POSIX shell
+# (no `for ...; do ...; done` fish one-liner with parens, no `and`/`or`).
+# The `scripts/*.sh` wrappers are what the tasks call.
 [tasks]
 # Build every tool in dependency order (fasthelper last).
-build = { cmd = "for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release); done", depends-on = [] }
-build-offline = "for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper; do (cd tools/$t && cargo build --release --offline); done"
-test = "for t in fastcheck fastprep fastdedup fastsim fastmaps fasthelper; do (cd tools/$t && cargo test --offline); done"
+build = "bash scripts/build.sh"
+build-offline = "bash scripts/build.sh --offline"
+# All six tool test suites (397 tests).
+test = "bash scripts/test.sh"
 doctor = "./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools"
 demo = "bash examples/demo.sh"
 report = "./tools/fasthelper/target/release/fasthelper report examples/runs/demo -o examples/runs/demo --format html,tsv"
