@@ -94,7 +94,8 @@ FastSuite/
 ├── README.md
 ├── LICENSE                MIT — Copyright 2026 Raphaël Ribes
 ├── docs/
-│   ├── CLI-SPEC.md        the unified option grammar (the contract)
+│   ├── STATUS.md           the dated état des lieux (what is done, what is next, verified)
+│   ├── CLI-SPEC.md         the unified option grammar (the contract)
 │   ├── REPORT-SCHEMA.md   fastsuite.report.v1
 │   ├── RENAME-MAP.md      every old name → new name, and what changed
 │   ├── DECISIONS.md       the decision log (D-1 … D-12)
@@ -106,6 +107,7 @@ FastSuite/
 │   ├── PLAN-ML-LOCAL.md   the current ML execution plan: desktop-only benchmarks
 │   ├── DEPLOY-IO.md       running the campaign on the Io cluster (historical — access ended 2026-10-12)
 │   ├── RELEASES.md        release train + per-tool maturity
+│   ├── DESKTOP-SETUP.md   clone → pixi install → build → bench on the desktop
 │   └── plans/             per-tool implementation plans (bite-sized TDD)
 ├── examples/              fastsuite.toml + demo.sh (synthetic control)
 ├── deploy/io/             historical SLURM scripts (Io access ended 2026-10-12)
