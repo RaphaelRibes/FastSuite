@@ -115,6 +115,8 @@ fn run_sample(
     config_dir: &Path,
     dry_run: bool,
     threads: usize,
+    resume: &BTreeMap<String, ResumeEntry>,
+    from: Option<&str>,
 ) -> Result<SampleOutcome> {
     let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
@@ -141,6 +143,7 @@ fn run_sample(
     let mut cur1 = in1.clone();
     let mut cur2 = in2.clone();
     let mut to_delete: Vec<PathBuf> = Vec::new();
+    let mut from_reached = false;
 
     for (step_idx, tool) in cfg.run.steps.iter().enumerate() {
         let step = cfg.step(tool);
@@ -209,6 +212,55 @@ fn run_sample(
             config_dir,
         );
         let log = logs.join(format!("{}.{}.log", sample.name, tool));
+        // Resume: skip this step when a previous manifest recorded the exact
+        // same (argv, binary, version). --from <step> forces a rerun from
+        // that step onward, so once the named step is reached everything is
+        // forced regardless of what the manifest says.
+        let forced = from.map(|f| f == tool).unwrap_or(false);
+        if forced {
+            from_reached = true;
+        }
+        let key = format!("{}/{}", sample.name, tool);
+        if !forced && !from_reached {
+            if let Some((prev_argv, prev_bin, prev_ver)) = resume.get(&key) {
+                if prev_argv == &argv
+                    && prev_bin == &s(&bin)
+                    && *prev_ver == tool_version(&bin)
+                {
+                    println!("fasthelper: resumed {key}");
+                    entries.push((
+                        step_idx,
+                        serde_json::json!({
+                            "sample": sample.name,
+                            "tool": tool,
+                            "binary": prev_bin,
+                            "argv": prev_argv,
+                            "exit": 0,
+                            "elapsed_s": 0.0,
+                            "log": s(&log),
+                            "resumed": true,
+                        }),
+                    ));
+                    // The chain continues from this step's output: the file
+                    // the resumed step produced (same argv) is still there.
+                    if tool != "fastmaps" {
+                        if !cfg.run.keep_intermediate {
+                            if cur1 != in1 {
+                                to_delete.push(cur1.clone());
+                            }
+                            if let Some(c2) = &cur2 {
+                                if Some(c2) != in2.as_ref() {
+                                    to_delete.push(c2.clone());
+                                }
+                            }
+                        }
+                        cur1 = out1;
+                        cur2 = out2;
+                    }
+                    continue;
+                }
+            }
+        }
         let outcome = run_step(tool, &bin, &argv, &log, dry_run, None)?;
         println!(
             "  {tool:<10} exit {:<3} {:>7.2}s  log {}",
@@ -306,6 +358,55 @@ fn run_step(
 
 fn s(p: &Path) -> String {
     p.display().to_string()
+}
+
+/// Run `<bin> --version` and return its trimmed stdout (None if it fails).
+fn tool_version(bin: &Path) -> Option<String> {
+    std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+}
+
+/// What a previous run recorded for one `sample/tool` step: the argv it ran,
+/// the binary path, and that binary's `--version` at the time. A step is only
+/// resumed when all three match today.
+type ResumeEntry = (Vec<String>, String, Option<String>);
+
+/// Read `<outdir>/manifest.json` and build the `sample/tool -> ResumeEntry`
+/// map. A missing or unreadable manifest yields an empty map (fresh run).
+fn load_resume(outdir: &Path) -> BTreeMap<String, ResumeEntry> {
+    let mut map = BTreeMap::new();
+    let path = outdir.join("manifest.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return map;
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return map;
+    };
+    if let Some(cmds) = doc["commands"].as_array() {
+        for c in cmds {
+            let sample = c["sample"].as_str().unwrap_or("");
+            let tool = c["tool"].as_str().unwrap_or("");
+            if sample.is_empty() || tool.is_empty() {
+                continue;
+            }
+            let argv: Vec<String> = serde_json::from_value(c["argv"].clone()).unwrap_or_default();
+            let binary = c["binary"].as_str().unwrap_or("").to_string();
+            // Version is re-resolved live from the recorded binary; None when
+            // that binary no longer answers --version (then never resume).
+            let ver = if binary.is_empty() {
+                None
+            } else {
+                tool_version(Path::new(&binary))
+            };
+            map.insert(format!("{sample}/{tool}"), (argv, binary, ver));
+        }
+    }
+    map
 }
 
 /// Build the argv for one tool. Every tool receives the shared FastSuite flags
@@ -508,6 +609,10 @@ pub fn run(args: &RunArgs) -> Result<()> {
         });
     }
 
+    // Resume state from the previous manifest (empty on a fresh run). Shared
+    // read-only across the worker threads.
+    let resume = load_resume(&outdir);
+
     // Samples run through a shared work queue: min(P, samples) threads each
     // pull the next sample until the queue is empty. Per-sample step order
     // stays strict; only samples are concurrent. The merged manifest is
@@ -535,6 +640,8 @@ pub fn run(args: &RunArgs) -> Result<()> {
                     &config_dir,
                     args.dry_run,
                     per_sample_threads,
+                    &resume,
+                    args.from.as_deref(),
                 ) {
                     Ok(mut o) => {
                         entries

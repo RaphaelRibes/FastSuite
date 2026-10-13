@@ -57,6 +57,10 @@ pub struct RunArgs {
     #[arg(short = 'P', long, default_value_t = 1)]
     pub jobs: usize,
 
+    /// Re-run starting at this step (earlier steps are resumed/skipped as usual).
+    #[arg(long)]
+    pub from: Option<String>,
+
     /// Print the commands without executing them.
     #[arg(long)]
     pub dry_run: bool,

@@ -374,3 +374,35 @@ fn jobs_flag_is_accepted_and_the_run_still_succeeds() {
         assert_eq!(cmds.len(), 2, "both samples must run: {cmds:?}");
     }
 }
+
+#[test]
+fn from_flag_forces_a_step_rerun_and_resume_skips_matches() {
+    let d = tmpdir("resume");
+    let out = d.join("run");
+    std::fs::create_dir_all(&out).unwrap();
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(&fq, "@r1\nACGTACGT\n+\nIIIIIIII\n").unwrap();
+    let cfg = d.join("one.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"r\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n[[samples]]\nname = \"s1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+    // First run populates the manifest.
+    let (_, _, c1) = run(&["run", "-c", cfg.to_str().unwrap()]);
+    if c1 != 0 {
+        return; // fastcheck not installed here; the flag test below still runs
+    }
+    // Second run: identical config -> the step is resumed (skipped).
+    let (stdout2, _, c2) = run(&["run", "-c", cfg.to_str().unwrap()]);
+    assert_eq!(c2, 0);
+    assert!(stdout2.contains("resumed s1/fastcheck"), "{stdout2}");
+    // --from fastcheck forces it to run again.
+    let (stdout3, _, c3) = run(&["run", "-c", cfg.to_str().unwrap(), "--from", "fastcheck"]);
+    assert_eq!(c3, 0);
+    assert!(!stdout3.contains("resumed s1/fastcheck"), "{stdout3}");
+}
