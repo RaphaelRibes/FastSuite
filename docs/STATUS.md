@@ -14,10 +14,10 @@ here is production-ready** (see the README banner).
 | fastprep | 0.1.0 | 117 | working — swept-winner default, `--force`/`--dry-run`/`-q` | v1 report wrapper + streaming (round 2) |
 | fastsim | 0.1.0 | 57 | working — measured insert CDF, SE mode | clap migration (`plans/2026-10-12_fastsim-cli-convergence.md`) |
 | fastmaps | 0.1.0 | 43 | **CLI-converged** (`--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`) | — |
-| fastcheck | 0.1.0 | 73 | working — `--max-mem` + admission, harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–14) |
+| fastcheck | 0.1.0 | 77 | working — `--max-mem` + admission, **insert measurement fixed** (Task 10), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
 | fasthelper | 0.1.0 | 16 | working — fastcheck step, `check -c`, `--fail-on` | `plans/2026-10-12_fasthelper-hardening.md` (tasks 5–8) |
 
-**393 tests, 0 failures.** `pixi run doctor` lists all six; `bash
+**397 tests, 0 failures.** `pixi run doctor` lists all six; `bash
 examples/demo.sh 20000` runs the whole chain (fastsim → fastdedup → fastprep
 → fastmaps → aggregate).
 
@@ -51,11 +51,14 @@ examples/demo.sh 20000` runs the whole chain (fastsim → fastdedup → fastprep
 
 ## Known defects (measured, not guessed)
 
-1. **fastcheck's insert measurement** — the overlap anchor sat in R2's polyG
-   tail, so only ~25% of measurable inserts were found, and the identity
-   over-counted by the artefact lengths. Measured: 80.75% censored vs a true
-   55.77%; inserts below L=288 measure exactly, above L=290 everything is
-   censored. Fix: fastcheck plan Task 10 (prototype recovered 98.7%).
+1. **fastcheck's insert measurement** — FIXED 2026-10-13 (Task 10, commit
+   `98296e3`): the anchor sat in R2's polyG tail (only ~25% of measurable
+   inserts found) and the identity over-counted by the artefact lengths. Now:
+   anchor at offset t2, `insert = b1 + b2 - o`, <= 3 mismatches tolerated.
+   Verified on ground truth: 94.4% measured (seed 99), p50 201 vs injected
+   200; on the strict window 97.3%, mean 206.62 vs GT 206.83. Residual known
+   quirk: ~3% of sub-151 inserts leak out of `censored_below` (the
+   `o >= min(l1,l2)` gate), flagged for Task 13.
 2. **fastcheck's polyG detector** — reports 93.98% tail-free against a true
    66.01%, zero mass at t=3/t=15 (true 7.99%/6.99%). Reported in the fastsim
    paper §5.3 as a measured limitation.
