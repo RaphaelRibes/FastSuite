@@ -411,6 +411,160 @@ fn the_kmer_spectrum_is_labelled_approximate_because_its_counter_evicts() {
     assert!(note.contains("evict"), "{note}");
 }
 
+/// A fixture where one sequence appears 4 times out of 12 reads.
+///
+/// NOTE: the plan's original fixture had seq/qual length mismatches (which fastcheck
+/// correctly refuses as wrapped FASTQ) and a repeated sequence containing N (which the
+/// 2-bit packer of --overrep-mode table cannot represent). Quality lengths match their
+/// sequences here and the repeated sequence is pure ACGT, so every mode can name or
+/// count it.
+const OVERREP_FASTQ: &[u8] = b"@a\n\
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCA\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@b\n\
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCA\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@c\n\
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCA\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@d\n\
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCA\n\
++\n\
+#################################\n\
+@e\n\
+TTTTAAAACCCCGGGGTTTTAAAACCCCGGGGT\n\
++\n\
+555555555555555555555555555555555\n\
+@f\n\
+ACGTACGTACGTACGTACGTACGTACGTACGT\n\
++\n\
+JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ\n\
+@g\n\
+GGGGCCCCAAAATTTTGGGGCCCCAAAATTTT\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@h\n\
+CTCTCTCTCTCTCTCTCTCTCTCTCTCTCTCT\n\
++\n\
+55555555555555555555555555555555\n\
+@i\n\
+AACCAACCAACCAACCAACCAACCAACCAACC\n\
++\n\
+JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ\n\
+@j\n\
+TGCATGCATGCATGCATGCATGCATGCATGCA\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@k\n\
+GGATCCTTAGGCCAATTGGCCAATTGGCCAA\n\
++\n\
+5555555555555555555555555555555\n\
+@l\n\
+CATCATCATCATCATCATCATCATCATCATCA\n\
++\n\
+JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ\n\
+";
+
+fn write_overrep(dir: &Path) -> std::path::PathBuf {
+    let p = dir.join("over.fastq");
+    std::fs::write(&p, OVERREP_FASTQ).unwrap();
+    p
+}
+
+#[test]
+fn overrep_mode_none_is_the_default_and_reports_no_names() {
+    let d = tmpdir("overrep_none");
+    let fq = write_overrep(&d);
+    let json = d.join("r.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
+    let v = read_json(&json);
+    assert_eq!(v["overrep"]["mode"], "none");
+    assert_eq!(v["overrep"]["names_available"], false);
+    // Duplication levels are still exact in this mode.
+    assert!(v["metrics"]["distinct_seqs"].is_u64());
+    assert!(v["overrep"]["sequences"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn overrep_mode_fingerprint_reports_exact_multiplicity_without_names() {
+    let d = tmpdir("overrep_fp");
+    let fq = write_overrep(&d);
+    let json = d.join("r.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(),
+              "--overrep-mode", "fingerprint", "-q"]);
+    let v = read_json(&json);
+    assert_eq!(v["overrep"]["mode"], "fingerprint");
+    assert_eq!(v["overrep"]["names_available"], false);
+    // 4 copies of the first sequence, threshold max(10, 0.1% of 12) = 10 -> none reported.
+    assert!(v["overrep"]["sequences"].as_array().unwrap().is_empty());
+    // The threshold is a flag, so it can be lowered to see the 4x sequence.
+    let json2 = d.join("r2.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json2.to_str().unwrap(),
+              "--overrep-mode", "fingerprint", "--overrep-min-count", "3", "-q"]);
+    let v2 = read_json(&json2);
+    let seqs = v2["overrep"]["sequences"].as_array().unwrap();
+    assert_eq!(seqs.len(), 1, "only the 4x sequence clears a threshold of 3");
+    assert_eq!(seqs[0]["count"], 4);
+    assert!(seqs[0].get("seq").is_none(), "fingerprint mode cannot name the sequence");
+    assert_eq!(v2["overrep"]["names_available"], false);
+}
+
+#[test]
+fn overrep_mode_table_names_the_sequences_and_second_pass_records_two_passes() {
+    let d = tmpdir("overrep_tbl");
+    let fq = write_overrep(&d);
+    let json = d.join("t.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(),
+              "--overrep-mode", "table", "--overrep-min-count", "3", "-q"]);
+    let v = read_json(&json);
+    assert_eq!(v["overrep"]["mode"], "table");
+    assert_eq!(v["overrep"]["names_available"], true);
+    assert_eq!(v["overrep"]["unique_sequences_retained"], true);
+    let seqs = v["overrep"]["sequences"].as_array().unwrap();
+    assert_eq!(seqs.len(), 1);
+    assert_eq!(seqs[0]["seq"], "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA");
+    assert_eq!(seqs[0]["count"], 4);
+
+    let json2 = d.join("s.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json2.to_str().unwrap(),
+              "--overrep-mode", "second-pass", "--overrep-min-count", "3", "-q"]);
+    let v2 = read_json(&json2);
+    assert_eq!(v2["overrep"]["mode"], "second-pass");
+    assert_eq!(v2["overrep"]["names_available"], true);
+    assert_eq!(v2["overrep"]["passes"], 2, "the second read must be declared");
+    let seqs2 = v2["overrep"]["sequences"].as_array().unwrap();
+    assert_eq!(seqs2.len(), 1);
+    assert_eq!(seqs2[0]["seq"], "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA");
+}
+
+#[test]
+fn overrep_mode_table_refuses_above_max_mem_like_the_fingerprint_table() {
+    let d = tmpdir("overrep_refuse");
+    let fq = write_overrep(&d);
+    let (_, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--overrep-mode", "table", "--max-mem", "1", "-q"],
+    );
+    assert_ne!(code, 0, "must refuse: {stderr}");
+    assert!(
+        stderr.contains("unique sequences") || stderr.contains("fingerprint table"),
+        "the refusal must name the table: {stderr}"
+    );
+    assert!(stderr.contains("--overrep-mode fingerprint"), "must offer the cheaper mode: {stderr}");
+}
+
+#[test]
+fn overrep_mode_is_rejected_when_unknown() {
+    let d = tmpdir("overrep_bad");
+    let fq = write_fixture(&d);
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--overrep-mode", "sampled", "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("none") && stderr.contains("second-pass"), "{stderr}");
+}
+
 #[test]
 fn processed_files_produce_a_before_after_report() {
     let d = tmpdir("cmp");

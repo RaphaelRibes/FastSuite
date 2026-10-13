@@ -17,6 +17,7 @@ mod rich;
 mod insert;
 mod memory;
 mod fingerprint;
+mod overrep;
 mod reader;
 mod report;
 
@@ -111,8 +112,63 @@ fn main() -> Result<()> {
             .unwrap_or(memory::LimitSource::RlimitAs), // an explicit --max-mem is a soft cap
     });
 
+    // --overrep-mode table keeps every unique sequence in RAM (2-bit packed), so it is
+    // admission-checked with the same rule as the fingerprint table it builds on. It is
+    // checked FIRST: refusing on the mode the user asked for, with the cheaper modes
+    // named, is more useful than a refusal about the table they get either way.
+    let overrep = cli.overrep_mode()?;
+    let table_proj = if overrep == overrep::OverrepMode::Table {
+        let proj = overrep::table_projection(fp_capacity, 150);
+        eprintln!(
+            "fastcheck: over-representation table projected at {:.1} MB for ~{} unique sequences",
+            memory::mib(proj),
+            fp_capacity,
+        );
+        match memory::admit(proj, limit.as_ref()) {
+            memory::Admission::Refuse { projected, limit, source } => anyhow::bail!(
+                "--overrep-mode table needs ~{:.1} MB of packed unique sequences\n\
+                 but this process is limited to {:.1} MB ({})\n\
+\n\
+                 --overrep-mode fingerprint   exact multiplicities at 8 B per unique read\n\
+                 --overrep-mode second-pass   same memory as fingerprint, plus one extra read\n\
+                 --overrep-mode none         duplication levels only, zero cost",
+                memory::mib(projected),
+                memory::mib(limit),
+                source,
+            ),
+            memory::Admission::ProceedWithWarning { headroom_bytes } => eprintln!(
+                "fastcheck: warning: unique-sequence table projected at {:.1} MB, leaving \
+                 {:.1} MB headroom",
+                memory::mib(proj),
+                memory::mib(headroom_bytes),
+            ),
+            memory::Admission::Proceed => {}
+        }
+        Some(proj)
+    } else {
+        None
+    };
+
     match memory::admit(fp_proj.bytes, limit.as_ref()) {
-        memory::Admission::Refuse { projected, limit, source } => anyhow::bail!(
+        memory::Admission::Refuse { projected, limit, source } => {
+            // In table mode the sequence table is the larger allocation, so name it.
+            if let Some(tp) = table_proj {
+                anyhow::bail!(
+                    "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
+                     and --overrep-mode table needs ~{:.1} MB of packed unique sequences on top\n\
+                     but this process is limited to {:.1} MB ({})\n\
+\n\
+                     --max-mem <MB>                    raise the ceiling (it cannot exceed the cgroup limit)\n\
+                     --overrep-mode fingerprint        exact multiplicities at 8 B per unique read\n\
+                     --overrep-mode none               duplication levels only, zero cost",
+                    memory::mib(projected),
+                    fp_proj.buckets,
+                    memory::mib(tp),
+                    memory::mib(limit),
+                    source,
+                )
+            }
+            anyhow::bail!(
             "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
              but this process is limited to {:.1} MB ({})\n\
              --max-mem <MB>           raise the ceiling (it cannot exceed the cgroup limit)\n\
@@ -122,7 +178,8 @@ fn main() -> Result<()> {
             fp_proj.buckets,
             memory::mib(limit),
             source,
-        ),
+        )
+        }
         memory::Admission::ProceedWithWarning { headroom_bytes } => eprintln!(
             "fastcheck: warning: fingerprint table projected at {:.1} MB, leaving only {:.1} MB headroom",
             memory::mib(fp_proj.bytes),
@@ -136,7 +193,7 @@ fn main() -> Result<()> {
     let reports: Vec<FileReport> = if files.len() == 1 || threads <= 1 {
         let mut out = Vec::with_capacity(files.len());
         for path in &files {
-            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile)?);
+            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep)?);
         }
         out
     } else {
@@ -149,7 +206,7 @@ fn main() -> Result<()> {
             handles.push(std::thread::spawn(move || -> Result<Vec<FileReport>> {
                 let mut out = Vec::with_capacity(chunk.len());
                 for path in &chunk {
-                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile)?);
+                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile, overrep)?);
                 }
                 Ok(out)
             }));
@@ -214,7 +271,7 @@ fn main() -> Result<()> {
             pfiles.push(p2.clone());
         }
         for path in &pfiles {
-            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile)?);
+            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep)?);
         }
         for r in &processed_reports {
             processed_total.merge(&r.acc);
@@ -224,6 +281,9 @@ fn main() -> Result<()> {
     let verdict = offset_verdict(&total.qual_byte, requested_offset);
     let elapsed = started.elapsed().as_secs_f64();
 
+    let min_count = cli
+        .overrep_min_count
+        .unwrap_or_else(|| ((total.reads as f64 * 0.001) as u32).max(10));
     if let Some(p) = &cli.json {
         report::write_report(
             p,
@@ -235,6 +295,8 @@ fn main() -> Result<()> {
             cli.positions_tsv.as_deref(),
             insert.as_ref().map(|h| (h, total.reads / 2)),
             if processed_reports.is_empty() { None } else { Some(&processed_total) },
+            overrep,
+            min_count,
         )?;
     }
     if let Some(p) = &cli.html {
@@ -300,9 +362,11 @@ fn scan_one(
     limits: Limits,
     max_pos: usize,
     track_profile: bool,
+    overrep: overrep::OverrepMode,
 ) -> Result<FileReport> {
     let mut acc = Accum::new(max_pos);
     acc.track_profile = track_profile;
+    acc.track_overrep_table = overrep == overrep::OverrepMode::Table;
     let scan = reader::scan_file(path, gz_threads, limits, &mut acc)?;
     Ok(FileReport {
         path: path.clone(),

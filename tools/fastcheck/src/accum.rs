@@ -86,6 +86,11 @@ pub struct Accum {
     pub seq_counts: crate::fingerprint::FingerprintTable,
     /// Bounded 12-mer counter (packed u64 keys).
     pub kmer_counts: RepeatedCounter<u64>,
+    /// 2-bit packed sequence table, filled only in `--overrep-mode table` (the memory is
+    /// real: ~46 B per unique 150 bp read, admission-checked in main.rs).
+    pub overrep_table: crate::overrep::SequenceTable,
+    /// Whether the packed sequence table is filled (set in main.rs for `table` mode).
+    pub track_overrep_table: bool,
 }
 
 /// Adapter prefixes the fitter's readthrough scan looks for.
@@ -126,6 +131,8 @@ impl Accum {
             heatmap: vec![0; heatmap::SIZE * heatmap::SIZE],
             seq_counts: crate::fingerprint::FingerprintTable::with_capacity(1024),
             kmer_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
+            overrep_table: crate::overrep::SequenceTable::default(),
+            track_overrep_table: false,
         }
     }
 
@@ -245,6 +252,12 @@ impl Accum {
         // The table is pre-sized from the projected record count in main.rs, so this does
         // not rehash. Over-representation naming is a separate, opt-in concern (§5.9).
         self.seq_counts.observe(seq);
+        if self.track_overrep_table {
+            // A non-ACGT base cannot be packed; refusing is the caller's job (main.rs
+            // checks the first read), and here the sequence is simply skipped rather than
+            // silently mis-counted — the report's unique_sequences count shows the gap.
+            let _ = self.overrep_table.observe(seq);
+        }
         if seq.len() >= 12 {
             for w in seq.windows(12) {
                 if let Some(pk) = repeated::pack_kmer(w) {
@@ -274,6 +287,10 @@ impl Accum {
         }
         // The fingerprint table merges exactly, like every other accumulator here.
         self.seq_counts.merge(&o.seq_counts);
+        if self.track_overrep_table || o.track_overrep_table {
+            self.track_overrep_table = true;
+            self.overrep_table.merge(&o.overrep_table);
+        }
         add_hist(&mut self.len_hist, &o.len_hist);
         add_hist(&mut self.acgt_hist, &o.acgt_hist);
         add_hist(&mut self.gc_hist, &o.gc_hist);

@@ -25,6 +25,11 @@ pub(crate) fn bases_other(a: &Accum) -> u64 {
     a.bases - acgt
 }
 
+/// The input paths, for the modules that re-read the files (overrep second-pass).
+fn files_paths(files: &[FileReport]) -> Vec<PathBuf> {
+    files.iter().map(|f| f.path.clone()).collect()
+}
+
 pub(crate) fn gc_fraction(a: &Accum) -> f64 {
     let acgt: u64 = (0..a.acgt_hist.len()).map(|i| i as u64 * a.acgt_hist[i]).sum();
     if acgt == 0 {
@@ -150,6 +155,8 @@ pub fn write_report(
     positions_tsv: Option<&Path>,
     insert: Option<(&crate::insert::InsertHist, u64)>,
     processed: Option<&Accum>,
+    overrep: crate::overrep::OverrepMode,
+    overrep_min_count: u32,
 ) -> Result<()> {
     let offset = verdict.offset;
     let (byte_min, byte_max) = byte_range(&total.qual_byte);
@@ -296,6 +303,7 @@ pub fn write_report(
         "base_position": base_position_json(total),
         "polyx": polyx_block,
         "repeated_sequences": rep_block,
+        "overrep": crate::overrep::report(overrep, total, &files_paths(files), 1, overrep_min_count)?,
         "kmer_spectrum": kmer_block,
         "heatmap": hm_block,
         "processed": match processed {

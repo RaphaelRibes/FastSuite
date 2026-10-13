@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+use crate::overrep::OverrepMode;
+
 /// Exact, one-pass FASTQ quality control.
 ///
 /// Every number is an integer count read off the whole file: no sampling, no
@@ -86,6 +88,28 @@ pub struct Cli {
     #[arg(long, default_value_t = 20000, value_name = "N")]
     pub insert_pairs: u64,
 
+    /// How over-represented sequences are identified (PLAN-QC §5.9). The one honest
+    /// trade-off in fastcheck: exact identity needs either the sequences themselves or a
+    /// second read of the file.
+    ///
+    ///   none        (default, zero cost) exact duplication levels, no sequence names
+    ///   fingerprint +unique x 8 B/0.8 RAM; exact multiplicity, names_available: false
+    ///   second-pass one extra read of the file to emit the text of sequences above the
+    ///               threshold; memory stays at the fingerprint table; passes: 2
+    ///   table       2-bit packed sequences (ceil(len/4)+8 B each); refuses above --max-mem;
+    ///               unique_sequences_retained: true
+    ///
+    /// FastQC instead analyses the first 100 000 sequences and hopes. None of these modes
+    /// samples: a sample is never presented as the whole.
+    #[arg(long, value_name = "none|fingerprint|second-pass|table", default_value = "none")]
+    pub overrep_mode: String,
+
+    /// Minimum multiplicity for a sequence to be reported as over-represented
+    /// (default: max(10, 0.1% of reads) — FastQC's 0.1% convention, but computed from the
+    /// exact read count rather than from a 100 k sample).
+    #[arg(long, value_name = "N")]
+    pub overrep_min_count: Option<u32>,
+
     /// Suppress the end-of-run summary line.
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -109,5 +133,9 @@ impl Cli {
                 .map(|n| n.get())
                 .unwrap_or(1)
         }
+    }
+
+    pub fn overrep_mode(&self) -> anyhow::Result<OverrepMode> {
+        OverrepMode::parse(&self.overrep_mode)
     }
 }
