@@ -9,11 +9,16 @@
 //!
 //! The per-pair measurement is exact, not a heuristic. When the insert is shorter
 //! than the two reads together, R1's suffix equals the reverse complement of R2's
-//! prefix, and the overlap length gives the insert:
+//! prefix, and the overlap length gives the insert. Both mates are trimmed of
+//! their 5' and 3' homopolymer artefacts first, because a polyG run and adapter
+//! readthrough are not biology, so the identity is on biology lengths:
 //!
 //! ```text
-//!   insert = len(R1) + len(R2) - overlap
+//!   insert = b1 + b2 - overlap        b = L - h - t
 //! ```
+//!
+//! (the old `insert = len(R1) + len(R2) - overlap` over-estimated the insert by
+//! `(h1+t1+h2+t2)/2`, because it counted the polyG runs and the adapter).
 //!
 //! Three outcomes exist and each is counted separately, because a distribution
 //! that hides its censoring is worse than no distribution at all:
@@ -23,7 +28,7 @@
 //!   length (the adapter-readthrough regime). Measuring it needs adapter
 //!   detection, which is not this module's job.
 //! * `censored_above` — no overlap: the insert exceeds
-//!   `len(R1) + len(R2) - ANCHOR`, or is too short to place the anchor.
+//!   `b1 + b2 - ANCHOR`, or is too short to place the anchor.
 //!
 //! Picard's CollectInsertSizeMetrics has the same censoring; the difference is
 //! that here it is reported per category instead of being folded into a mode.
@@ -40,6 +45,27 @@ use crate::reader::{open, read_line};
 /// overlaps are still found.
 const ANCHOR: usize = 12;
 
+/// Mismatch tolerance for the overlap verification.
+///
+/// Not zero, and deliberately so: the boundary rule in the simulator (and any real
+/// two-colour dataset) replaces the base adjacent to an artefact with a random non-G,
+/// independently in each mate, so the two reads disagree at that base BY CONSTRUCTION.
+/// Sequencing errors add ~2e-3..2e-2 mismatches per base (a Q38 profile substitutes
+/// ~1.6e-4 of bases, so an 80-base overlap carries one about 1% of the time). A tolerance
+/// of 3 absorbs both over the whole overlap while still rejecting a chance alignment
+/// (which differs in a quarter of positions).
+const MAX_OVERLAP_MISMATCHES: usize = 3;
+
+/// Mismatch tolerance for the anchor match itself. One base of slack lets the anchor
+/// tolerate a sequencing error (or the artefact boundary) inside its 12 bases, which
+/// otherwise drops a whole pair that the full verification would have accepted.
+const MAX_ANCHOR_MISMATCHES: usize = 1;
+
+/// Shortest terminal homopolymer run that counts as an artefact. A run of 1 (or 2) is
+/// ordinary biology — a fragment ending in `...ACG` is not carrying a polyG tail — so
+/// treating it as one would shave real biology off both mates and bias the insert low.
+const MIN_HOMOPOLYMER: usize = 3;
+
 #[inline]
 fn comp(b: u8) -> u8 {
     match b {
@@ -51,32 +77,98 @@ fn comp(b: u8) -> u8 {
     }
 }
 
-/// Longest overlap `o` such that `s1[len1-o..] == revcomp(s2)[0..o]`.
+/// The measured 3' homopolymer run of each base, so the tail can be skipped. N and other
+/// IUPAC codes end the run. A single terminal base is biology, not an artefact: only a run
+/// of at least [`MIN_HOMOPOLYMER`] is an artefact worth excluding from the biology length.
+fn trailing_run(s: &[u8]) -> usize {
+    let run = terminal_run(s, false);
+    if run >= MIN_HOMOPOLYMER { run } else { 0 }
+}
+
+/// The measured 5' homopolymer run, so the head artefact can be excluded from the biology
+/// length. Mirrors [`trailing_run`].
+fn leading_run(s: &[u8]) -> usize {
+    let run = terminal_run(s, true);
+    if run >= MIN_HOMOPOLYMER { run } else { 0 }
+}
+
+/// Length of the run of the terminal base at one end of `s`, or 0 when the terminal base is
+/// not an unambiguous base (N, IUPAC), since such a run cannot be an artefact run.
+fn terminal_run(s: &[u8], from_start: bool) -> usize {
+    let pick = |i: usize| if from_start { s[i] } else { s[s.len() - 1 - i] };
+    let first = pick(0);
+    if !matches!(
+        first.to_ascii_uppercase(),
+        b'A' | b'C' | b'G' | b'T'
+    ) {
+        return 0;
+    }
+    let base = first.to_ascii_uppercase();
+    let mut n = 0usize;
+    while n < s.len() && pick(n).to_ascii_uppercase() == base {
+        n += 1;
+    }
+    n
+}
+
+/// An alignment is accepted with up to [`MAX_OVERLAP_MISMATCHES`] differences, because the
+/// boundary rule and sequencing errors guarantee a few. A chance alignment differs
+/// everywhere, so the tolerance does not admit noise.
+fn verify(a: &[u8], b: &[u8]) -> bool {
+    let mut mm = 0usize;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x.to_ascii_uppercase() != y.to_ascii_uppercase() {
+            mm += 1;
+            if mm > MAX_OVERLAP_MISMATCHES {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Reverse complement, for the overlap search.
+fn revcomp(s: &[u8]) -> Vec<u8> {
+    s.iter().rev().map(|&b| comp(b)).collect()
+}
+
+/// Longest overlap `o` such that `s1[len1-t1-o..len1-t1] == revcomp(s2)[t2..t2+o]`.
 ///
-/// `o` is the number of bases the two reads share, so `insert = len1 + len2 - o`.
-/// The search is anchored on the first [`ANCHOR`] bases of `revcomp(s2)` — which
-/// must sit at a position `p` of `s1` with `p + o == len1` — and then verified
-/// base by base over the whole overlap, so a chance anchor hit cannot produce a
-/// measurement.
+/// `t1` and `t2` are the measured 3' homopolymer run lengths of each mate: the anchor is
+/// placed at offset `t2` inside `revcomp(s2)` because offsets below that are the polyG
+/// tail, and an anchor of Gs matches a chance G-stretch in R1 and produces a garbage
+/// "verified" overlap. The overlap extends to the end of R1's biology (`len1 - t1`), not
+/// to the end of the read, for the same reason.
+///
+/// The insert identity is then `b1 + b2 - o` with `b = L - h - t`: polyG and adapter are
+/// not biology, so counting them (as `len1 + len2 - o` does) over-estimates the insert by
+/// `(h1+t1+h2+t2)/2`.
 fn overlap(s1: &[u8], s2: &[u8]) -> Option<usize> {
     let l1 = s1.len();
     let l2 = s2.len();
     if l1 < ANCHOR || l2 < ANCHOR {
         return None;
     }
-    let mut anchor = [0u8; ANCHOR];
-    for (i, a) in anchor.iter_mut().enumerate() {
-        *a = comp(s2[l2 - 1 - i]);
+    let t1 = trailing_run(s1);
+    let t2 = trailing_run(s2);
+    let bio1 = l1.saturating_sub(t1);
+    let r = revcomp(s2);
+    if bio1 < ANCHOR || r.len() < t2 + ANCHOR {
+        return None;
     }
+    // The anchor is the first ANCHOR biology bases of revcomp(s2), i.e. at offset t2.
+    // revcomp(s2) is the fragment's own frame, so the anchor equals R1 at the position p
+    // where the shared region starts, and the whole overlap then pairs as
+    // `s1[p..bio1] == r[t2..t2+o]` with `o = bio1 - p`.
+    let anchor = &r[t2..t2 + ANCHOR];
     if anchor.iter().all(|&b| b == b'N') {
         return None;
     }
-    let first = anchor[0];
     let mut p = 0usize;
-    while p + ANCHOR <= l1 {
-        if s1[p] == first && s1[p..p + ANCHOR] == anchor {
-            let o = l1 - p;
-            if o <= l2 && verify(s1, s2, o) {
+    while p + ANCHOR <= bio1 {
+        if anchor_matches(&s1[p..p + ANCHOR], anchor) {
+            let o = bio1 - p;
+            if o <= r.len() - t2 && verify(&s1[p..bio1], &r[t2..t2 + o]) {
                 return Some(o);
             }
         }
@@ -85,9 +177,20 @@ fn overlap(s1: &[u8], s2: &[u8]) -> Option<usize> {
     None
 }
 
-fn verify(s1: &[u8], s2: &[u8], o: usize) -> bool {
-    let (l1, l2) = (s1.len(), s2.len());
-    (0..o).all(|i| comp(s2[l2 - 1 - i]) == s1[l1 - o + i])
+/// The anchor matches with up to [`MAX_ANCHOR_MISMATCHES`] differences. A sequencing
+/// error or the artefact boundary inside the 12 anchor bases must not cost a pair that
+/// the full-overlap verification (tolerant of [`MAX_OVERLAP_MISMATCHES`]) would accept.
+fn anchor_matches(a: &[u8], b: &[u8]) -> bool {
+    let mut mm = 0usize;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x.to_ascii_uppercase() != y.to_ascii_uppercase() {
+            mm += 1;
+            if mm > MAX_ANCHOR_MISMATCHES {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Insert-size histogram with its censoring, merged across passes.
@@ -150,7 +253,16 @@ impl InsertHist {
             // exact value lives in the adapter, which this module does not read.
             Some(o) if o >= l1.min(l2) => self.censored_below += 1,
             Some(o) => {
-                let insert = l1 + l2 - o;
+                // b1 + b2 - o, with b = L - h - t the BIOLOGY length: the polyG runs and
+                // any adapter are not biology, and counting them over-estimates the insert
+                // by (h1+t1+h2+t2)/2. This is the identity the ground-truth test checks.
+                let t1 = trailing_run(s1);
+                let t2 = trailing_run(s2);
+                let h1 = leading_run(s1);
+                let h2 = leading_run(s2);
+                let b1 = l1.saturating_sub(h1 + t1);
+                let b2 = l2.saturating_sub(h2 + t2);
+                let insert = b1 + b2 - o;
                 if insert < self.bins.len() {
                     self.bins[insert] += 1;
                     self.measured += 1;
@@ -438,10 +550,12 @@ impl InsertHist {
             } else { 0.0 },
             "resolution": format!(
                 "an overlap shorter than {ANCHOR} bases cannot be anchored, so inserts above \
-                 len(R1)+len(R2)-{ANCHOR} are not measured. The no-overlap bucket also holds \
-                 readthrough pairs (insert <= read length), where the adapter breaks the \
-                 overlap: a dominant 3'-terminal k-mer is the signature, and its exact insert \
-                 needs the adapter boundary, which this module does not read"
+                 b1+b2-{ANCHOR} (b = L - h - t, the biology length) are not measured. The anchor \
+                 is placed after each mate's 3' homopolymer run, and up to {MAX_OVERLAP_MISMATCHES} \
+                 mismatches are tolerated because the artefact boundary rule guarantees one. The \
+                 no-overlap bucket also holds readthrough pairs (insert <= read length), where the \
+                 adapter breaks the overlap: a dominant 3'-terminal k-mer is the signature, and its \
+                 exact insert needs the adapter boundary, which this module does not read"
             ),
             "bins": serde_json::Value::Object(bins),
             "bins_unioned_with_adapter": serde_json::Value::Object({
@@ -593,5 +707,79 @@ mod tests {
         assert!((h.mean() - 300.0).abs() < 1e-9);
         assert!((h.sd() - 100.0).abs() < 1e-9, "sd {}", h.sd());
         assert_eq!(h.quantile(0.5), 300.0);
+    }
+
+    /// DEFECT A: the anchor used to be revcomp(s2)[0..12], which sits in R2's 3' polyG
+    /// tail whenever t2 > 0. Anchoring on GGGGGGGGGGGG finds a chance G-stretch in R1, so
+    /// the "verified" overlap is garbage and only ~25% of measurable inserts were found.
+    /// The anchor must start AFTER the tail.
+    #[test]
+    fn the_anchor_skips_r2_s_polyg_tail() {
+        // R2 = [biology][6 Gs]. revcomp(R2) starts with those 6 Gs, so an anchor at
+        // offset 0 is all G and must not be used.
+        let frag = dna(200, 31);
+        let mut r2 = revcomp(&frag[50..200]);
+        r2.extend_from_slice(b"GGGGGG");
+        let r1 = frag[0..150].to_vec();
+        // The biology overlap is 100 bases; the anchor must land inside the biology.
+        let o = overlap(&r1, &r2).expect("a 150+156 pair with a 100-base overlap must be found");
+        assert_eq!(o, 100, "the overlap is the shared biology, tail excluded");
+    }
+
+    /// DEFECT B: insert = len(R1)+len(R2)-o over-estimates by (h1+t1+h2+t2)/2 because
+    /// polyG runs and adapter are not biology. The identity is insert = b1 + b2 - o with
+    /// b = L - h - t.
+    #[test]
+    fn the_insert_uses_biology_lengths_not_read_lengths() {
+        let frag = dna(220, 30);
+        // Both mates carry a 5-base 3' G-run, so b1 = b2 = 145 while L = 150. This seed is
+        // chosen so neither biology end is itself a homopolymer run, so the only 3' run on
+        // each read is the injected tail (no boundary-rule substitution needed).
+        let mut r1 = frag[0..145].to_vec();
+        r1.extend_from_slice(b"GGGGG");
+        let mut r2 = revcomp(&frag[75..220]);
+        r2.extend_from_slice(b"GGGGG");
+        let mut h = InsertHist::new(1024, Vec::new());
+        h.observe_pair(&r1, &r2);
+        assert_eq!(h.measured, 1);
+        // b1 + b2 - o = 145 + 145 - 70 = 220.
+        assert!((h.mean() - 220.0).abs() < 1e-9, "got {}, want 220", h.mean());
+    }
+
+    /// Verification used to demand 0 mismatches. The simulator's own boundary rule
+    /// guarantees ~1 disagreement at the overlap's first base, and sequencing errors add
+    /// ~2e-3 per base, so a correct alignment was rejected about half the time.
+    #[test]
+    fn verification_tolerates_the_boundary_disagreement_and_sequencing_errors() {
+        let frag = dna(220, 41);
+        let mut r1 = frag[0..150].to_vec();
+        let r2 = revcomp(&frag[70..220]);
+        // Three disagreements inside the 80-base shared region: one at the boundary
+        // (R1 position 81) and two deeper (R1 positions 107, 130). R2 index i pairs with
+        // R1 index 149-i, so the chosen R1 positions currently agree with R2 and each
+        // mutation creates a genuine mismatch.
+        for i in [81, 107, 130] {
+            r1[i] = if r1[i] == b'A' { b'C' } else { b'A' };
+        }
+        let mut h = InsertHist::new(1024, Vec::new());
+        h.observe_pair(&r1, &r2);
+        assert_eq!(h.measured, 1, "3 mismatches in 80 bases must not reject the pair");
+    }
+
+    /// Four mismatches in 80 bases is beyond the tolerance and must be rejected rather
+    /// than silently mis-measured.
+    #[test]
+    fn too_many_mismatches_is_rejected_not_mismeasured() {
+        let frag = dna(220, 41);
+        let mut r1 = frag[0..150].to_vec();
+        let r2 = revcomp(&frag[70..220]);
+        // Four disagreements, all inside the shared region frag[70..150].
+        for i in [81, 107, 130, 145] {
+            r1[i] = if r1[i] == b'A' { b'C' } else { b'A' };
+        }
+        let mut h = InsertHist::new(1024, Vec::new());
+        h.observe_pair(&r1, &r2);
+        assert!(h.measured + h.censored_above + h.censored_below == 1);
+        assert_eq!(h.measured, 0, "4 mismatches in 80 bases must not verify");
     }
 }
