@@ -18,8 +18,11 @@ of the tool process itself.
 
 Note on fairness: fastp's defaults are genuinely good and this comparison is
 not a rigged race — fastp-best is included precisely so that "fastp loses" can
-never mean "fastp was misconfigured". If the winner only beats fastp-default
-and loses to fastp-best, the memo says so.
+never mean "fastp was misconfigured". Compression is equalised: every fastp run
+passes -z GZ_LEVEL (6, the FastSuite canonical level) so the wall-time
+comparison does not charge the winner's output for a higher compression level
+than fastp's (fastp's own default is 4, fastprep's is 6). If the winner only
+beats fastp-default and loses to fastp-best, the memo says so.
 
 Usage:
   fastp_compare.py --fastcheck PATH --fastprep PATH --fastp PATH \\
@@ -44,6 +47,8 @@ ROW_FIELDS = ["domain", "run_accession", "tool", "variant", "argv",
 
 # fastp's best-effort pass: the settings its documentation recommends for
 # NovaSeq-style libraries with polyG at the 5' end.
+GZ_LEVEL = 6  # every tool compresses its output at the same level (fastp defaults to 4)
+
 FASTP_BEST = ["--cut_front", "--cut_front_window_size", "5",
               "--cut_front_mean_quality", "20",
               "--cut_tail", "--cut_tail_window_size", "5",
@@ -188,7 +193,7 @@ def main() -> int:
             o1 = os.path.join(d, "fp_R1.fastq.gz")
             o2 = os.path.join(d, "fp_R2.fastq.gz")
             argv = [args.fastp, "-i", r1, "-I", r2, "-o", o1, "-O", o2,
-                    "-w", str(args.threads)]
+                    "-w", str(args.threads), "-z", str(GZ_LEVEL)]
             rc, secs, log = run_timed(argv, os.path.join(d, "fp.log"))
             rep = fastcheck_report(args.fastcheck, o1, o2, os.path.join(d, "fp.json"), args.threads) \
                 if rc == 0 else None
@@ -199,7 +204,7 @@ def main() -> int:
             o1 = os.path.join(d, "fpb_R1.fastq.gz")
             o2 = os.path.join(d, "fpb_R2.fastq.gz")
             argv = [args.fastp, "-i", r1, "-I", r2, "-o", o1, "-O", o2,
-                    "-w", str(args.threads)] + FASTP_BEST
+                    "-w", str(args.threads), "-z", str(GZ_LEVEL)] + FASTP_BEST
             rc, secs, log = run_timed(argv, os.path.join(d, "fpb.log"))
             rep = fastcheck_report(args.fastcheck, o1, o2, os.path.join(d, "fpb.json"), args.threads) \
                 if rc == 0 else None

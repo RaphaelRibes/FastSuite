@@ -260,6 +260,8 @@ def score_config(meta: dict, gt: list[tuple], read_len: int) -> dict:
                 kept=kept, should_keep=should_keep, score=score)
 
 
+GZ_LEVEL = 6  # every tool compresses its output at the same level
+
 # ---------------------------------------------------------------- fastprep
 def min_len_arg(v: float) -> str:
     """fastprep takes `N` (bases) or `0.6L` (fraction of the read length).
@@ -287,7 +289,8 @@ def build_argv(cfg: dict, work: str, cid: int) -> list[str]:
          "--min-len", min_len_arg(cfg["min_len"]),
          "--mean-q", str(cfg["mean_q"]),
          "--adapter-error-rate", str(cfg["adapter_err"]),
-         "--min-adapter-overlap", str(cfg["min_overlap"])]
+         "--min-adapter-overlap", str(cfg["min_overlap"]),
+         "--gz-level", str(GZ_LEVEL)]  # equal compression with every other tool
     if cfg.get("r2_reverse"):
         a.append("--r2-scan-reverse")
     if cfg.get("interior"):
