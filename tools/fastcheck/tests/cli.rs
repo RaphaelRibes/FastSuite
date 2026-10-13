@@ -590,3 +590,100 @@ fn processed_files_produce_a_before_after_report() {
     assert!(h.contains("Per-base sequence content"), "missing per-base section");
     assert!(h.contains("ppolyx"), "missing processed polyX tabs");
 }
+
+/// 6 reads of 150 bp: two carry the full 19-base Nextera adapter starting at 1-based
+/// position 121, one carries a truncated 16-base Nextera tail at 135, three are clean.
+const ADAPTER_FASTQ: &[u8] = b"@a\n\
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACTGTCTCTTATACACATCTAAAAAAAAAAA\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@b\n\
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACTGTCTCTTATACACATCTAAAAAAAAAAA\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@c\n\
+TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTCTGTCTCTTATACACA\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@d\n\
+CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n\
++\n\
+555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555\n\
+@e\n\
+TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n\
++\n\
+555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555\n\
+@f\n\
+ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAC\n\
++\n\
+JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ\n\
+";
+
+#[test]
+fn adapter_content_per_position_counts_every_match_start() {
+    let d = tmpdir("adapter_pos");
+    let p = d.join("ad.fastq");
+    std::fs::write(&p, ADAPTER_FASTQ).unwrap();
+    let json = d.join("a.json");
+    let tsv = d.join("pos.tsv");
+    let (_, stderr, code) = run(
+        &d,
+        &[p.to_str().unwrap(), "--adapter-content", "--adapter-preset", "nextera",
+          "--json", json.to_str().unwrap(), "--positions-tsv", tsv.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&json);
+    let blk = &v["adapter_content"];
+    assert_eq!(blk["adapters"].as_array().unwrap().len(), 1, "nextera preset = one adapter");
+    assert_eq!(blk["adapters"][0]["name"], "Nextera");
+    // Per-position counts: 2 full adapters at position 121 (0-based 120), one truncated
+    // 16-base match at position 135 (0-based 134).
+    let per_pos = blk["adapters"][0]["per_position"].as_object().unwrap();
+    assert_eq!(per_pos["121"], 2, "two reads carry the full adapter at 121");
+    assert_eq!(per_pos["135"], 1, "one read carries a 16-base truncated adapter at 135");
+    // Totals: 3 of 6 reads carry an adapter somewhere.
+    assert_eq!(blk["adapters"][0]["reads_with_match"], 3);
+    assert_eq!(blk["error_rate"], 0.2);
+    assert_eq!(blk["min_overlap"], 14);
+
+    // The TSV gains one column per adapter.
+    let text = std::fs::read_to_string(&tsv).unwrap();
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("adapter_Nextera"), "header: {header}");
+    let rows: Vec<&str> = text.lines().skip(1).collect();
+    let idx = header.split('\t').position(|c| c == "adapter_Nextera").unwrap();
+    assert_eq!(rows[120].split('\t').nth(idx).unwrap(), "2");
+    assert_eq!(rows[134].split('\t').nth(idx).unwrap(), "1");
+    assert_eq!(rows[0].split('\t').nth(idx).unwrap(), "0", "clean at position 1");
+}
+
+#[test]
+fn adapter_content_is_off_by_default_and_the_columns_are_absent() {
+    let d = tmpdir("adapter_off");
+    let fq = write_fixture(&d);
+    let json = d.join("a.json");
+    let tsv = d.join("pos.tsv");
+    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(),
+              "--positions-tsv", tsv.to_str().unwrap(), "-q"]);
+    let v = read_json(&json);
+    assert!(v.get("adapter_content").is_none(), "must be opt-in");
+    let header = std::fs::read_to_string(&tsv).unwrap().lines().next().unwrap().to_string();
+    assert!(!header.contains("adapter_"), "no adapter columns by default: {header}");
+}
+
+#[test]
+fn adapter_content_honours_the_error_rate_and_overlap_flags() {
+    let d = tmpdir("adapter_flags");
+    let p = d.join("ad.fastq");
+    std::fs::write(&p, ADAPTER_FASTQ).unwrap();
+    let json = d.join("a.json");
+    // An 18-base floor rejects the 16-base truncated match but keeps the full 19-base
+    // ones (the plan's 30-base floor would reject both: Nextera is 19 bases long).
+    run(&d, &[p.to_str().unwrap(), "--adapter-content", "--adapter-preset", "nextera",
+              "--min-adapter-overlap", "18", "--json", json.to_str().unwrap(), "-q"]);
+    let v = read_json(&json);
+    let per_pos = v["adapter_content"]["adapters"][0]["per_position"].as_object().unwrap();
+    assert_eq!(per_pos.get("135"), None, "16 < 18: below the floor");
+    assert_eq!(per_pos["121"], 2);
+    assert_eq!(v["adapter_content"]["min_overlap"], 18);
+}

@@ -1,6 +1,8 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+use anyhow::Context;
+
 use crate::overrep::OverrepMode;
 
 /// Exact, one-pass FASTQ quality control.
@@ -110,6 +112,25 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub overrep_min_count: Option<u32>,
 
+    /// Count, per position, the reads whose adapter match STARTS there, for every adapter
+    /// in the catalogue (PLAN-QC module 11). Off by default: it costs one catalogue scan
+    /// per read. The matcher semantics are fastprep's, exactly.
+    #[arg(long)]
+    pub adapter_content: bool,
+
+    /// Adapter catalogue for --adapter-content: illumina (TruSeq R1/R2 + Nextera),
+    /// nextera, or a FASTA path.
+    #[arg(long, value_name = "illumina|nextera|PATH", default_value = "illumina")]
+    pub adapter_preset: String,
+
+    /// Maximum mismatch rate for --adapter-content matching [0, 1] (fastprep's default).
+    #[arg(long, default_value_t = 0.2, value_name = "FLOAT")]
+    pub adapter_error_rate: f64,
+
+    /// Minimum adapter overlap for --adapter-content matching (fastprep's default).
+    #[arg(long, default_value_t = 14, value_name = "N")]
+    pub min_adapter_overlap: usize,
+
     /// Suppress the end-of-run summary line.
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -138,4 +159,53 @@ impl Cli {
     pub fn overrep_mode(&self) -> anyhow::Result<OverrepMode> {
         OverrepMode::parse(&self.overrep_mode)
     }
+
+    /// The adapter set for --adapter-content, with fastprep's presets.
+    pub fn adapter_set(&self) -> anyhow::Result<crate::adapter::AdapterSet> {
+        if !(0.0..=1.0).contains(&self.adapter_error_rate) {
+            anyhow::bail!("--adapter-error-rate must be in [0, 1]");
+        }
+        if self.min_adapter_overlap == 0 {
+            anyhow::bail!("--min-adapter-overlap must be >= 1");
+        }
+        let adapters = match self.adapter_preset.as_str() {
+            "illumina" => crate::adapter::preset_illumina(),
+            "nextera" => crate::adapter::preset_nextera(),
+            path => {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading adapter FASTA {}", path))?;
+                parse_fasta_adapters(&text)?
+            }
+        };
+        Ok(crate::adapter::AdapterSet::new(
+            adapters,
+            self.adapter_error_rate,
+            self.min_adapter_overlap,
+        ))
+    }
+}
+
+/// Parse an adapter FASTA: `>name` then the sequence on the following lines.
+fn parse_fasta_adapters(text: &str) -> anyhow::Result<Vec<crate::adapter::Adapter>> {
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    let mut seq = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix('>') {
+            if let Some(n) = name.take() {
+                out.push(crate::adapter::Adapter { name: n, seq: std::mem::take(&mut seq).into_bytes() });
+            }
+            name = Some(rest.split_whitespace().next().unwrap_or("adapter").to_string());
+        } else if !line.is_empty() {
+            seq.push_str(&line.to_ascii_uppercase());
+        }
+    }
+    if let Some(n) = name {
+        out.push(crate::adapter::Adapter { name: n, seq: seq.into_bytes() });
+    }
+    if out.is_empty() {
+        anyhow::bail!("adapter FASTA contained no records");
+    }
+    Ok(out)
 }

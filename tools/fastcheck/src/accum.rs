@@ -91,6 +91,10 @@ pub struct Accum {
     pub overrep_table: crate::overrep::SequenceTable,
     /// Whether the packed sequence table is filled (set in main.rs for `table` mode).
     pub track_overrep_table: bool,
+    /// Adapter content per position, only when --adapter-content is on.
+    pub adapter_pos: Option<crate::adapter_pos::AdapterPos>,
+    /// The adapter set for --adapter-content (only consulted when adapter_pos is Some).
+    pub adapter_set: crate::adapter::AdapterSet,
 }
 
 /// Adapter prefixes the fitter's readthrough scan looks for.
@@ -133,6 +137,8 @@ impl Accum {
             kmer_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
             overrep_table: crate::overrep::SequenceTable::default(),
             track_overrep_table: false,
+            adapter_pos: None,
+            adapter_set: crate::adapter::AdapterSet::illumina_default(),
         }
     }
 
@@ -258,6 +264,9 @@ impl Accum {
             // silently mis-counted — the report's unique_sequences count shows the gap.
             let _ = self.overrep_table.observe(seq);
         }
+        if let Some(ap) = self.adapter_pos.as_mut() {
+            ap.observe(seq, &self.adapter_set);
+        }
         if seq.len() >= 12 {
             for w in seq.windows(12) {
                 if let Some(pk) = repeated::pack_kmer(w) {
@@ -287,6 +296,14 @@ impl Accum {
         }
         // The fingerprint table merges exactly, like every other accumulator here.
         self.seq_counts.merge(&o.seq_counts);
+        match (self.adapter_pos.as_mut(), o.adapter_pos.as_ref()) {
+            (Some(a), Some(b)) => a.merge(b),
+            // The run total starts without the optional counter: the first file that
+            // tracked it is ADOPTED whole (a clone of nothing-plus-itself), so its
+            // counts are not added twice.
+            (None, Some(b)) => self.adapter_pos = Some(b.clone()),
+            _ => {}
+        }
         if self.track_overrep_table || o.track_overrep_table {
             self.track_overrep_table = true;
             self.overrep_table.merge(&o.overrep_table);

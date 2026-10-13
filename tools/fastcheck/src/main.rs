@@ -19,6 +19,7 @@ mod memory;
 mod fingerprint;
 mod overrep;
 mod adapter;
+mod adapter_pos;
 mod reader;
 mod report;
 
@@ -118,6 +119,7 @@ fn main() -> Result<()> {
     // checked FIRST: refusing on the mode the user asked for, with the cheaper modes
     // named, is more useful than a refusal about the table they get either way.
     let overrep = cli.overrep_mode()?;
+    let adapter_set = cli.adapter_set()?;
     let table_proj = if overrep == overrep::OverrepMode::Table {
         let proj = overrep::table_projection(fp_capacity, 150);
         eprintln!(
@@ -194,7 +196,7 @@ fn main() -> Result<()> {
     let reports: Vec<FileReport> = if files.len() == 1 || threads <= 1 {
         let mut out = Vec::with_capacity(files.len());
         for path in &files {
-            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep)?);
+            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content)?);
         }
         out
     } else {
@@ -204,10 +206,11 @@ fn main() -> Result<()> {
         for w in 0..workers {
             let chunk: Vec<PathBuf> =
                 files.iter().skip(w).step_by(workers).cloned().collect();
+            let adapter_set = adapter_set.clone();
             handles.push(std::thread::spawn(move || -> Result<Vec<FileReport>> {
                 let mut out = Vec::with_capacity(chunk.len());
                 for path in &chunk {
-                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile, overrep)?);
+                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content)?);
                 }
                 Ok(out)
             }));
@@ -272,7 +275,7 @@ fn main() -> Result<()> {
             pfiles.push(p2.clone());
         }
         for path in &pfiles {
-            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep)?);
+            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content)?);
         }
         for r in &processed_reports {
             processed_total.merge(&r.acc);
@@ -298,6 +301,9 @@ fn main() -> Result<()> {
             if processed_reports.is_empty() { None } else { Some(&processed_total) },
             overrep,
             min_count,
+            total.adapter_pos.as_ref().map(|ap| {
+                (ap, cli.adapter_error_rate, cli.min_adapter_overlap)
+            }),
         )?;
     }
     if let Some(p) = &cli.html {
@@ -307,7 +313,7 @@ fn main() -> Result<()> {
                          else { Some((&processed_reports, &processed_total)) })?;
     }
     if let Some(p) = &cli.positions_tsv {
-        report::write_positions_tsv(p, &total, verdict.offset)?;
+        report::write_positions_tsv(p, &total, verdict.offset, total.adapter_pos.as_ref())?;
     }
     if let Some(p) = &cli.profile {
         let name = files
@@ -364,10 +370,16 @@ fn scan_one(
     max_pos: usize,
     track_profile: bool,
     overrep: overrep::OverrepMode,
+    adapter_set: &crate::adapter::AdapterSet,
+    adapter_content: bool,
 ) -> Result<FileReport> {
     let mut acc = Accum::new(max_pos);
     acc.track_profile = track_profile;
     acc.track_overrep_table = overrep == overrep::OverrepMode::Table;
+    acc.adapter_set = adapter_set.clone();
+    if adapter_content {
+        acc.adapter_pos = Some(crate::adapter_pos::AdapterPos::new(adapter_set));
+    }
     let scan = reader::scan_file(path, gz_threads, limits, &mut acc)?;
     Ok(FileReport {
         path: path.clone(),

@@ -157,6 +157,7 @@ pub fn write_report(
     processed: Option<&Accum>,
     overrep: crate::overrep::OverrepMode,
     overrep_min_count: u32,
+    adapter_content: Option<(&crate::adapter_pos::AdapterPos, f64, usize)>,
 ) -> Result<()> {
     let offset = verdict.offset;
     let (byte_min, byte_max) = byte_range(&total.qual_byte);
@@ -354,12 +355,24 @@ pub fn write_report(
         "notes": notes,
     });
 
+    // The adapter-content block is added only when the module ran: an absent key means
+    // "not measured", which is different from a measured null (D-6 discipline).
+    let mut doc = doc;
+    if let Some((ap, error_rate, min_overlap)) = adapter_content {
+        doc["adapter_content"] = ap.to_json(error_rate, min_overlap);
+    }
+
     let text = serde_json::to_string_pretty(&doc)? + "\n";
     write_out(path, &text)?;
     Ok(())
 }
 
-pub fn write_positions_tsv(path: &Path, total: &Accum, offset: u8) -> Result<()> {
+pub fn write_positions_tsv(
+    path: &Path,
+    total: &Accum,
+    offset: u8,
+    adapter_pos: Option<&crate::adapter_pos::AdapterPos>,
+) -> Result<()> {
     let n_pos = total.covered_positions();
     let reads = total.reads.max(1) as f64;
     // Per-position polyX reach: the fraction of reads whose trailing (3') or
@@ -384,10 +397,19 @@ pub fn write_positions_tsv(path: &Path, total: &Accum, offset: u8) -> Result<()>
             }
         }
     }
+    // Adapter columns, only with --adapter-content: one per adapter, 1-based positions,
+    // 0 when past the end of that adapter's observed rows.
+    let adapter_cols: Vec<(String, Vec<u64>)> =
+        adapter_pos.map(|ap| ap.tsv_columns()).unwrap_or_default();
     let mut out = String::with_capacity(64 * (n_pos + 1));
     out.push_str(
-        "pos\ta\tc\tg\tt\tn\tdepth\tmean_q\tq10\tq50\tq90\tg_frac\tpolyx3_frac\tpolyx5_frac\n",
+        "pos\ta\tc\tg\tt\tn\tdepth\tmean_q\tq10\tq50\tq90\tg_frac\tpolyx3_frac\tpolyx5_frac",
     );
+    for (name, _) in &adapter_cols {
+        out.push('\t');
+        out.push_str(name);
+    }
+    out.push('\n');
     for pos in 0..n_pos {
         let row = total.qual_at(pos);
         let depth: u64 = row.iter().sum();
@@ -398,7 +420,7 @@ pub fn write_positions_tsv(path: &Path, total: &Accum, offset: u8) -> Result<()>
             0.0
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.0}\t{:.0}\t{:.0}\t{:.4}\t{:.4}\t{:.4}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.0}\t{:.0}\t{:.0}\t{:.4}\t{:.4}\t{:.4}",
             pos + 1,
             total.base_at(pos, 0),
             total.base_at(pos, 1),
@@ -414,6 +436,11 @@ pub fn write_positions_tsv(path: &Path, total: &Accum, offset: u8) -> Result<()>
             p3_reach[pos] as f64 / reads,
             p5_reach[pos] as f64 / reads,
         ));
+        for (_, counts) in &adapter_cols {
+            out.push('\t');
+            out.push_str(&counts.get(pos).copied().unwrap_or(0).to_string());
+        }
+        out.push('\n');
     }
     write_out(path, &out)?;
     Ok(())
