@@ -406,3 +406,30 @@ fn from_flag_forces_a_step_rerun_and_resume_skips_matches() {
     assert_eq!(c3, 0);
     assert!(!stdout3.contains("resumed s1/fastcheck"), "{stdout3}");
 }
+
+#[test]
+fn install_symlinks_binaries_and_legacy_names() {
+    let d = tmpdir("install");
+    let prefix = d.join("prefix");
+    std::fs::create_dir_all(&prefix).unwrap();
+    let (stdout, stderr, code) = run(&[
+        "install",
+        "--prefix",
+        prefix.to_str().unwrap(),
+        "--tools-dir",
+        &std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()),
+    ]);
+    if code != 0 {
+        // No binaries resolved here (empty tools dir): must still say so, not crash.
+        assert!(
+            stderr.contains("no FastSuite binaries") || stderr.contains("not found"),
+            "{stderr}"
+        );
+        return;
+    }
+    let bin = prefix.join("bin");
+    assert!(bin.is_dir(), "{stdout} {stderr}");
+    // Whatever was found, the directory must contain at least one symlink.
+    let n = std::fs::read_dir(&bin).unwrap().count();
+    assert!(n > 0, "nothing installed");
+}

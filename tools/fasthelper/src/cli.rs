@@ -35,6 +35,8 @@ pub enum Cmd {
     Doctor(DoctorArgs),
     /// Validate a run config: inputs exist, tools resolve, steps and flags are known.
     Check(CheckArgs),
+    /// Symlink the suite binaries (plus legacy names) into <prefix>/bin.
+    Install(InstallArgs),
     /// Print the report schema (version, fields, how each tool contributes).
     Schema,
 }
@@ -146,4 +148,17 @@ pub struct CheckArgs {
     /// Directory holding the tool checkouts (default: this crate's parent, then $FASTSUITE_TOOLS_DIR).
     #[arg(long, env = "FASTSUITE_TOOLS_DIR")]
     pub tools_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct InstallArgs {
+    /// Installation prefix; binaries land in <prefix>/bin.
+    #[arg(long, default_value = "/usr/local")]
+    pub prefix: PathBuf,
+    /// Directory holding the tool checkouts (default: this crate's parent, then $FASTSUITE_TOOLS_DIR).
+    #[arg(long, env = "FASTSUITE_TOOLS_DIR")]
+    pub tools_dir: Option<PathBuf>,
+    /// Skip the legacy binary names (rpolyx, fdedup, novaseq-sim).
+    #[arg(long)]
+    pub no_legacy: bool,
 }
