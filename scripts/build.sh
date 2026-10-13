@@ -15,4 +15,4 @@ for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper; do
     (cd "tools/$t" && cargo build --release $OFFLINE)
 done
 
-echo "echo "build OK — run: pixi run doctor"
+echo "build OK — six binaries in tools/*/target/release/ (run: pixi run doctor)"
