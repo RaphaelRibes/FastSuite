@@ -93,6 +93,175 @@ struct StepOutcome {
     log: PathBuf,
 }
 
+/// What one sample contributed to the run: its manifest entries (each tagged
+/// with its step index for deterministic merging) plus any failures.
+struct SampleOutcome {
+    entries: Vec<(usize, serde_json::Value)>,
+    failed: Vec<String>,
+}
+
+/// Run one sample through the configured steps, strictly in order.
+///
+/// Returns the manifest entries (tagged with the step index in `cfg.run.steps`)
+/// and the failure labels (`sample` or `sample/tool`). Safe to call from
+/// several threads: it only touches paths under `<outdir>/<sample.name>` and
+/// its own log files.
+fn run_sample(
+    sample: &crate::config::Sample,
+    cfg: &Config,
+    ts: &ToolSet,
+    outdir: &Path,
+    logs: &Path,
+    config_dir: &Path,
+    dry_run: bool,
+    threads: usize,
+) -> Result<SampleOutcome> {
+    let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+
+    let work = outdir.join(&sample.name);
+    std::fs::create_dir_all(&work)?;
+    let in1 = resolve_rel(&sample.r1, config_dir);
+    let in2 = sample.r2.as_ref().map(|p| resolve_rel(p, config_dir));
+    if !dry_run && !in1.is_file() {
+        eprintln!(
+            "fasthelper: skipping {}: input {} not found",
+            sample.name,
+            in1.display()
+        );
+        failed.push(sample.name.clone());
+        return Ok(SampleOutcome { entries, failed });
+    }
+
+    println!(
+        "fasthelper: sample {} ({} steps)",
+        sample.name,
+        cfg.run.steps.len()
+    );
+    let mut cur1 = in1.clone();
+    let mut cur2 = in2.clone();
+    let mut to_delete: Vec<PathBuf> = Vec::new();
+
+    for (step_idx, tool) in cfg.run.steps.iter().enumerate() {
+        let step = cfg.step(tool);
+        if !step.enabled {
+            continue;
+        }
+        let Some(bin) = ts.get(tool).cloned() else {
+            eprintln!("fasthelper: {tool} not found, step skipped");
+            continue;
+        };
+        let (out1, out2, json_path, maps_dir) = match tool.as_str() {
+            "fastdedup" => (
+                work.join(format!("{}_dedup_R1.fastq.gz", sample.name)),
+                cur2.as_ref()
+                    .map(|_| work.join(format!("{}_dedup_R2.fastq.gz", sample.name))),
+                work.join("fastdedup.json"),
+                work.join("maps"),
+            ),
+            "fastprep" => (
+                work.join(format!("{}_clean_R1.fastq.gz", sample.name)),
+                cur2.as_ref()
+                    .map(|_| work.join(format!("{}_clean_R2.fastq.gz", sample.name))),
+                work.join("fastprep.json"),
+                work.join("maps"),
+            ),
+            "fastmaps" => (
+                PathBuf::new(),
+                None,
+                work.join("maps").join("heatmap.json"),
+                work.join("maps"),
+            ),
+            "fastcheck" => (
+                PathBuf::new(), // no FASTQ output
+                None,
+                work.join("fastcheck.json"),
+                work.join("maps"), // unused; the aggregator reads the JSON
+            ),
+            "fastsim" => (
+                PathBuf::new(), // simulate-only: the generated FASTQs are inputs
+                None,
+                work.join("fastsim.json"),
+                work.join("maps"), // unused
+            ),
+            other => {
+                eprintln!("fasthelper: unsupported step '{other}' — skipped");
+                continue;
+            }
+        };
+        let argv = argv_for(
+            tool,
+            &cur1,
+            cur2.as_deref(),
+            &out1,
+            out2.as_deref(),
+            &json_path,
+            threads,
+            cfg.run.gz_level,
+            &step.args,
+            &maps_dir,
+            if tool == "fastsim" {
+                Some(&cfg.simulate)
+            } else {
+                None
+            },
+            &outdir.join(&cfg.simulate.name).join("sim"),
+            config_dir,
+        );
+        let log = logs.join(format!("{}.{}.log", sample.name, tool));
+        let outcome = run_step(tool, &bin, &argv, &log, dry_run, None)?;
+        println!(
+            "  {tool:<10} exit {:<3} {:>7.2}s  log {}",
+            outcome.exit,
+            outcome.elapsed,
+            outcome.log.display()
+        );
+        entries.push((
+            step_idx,
+            serde_json::json!({
+                "sample": sample.name,
+                "tool": tool,
+                "binary": s(&bin),
+                "argv": outcome.argv,
+                "exit": outcome.exit,
+                "elapsed_s": outcome.elapsed,
+                "log": s(&outcome.log),
+            }),
+        ));
+        if outcome.exit != 0 {
+            eprintln!(
+                "fasthelper: {} failed for {} (exit {}) — see {}",
+                tool,
+                sample.name,
+                outcome.exit,
+                outcome.log.display()
+            );
+            failed.push(format!("{}/{}", sample.name, tool));
+            break;
+        }
+        if tool != "fastmaps" {
+            if !cfg.run.keep_intermediate {
+                if cur1 != in1 {
+                    to_delete.push(cur1.clone());
+                }
+                if let Some(c2) = &cur2 {
+                    if Some(c2) != in2.as_ref() {
+                        to_delete.push(c2.clone());
+                    }
+                }
+            }
+            cur1 = out1;
+            cur2 = out2;
+        }
+    }
+    for p in to_delete {
+        if p.is_file() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    Ok(SampleOutcome { entries, failed })
+}
+
 fn run_step(
     tool: &str,
     bin: &Path,
@@ -339,140 +508,57 @@ pub fn run(args: &RunArgs) -> Result<()> {
         });
     }
 
-    let mut manifest = Vec::new();
-    let mut failed = Vec::new();
+    // Samples run through a shared work queue: min(P, samples) threads each
+    // pull the next sample until the queue is empty. Per-sample step order
+    // stays strict; only samples are concurrent. The merged manifest is
+    // sorted by (sample index, step index) so it is byte-identical to the
+    // sequential run's.
+    let per_sample_threads = (cfg.run.threads / args.jobs.max(1)).max(1);
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
+        samples.iter().enumerate().collect::<Vec<_>>(),
+    ));
+    let entries: std::sync::Mutex<Vec<(usize, usize, serde_json::Value)>> =
+        std::sync::Mutex::new(Vec::new());
+    let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-    for sample in &samples {
-        let work = outdir.join(&sample.name);
-        std::fs::create_dir_all(&work)?;
-        let in1 = resolve_rel(&sample.r1, &config_dir);
-        let in2 = sample.r2.as_ref().map(|p| resolve_rel(p, &config_dir));
-        if !args.dry_run && !in1.is_file() {
-            eprintln!("fasthelper: skipping {}: input {} not found", sample.name, in1.display());
-            failed.push(sample.name.clone());
-            continue;
-        }
-
-        println!("fasthelper: sample {} ({} steps)", sample.name, cfg.run.steps.len());
-        let mut cur1 = in1.clone();
-        let mut cur2 = in2.clone();
-        let mut to_delete: Vec<PathBuf> = Vec::new();
-
-        for tool in &cfg.run.steps {
-            let step = cfg.step(tool);
-            if !step.enabled {
-                continue;
-            }
-            let Some(bin) = ts.get(tool).cloned() else {
-                eprintln!("fasthelper: {tool} not found, step skipped");
-                continue;
-            };
-            let (out1, out2, json_path, maps_dir) = match tool.as_str() {
-                "fastdedup" => (
-                    work.join(format!("{}_dedup_R1.fastq.gz", sample.name)),
-                    cur2.as_ref()
-                        .map(|_| work.join(format!("{}_dedup_R2.fastq.gz", sample.name))),
-                    work.join("fastdedup.json"),
-                    work.join("maps"),
-                ),
-                "fastprep" => (
-                    work.join(format!("{}_clean_R1.fastq.gz", sample.name)),
-                    cur2.as_ref()
-                        .map(|_| work.join(format!("{}_clean_R2.fastq.gz", sample.name))),
-                    work.join("fastprep.json"),
-                    work.join("maps"),
-                ),
-                "fastmaps" => (
-                    PathBuf::new(),
-                    None,
-                    work.join("maps").join("heatmap.json"),
-                    work.join("maps"),
-                ),
-                "fastcheck" => (
-                    PathBuf::new(), // no FASTQ output
-                    None,
-                    work.join("fastcheck.json"),
-                    work.join("maps"), // unused; the aggregator reads the JSON
-                ),
-                "fastsim" => (
-                    PathBuf::new(), // simulate-only: the generated FASTQs are inputs
-                    None,
-                    work.join("fastsim.json"),
-                    work.join("maps"), // unused
-                ),
-                other => {
-                    eprintln!("fasthelper: unsupported step '{other}' — skipped");
-                    continue;
-                }
-            };
-            let argv = argv_for(
-                tool,
-                &cur1,
-                cur2.as_deref(),
-                &out1,
-                out2.as_deref(),
-                &json_path,
-                cfg.run.threads,
-                cfg.run.gz_level,
-                &step.args,
-                &maps_dir,
-                if tool == "fastsim" {
-                    Some(&cfg.simulate)
-                } else {
-                    None
-                },
-                &sim_prefix,
-                &config_dir,
-            );
-            let log = logs.join(format!("{}.{}.log", sample.name, tool));
-            let outcome = run_step(tool, &bin, &argv, &log, args.dry_run, None)?;
-            println!(
-                "  {tool:<10} exit {:<3} {:>7.2}s  log {}",
-                outcome.exit,
-                outcome.elapsed,
-                outcome.log.display()
-            );
-            manifest.push(serde_json::json!({
-                "sample": sample.name,
-                "tool": tool,
-                "binary": s(&bin),
-                "argv": outcome.argv,
-                "exit": outcome.exit,
-                "elapsed_s": outcome.elapsed,
-                "log": s(&outcome.log),
-            }));
-            if outcome.exit != 0 {
-                eprintln!(
-                    "fasthelper: {} failed for {} (exit {}) — see {}",
-                    tool,
-                    sample.name,
-                    outcome.exit,
-                    outcome.log.display()
-                );
-                failed.push(format!("{}/{}", sample.name, tool));
-                break;
-            }
-            if tool != "fastmaps" {
-                if !cfg.run.keep_intermediate {
-                    if cur1 != in1 {
-                        to_delete.push(cur1.clone());
+    std::thread::scope(|scope| {
+        for _ in 0..args.jobs.max(1) {
+            scope.spawn(|| loop {
+                let job = { queue.lock().unwrap().pop_front() };
+                let Some((sample_idx, sample)) = job else { break };
+                match run_sample(
+                    sample,
+                    &cfg,
+                    &ts,
+                    &outdir,
+                    &logs,
+                    &config_dir,
+                    args.dry_run,
+                    per_sample_threads,
+                ) {
+                    Ok(mut o) => {
+                        entries
+                            .lock()
+                            .unwrap()
+                            .extend(o.entries.into_iter().map(|(step_idx, m)| (sample_idx, step_idx, m)));
+                        failures.lock().unwrap().append(&mut o.failed);
                     }
-                    if let Some(c2) = &cur2 {
-                        if Some(c2) != in2.as_ref() {
-                            to_delete.push(c2.clone());
-                        }
+                    Err(err) => {
+                        eprintln!("fasthelper: {} failed: {err}", sample.name);
+                        failures.lock().unwrap().push(sample.name.clone());
                     }
                 }
-                cur1 = out1;
-                cur2 = out2;
-            }
+            });
         }
-        for p in to_delete {
-            if p.is_file() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
+    });
+
+    let mut tagged = entries.into_inner().unwrap();
+    tagged.sort_by_key(|(sample_idx, step_idx, _)| (*sample_idx, *step_idx));
+    let manifest: Vec<serde_json::Value> =
+        tagged.into_iter().map(|(_, _, m)| m).collect();
+    let mut failed = failures.into_inner().unwrap();
+    failed.sort();
+    failed.dedup();
 
     // Manifest + aggregate report over everything the run produced.
     let manifest_path = outdir.join("manifest.json");

@@ -53,6 +53,10 @@ pub struct RunArgs {
     #[arg(short = 'j', long)]
     pub threads: Option<usize>,
 
+    /// Samples to process in parallel (default 1). Threads are divided across the pool.
+    #[arg(short = 'P', long, default_value_t = 1)]
+    pub jobs: usize,
+
     /// Print the commands without executing them.
     #[arg(long)]
     pub dry_run: bool,

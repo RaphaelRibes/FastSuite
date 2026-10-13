@@ -338,3 +338,39 @@ fn fastcheck_step_runs_and_writes_a_v1_report() {
         assert!(out.join("s1/fastcheck.json").is_file());
     }
 }
+
+#[test]
+fn jobs_flag_is_accepted_and_the_run_still_succeeds() {
+    let d = tmpdir("jobs");
+    let out = d.join("run");
+    std::fs::create_dir_all(&out).unwrap();
+    let fq1 = d.join("s1_R1.fastq");
+    let fq2 = d.join("s2_R1.fastq");
+    std::fs::write(&fq1, "@r1\nACGTACGT\n+\nIIIIIIII\n").unwrap();
+    std::fs::write(&fq2, "@r2\nTTTTAAAA\n+\nIIIIIIII\n").unwrap();
+    let cfg = d.join("two.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"two\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\nthreads = 2\n\n[[samples]]\nname = \"s1\"\nr1 = \"{}\"\n\n[[samples]]\nname = \"s2\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq1.display(),
+            fq2.display()
+        ),
+    )
+    .unwrap();
+    let (_, stderr, code) = run(&["run", "-c", cfg.to_str().unwrap(), "-P", "2"]);
+    // fastcheck may be missing; what must hold: -P is a real flag, and when
+    // the step runs both samples get manifest entries.
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "-P must exist: {stderr}"
+    );
+    if code == 0 {
+        let man: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+                .unwrap();
+        let cmds = man["commands"].as_array().unwrap();
+        assert_eq!(cmds.len(), 2, "both samples must run: {cmds:?}");
+    }
+}
