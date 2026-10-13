@@ -14,6 +14,18 @@ cmake = "*"       # flate2's zlib-ng builds from source
 zlib = "*"
 zstd = "*"
 
+# The conda `rust` package's activation script hard-codes
+#   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=<conda>/x86_64-conda-linux-gnu-cc
+# and that env var OVERRIDES .cargo/config.toml's linker= (env beats config in
+# cargo's precedence). The conda toolchain's 2.28 sysroot links Rust binaries
+# against a Scrt1.o referencing __libc_csu_init/__libc_csu_fini (glibc symbols
+# removed in 2.34), so the link fails on any machine whose glibc also lacks
+# them. Point the linker at the system cc instead; the C build scripts (cc
+# crate, cmake for zlib-ng/libdeflate/zstd) still use the conda compiler and
+# build fine — only the final link was ever broken.
+[activation.env]
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "/usr/bin/cc"
+
 # NOTE: pixi executes tasks with sh/bash, NOT fish — write plain POSIX shell
 # (no `for ...; do ...; done` fish one-liner with parens, no `and`/`or`).
 # The `scripts/*.sh` wrappers are what the tasks call.
