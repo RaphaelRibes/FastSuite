@@ -26,28 +26,37 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 
+# Layout is part of the row: B2's unit must be paired for the whole C chain
+# (insert histogram, paired simulation, fastprep -2, fastp). Without this
+# filter a domain comes back 70% single-end and the pilot cannot run at all —
+# human_gut is exactly that case. PAIRED keeps every row mate-pairable; the
+# few rows whose ftp list carries a third (unsplit) file are dropped by
+# complete_row below.
+LAYOUT = "PAIRED"
+
 API = "https://www.ebi.ac.uk/ena/portal/api/search"
 RESULT = "read_run"
-FIELDS = "run_accession,fastq_ftp,fastq_md5,fastq_bytes,read_count,library_strategy,sample_title"
+FIELDS = "run_accession,fastq_ftp,fastq_md5,fastq_bytes,read_count,library_strategy,library_layout,sample_title"
 FORMAT = "tsv"
 TIMEOUT = 60
 MAX_RETRIES = 4
 
-# Fixed domain order (deterministic output).
+# Fixed domain order (deterministic output). Every query is layout-constrained
+# to LAYOUT so the manifest is uniformly paired and B2 can emit PE units.
 DOMAINS = [
     # generalised: broad bacterial WGS pool (no human taxon filter, no niche
     # filter) — the "anything goes" reference population.
-    ("generalised", 'library_strategy="WGS"'),
+    ("generalised", f'library_strategy="WGS" AND library_layout="{LAYOUT}"'),
     # metagenomics: WGS from a metagenomic library source.
-    ("metagenomics", 'library_strategy="WGS" AND library_source="METAGENOMIC"'),
+    ("metagenomics", f'library_strategy="WGS" AND library_layout="{LAYOUT}" AND library_source="METAGENOMIC"'),
     # human gut: WGS of samples titled gut/stool/feces/fecal.
-    ("human_gut", 'library_strategy="WGS" AND (sample_title="*gut*" OR sample_title="*stool*" OR sample_title="*feces*" OR sample_title="*fecal*")'),
+    ("human_gut", f'library_strategy="WGS" AND library_layout="{LAYOUT}" AND (sample_title="*gut*" OR sample_title="*stool*" OR sample_title="*feces*" OR sample_title="*fecal*")'),
     # virome: WGS of samples titled virome/viral (host-read depletion style).
-    ("virome", 'library_strategy="WGS" AND (sample_title="*virome*" OR sample_title="*viral*")'),
+    ("virome", f'library_strategy="WGS" AND library_layout="{LAYOUT}" AND (sample_title="*virome*" OR sample_title="*viral*")'),
     # bacterial isolate: WGS from a genomic library source (isolates).
-    ("bacterial_isolate", 'library_strategy="WGS" AND library_source="GENOMIC"'),
+    ("bacterial_isolate", f'library_strategy="WGS" AND library_layout="{LAYOUT}" AND library_source="GENOMIC"'),
     # rna_seq: transcriptomics.
-    ("rna_seq", 'library_strategy="RNA-Seq"'),
+    ("rna_seq", f'library_strategy="RNA-Seq" AND library_layout="{LAYOUT}"'),
 ]
 
 # Deterministic, stable ordering + a hard limit well above the per-domain
@@ -55,7 +64,7 @@ DOMAINS = [
 # leave >= target rows.
 OVERSAMPLE = 3
 
-HEADER = ["domain", "run_accession", "fastq_ftp", "fastq_md5", "fastq_bytes", "read_count", "library_strategy", "sample_title"]
+HEADER = ["domain", "run_accession", "fastq_ftp", "fastq_md5", "fastq_bytes", "read_count", "library_strategy", "library_layout", "sample_title"]
 
 
 def query_ena(query: str, limit: int) -> list[list[str]]:
@@ -87,11 +96,25 @@ def query_ena(query: str, limit: int) -> list[list[str]]:
 
 
 def complete_row(row: list[str]) -> bool:
-    """A usable row needs a run accession, an FTP path, an md5 and a read count."""
+    """A usable row needs an accession, an FTP path, an md5, a read count, and
+    a paired layout with exactly two files (one per mate).
+
+    The two-file requirement is the load-bearing half: ENA reports PAIRED but
+    still ships three files for runs whose library was submitted unsplit
+    (a combined .fastq.gz plus the two mates). Those rows cannot be subsampled
+    mate-by-mate without a split pass, so they are dropped here rather than
+    failing later in B2.
+    """
     if len(row) < len(FIELDS.split(",")):
         return False
-    acc, ftp, md5, _bytes, reads = row[:5]
-    return bool(acc and ftp and md5 and reads) and all(p.startswith("ftp.") for p in ftp.split(";") if p)
+    acc, ftp, md5, _bytes, reads, _strat, layout = row[:7]
+    if layout != LAYOUT:
+        return False
+    urls = [p for p in ftp.split(";") if p]
+    md5s = [m for m in md5.split(";") if m]
+    if len(urls) != 2 or len(md5s) != 2:
+        return False
+    return bool(acc and reads) and all(p.startswith("ftp.") for p in urls)
 
 
 def build_manifest(per_domain: int, out_path: str) -> dict[str, int]:
@@ -141,6 +164,8 @@ def stats(path: str) -> None:
 
     print(f"manifest: {path}")
     print(f"total rows: {len(rows)}  accessions: {len({r['run_accession'] for r in rows})}")
+    layouts = sorted({r.get("library_layout", "?") for r in rows})
+    print(f"layouts: {','.join(layouts)}")
     print()
     print(f"{'domain':18s} {'n':>4s} {'bytes p10/med/p90':>22s} {'reads p10/med/p90':>22s} strategies")
     for domain, _ in DOMAINS:
@@ -161,7 +186,8 @@ def stats(path: str) -> None:
 
 
 def verify(path: str, per_domain: int) -> int:
-    """Hard verification: floors, uniqueness, completeness. Exit code 0 = pass."""
+    """Hard verification: floors, uniqueness, completeness, paired layout.
+    Exit code 0 = pass."""
     rows = load_manifest(path)
     errs: list[str] = []
     accs = [r["run_accession"] for r in rows]
@@ -172,6 +198,13 @@ def verify(path: str, per_domain: int) -> int:
         missing = [f for f in ("fastq_ftp", "fastq_md5", "read_count") if not r.get(f)]
         if missing:
             errs.append(f"{r['run_accession']}: missing {','.join(missing)}")
+        # the C chain is paired-only: a SE row cannot be subsampled mate-by-mate
+        if r.get("library_layout") != LAYOUT:
+            errs.append(f"{r['run_accession']}: library_layout={r.get('library_layout')!r} != {LAYOUT}")
+        n_urls = len(r["fastq_ftp"].split(";"))
+        n_md5s = len(r["fastq_md5"].split(";"))
+        if n_urls != 2 or n_urls != n_md5s:
+            errs.append(f"{r['run_accession']}: {n_urls} ftp file(s), {n_md5s} md5(s) — want exactly 2")
     by_domain: dict[str, int] = defaultdict(int)
     for r in rows:
         by_domain[r["domain"]] += 1
@@ -180,7 +213,7 @@ def verify(path: str, per_domain: int) -> int:
         if n < per_domain:
             errs.append(f"domain {domain}: {n} rows < floor {per_domain}")
 
-    print(f"verify: {len(rows)} rows, {len(accs)} unique accessions")
+    print(f"verify: {len(rows)} rows, {len(accs)} unique accessions, layout={LAYOUT}")
     for domain, _ in DOMAINS:
         print(f"  {domain:18s} {by_domain.get(domain, 0):4d}")
     if errs:
@@ -188,7 +221,7 @@ def verify(path: str, per_domain: int) -> int:
         for e in errs[:20]:
             print(f"  - {e}")
         return 1
-    print("\nOK: floors met, no duplicates, every row complete")
+    print("\nOK: floors met, no duplicates, every row complete and paired")
     return 0
 
 
