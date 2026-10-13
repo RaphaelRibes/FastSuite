@@ -168,7 +168,12 @@ do_run() {
         fi
         got=$(md5sum "$raw" | cut -d' ' -f1)
         if [[ "$got" != "$want" ]]; then
-            record "$domain" "$acc" "fail-md5" - - - "$total_raw" - - "want=$want got=$got"
+            # ENA occasionally re-uploads a run, which invalidates the md5 the
+            # manifest was built from. That is a data-provenance problem, not a
+            # transport one: retrying cannot help, so record it distinctly from
+            # fail-truncated and move on. The pilot tolerates a handful of these.
+            record "$domain" "$acc" "fail-md5-upstream" - - - "$total_raw" - - \
+                "want=$want got=$got (ENA served different bytes)"
             rm -f "$raw"; unclaim "$acc"; return 1
         fi
         total_raw=$(( total_raw + $(stat -c%s "$raw") ))
