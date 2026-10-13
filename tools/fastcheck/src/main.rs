@@ -16,6 +16,7 @@ mod repeated;
 mod rich;
 mod insert;
 mod memory;
+mod fingerprint;
 mod reader;
 mod report;
 

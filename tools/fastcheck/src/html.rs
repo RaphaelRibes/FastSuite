@@ -582,20 +582,21 @@ pub fn write_html(
     fn repeats_for(acc: &Accum) -> String {
         let reads = acc.reads.max(1) as f64;
         let min_count = (reads * 0.001).max(10.0) as u32;
-        let seqs = acc.seq_counts.report(min_count);
+        let seqs = acc.seq_counts.at_least(min_count);
         let mut rep_rows = String::new();
-        for (s, c) in seqs.iter().take(20) {
+        for (fp, c) in seqs.iter().take(20) {
             let _ = write!(
                 rep_rows,
-                "<tr><td><code>{}</code></td><td>{}</td><td>{:.3}%</td></tr>",
-                esc(&String::from_utf8_lossy(s)), c, 100.0 * *c as f64 / reads
+                "<tr><td><code>{fp:016x}</code></td><td>{}</td><td>{:.3}%</td></tr>",
+                c,
+                100.0 * *c as f64 / reads
             );
         }
         let rep_table = if seqs.is_empty() {
             "<p class=\"note\">No sequence appears more than 0.1% of reads — the library is not dominated by a repeated sequence.</p>".to_string()
         } else {
             format!(
-                "<table class=\"rep\"><tr><th>sequence</th><th>count</th><th>% of reads</th></tr>{rep_rows}</table>"
+                "<table class=\"rep\"><tr><th>fingerprint</th><th>count</th><th>% of reads</th></tr>{rep_rows}</table>"
             )
         };
         let kmers = acc.kmer_counts.report(min_count);
@@ -606,12 +607,12 @@ pub fn write_html(
         } else {
             labeled_bar_chart(&kmer_bars, "count")
         };
-        let dup = 1.0 - acc.distinct_seqs as f64 / reads;
+        let dup = 1.0 - acc.seq_counts.distinct() as f64 / reads;
         format!(
             r#"<div class="grid2"><div><h3>Over-represented full sequences</h3>{rep_table}</div>
                <div><h3>Top 12-mers</h3>{kmer_chart}</div></div>
                <div class="callout">{} distinct sequences of {reads:.0} reads — duplication level {:.2}%.</div>"#,
-            acc.distinct_seqs, dup * 100.0
+            acc.seq_counts.distinct(), dup * 100.0
         )
     }
     let repeats_before = repeats_for(total);

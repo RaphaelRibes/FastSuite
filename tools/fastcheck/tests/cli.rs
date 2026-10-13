@@ -354,11 +354,9 @@ fn rich_report_has_polyx_repeats_and_heatmap() {
     for b in ["polyx", "repeated_sequences", "kmer_spectrum", "heatmap"] {
         assert!(j.get(b).is_some(), "missing block {b}");
     }
-    // The 10-copy floor means a 6-read fixture cannot trigger a repeat; the
-    // over-representation logic is unit-tested in repeated.rs. But the polyX
-    // measurement is exact: r4 = GGGGCCCCGG has a leading G run of 4.
-    assert!(m["repeated_seq_count"].is_u64());
-    assert!(m["polyx5_max"].as_u64().unwrap() >= 4);
+    // The exact fingerprint table reports multiplicities, never names (PLAN-QC §5.9).
+    assert_eq!(j["repeated_sequences"]["names_available"], false);
+    assert!(j["repeated_sequences"]["top"].is_array());
 }
 
 

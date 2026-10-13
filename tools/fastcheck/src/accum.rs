@@ -80,17 +80,13 @@ pub struct Accum {
     pub polyx5: [Vec<u64>; 4],
     /// The fastmaps-style heatmap grid (SIZE*SIZE, row-major y*SIZE+x).
     pub heatmap: Vec<u64>,
-    /// Bounded over-represented full-sequence counter.
-    pub seq_counts: RepeatedCounter<Vec<u8>>,
+    /// Exact duplication counter over 64-bit fingerprints of the whole read. Quality is
+    /// ignored (stated in the report). This is the baseline every --overrep-mode builds on
+    /// (PLAN-QC §5.9): it gives the exact multiplicity histogram with no sequence text.
+    pub seq_counts: crate::fingerprint::FingerprintTable,
     /// Bounded 12-mer counter (packed u64 keys).
     pub kmer_counts: RepeatedCounter<u64>,
-    /// Distinct full sequences seen (for the duplication level).
-    pub distinct_seqs: u64,
 }
-
-/// Reads over which over-represented sequences and k-mers are counted. A
-/// 1 M-read sample is representative for a QC report and bounds the work.
-pub const COUNT_LIMIT: u64 = 100_000;
 
 /// Adapter prefixes the fitter's readthrough scan looks for.
 pub const ADAPTER_PREFIXES: [(&str, &str); 2] =
@@ -128,9 +124,8 @@ impl Accum {
             polyx3: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             polyx5: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             heatmap: vec![0; heatmap::SIZE * heatmap::SIZE],
-            seq_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
+            seq_counts: crate::fingerprint::FingerprintTable::with_capacity(1024),
             kmer_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
-            distinct_seqs: 0,
         }
     }
 
@@ -246,19 +241,14 @@ impl Accum {
         let (hx, hy) = heatmap::encode(seq);
         self.heatmap[heatmap::index(hx, hy)] += 1;
 
-        // Over-represented sequences + 12-mer spectrum, bounded to the first
-        // COUNT_LIMIT reads. Counting every read of a 50 M-read file would
-        // fill the map to the cap and then re-scan it on every insert (O(n^2));
-        // a 1 M-read sample is representative for a QC report and costs the
-        // same regardless of file size.
-        if self.reads <= COUNT_LIMIT {
-            self.seq_counts.insert(seq.to_vec());
-            self.distinct_seqs += 1;
-            if seq.len() >= 12 {
-                for w in seq.windows(12) {
-                    if let Some(pk) = repeated::pack_kmer(w) {
-                        self.kmer_counts.insert(pk);
-                    }
+        // Duplication: every read is fingerprinted, exactly, with no sample and no cap.
+        // The table is pre-sized from the projected record count in main.rs, so this does
+        // not rehash. Over-representation naming is a separate, opt-in concern (§5.9).
+        self.seq_counts.observe(seq);
+        if seq.len() >= 12 {
+            for w in seq.windows(12) {
+                if let Some(pk) = repeated::pack_kmer(w) {
+                    self.kmer_counts.insert(pk);
                 }
             }
         }
@@ -282,9 +272,8 @@ impl Accum {
         for (i, &c) in o.heatmap.iter().enumerate() {
             self.heatmap[i] += c;
         }
-        // The bounded counters are not merged (they are per-file approximations);
-        // distinct_seqs is summed so the duplication level stays meaningful.
-        self.distinct_seqs += o.distinct_seqs;
+        // The fingerprint table merges exactly, like every other accumulator here.
+        self.seq_counts.merge(&o.seq_counts);
         add_hist(&mut self.len_hist, &o.len_hist);
         add_hist(&mut self.acgt_hist, &o.acgt_hist);
         add_hist(&mut self.gc_hist, &o.gc_hist);

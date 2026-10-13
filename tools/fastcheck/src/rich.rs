@@ -71,32 +71,48 @@ pub fn head_dropout(acc: &Accum) -> (f64, f64) {
     (g1, baseline - g1)
 }
 
-/// Over-represented full sequences: metrics + the top list.
+/// Duplication levels: the exact multiplicity histogram, plus the duplication level and the
+/// distinct/read ratio. Over-represented sequences are a separate concern handled by
+/// `crate::overrep` (§5.9) — this function only reports what the exact fingerprint table
+/// knows. The top list names no sequences: that requires one of the --overrep-mode table
+/// modes, and `names_available` says so.
 pub fn repeated_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
     let reads = acc.reads.max(1) as f64;
+    let distinct = acc.seq_counts.distinct();
+    let hist = acc.seq_counts.multiplicity_hist();
     let min_count = (reads * 0.001).max(10.0) as u32;
-    let seqs = acc.seq_counts.report(min_count);
+    let overrep = acc.seq_counts.at_least(min_count);
+
     let mut m = Map::new();
-    m.insert("repeated_seq_count".into(), json!(seqs.len()));
-    let frac: f64 = seqs.iter().map(|(_, c)| *c as f64).sum::<f64>() / reads;
-    m.insert("repeated_seq_frac".into(), json!(r4(frac)));
-    m.insert("distinct_seqs".into(), json!(acc.distinct_seqs));
+    m.insert("distinct_seqs".into(), json!(distinct));
     m.insert(
         "duplication_level".into(),
-        json!(r4(1.0 - acc.distinct_seqs as f64 / reads)),
+        json!(r4(1.0 - distinct as f64 / reads)),
     );
-    let list: Vec<Value> = seqs
+    m.insert(
+        "total_deduplicated_pct".into(),
+        json!(r4(100.0 * (reads - distinct as f64) / reads)),
+    );
+    m.insert("dup_multiplicity_max".into(), json!(hist.len().saturating_sub(2)));
+    m.insert("dup_singletons".into(), json!(hist.get(1).copied().unwrap_or(0)));
+    m.insert("repeated_seq_count".into(), json!(overrep.len()));
+    let frac: f64 = overrep.iter().map(|(_, c)| *c as f64).sum::<f64>() / reads;
+    m.insert("repeated_seq_frac".into(), json!(r4(frac)));
+
+    // `names_available: false` is not a caveat, it is the contract of this mode: the
+    // multiplicities are exact, the sequences are not recoverable from a hash.
+    let list: Vec<Value> = overrep
         .iter()
         .take(20)
-        .map(|(s, c)| {
+        .map(|(fp, c)| {
             json!({
-                "seq": String::from_utf8_lossy(s),
+                "fingerprint": format!("{fp:016x}"),
                 "count": c,
                 "frac": r4(*c as f64 / reads),
             })
         })
         .collect();
-    (m, json!(list))
+    (m, json!({ "names_available": false, "top": list }))
 }
 
 /// 12-mer spectrum: metrics + the top list.
