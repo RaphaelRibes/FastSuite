@@ -60,17 +60,25 @@ if [[ ! -s real.report.json ]]; then
     fi
 fi
 
-# The profile must carry a measured insert block or the simulation is invented.
+# The profile must carry a MEASURED insert block or the simulation is invented.
+# --insert-hist makes fastcheck write it as a sparse {length: count} histogram
+# (the same bins the report's insert_hist block carries), so the check is that
+# the dict exists, is non-trivial, and the mode is sane — not that it is a list.
 python3 - "$WORK/real.profile.json" <<'PY' || exit 1
 import json, sys
 p = json.load(open(sys.argv[1]))
 ins = p.get("insert")
-if not ins:
-    print("chain: profile has no insert block", file=sys.stderr); sys.exit(1)
-cdf = ins.get("cdf") or ins.get("cum") or []
-if len(cdf) < 2:
-    print("chain: profile insert block is empty", file=sys.stderr); sys.exit(1)
-print(f"chain: insert cdf {len(cdf)} bins, pairs_sampled={ins.get('pairs_sampled','?')}")
+if not isinstance(ins, dict) or not ins:
+    print("chain: profile insert block missing or not a histogram", file=sys.stderr)
+    sys.exit(1)
+bins = {int(k): int(v) for k, v in ins.items()}
+n = sum(bins.values())
+if n < 100:
+    print(f"chain: insert histogram has only {n} sampled pairs", file=sys.stderr)
+    sys.exit(1)
+mode = max(bins, key=bins.get)
+lo, hi = min(bins), max(bins)
+print(f"chain: insert hist {len(bins)} bins, {n} pairs, mode {mode}bp, range {lo}-{hi}bp")
 PY
 
 # ------------------------------------------------------- 2. simulate from it

@@ -98,10 +98,10 @@ subsample_stream() {
 count_records() { zcat -f -- "$1" | wc -l | awk '{print int($1/4)}'; }
 
 # --------------------------------------------------------------------------
-# do_run DOMAIN ACC FTP MD5 READS
+# do_run DOMAIN ACC FTP MD5 READS BYTES
 # --------------------------------------------------------------------------
 do_run() {
-    local domain="$1" acc="$2" ftp="$3" md5="$4" reads="$5"
+    local domain="$1" acc="$2" ftp="$3" md5="$4" reads="$5" bytes="$6"
     local udir="$UNITS/$domain/$acc"
     local t0 t1
     t0=$(date +%s)
@@ -119,12 +119,18 @@ do_run() {
     fi
     claim "$acc" || { record "$domain" "$acc" "skip-claimed" - - - - - - "race"; return 0; }
 
-    # D-11 backstop: however this worker ends, its raws go away.
-    trap 'rm -f "$RAWDIR"/*.fastq.gz' EXIT INT TERM
+    # D-11 backstop: however this worker ends, ITS OWN raws go away.
+    # Scoped to this accession's files only: a bare *.fastq.gz glob would delete
+    # another concurrent worker's in-flight download, which is exactly what
+    # happened before this was scoped (a fail-md5 row whose 'got=' was empty
+    # because the file had already been removed by a sibling's trap).
+    MY_RAWS="$RAWDIR/${acc}_"*.fastq.gz
+    trap 'rm -f "$RAWDIR"/"${acc}"_*.fastq.gz' EXIT INT TERM
 
-    local -a urls md5s
+    local -a urls md5s byte_list
     IFS=';' read -r -a urls <<< "$ftp"
     IFS=';' read -r -a md5s <<< "$md5"
+    IFS=';' read -r -a byte_list <<< "$bytes"
     if [[ "${#urls[@]}" -ne "${#md5s[@]}" || "${#urls[@]}" -eq 0 ]]; then
         record "$domain" "$acc" "fail-manifest" - - - - - - "ftp/md5 count mismatch"
         unclaim "$acc"; return 1
@@ -140,6 +146,18 @@ do_run() {
                   --max-time 5400 -o "$raw" "$url"; then
             record "$domain" "$acc" "fail-download" - - - "$total_raw" - - "$url"
             rm -f "$raw"; unclaim "$acc"; return 1
+        fi
+        # A partial file is a failed download, not a checksum failure: say so
+        # distinctly, because the two have different fixes (retry vs bad manifest).
+        local want_bytes="${byte_list[$i]}"
+        if [[ -n "$want_bytes" && "$want_bytes" =~ ^[0-9]+$ ]]; then
+            local got_bytes
+            got_bytes=$(stat -c%s "$raw")
+            if [[ "$got_bytes" -ne "$want_bytes" ]]; then
+                record "$domain" "$acc" "fail-truncated" - - - "$total_raw" - - \
+                    "want=${want_bytes}B got=${got_bytes}B"
+                rm -f "$raw"; unclaim "$acc"; return 1
+            fi
         fi
         got=$(md5sum "$raw" | cut -d' ' -f1)
         if [[ "$got" != "$want" ]]; then
@@ -186,7 +204,7 @@ do_run() {
         record "$domain" "$acc" "ok-se" "$sha" "$r1" - "$total_raw" "$ubytes" $(( $(date +%s) - t0 )) "$note"
     fi
 
-    rm -f "$RAWDIR"/*.fastq.gz
+    rm -f "$RAWDIR/${acc}"_*.fastq.gz
     unclaim "$acc"
     trap - EXIT INT TERM
     return 0
@@ -213,17 +231,22 @@ for r in rows:
     per[d] = per.get(d, 0) + 1
     urls = [u for u in r["fastq_ftp"].split(";") if u]
     md5s = [m for m in r["fastq_md5"].split(";") if m]
+    bytez = [b for b in r.get("fastq_bytes", "").split(";") if b]
     if len(urls) != len(md5s) or not urls:
         continue
-    print("\t".join([d, r["run_accession"], ";".join(urls), ";".join(md5s), r["read_count"]]))
+    if len(bytez) != len(urls):
+        bytez = [""] * len(urls)
+    # fields: domain, acc, ftp, md5, read_count, per-file byte counts
+    print("\t".join([d, r["run_accession"], ";".join(urls), ";".join(md5s),
+                     r["read_count"], ";".join(bytez)]))
 PY
     [[ -s "$jobs_file" ]] || { rm -f "$jobs_file"; die "no rows selected (domains='$DOMAINS' limit=$LIMIT)"; }
 
     printf 'subsample: %d run(s), pairs=%d, jobs=%d, units=%s\n' \
         "$(wc -l < "$jobs_file")" "$PAIRS" "$JOBS" "$UNITS"
 
-    while IFS=$'\t' read -r domain acc ftp md5 reads; do
-        do_run "$domain" "$acc" "$ftp" "$md5" "$reads" >> "$LOG.err" 2>&1 &
+    while IFS=$'\t' read -r domain acc ftp md5 reads bytes; do
+        do_run "$domain" "$acc" "$ftp" "$md5" "$reads" "$bytes" >> "$LOG.err" 2>&1 &
         # job-slot throttler: at most JOBS live workers
         while [[ "$(jobs -rp | wc -l)" -ge "$JOBS" ]]; do sleep 2; done
     done < "$jobs_file"
