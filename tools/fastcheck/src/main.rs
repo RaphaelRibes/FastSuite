@@ -18,6 +18,7 @@ mod insert;
 mod memory;
 mod fingerprint;
 mod overrep;
+mod adapter;
 mod reader;
 mod report;
 
