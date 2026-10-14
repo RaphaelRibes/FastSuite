@@ -1,7 +1,7 @@
 use crate::hasher::{AbundanceTracker, HashVerifier, SequenceHasher};
 use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
 use crate::writer::{
-    OutputFormat, preload_existing_hashes, preload_existing_paired_hashes, prepare_writer,
+    OutputFormat, preload_existing_hashes, preload_existing_paired_hashes,
     write_fasta_record, write_fasta_record_with_abundance, write_fastq_record_with_abundance,
 };
 use anyhow::{Context, Result, bail};
@@ -555,7 +555,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
 
         // --- PASS 1: count abundances only ---
         {
-            let mut reader = parse_fastx_file(input_path).context("Failed to read input file")?;
+            let mut reader = crate::stream::open_fastx(input_path)?;
             while let Some(record) = reader.next() {
                 let seq_record = record.context("Invalid sequence data")?;
                 let seq = seq_record.seq();
@@ -566,8 +566,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
         }
 
         // --- PASS 2: re-read gzip, annotate with abundance ---
-        let output_path_bound = Path::new(output_path);
-        let (writer, output_format) = prepare_writer(output_path_bound, true, cfg.compression_level)?;
+        let (writer, output_format) = open_output(output_path, cfg)?;
         let buf_size = compute_write_buffer_size(cfg.read_length);
         let mut buffered_writer = BufWriter::with_capacity(buf_size, writer);
 
@@ -580,7 +579,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
         }
 
         let sep = cfg.abundance_sep.as_bytes();
-        let mut reader = parse_fastx_file(input_path).context("Failed to read input file")?;
+        let mut reader = crate::stream::open_fastx(input_path)?;
         let mut written = rustc_hash::FxHashSet::default();
         let mut format_validated = false;
 
@@ -663,8 +662,8 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
         let mut temp_writer = BufWriter::with_capacity(256 * 1024, temp_file);
 
         {
-            let mut reader_r1 = parse_fastx_file(input_r1_path).context("Failed to read R1")?;
-            let mut reader_r2 = parse_fastx_file(input_r2_path).context("Failed to read R2")?;
+            let mut reader_r1 = crate::stream::open_fastx(input_r1_path)?;
+            let mut reader_r2 = crate::stream::open_fastx(input_r2_path)?;
             let mut is_fastq = false;
             let mut format_detected = false;
 
@@ -718,11 +717,8 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
         }
 
         // --- PASS 2: read temp file in pairs, annotate with abundance ---
-        let path_r1_bound = Path::new(output_r1_path);
-        let path_r2_bound = Path::new(output_r2_path);
-
-        let (writer_r1, output_format_r1) = prepare_writer(path_r1_bound, true, cfg.compression_level)?;
-        let (writer_r2, output_format_r2) = prepare_writer(path_r2_bound, true, cfg.compression_level)?;
+        let (writer_r1, output_format_r1) = open_output(output_r1_path, cfg)?;
+        let (writer_r2, output_format_r2) = open_output(output_r2_path, cfg)?;
 
         if output_format_r1 != output_format_r2 {
             bail!("Output files R1 and R2 must have the same format (FASTA or FASTQ)");
@@ -828,8 +824,8 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
 
         // --- PASS 1: count abundances only ---
         {
-            let mut reader_r1 = parse_fastx_file(input_r1_path).context("Failed to read R1")?;
-            let mut reader_r2 = parse_fastx_file(input_r2_path).context("Failed to read R2")?;
+            let mut reader_r1 = crate::stream::open_fastx(input_r1_path)?;
+            let mut reader_r2 = crate::stream::open_fastx(input_r2_path)?;
 
             while let (Some(r1_res), Some(r2_res)) = (reader_r1.next(), reader_r2.next()) {
                 let seq_r1 = r1_res.context("Invalid sequence in R1")?;
@@ -860,11 +856,8 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
         }
 
         // --- PASS 2: re-read gzip, annotate with abundance ---
-        let path_r1_bound = Path::new(output_r1_path);
-        let path_r2_bound = Path::new(output_r2_path);
-
-        let (writer_r1, output_format_r1) = prepare_writer(path_r1_bound, true, cfg.compression_level)?;
-        let (writer_r2, output_format_r2) = prepare_writer(path_r2_bound, true, cfg.compression_level)?;
+        let (writer_r1, output_format_r1) = open_output(output_r1_path, cfg)?;
+        let (writer_r2, output_format_r2) = open_output(output_r2_path, cfg)?;
 
         if output_format_r1 != output_format_r2 {
             bail!("Output files R1 and R2 must have the same format (FASTA or FASTQ)");
@@ -882,8 +875,8 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
         }
 
         let sep = cfg.abundance_sep.as_bytes();
-        let mut reader_r1 = parse_fastx_file(input_r1_path).context("Failed to read R1")?;
-        let mut reader_r2 = parse_fastx_file(input_r2_path).context("Failed to read R2")?;
+        let mut reader_r1 = crate::stream::open_fastx(input_r1_path)?;
+        let mut reader_r2 = crate::stream::open_fastx(input_r2_path)?;
         let mut written = rustc_hash::FxHashSet::default();
         let mut format_validated = false;
 
