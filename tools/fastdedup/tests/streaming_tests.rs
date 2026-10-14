@@ -83,3 +83,27 @@ fn empty_stdin_is_a_clean_refusal() {
         .failure()
         .stderr(predicate::str::contains("empty"));
 }
+
+#[test]
+fn stdin_to_stdout_plain() {
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .write_stdin(FASTQ)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with('@')).count(),
+        1,
+        "2 reads in, 1 unique out"
+    );
+    assert!(out.starts_with('@'), "stdout must be FASTQ only, no summary");
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        err.contains("fastdedup: 2 reads in, 1 out"),
+        "summary belongs on stderr when stdout carries data: {err}"
+    );
+}

@@ -18,6 +18,8 @@ use crate::utils::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cli::Cli;
+use crate::cli::{OutCompression, OutFormat};
+use crate::writer::{OutputFormat, StreamCompression};
 use std::path::Path;
 use std::time::Instant;
 
@@ -308,6 +310,14 @@ fn main() -> Result<()> {
         abundance_sep: args.abundance_sep.clone(),
         threads: args.threads,
         temp_dir: args.temp_dir.clone(),
+        out_format: match args.out_format {
+            OutFormat::Fastq => OutputFormat::Fastq,
+            OutFormat::Fasta => OutputFormat::Fasta,
+        },
+        out_compression: match args.out_compression {
+            OutCompression::None => StreamCompression::None,
+            OutCompression::Gz => StreamCompression::Gz,
+        },
     };
 
     if args.abundance && args.threads != 1 {
@@ -401,15 +411,17 @@ fn main() -> Result<()> {
     let reads_out = processed.saturating_sub(duplicates);
 
     if !args.quiet {
-        println!(
+        // D-4 / CLI-SPEC §0: with `-o -` or `--json -` stdout carries data,
+        // so the summary goes to stderr and never pollutes the pipe.
+        let summary = format!(
             "fastdedup: {} reads in, {} out, {} duplicates ({:.2}%), {} threads, {:.2?}",
-            processed,
-            reads_out,
-            duplicates,
-            dup_pct,
-            args.threads,
-            elapsed
+            processed, reads_out, duplicates, dup_pct, args.threads, elapsed
         );
+        if out1_stream || args.json.as_deref() == Some("-") {
+            eprintln!("{summary}");
+        } else {
+            println!("{summary}");
+        }
         // Citation request (MIT stays permissive; this is the community-norm ask).
         eprintln!(
             "If you use fastdedup in published research, please cite: \

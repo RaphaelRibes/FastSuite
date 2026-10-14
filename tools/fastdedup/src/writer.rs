@@ -37,6 +37,33 @@ impl OutputFormat {
     }
 }
 
+/// Compression decision for stream output (D-4): a stream has no
+/// filename, so `-o -` cannot infer gzip from an extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamCompression {
+    None,
+    Gz,
+}
+
+/// Open stdout as an output stream. The record format is chosen per
+/// record by the caller from `--out-format`; this only decides the bytes'
+/// compression. Gzip finishes on drop, exactly like the file path.
+pub fn prepare_stream_writer(
+    compression: StreamCompression,
+    compression_level: u32,
+) -> Box<dyn Write> {
+    const STREAM_BUFFER: usize = 1 << 20; // 1 MiB, same as the file path
+    match compression {
+        StreamCompression::None => {
+            Box::new(io::BufWriter::with_capacity(STREAM_BUFFER, io::stdout()))
+        }
+        StreamCompression::Gz => Box::new(GzEncoder::new(
+            io::BufWriter::with_capacity(STREAM_BUFFER, io::stdout()),
+            Compression::new(compression_level),
+        )),
+    }
+}
+
 /// Prepares a writer for the output file based on the format and whether it should
 /// be forced (overwritten) or appended.
 ///

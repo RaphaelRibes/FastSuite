@@ -26,7 +26,7 @@ const ASCII_ART: &str = r#"
 )]
 #[command(help_expected = true)]
 pub struct Cli {
-    /// Path to the input FASTX file (R1 or Single-End)
+    /// Path to the input FASTX file (R1 or Single-End). `-` reads stdin (D-4).
     #[arg(required = true, short = '1', long, visible_alias = "in1")]
     pub input: String,
 
@@ -35,7 +35,7 @@ pub struct Cli {
     #[arg(short = '2', long, visible_alias = "in2")]
     pub input_r2: Option<String>,
 
-    /// Path to the output file (R1 or Single-End)
+    /// Path to the output file (R1 or Single-End). `-` writes stdout (D-4).
     /// Supported formats: .fastq, .fq, .fasta, .fa, .fna (+ .gz for compression)
     /// Optional when --dry-run is set.
     #[arg(short = 'o', long, visible_alias = "out1")]
@@ -45,6 +45,16 @@ pub struct Cli {
     /// Must have the same format as --output
     #[arg(short = 'p', long, visible_alias = "out2")]
     pub output_r2: Option<String>,
+
+    /// Output record format when the output is a stream (`-`).
+    /// Named paths keep inferring the format from their extension.
+    #[arg(long, value_enum, default_value_t = OutFormat::Fastq)]
+    pub out_format: OutFormat,
+
+    /// Compression when the output is a stream (`-`).
+    /// Named paths keep inferring compression from their extension.
+    #[arg(long, value_enum, default_value_t = OutCompression::None)]
+    pub out_compression: OutCompression,
 
     /// Force overwrite of output files if they exist
     #[arg(long, short)]
@@ -139,4 +149,20 @@ impl From<HashMode> for HashType {
             HashMode::Bit128 => HashType::XXH3_128,
         }
     }
+}
+
+/// Record format for stream output (`-o -`): D-4 gives a stream no
+/// extension to infer from, so the choice is explicit. Default: fastq.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutFormat {
+    Fastq,
+    Fasta,
+}
+
+/// Compression for stream output (`-o -`). Default: none — plain bytes in
+/// the pipe; ask for `gz` when the consumer wants compressed bytes.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutCompression {
+    None,
+    Gz,
 }

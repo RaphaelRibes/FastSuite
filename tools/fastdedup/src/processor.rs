@@ -31,6 +31,12 @@ pub(crate) struct DedupConfig {
     /// When `Some`, abundance mode uses a temp file in this directory to avoid
     /// re-decompressing the input gzip in the second pass.
     pub temp_dir: Option<String>,
+    /// Output record format, used when the output is a stream; named paths
+    /// infer it from their extension.
+    pub out_format: OutputFormat,
+    /// Output compression, used when the output is a stream; named paths
+    /// infer it from their extension.
+    pub out_compression: crate::writer::StreamCompression,
 }
 
 /// Owned snapshot of a sequence record, used to break needletail's borrow
@@ -44,6 +50,20 @@ struct OwnedRecord {
 // ==========================================
 // SINGLE-END MODE
 // ==========================================
+
+/// Open the output for a run: stdout when the path is `-` (D-4), the file
+/// otherwise. The stream branch carries the explicit format/compression
+/// decision from `--out-format` / `--out-compression`.
+fn open_output(path: &str, cfg: &DedupConfig) -> Result<(Box<dyn Write>, OutputFormat)> {
+    if crate::stream::is_stream(path) {
+        Ok((
+            crate::writer::prepare_stream_writer(cfg.out_compression, cfg.compression_level),
+            cfg.out_format,
+        ))
+    } else {
+        crate::writer::prepare_writer(Path::new(path), cfg.force, cfg.compression_level)
+    }
+}
 
 /// Executes deduplication for single-end reads.
 pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
@@ -80,7 +100,13 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
     let output_path_bound = Path::new(output_path);
     let is_gz = OutputFormat::is_gz(output_path_bound);
 
-    if cfg.force {
+    if crate::stream::is_stream(output_path) {
+        // D-4: a stream is written fresh — nothing exists to preload hashes
+        // from and nothing to truncate. Resume is a file-only feature.
+        if cfg.verbose {
+            println!("Output is a stream: written fresh (no preload, no resume).");
+        }
+    } else if cfg.force {
         if cfg.verbose {
             println!("--force enabled: overwriting output.");
         }
@@ -113,8 +139,7 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
     }
 
     // --- WRITER PREPARATION ---
-    let (writer, output_format) =
-        prepare_writer(output_path_bound, cfg.force, cfg.compression_level)?;
+    let (writer, output_format) = open_output(output_path, cfg)?;
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buffered_writer = BufWriter::with_capacity(buf_size, writer);
 
