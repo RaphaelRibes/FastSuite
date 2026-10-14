@@ -206,3 +206,46 @@ fn fasta_stdin_to_fastq_stdout_is_refused() {
             "FASTA → FASTQ conversion not supported",
         ));
 }
+
+// ================================================================
+// Task 8: --json - writes the report to stdout, summary to stderr
+// ================================================================
+
+#[test]
+fn json_report_to_stdout_moves_summary_to_stderr() {
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-s")
+        .arg("--json")
+        .arg("-")
+        .write_stdin(FASTQ)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("fastsuite.report.v1"),
+        "stdout must carry the report: {out}"
+    );
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        err.contains("fastdedup: 2 reads in"),
+        "summary must move to stderr: {err}"
+    );
+}
+
+#[test]
+fn json_and_fastq_on_stdout_is_refused() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .arg("--json")
+        .arg("-")
+        .write_stdin(FASTQ)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--json (-)"));
+}

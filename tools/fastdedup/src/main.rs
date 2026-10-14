@@ -457,8 +457,18 @@ fn main() -> Result<()> {
                 "abundance": args.abundance
             }
         });
-        std::fs::write(path, serde_json::to_string_pretty(&report)? + "\n")
-            .with_context(|| format!("writing JSON report to {path}"))?;
+        let body = serde_json::to_string_pretty(&report)? + "\n";
+        if crate::stream::is_stream(path) {
+            // D-4: `-` means the stream, for the report too.
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            out.write_all(body.as_bytes())
+                .and_then(|_| out.flush())
+                .context("writing the JSON report to stdout")?;
+        } else {
+            std::fs::write(path, body)
+                .with_context(|| format!("writing JSON report to {path}"))?;
+        }
     }
 
     Ok(())
