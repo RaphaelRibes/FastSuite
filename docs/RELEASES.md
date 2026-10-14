@@ -47,7 +47,12 @@ fails on a missing output directory.
 * [ ] Every tool has a `LICENSE` (MIT; fastprep's carries the Mandrillus
       Project copyright line).
 * [ ] Every tool has a `CITATION.cff`.
-* [ ] Recipes download nothing at build time.
+* [x] The pixitainer suite image builds and runs (`pixi containerize -o
+      fastsuite.sif`; all six binaries verified with `--version` inside the
+      container, plus a real fastprep trim and `fasthelper schema`). The image
+      build fetches crates from crates.io during construction — a deliberate,
+      documented deviation from the no-downloads rule (see the pixi.toml
+      container section); every Cargo.lock is committed so versions stay pinned.
 * [ ] The suite is only claimed to replace what `docs/REPLACEMENT-MAP.md`
       grants: "FastQC's modules, replaced and extended, minus per-tile and
       exact over-representation" and "MultiQC's aggregation, replaced".
