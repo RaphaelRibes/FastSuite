@@ -43,11 +43,11 @@ examples/demo.sh 20000` runs the whole chain (fastsim → fastdedup → fastprep
 | claim | measurement |
 |---|---|
 | fastcheck memory is flat in dataset size | 133–140 MB from 100k to **20M pairs** (2.7 GB of reads) vs FastQC's 341–363 MB |
-| fastmaps vs FastQC (5M pairs) | 12.25 s / 143 MB vs 72.22 s / 375 MB |
-| fastprep vs fastp (5M pairs, pinned 1 core) | 32.9 s vs 84.7 s (2.58×); defaults: 33.9 s / 102 MB vs 24.1 s / 1143 MB |
+| fastmaps vs FastQC (5M pairs) | 9.17 s / 145 MB vs 16.1 s / 16 MB (paper CSV; the 12.25/72.22 pair was the pre-CSV run log) |
+| fastprep vs fastp (5M pairs, 1 core, gzip level 6 both) | 34.37 s vs 28.50 s — fastp LEADS this cell; fastprep leads at 100k/500k/1M and on 2 cores (25.84 vs 39.61 s); defaults 33.51 s / 101 MB vs 28.20 s / 1143 MB |
 | fastprep's shipped default is correct | 7.9% drops vs the 4.8% injected must-drop + polyG (fastp drops 0.0% — its length filter is off) |
 | fasthelper vs MultiQC | zero orchestration overhead + manifest provenance; MultiQC v1.35 emits **no output** on `fastsuite.report.v1` (no module for it) |
-| fastsim ground-truth recovery | 7/10 parameters exact; the failures are fastcheck defects (below) |
+| fastsim ground-truth recovery | 8/10 parameters exact; the failures are fastcheck defects (below) |
 
 ## Known defects (measured, not guessed)
 
