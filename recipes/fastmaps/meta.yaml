@@ -1,0 +1,39 @@
+{% set name = "fastmaps" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ../../
+
+build:
+  number: 0
+  script:
+    - cargo install --locked --path tools/fastmaps --root $PREFIX
+  # Local checkout as the source plus a committed Cargo.lock (--locked):
+  # no URL is fetched and no crates are downloaded at build time (D-11).
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - rust >=1.70
+
+test:
+  commands:
+    - fastmaps --version | grep -q "fastmaps 0.1.0"
+    - >
+      mkdir -p fmaps_t && printf '@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nACGTACGA\n+\nIIIIIIII\n' > fmaps_t/s.fastq &&
+      fastmaps -o fmaps_t/maps fmaps_t/s.fastq && test -s fmaps_t/maps/heatmap.json
+
+about:
+  home: https://github.com/RaphaelRibes/FastSuite
+  license: MIT
+  license_family: MIT
+  license_file: tools/fastmaps/LICENSE
+  summary: "2-D heatmap of FASTQ reads by base composition"
+
+extra:
+  recipe-maintainers:
+    - RaphaelRibes

@@ -1,0 +1,44 @@
+{% set name = "fastprep" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ../../
+
+build:
+  number: 0
+  script:
+    - cargo install --locked --path tools/fastprep --root $PREFIX
+  # Local checkout as the source plus a committed Cargo.lock (--locked):
+  # no URL is fetched and no crates are downloaded at build time (D-11).
+  # zstd/mimalloc are pure-Rust crates that vendor their C sources and build
+  # # them via cc — no system packages needed beyond the C compiler.
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - rust >=1.70
+    - cmake  # libz-ng-sys (flate2's zlib-ng feature) builds the vendored zlib-ng
+  run:
+    - zlib
+
+test:
+  commands:
+    - fastprep --version | grep -q "fastprep 0.1.0"
+    - >
+      mkdir -p fprep_t && printf '@r1\nACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@r2\nACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n' > fprep_t/s.fastq &&
+      fastprep -1 fprep_t/s.fastq -o fprep_t/o.fastq && test -s fprep_t/o.fastq
+
+about:
+  home: https://github.com/RaphaelRibes/FastSuite
+  license: MIT
+  license_family: MIT
+  license_file: tools/fastprep/LICENSE
+  summary: "Asymmetric quality-weighted polyX trimming for FASTQ/FASTA reads"
+
+extra:
+  recipe-maintainers:
+    - RaphaelRibes

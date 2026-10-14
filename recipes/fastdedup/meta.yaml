@@ -1,0 +1,42 @@
+{% set name = "fastdedup" %}
+{% set version = "1.3.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ../../
+
+build:
+  number: 0
+  script:
+    - cargo install --locked --path tools/fastdedup --root $PREFIX
+  # Local checkout as the source plus a committed Cargo.lock (--locked): no
+  # URL is fetched and no crates are downloaded at build time (D-11).
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - rust >=1.85
+    - cmake  # libz-ng-sys (flate2's zlib-ng feature) builds the vendored zlib-ng
+  run:
+    - zlib
+
+test:
+  commands:
+    - fastdedup --version | grep -q "fastdedup 1.3.0"
+    - >
+      mkdir -p fdedup_t && printf '@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nACGTACGA\n+\nIIIIIIII\n' > fdedup_t/s.fastq &&
+      fastdedup -1 fdedup_t/s.fastq -o fdedup_t/d.fastq && test -s fdedup_t/d.fastq
+
+about:
+  home: https://github.com/RaphaelRibes/FastSuite
+  license: MIT
+  license_family: MIT
+  license_file: tools/fastdedup/LICENSE
+  summary: "A fast and memory-efficient FASTX PCR deduplication tool"
+
+extra:
+  recipe-maintainers:
+    - RaphaelRibes

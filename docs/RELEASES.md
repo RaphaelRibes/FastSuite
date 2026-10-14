@@ -34,9 +34,16 @@ fails on a missing output directory.
 
 ## Before the first bioconda publication (checklist)
 
-* [ ] Every tool has a `meta.yaml` recipe (`recipes/<tool>/meta.yaml`) —
+* [x] Every tool has a `meta.yaml` recipe (`recipes/<tool>/meta.yaml`) —
       `run:` and `test:` sections invoke `--version` and a **synthetic**
-      fixture run only (**D-11**: never ship any data).
+      fixture run only (**D-11**: never ship any data). Recipes:
+      `recipes/fastcheck`, `recipes/fastdedup`, `recipes/fasthelper`,
+      `recipes/fastmaps`, `recipes/fastprep`, `recipes/fastsim` (each
+      `cargo install --path tools/<tool> --root $PREFIX --locked`; sources
+      are the local checkout, so nothing is downloaded at build time).
+* [x] Recipes download nothing at build time — every `meta.yaml` uses
+      `source: path: ../../` (local checkout) plus the committed
+      `Cargo.lock` (`--locked`); no URL, no crates fetched.
 * [ ] Every tool has a `LICENSE` (MIT; fastprep's carries the Mandrillus
       Project copyright line).
 * [ ] Every tool has a `CITATION.cff`.
