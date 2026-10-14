@@ -199,7 +199,9 @@ fn missing_profile_is_an_error() {
         .unwrap();
     assert!(!status.status.success());
     let err = String::from_utf8_lossy(&status.stderr);
-    assert!(err.contains("--profile is required"), "stderr: {err}");
+    // clap reports a missing required argument with its own wording; the
+    // contract is "non-zero exit + the flag named on stderr".
+    assert!(err.contains("--profile"), "stderr: {err}");
 }
 
 #[test]
@@ -218,7 +220,8 @@ fn unknown_flag_is_an_error() {
         .unwrap();
     assert!(!status.status.success());
     let err = String::from_utf8_lossy(&status.stderr);
-    assert!(err.contains("unknown argument"), "stderr: {err}");
+    // Suite error style (clap): "unexpected argument" + usage, exit 2.
+    assert!(err.contains("unexpected argument"), "stderr: {err}");
 }
 
 #[test]

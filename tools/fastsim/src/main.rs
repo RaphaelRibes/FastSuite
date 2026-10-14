@@ -23,8 +23,7 @@ use fastsim::quality::qualify;
 use fastsim::truth::GtWriter;
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cfg = cli::parse(&args)?;
+    let cfg = cli::parse()?;
     run(&cfg)
 }
 
