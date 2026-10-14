@@ -6,10 +6,26 @@ use std::time::Instant;
 
 use fastprep::cli::{Cli, Mode};
 use fastprep::pipeline::{run_paired, run_single};
-use fastprep::stats::{report, report_runtime, pct};
+use fastprep::stats::{report, report_runtime, pct, to_report_paired_v1, to_report_v1, ReportContext};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// The exact argv, space-joined: enough to reproduce the run without
+/// guessing which flags produced the numbers (REPORT-SCHEMA.md rule 5).
+fn command_line() -> String {
+    std::env::args().collect::<Vec<_>>().join(" ")
+}
+
+/// Write the fastsuite.report.v1 wrapper. `--dry-run` writes nothing
+/// (CLI-SPEC §1), which is what the `.filter` at both call sites preserves.
+fn write_json(
+    path: &std::path::Path,
+    doc: &serde_json::Value,
+) -> anyhow::Result<()> {
+    std::fs::write(path, serde_json::to_string_pretty(doc)? + "\n")
+        .with_context(|| format!("writing JSON report to {}", path.display()))
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -40,8 +56,15 @@ fn main() -> Result<()> {
                 report_runtime(elapsed, s.reads_in);
             }
             if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
-                std::fs::write(path, serde_json::to_string_pretty(&s)? + "\n")
-                    .with_context(|| format!("writing JSON stats to {}", path.display()))?;
+                let ctx = ReportContext {
+                    mode: "single",
+                    dry_run: rt.dry_run,
+                    elapsed,
+                    inputs: serde_json::json!({ "r1": in1 }),
+                    outputs: serde_json::json!({ "r1": out1 }),
+                };
+                let doc = to_report_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
+                write_json(path, &doc)?;
             }
         }
         Mode::Paired {
@@ -98,8 +121,20 @@ fn main() -> Result<()> {
                 report_runtime(elapsed, s.r1.reads_in + s.r2.reads_in);
             }
             if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
-                std::fs::write(path, serde_json::to_string_pretty(&s)? + "\n")
-                    .with_context(|| format!("writing JSON stats to {}", path.display()))?;
+                let ctx = ReportContext {
+                    mode: "paired",
+                    dry_run: rt.dry_run,
+                    elapsed,
+                    inputs: serde_json::json!({ "r1": in1, "r2": in2 }),
+                    outputs: serde_json::json!({
+                        "r1": out1,
+                        "r2": out2,
+                        "singletons1": singletons1,
+                        "singletons2": singletons2,
+                    }),
+                };
+                let doc = to_report_paired_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
+                write_json(path, &doc)?;
             }
         }
     }

@@ -9,6 +9,14 @@ use std::time::Duration;
 
 use crate::algorithm::{DropReason, TrimResult};
 
+/// The schema string every FastSuite tool writes with `--json`.
+///
+/// Copied from the canonical v1 emitter in `tools/fastdedup/src/main.rs`
+/// (the `serde_json::json!({...})` block); `tools/fastsim/src/main.rs`
+/// repeats the same shape with `outputs.gt` (DECISIONS D-1: copy the
+/// reference implementation and name the source).
+pub const REPORT_SCHEMA: &str = "fastsuite.report.v1";
+
 // ---------------------------------------------------------------------------
 // Per-adapter stats (counts by adapter name).
 // ---------------------------------------------------------------------------
@@ -127,6 +135,122 @@ impl Stats {
     pub fn bases_trimmed_total(&self) -> u64 {
         self.bases_trimmed_5 + self.bases_trimmed_3
     }
+
+    /// The flat `metrics` block for one mate (single-end, or one side of a
+    /// paired run). Nothing structured goes in here: the per-adapter counts
+    /// stay under the `legacy` block, per REPORT-SCHEMA.md rule 1.
+    fn metrics_flat(&self) -> serde_json::Value {
+        serde_json::json!({
+            "reads_in":        self.reads_in,
+            "reads_out":       self.reads_kept,
+            "reads_dropped":   self.reads_dropped,
+            "bases_in":        self.bases_in,
+            "bases_trimmed":   self.bases_trimmed_total(),
+            "bases_trimmed_5": self.bases_trimmed_5,
+            "bases_trimmed_3": self.bases_trimmed_3,
+            "reads_dropped_poly5":  self.reads_dropped_poly5,
+            "reads_dropped_poly3":  self.reads_dropped_poly3,
+            "reads_dropped_poly_int": self.reads_dropped_poly_int,
+            "reads_dropped_hard":   self.reads_dropped_hard,
+            "reads_dropped_mean_q": self.reads_dropped_mean_q,
+            "reads_dropped_adapter": self.reads_dropped_adapter,
+            "reads_dropped_duplicate": self.reads_dropped_duplicate,
+            "reads_adapter_trimmed": self.adapter.reads_trimmed,
+        })
+    }
+}
+
+/// Every piece of run context the wrapper records but the counters do not.
+pub struct ReportContext<'a> {
+    /// `single` or `paired`.
+    pub mode: &'a str,
+    pub dry_run: bool,
+    pub elapsed: Duration,
+    pub inputs: serde_json::Value,
+    pub outputs: serde_json::Value,
+}
+
+/// The `fastsuite.report.v1` wrapper for a single-end run (PLAN.md §1.1).
+///
+/// Shape copied from the canonical emitter in `tools/fastdedup/src/main.rs`
+/// (`serde_json::json!({...})` at the `--json` write site); `tools/fastsim/
+/// src/main.rs` uses the same pattern. `metrics` is a flat numeric namespace
+/// (REPORT-SCHEMA.md rule 1) and the raw `Stats` object is preserved under
+/// `legacy` for one release, so a consumer written against the old shape
+/// keeps working.
+pub fn to_report_v1(
+    tool_version: &str,
+    command: &str,
+    ctx: &ReportContext,
+    s: &Stats,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema":       REPORT_SCHEMA,
+        "tool":         "fastprep",
+        "tool_version": tool_version,
+        "command":      command,
+        "mode":         ctx.mode,
+        "dry_run":      ctx.dry_run,
+        "inputs":       ctx.inputs,
+        "outputs":      ctx.outputs,
+        "elapsed_s":    ctx.elapsed.as_secs_f64(),
+        "metrics":      s.metrics_flat(),
+        // Raw stats object, exactly as fastprep used to write it.
+        "legacy":       serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// The `fastsuite.report.v1` wrapper for a paired-end run.
+///
+/// `metrics` is the SUM over both mates for every read-level counter: a
+/// read budget taken from one mate alone silently halves the run
+/// (the same trap the legacy fasthelper adapter documents). Where a name
+/// would be ambiguous across mates, both are kept, `r2_`-prefixed
+/// (REPORT-SCHEMA.md rule 2).
+pub fn to_report_paired_v1(
+    tool_version: &str,
+    command: &str,
+    ctx: &ReportContext,
+    p: &crate::pipeline::PairedStats,
+) -> serde_json::Value {
+    let mut metrics = serde_json::Map::new();
+    let (a, b) = (p.r1.metrics_flat(), p.r2.metrics_flat());
+    let (a, b) = (a.as_object().unwrap(), b.as_object().unwrap());
+    // Every counter is a u64: sum as u64 so the JSON stays integral
+    // (`8`, never `8.0`), matching what the single-end path emits.
+    for key in a.keys() {
+        let sum = a[key].as_u64().unwrap_or(0) + b[key].as_u64().unwrap_or(0);
+        metrics.insert(key.clone(), serde_json::json!(sum));
+    }
+    // Per-mate breakdown for the keys that are genuinely mate-specific:
+    // r1_* and r2_*, so neither mate is lost when the sum is what a
+    // consumer wants.
+    for (key, val) in a {
+        metrics.insert(format!("r1_{key}"), val.clone());
+    }
+    for (key, val) in b {
+        metrics.insert(format!("r2_{key}"), val.clone());
+    }
+    // Pair-level counters, from the PairedStats header.
+    metrics.insert("pairs_out".into(), serde_json::json!(p.pairs_out));
+    metrics.insert("pairs_dropped".into(), serde_json::json!(p.pairs_dropped));
+    metrics.insert("singletons_r1".into(), serde_json::json!(p.singletons_r1));
+    metrics.insert("singletons_r2".into(), serde_json::json!(p.singletons_r2));
+
+    serde_json::json!({
+        "schema":       REPORT_SCHEMA,
+        "tool":         "fastprep",
+        "tool_version": tool_version,
+        "command":      command,
+        "mode":         ctx.mode,
+        "dry_run":      ctx.dry_run,
+        "inputs":       ctx.inputs,
+        "outputs":      ctx.outputs,
+        "elapsed_s":    ctx.elapsed.as_secs_f64(),
+        "metrics":      serde_json::Value::Object(metrics),
+        // Raw PairedStats object, exactly as fastprep used to write it.
+        "legacy":       serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+    })
 }
 
 // ---------------------------------------------------------------------------
