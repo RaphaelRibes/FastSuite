@@ -3,6 +3,7 @@ use assert_cmd::cargo;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
 use std::fs;
+use std::io::Write;
 
 fn cmd() -> Command {
     cargo::cargo_bin_cmd!("fastdedup")
@@ -55,4 +56,30 @@ fn abundance_from_stdin_requires_temp_dir() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--temp-dir"));
+}
+
+#[test]
+fn dry_run_from_stdin() {
+    cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-s")
+        .arg("-v")
+        .write_stdin(FASTQ)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Processed fragments: 2"))
+        .stdout(predicate::str::contains("Duplicates removed: 50.00%"));
+}
+
+#[test]
+fn empty_stdin_is_a_clean_refusal() {
+    cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-s")
+        .write_stdin(b"")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("empty"));
 }

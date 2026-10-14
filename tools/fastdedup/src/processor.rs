@@ -57,7 +57,7 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
         if cfg.verbose {
             println!("--dry-run enabled: calculating duplication rate without writing files.");
         }
-        let mut reader = parse_fastx_file(input_path).context("Failed to read input file")?;
+        let mut reader = crate::stream::open_fastx(input_path)?;
         let mut processed_sequences = 0;
         let mut duplicates = 0;
 
@@ -123,7 +123,7 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
     }
 
     // --- READING AND PARSING ---
-    let mut reader = parse_fastx_file(input_path).context("Failed to read input file")?;
+    let mut reader = crate::stream::open_fastx(input_path)?;
     let mut processed_sequences = 0;
     let mut duplicates = 0;
     let mut format_validated = false;
