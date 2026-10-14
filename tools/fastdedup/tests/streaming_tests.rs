@@ -12,6 +12,18 @@ fn cmd() -> Command {
 /// Two reads, second identical to the first: 2 in, 1 out.
 const FASTQ: &[u8] = b"@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nACGTACGT\n+\n!!!!!!!!\n";
 
+fn gz(body: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(body).unwrap();
+    enc.finish().unwrap()
+}
+
+// ================================================================
+// Task 2: stream refusals
+// ================================================================
+
 #[test]
 fn pre_count_with_stdin_is_refused() {
     cmd()
@@ -58,6 +70,10 @@ fn abundance_from_stdin_requires_temp_dir() {
         .stderr(predicate::str::contains("--temp-dir"));
 }
 
+// ================================================================
+// Task 3: stdin reading in the single-end serial path
+// ================================================================
+
 #[test]
 fn dry_run_from_stdin() {
     cmd()
@@ -84,6 +100,10 @@ fn empty_stdin_is_a_clean_refusal() {
         .stderr(predicate::str::contains("empty"));
 }
 
+// ================================================================
+// Task 4: stream output — flags, writer, summary-to-stderr rule
+// ================================================================
+
 #[test]
 fn stdin_to_stdout_plain() {
     let assert = cmd()
@@ -106,4 +126,83 @@ fn stdin_to_stdout_plain() {
         err.contains("fastdedup: 2 reads in, 1 out"),
         "summary belongs on stderr when stdout carries data: {err}"
     );
+}
+
+// ================================================================
+// Task 5: gzip on stdin is decoded by magic bytes
+// ================================================================
+
+#[test]
+fn gzipped_stdin_is_decoded_from_magic_bytes() {
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .write_stdin(gz(FASTQ))
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with('@')).count(),
+        1,
+        "the gzip stream must be transparently decoded"
+    );
+}
+
+// ================================================================
+// Task 6: --out-compression gz writes gzip to stdout
+// ================================================================
+
+#[test]
+fn stdout_can_be_gzip() {
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .arg("--out-compression")
+        .arg("gz")
+        .write_stdin(FASTQ)
+        .assert()
+        .success();
+    let bytes = assert.get_output().stdout.clone();
+    assert_eq!(bytes[0], 0x1f, "gzip magic byte");
+    assert_eq!(bytes[1], 0x8b, "gzip magic byte");
+}
+
+// ================================================================
+// Task 7: --out-format fasta on stdout, and FASTA-in → FASTQ-out refusal
+// ================================================================
+
+#[test]
+fn stdout_can_be_fasta() {
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .arg("--out-format")
+        .arg("fasta")
+        .write_stdin(FASTQ)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.starts_with('>'), "FASTA output must start with '>'");
+    assert!(!out.contains('+'), "FASTA has no '+' separator line");
+}
+
+#[test]
+fn fasta_stdin_to_fastq_stdout_is_refused() {
+    cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .write_stdin(b">r1\nACGTACGT\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "FASTA → FASTQ conversion not supported",
+        ));
 }
