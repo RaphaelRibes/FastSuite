@@ -25,9 +25,15 @@ use serde_json::{json, Map, Value};
 use crate::accum::Accum;
 use crate::insert::InsertHist;
 
-/// Bases of per-position composition carried into the profile: enough to hold a
-/// located end bias (a dropout is a few bases), at ~4 floats each.
-const BASE_POSITIONS: usize = 60;
+/// Bases of per-position composition carried into the profile. The full read
+/// length, capped: high-GC libraries carry a G ramp that runs the whole read
+/// (measured on the closed-loop pilot: a virome whose per-position G fraction
+/// climbs from 0.18 at position 1 to 0.64 at 151). A 60-position cap cut that
+/// ramp in half, the tail fell back to the flat --gc draw, and the sim's G
+/// fraction collapsed where the real data was G-heavy (g_frac up to 0.37,
+/// GC diff up to 0.10 — the whole virome cluster of GATE-2 failures). At
+/// 4 floats per position the cap costs ~2.4 KB per mate.
+const BASE_POSITIONS: usize = 512;
 
 fn adapter_seq(name: &str) -> &'static str {
     match name {
@@ -364,6 +370,20 @@ pub fn write_profile(
     prof.insert("tail_q_collapse".into(), Value::Object(tail_q_collapse));
     prof.insert("pos_q".into(), Value::Object(pos_q));
     prof.insert("read_meanq".into(), Value::Object(read_meanq));
+    // The measured duplication level, so the chain can pass the profile's own
+    // duplicate rate to the simulator. Without it the chain falls back to
+    // fastsim's --dup-rate default (0.02) and the sim sits at 0.015-0.018
+    // whatever the real library's rate is (measured: real 0.001-0.014, sim
+    // 0.015-0.018 -> dup_ratio up to 20x, the other GATE-2 cluster).
+    // duplication_level = 1 - distinct/reads over the whole read fingerprint.
+    if let Some(a) = accs.first() {
+        let reads = a.reads.max(1) as f64;
+        let distinct = a.seq_counts.distinct() as f64;
+        if reads > 0.0 && a.seq_counts.distinct() > 0 {
+            let dup = (1.0 - distinct / reads).clamp(0.0, 1.0);
+            prof.insert("dup_rate".into(), json!((dup * 10000.0).round() / 10000.0));
+        }
+    }
     prof.insert("full_length_rate".into(), json!(0.0));
     prof.insert("full_length_q".into(), Value::Object(full_length_q));
     prof.insert(
