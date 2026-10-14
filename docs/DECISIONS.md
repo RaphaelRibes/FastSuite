@@ -62,11 +62,12 @@ Consequences:
   extension (a stream has no name).
 * A stream cannot be seeked, so the reader peeks the header bytes and chains
   them back in front of the stream.
-* Output to a stream needs an explicit format/compression decision, because
-  there is no filename to infer from: `--out-format fastq|fasta` and
-  `--out-compression none|gz` (defaults: fastq, none) — or `-o -` inherits the
-  input's compression. To be settled when the first tool implements output
-  streaming.
+* Settled 2026-10-12 (fastdedup, the first tool with output streaming): output
+  to a stream carries an explicit decision — `--out-format fastq|fasta` and
+  `--out-compression none|gz` (defaults: fastq, none). `-o -` does **not**
+  inherit the input's compression: a pipe whose bytes silently depend on the
+  producer's format is a trap for the next command in the chain. Named paths
+  keep inferring both from their extension.
 * FASTA stays tool-dependent and explicit: fastprep and fastdedup accept it;
   fastcheck and fastmaps need qualities and refuse it with a clear message.
 * **`fastmaps` is file-only.** It exists to take *many* files and classify

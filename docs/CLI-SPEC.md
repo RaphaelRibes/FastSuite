@@ -17,6 +17,8 @@ survives as an alias for one release.** Nothing breaks, everything converges.
 | R2 output | `-p, --out2 <PATH>` | path | required when `-2` is given |
 | threads | `-j, --threads <N>` | int | `0` = all cores (target); `-t` is **not** threads |
 | gzip level | `--gz-level <1..9>` | int | canonical; `--compression`, `-c` accepted |
+| output format on a stream | `--out-format fastq\|fasta` | enum | `-o -` only; named paths use the extension (D-4) |
+| output compression on a stream | `--out-compression none\|gz` | enum | `-o -` only; default `none` (D-4) |
 | overwrite | `--force` / `-f` | flag | without it, refuse to clobber |
 | dry run | `--dry-run` | flag | report only, write nothing |
 | report | `--json <PATH>` | path | `fastsuite.report.v1` |
@@ -147,8 +149,9 @@ Ordered by user-visible value:
 6. `FASTSUITE_THREADS` honoured as a default by all four binaries. **fastsim
    done 2026-10-12** (read when `-j` is absent; the value is reported-and-ignored
    because the simulator is single-threaded); fastprep/fastmaps/fastdedup to do.
-7. `-`/stdin-stdout support (streaming mode) — needed to compete with
-   `fastp`'s pipe usage; blocked on the reader architecture in fastprep.
+7. `-`/stdin-stdout support (streaming mode) — **fastdedup done** (2026-10-12:
+   `-` on `-1/-2/-o/-p`, plus `--out-format`/`--out-compression`); fastprep and
+   fastmaps remain, needed to compete with `fastp`'s pipe usage.
 8. ~~`fastsim` adopting clap for generated help (cosmetic; hand-parser
    works).~~ **Done 2026-10-12** — clap 4.5 derive, every flag name kept (the
    `-o` aliases are clap visible aliases), errors now in suite style

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### ✨ New Features
+
+- **Standard streams (D-4)**: `-` is accepted for `-1/--input`, `-2/--input-r2`, `-o/--output` and `-p/--output-r2`. `zcat in.fastq.gz | fastdedup -1 - -o - | ...` runs with zero intermediate files.
+- `--out-format <fastq|fasta>` and `--out-compression <none|gz>`: explicit format and compression when writing to a stream; named paths keep inferring both from the extension.
+- `--json -` writes the report to stdout; the summary line then moves to stderr.
+- Input compression is detected from magic bytes, so gzip on a stream is decoded like gzip in a file.
+
 ## v1.3.0 — 2025-05-18
 
 ### ✨ New Features
