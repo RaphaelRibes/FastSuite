@@ -316,3 +316,27 @@ fn abundance_from_stdin_with_temp_dir_works() {
         "the duplicated read must be annotated with its abundance: {out}"
     );
 }
+
+// ================================================================
+// Task 11: multi-threaded pipeline streams (stdin in, stdout out)
+// ================================================================
+
+#[test]
+fn threaded_stdin_to_stdout() {
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .arg("-j")
+        .arg("4")
+        .write_stdin(FASTQ)
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with('@')).count(),
+        1,
+        "the threaded pipeline must read stdin and write stdout identically"
+    );
+}

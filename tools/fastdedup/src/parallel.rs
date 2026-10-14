@@ -10,7 +10,7 @@ use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::hasher::SequenceHasher;
 use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
-use crate::writer::{OutputFormat, prepare_writer, write_fasta_record};
+use crate::writer::{OutputFormat, prepare_writer, write_fasta_record, StreamCompression};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -135,6 +135,11 @@ impl Read for ChanReader {
 /// Open a FASTX input as a byte stream, using flate2 GzDecoder for gzip
 /// decompression when the path ends with `.gz` (streaming, no subprocess).
 fn open_input_reader(path: &str) -> Result<Box<dyn Read + Send + 'static>> {
+    if crate::stream::is_stream(path) {
+        // needletail sniffs gzip from magic bytes on any reader, so a
+        // stdin stream decodes exactly like a mislabelled file.
+        return Ok(Box::new(std::io::stdin()));
+    }
     if path.ends_with(".gz") {
         let file = File::open(path).with_context(|| format!("Failed to open input file: {path}"))?;
         Ok(Box::new(flate2::read::GzDecoder::new(file)))
@@ -176,11 +181,19 @@ fn create_output_writer(
     path: &str,
     compression_level: u32,
     num_threads: usize,
+    out_format: OutputFormat,
+    out_compression: StreamCompression,
 ) -> Result<(
     Box<dyn Write>,
     OutputFormat,
     Option<std::thread::JoinHandle<Result<()>>>,
 )> {
+    if crate::stream::is_stream(path) {
+        // D-4: stdout cannot be seeked or reopened, so there is no gzippy
+        // thread and no resume — serial flate2 gzip when asked for.
+        let writer = crate::writer::prepare_stream_writer(out_compression, compression_level);
+        return Ok((writer, out_format, None));
+    }
     let output_path = Path::new(path);
     let output_format = OutputFormat::from_extension(output_path);
     let is_gz = OutputFormat::is_gz(output_path);
@@ -307,8 +320,13 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     let output_path_str = output_path;
     let output_path = Path::new(output_path_str);
     let gzip_threads = if num_workers > 1 { num_workers } else { 0 };
-    let (writer, output_format, gzip_handle) =
-        create_output_writer(output_path_str, cfg.compression_level, gzip_threads)?;
+    let (writer, output_format, gzip_handle) = create_output_writer(
+        output_path_str,
+        cfg.compression_level,
+        gzip_threads,
+        cfg.out_format,
+        cfg.out_compression,
+    )?;
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buffered_writer = BufWriter::with_capacity(buf_size, writer);
 
@@ -516,10 +534,20 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     } else {
         0
     };
-    let (writer_r1, output_format, gzip_handle1) =
-        create_output_writer(output_r1_path, cfg.compression_level, gzip_threads)?;
-    let (writer_r2, _output_format_r2, gzip_handle2) =
-        create_output_writer(output_r2_path, cfg.compression_level, gzip_threads)?;
+    let (writer_r1, output_format, gzip_handle1) = create_output_writer(
+        output_r1_path,
+        cfg.compression_level,
+        gzip_threads,
+        cfg.out_format,
+        cfg.out_compression,
+    )?;
+    let (writer_r2, _output_format_r2, gzip_handle2) = create_output_writer(
+        output_r2_path,
+        cfg.compression_level,
+        gzip_threads,
+        cfg.out_format,
+        cfg.out_compression,
+    )?;
 
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buf_r1 = BufWriter::with_capacity(buf_size, writer_r1);
