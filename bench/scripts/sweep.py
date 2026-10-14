@@ -293,7 +293,14 @@ def scale_min_len(cfg: dict, read_len: int) -> float:
     """
     ml = cfg["min_len"]
     if isinstance(ml, int) or (isinstance(ml, float) and float(ml).is_integer()):
-        return round(float(ml) / read_len, 4) if read_len else float(ml)
+        if not read_len:
+            return float(ml)
+        # The scaled fraction must stay in fastprep's accepted range (0, 1].
+        # A 36 bp dataset scales the grid's 50 into 1.3889L, which fastprep
+        # correctly refuses — and the refusal aborted the whole sweep on that
+        # dataset (53/55 scored, 2 configs lost). Clamp to 1.0 ("keep every
+        # base"): a min-len floor above the read length is a no-op floor.
+        return round(min(1.0, float(ml) / read_len), 4)
     return ml
 
 
