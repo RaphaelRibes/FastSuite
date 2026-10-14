@@ -63,9 +63,24 @@ fdedup [OPTIONS] --input <INPUT>
 - `--abundance-sep <SEP>`: Separator for abundance annotation (default: `;size=`).
 - `--pre-count`: Pre-count sequences for exact hash table sizing (reduces peak RAM).
 - `--temp-dir <DIR>`: Directory for temp file in abundance mode (avoids re-reading gzip).
+- `-` in place of `-1/--input`, `-2/--input-r2`, `-o/--output`, `-p/--output-r2`: read from stdin / write to stdout (D-4, standard streams).
+- `--out-format <fastq|fasta>`: record format when writing to a stream. Named paths keep inferring it from the extension. Default: `fastq`.
+- `--out-compression <none|gz>`: compression when writing to a stream. Named paths keep inferring it from the extension. Default: `none`.
 
 1: The probability $p$ of having at least one collision is calculated as $p= \frac{x^2}{2 \cdot 2^{64}}$ where $x$ is the estimated number of hashes.
 If the probability is higher than the specified threshold, FDedup will automatically switch to 128-bit hashing to nullify the risk of collisions.
+
+### Streaming (zero intermediate files)
+
+```bash
+zcat in.fastq.gz | fastdedup -1 - -o - | fastprep -1 - -o clean.fastq.gz
+```
+
+- Input compression is detected from **magic bytes**, not the extension, so a stream and a mislabelled file behave identically.
+- Output format and compression are explicit (`--out-format`, `--out-compression`): a stream has no name to infer from, and the pipe's bytes must not silently depend on the producer's format.
+- Streams are written fresh: no preload, no resume, no truncation. Resume is a file-only feature.
+- With `-o -` (or `--json -`) the summary line goes to **stderr**, so stdout carries data only.
+- Refusals (exit 1, reason on stderr): both inputs as `-`; both outputs as `-`; `--json -` together with `-o -`; `--pre-count` with stdin; `--abundance` with stdin but no `--temp-dir`.
 
 ### Run it from Cargo
 
