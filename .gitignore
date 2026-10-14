@@ -44,3 +44,6 @@ tools/fastsim/validation/*.png
 # python bytecode from the bench harness
 __pycache__/
 *.pyc
+.tmp_pixitainer_apptainer/
+fastsuite.sif
+fastsuite.def
