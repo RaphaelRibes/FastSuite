@@ -178,13 +178,14 @@ fn main() -> Result<()> {
 
     // --- INPUT VALIDATION ---
 
-    if !Path::new(&args.input).exists() {
+    let streaming_input = crate::stream::is_stream(&args.input);
+    if !streaming_input && !Path::new(&args.input).exists() {
         bail!("Input file not found: {}", args.input);
     }
 
     if let Some(ref r2) = args.input_r2 {
-        if !Path::new(r2).exists() {
-            bail!("R2 input file not found: {}", r2);
+        if !crate::stream::is_stream(r2) && !Path::new(r2).exists() {
+            bail!("R2 input file not found: {r2}");
         }
     }
 
@@ -199,6 +200,36 @@ fn main() -> Result<()> {
 
     if args.dry_run && args.abundance {
         bail!("--abundance is not compatible with --dry-run");
+    }
+
+    // --- D-4: what a single stream cannot carry ---
+    let out1_stream = args.output.as_deref().is_some_and(crate::stream::is_stream);
+    let out2_stream = args.output_r2.as_deref().is_some_and(crate::stream::is_stream);
+
+    if streaming_input && args.input_r2.as_deref().is_some_and(crate::stream::is_stream) {
+        bail!(
+            "Both --input-r1 (-1) and --input-r2 (-2) cannot be stdin: one stream cannot carry two files. Pipe one mate and name the other."
+        );
+    }
+    if streaming_input && args.pre_count {
+        bail!(
+            "--pre-count needs a second pass over the input, impossible on a stream. Drop --pre-count or pass a file path."
+        );
+    }
+    if streaming_input && args.abundance && args.temp_dir.is_none() {
+        bail!(
+            "--abundance needs a second pass over the input. With stdin, pass --temp-dir so unique reads are spilled to disk and the stream is read once."
+        );
+    }
+    if out1_stream && out2_stream {
+        bail!(
+            "--out1 (-o) and --out2 (-p) cannot both be stdout: R1 and R2 would interleave into one corrupted stream. Send one mate to a file."
+        );
+    }
+    if out1_stream && args.json.as_deref() == Some("-") {
+        bail!(
+            "--out1 (-) and --json (-) cannot both write to stdout. Send the report to a file, or drop one of them."
+        );
     }
 
     // In dry-run mode, output_r2 is optional even when input_r2 is provided
@@ -216,7 +247,10 @@ fn main() -> Result<()> {
     }
 
     if args.verbose {
-        println!("Primary input file (R1): {}", args.input);
+        println!(
+            "Primary input file (R1): {}",
+            if streaming_input { "(stdin)" } else { &args.input }
+        );
         if args.dry_run && args.output.is_none() {
             println!("Primary output file (R1): (none, dry-run)");
         } else {
