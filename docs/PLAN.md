@@ -67,11 +67,22 @@ independently verifiable.
 * `0` = all cores in fastprep and fastmaps (fastdedup already does it).
 * Test: `FASTSUITE_THREADS=4 fastprep --json r.json` → `metrics.threads == 4`.
 
-**1.5 fastsim: clap adoption** (~2 h, optional/cosmetic)
+**1.5 fastsim: clap adoption** ~~(~2 h, optional/cosmetic)~~ **[done 2026-10-12 —
+see docs/plans/2026-10-12_fastsim-cli-convergence.md]**
 
-* Replace the hand-rolled parser with clap so `-h`, `--help`, `-V` and error
-  messages match the rest of the suite; keep every existing flag name.
-* Risk: low value, low risk — do it last in the phase, or skip.
+* clap 4.5 derive replaced the hand-rolled parser; `-h`, `--help`, `-V` and the
+  error messages now match the rest of the suite. Every existing flag name is
+  kept (`-o` plus the `--out1`/`--out-prefix`/legacy `--out` aliases).
+* `--force`/`-f` (refuse to clobber the output prefix) and `-q`/`--quiet`
+  (suppress the summary line) were added at the same time.
+* `FASTSUITE_THREADS` is read when `-j` is absent (CLI-SPEC gap #6); the value
+  is reported-and-ignored — fastsim is single-threaded.
+* Verification: 58 tests green (45 unit + 13 integration), the 19-form parity
+  gate passes on the release build, and the fastcheck→fastsim closed loop runs
+  end to end on a fastcheck-built profile.
+* The deployment scripts were migrated off the pre-rename `novaseq-sim`
+  checkout to a `FASTSUITE_ROOT` indirection with a
+  `/scratch/users/$USER/FastSuite` fallback (Task 6/7 of the same plan).
 
 Verification for the whole phase: `cargo test --offline` in all five crates
 (378 tests today, see below) plus `fasthelper run -c examples/fastsuite.toml`

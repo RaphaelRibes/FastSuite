@@ -96,12 +96,15 @@ Legend: **✓** already conforms · **+** added in this reorganisation ·
 
 | canonical | state | note |
 |---|---|---|
-| `-o` | + | `--out1`, `--out-prefix`, legacy `--out` all accepted |
-| `-j --threads` | + | accepted; simulator is single-threaded, warns |
-| `--json` | + | writes the suite report for the synthetic control |
-| `-V --version` | + | was missing entirely |
+| `-o` | ✓ | `--out1`, `--out-prefix`, legacy `--out` all accepted (clap visible aliases) |
+| `-j --threads` | + | accepted; simulator is single-threaded, warns. Defaults to `FASTSUITE_THREADS` when absent (§4 gap #6, fastsim side done) |
+| `--json` | ✓ | writes the suite report for the synthetic control |
+| `-V --version` | ✓ | clap-generated |
+| `-h --help` | ✓ | clap-generated, 29 lines; `-f/--force` and `-q/--quiet` present |
+| `--force -f` | ✓ | refuses to clobber an existing `-o` prefix (probes `.gt.tsv`, `_R1/_R2.fastq[.gz]`), naming the file |
+| `-q --quiet` | ✓ | suppresses the end-of-run summary line; warnings and errors still print |
 | tool-local | `--pairs`, `--profile`, `--seed`, `--read-len`, `--insert-*`, `--gc`, `--reference`, `--adapter-seq`, `--no-adapter`, `--no-gzip`, `--dup-rate`, `--dup-pool`, `--drop-rate`, `--drop-min-len` | |
-| gap | help text is hand-rolled; `-1/-2` meaningless for a simulator (it *generates* inputs) | |
+| gap | `-1/-2` meaningless for a simulator (it *generates* inputs); `--dry-run` deliberately absent (a generator always writes — the report records `"dry_run": false`) | |
 
 ### fastmaps
 
@@ -141,10 +144,16 @@ Ordered by user-visible value:
 4. `--threads 0 = all cores` in **fastprep** and **fastmaps**.
 5. ~~`--quiet` in **fastprep**/**fastmaps**.~~ fastprep done 2026-10-12
    (`-q`/`--quiet`); **fastmaps** still to do.
-6. `FASTSUITE_THREADS` honoured as a default by all four binaries.
+6. `FASTSUITE_THREADS` honoured as a default by all four binaries. **fastsim
+   done 2026-10-12** (read when `-j` is absent; the value is reported-and-ignored
+   because the simulator is single-threaded); fastprep/fastmaps/fastdedup to do.
 7. `-`/stdin-stdout support (streaming mode) — needed to compete with
    `fastp`'s pipe usage; blocked on the reader architecture in fastprep.
-8. `fastsim` adopting clap for generated help (cosmetic; hand-parser works).
+8. ~~`fastsim` adopting clap for generated help (cosmetic; hand-parser
+   works).~~ **Done 2026-10-12** — clap 4.5 derive, every flag name kept (the
+   `-o` aliases are clap visible aliases), errors now in suite style
+   (`error: unexpected argument '--bogus' found`, exit 2). See
+   `docs/plans/2026-10-12_fastsim-cli-convergence.md`.
 
 ## 5. Compatibility promises
 
