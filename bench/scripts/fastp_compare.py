@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import glob
 import os
 import resource
 import subprocess
@@ -166,11 +167,14 @@ def main() -> int:
         dpath = os.path.join(args.units, domain)
         if not os.path.isdir(dpath):
             continue
-        for acc in sorted(os.listdir(dpath)):
-            adir = os.path.join(dpath, acc)
-            r1 = os.path.join(adir, f"{acc}.R1.fastq.gz")
-            r2 = os.path.join(adir, f"{acc}.R2.fastq.gz")
-            if not (os.path.exists(r1) and os.path.exists(r2)):
+        # units are FLAT files under <domain>/: <acc>.R1.fastq.gz (not
+        # <domain>/<acc>/<acc>.R1.fastq.gz — the flat layout is what
+        # subsample.sh produces)
+        for f1 in sorted(glob.glob(os.path.join(dpath, "*.R1.fastq.gz"))):
+            acc = os.path.basename(f1)[:-len(".R1.fastq.gz")]
+            r1 = f1
+            r2 = os.path.join(dpath, f"{acc}.R2.fastq.gz")
+            if not os.path.exists(r2):
                 continue
             key = f"{domain}/{acc}"
             if key not in winners:

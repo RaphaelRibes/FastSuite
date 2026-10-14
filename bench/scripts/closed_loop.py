@@ -173,10 +173,14 @@ def main() -> int:
             if not os.path.exists(real_r):
                 continue
             for variant in range(3):
-                sim_r = os.path.join(adir, f"sim.v{variant}.report.json")
+                # the sim outputs live either in the shared dir (old layout)
+                # or under v<variant>/ (per-variant layout, current)
+                vdir = os.path.join(adir, f"v{variant}")
+                sdir = vdir if os.path.isdir(vdir) else adir
+                sim_r = os.path.join(sdir, f"sim.v{variant}.report.json")
                 if not os.path.exists(sim_r):
-                    r1 = os.path.join(adir, f"sim.v{variant}_R1.fastq.gz")
-                    r2 = os.path.join(adir, f"sim.v{variant}_R2.fastq.gz")
+                    r1 = os.path.join(sdir, f"sim.v{variant}_R1.fastq.gz")
+                    r2 = os.path.join(sdir, f"sim.v{variant}_R2.fastq.gz")
                     if not (os.path.exists(r1) and os.path.exists(r2)):
                         continue
                     subprocess.run([args.fastcheck, "--json", sim_r, "-q",
