@@ -20,7 +20,7 @@ pixitainer (distribution), DuckDB/polars (aggregation).
 ## Context (verified 2026-10-12)
 
 * All six tools build and pass tests: fastcheck 54, fastdedup 87, fastprep 110,
-  fastsim 54, fastmaps 27, fasthelper 13 (272 tests, 0 failures).
+  fastsim 58, fastmaps 43, fasthelper 21 (436 tests, 0 failures).
 * `examples/demo.sh` runs the chain end-to-end (fastsim → fastdedup →
   fastprep → fastmaps → aggregate).
 * The QC→sim closed loop works in Rust: `fastcheck --insert-hist --profile

@@ -17,7 +17,7 @@ here is production-ready** (see the README banner).
 | fastcheck | 0.1.0 | 77 | working — `--max-mem` + admission, **insert measurement fixed** (Task 10), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
 | fasthelper | 0.1.0 | 16 | working — fastcheck step, `check -c`, `--fail-on` | `plans/2026-10-12_fasthelper-hardening.md` (tasks 5–8) |
 
-**397 tests, 0 failures.** `pixi run doctor` lists all six; `bash
+**436 tests, 0 failures.** `pixi run doctor` lists all six; `bash
 examples/demo.sh 20000` runs the whole chain (fastsim → fastdedup → fastprep
 → fastmaps → aggregate).
 

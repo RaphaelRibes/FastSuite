@@ -184,7 +184,7 @@ phase 2.5 — the replacement map is written to survive scrutiny.
 
 * The six binaries build in this tree; `cargo test` green: fastprep 110,
   fastdedup 87, fastsim 54, fastcheck 54, fastmaps 27, fasthelper 13 —
-  345 tests, 0 failures.
+  436 tests, 0 failures.
 * `fasthelper run -c examples/fastsuite.toml` executes
   `fastsim → fastdedup → fastprep → fastmaps`, records a manifest with argv,
   exit codes and wall times, and aggregates four reports into
