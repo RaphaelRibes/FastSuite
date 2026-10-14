@@ -24,7 +24,9 @@ so accuracy is absolute, not relative to another tool. Scores per config:
                    (recall and precision both matter; over-trimming destroys
                    real biology and is penalised twice as hard as it is common)
 
-The grid: PLAN-ML-STEPS C1 asks for 60 configs x 3 variants. fastprep's shipped
+The grid: 55 authored configs x 3 variants (PLAN-ML-STEPS C1 said "60"; the
+authored grid is 55, and the count is reported against the authored length so
+a short grid is a visible mismatch, never a silent "55/60 failed"). fastprep's shipped
 default (small-trim-rest-max) is known to be the swept winner from the earlier
 dedup bench, so the grid explores AROUND it on the axes that matter for the
 artefact regime the profile describes: polyX aggressiveness (min-run, mercy,
@@ -331,7 +333,7 @@ def main() -> int:
     ap.add_argument("--work", required=True)
     ap.add_argument("--row", required=True)
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--configs", type=int, default=60)
+    ap.add_argument("--configs", type=int, default=len(GRID))
     args = ap.parse_args()
 
     work = os.path.join(args.work, f"sweep.v{args.variant}")
@@ -410,7 +412,8 @@ def main() -> int:
             except FileNotFoundError:
                 pass
 
-    print(f"sweep: {args.acc} v{args.variant}: {n_done}/{args.configs} configs scored", file=sys.stderr)
+    print(f"sweep: {args.acc} v{args.variant}: {n_done}/{args.configs} configs scored "
+          f"(grid has {len(GRID)})", file=sys.stderr)
     return 0 if n_done == args.configs else 1
 
 
