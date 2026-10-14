@@ -40,3 +40,7 @@ heatmap_3d.html
 tools/fastsim/profiles/mandril*.json
 tools/fastsim/profiles/*E.json
 tools/fastsim/validation/*.png
+
+# python bytecode from the bench harness
+__pycache__/
+*.pyc
