@@ -22,7 +22,7 @@ UNITS=""
 RESULTS=""
 JOBS=6
 VARIANTS=3
-CONFIGS=60
+CONFIGS=55  # the authored grid length (see sweep.py); the plan's "60" was never authored
 THREADS=4
 
 while [[ $# -gt 0 ]]; do
