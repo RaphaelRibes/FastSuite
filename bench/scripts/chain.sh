@@ -108,10 +108,22 @@ INSERT_MIN=$(echo "$PROFILE_KNOBS" | cut -d' ' -f2)
 # honest estimator of "does this config trim this data well".
 SEED=$(( 42 + VARIANT * 1000 ))
 if [[ ! -s "sim.v$VARIANT.gt.tsv" ]]; then
+    # --drop-rate 0: the closed loop (C2) compares the sim's QC against the
+    # REAL library's QC. fastsim's default --drop-rate 0.05 plants a forced
+    # short-insert class U[1, drop-min-len) — down to insert length 1 — which
+    # the real library does not have (its measured insert floor is 88bp, one
+    # bin under the 90bp read length). With the fitter correctly setting
+    # adapter.mode=none (zero adapter hits in the real data), those planted
+    # reads pad with N, so 4.35% of sim reads end in an N-run: position-90 G
+    # fraction 0.253 real vs 0.0013 sim, g_frac_max_diff 0.25 on every dataset,
+    # 0/69 closed-loop passes. The drop class is a CONTAMINANT model for the
+    # sweep, not part of the library's biology — simulating from the profile's
+    # own insert distribution (drop-rate 0) makes the sim's artefact mix the
+    # profile's artefact mix, which is what the closed loop measures.
     "$FASTSIM" --pairs "$SIM_PAIRS" --profile real.profile.json \
         --out "sim.v$VARIANT" --seed "$SEED" \
-        --read-len "$READ_LEN" --insert-min "$INSERT_MIN" --force \
-        > "sim.v$VARIANT.log" 2>&1
+        --read-len "$READ_LEN" --insert-min "$INSERT_MIN" --drop-rate 0 \
+        --force > "sim.v$VARIANT.log" 2>&1
     rc=$?
     # fastsim prints a citation line on stderr at the end of every run: EXPECTED.
     if [[ $rc -ne 0 || ! -s "sim.v$VARIANT.gt.tsv" ]]; then
