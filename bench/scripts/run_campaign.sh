@@ -72,10 +72,14 @@ run_one() {
 export -f run_one
 export SCRIPTS RESULTS WORK ROWS CONFIGS THREADS
 
-# dispatch: every (unit, variant) is independent
-for unit in "$UNITS"/*/*/; do
-    unit="${unit%/}"
-    [[ -s "$unit.R1.fastq.gz" ]] || continue
+# dispatch: every (unit, variant) is independent.
+# A unit lives at $UNITS/<domain>/<acc>.R1.fastq.gz (flat per accession, not a
+# per-accession directory), so UNIT is the path with the .R1.fastq.gz suffix
+# stripped — that is what chain.sh consumes.
+for r1 in "$UNITS"/*/*.R1.fastq.gz; do
+    [ -e "$r1" ] || continue
+    unit="${r1%.R1.fastq.gz}"
+    [ -s "$unit.R2.fastq.gz" ] || continue   # the C chain is paired-only
     for v in $(seq 0 $(( VARIANTS - 1 ))); do
         run_one "$unit" "$v" &
         while [[ "$(jobs -rp | wc -l)" -ge "$JOBS" ]]; do sleep 2; done
