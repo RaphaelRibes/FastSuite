@@ -135,12 +135,23 @@ def load_qc_features(qc_dir: str) -> dict[tuple[str, str], dict[str, float]]:
         dpath = os.path.join(qc_dir, domain)
         if not os.path.isdir(dpath):
             continue
+        # Two layouts, both seen in the wild:
+        #   <domain>/<acc>.json                 (a flat QC dir)
+        #   <domain>/<acc>/real.report.json     (the campaign's work/ layout —
+        #                                      the report of the REAL reads the
+        #                                      fitted profile came from)
+        entries = []
         for name in sorted(os.listdir(dpath)):
-            if not name.endswith(".json"):
-                continue
-            acc = name[: -len(".json")]
+            sub = os.path.join(dpath, name)
+            if os.path.isdir(sub):
+                rep = os.path.join(sub, "real.report.json")
+                if os.path.exists(rep):
+                    entries.append((name, rep))
+            elif name.endswith(".json"):
+                entries.append((name[: -len(".json")], sub))
+        for acc, path in entries:
             try:
-                with open(os.path.join(dpath, name)) as fh:
+                with open(path) as fh:
                     doc = json.load(fh)
             except (OSError, json.JSONDecodeError):
                 continue
