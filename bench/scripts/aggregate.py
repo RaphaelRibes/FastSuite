@@ -75,6 +75,9 @@ def main() -> int:
     def config_summary(cid: int, rows: list[dict]) -> dict:
         scores = [float(r["score"]) for r in rows if r.get("score") not in (None, "")]
         sc = mean(rows, "score")
+        # the effective min_len is per-config, not a mean: all variants of one
+        # config share the same read_len, so the first row's value is the value.
+        ml_eff = next((r.get("min_len_effective", "") for r in rows if r.get("min_len_effective")), "")
         return dict(
             config_id=cid,
             score=sc if sc is not None else float("-inf"),
@@ -84,6 +87,7 @@ def main() -> int:
             false_keep=mean(rows, "false_keep_rate"),
             trim_mae=mean(rows, "trim_mae"),
             spread=(max(scores) - min(scores)) if len(scores) > 1 else 0.0,
+            min_len_effective=ml_eff,
             params={k: rows[0].get(k, "") for k in
                     ("min_run", "mercy", "phred_sat", "gate_shape", "min_len",
                      "mean_q", "adapter_err", "min_overlap", "r2_reverse", "interior")},
@@ -121,6 +125,7 @@ def main() -> int:
             "score_spread_across_variants": winner["spread"],
         }
         row.update({f"winner_{k}": v for k, v in winner["params"].items()})
+        row["winner_min_len_effective"] = winner.get("min_len_effective", "")
         pilot_rows.append(row)
 
     # pilot.tsv: the summary columns first, the winning argv's params after
@@ -139,11 +144,14 @@ def main() -> int:
                     out[c] = f"{out[c]:.4f}"
             w.writerow(out)
 
-    # winners.tsv: exactly the columns fastp_compare.py consumes
+    # winners.tsv: exactly the columns fastp_compare.py consumes.
+    # min_len_effective is carried through so C3 replays the winner with the
+    # argv the sweep actually ran, not a re-derivation of it.
     winners_path = os.path.join(args.outdir, "winners.tsv")
     win_cols = ["domain", "run_accession", "config_id"] + \
                ["min_run", "mercy", "phred_sat", "gate_shape", "min_len",
-                "mean_q", "adapter_err", "min_overlap", "r2_reverse", "interior"]
+                "mean_q", "adapter_err", "min_overlap", "r2_reverse", "interior",
+                "min_len_effective"]
     with open(winners_path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=win_cols, delimiter="\t", lineterminator="\n")
         w.writeheader()
@@ -151,6 +159,8 @@ def main() -> int:
             out = {"domain": r["domain"], "run_accession": r["run_accession"],
                    "config_id": r["winner_config_id"]}
             out.update({k: r.get(f"winner_{k}", "") for k in win_cols[3:]})
+            # the effective value comes from the sweep row of the winning config
+            out["min_len_effective"] = r.get("winner_min_len_effective", "")
             w.writerow(out)
 
     n_beat = sum(r["beats_default"] for r in pilot_rows)

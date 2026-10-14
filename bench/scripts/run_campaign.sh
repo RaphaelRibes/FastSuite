@@ -45,7 +45,8 @@ WORK="$RESULTS/../work"
 mkdir -p "$RESULTS" "$WORK" "$RESULTS/status"
 
 ROWS="$RESULTS/sweep_rows.tsv"
-[[ -s "$ROWS" ]] || printf 'domain\trun_accession\tvariant\tconfig_id\tmin_run\tmercy\tphred_sat\tgate_shape\tmin_len\tmean_q\tadapter_err\tmin_overlap\tr2_reverse\tinterior\tkeep_precision\tkeep_recall\ttrim_mae\tover_trim_rate\tunder_trim_rate\tfalse_keep_rate\tdrop_accuracy\tkept\tshould_keep\tscore\tseconds\n' > "$ROWS"
+[[ -s "$ROWS" ]] || # Same columns as sweep.py's ROW_FIELDS, in the same order.
+printf 'domain\trun_accession\tvariant\tconfig_id\tmin_run\tmercy\tphred_sat\tgate_shape\tmin_len\tmean_q\tadapter_err\tmin_overlap\tr2_reverse\tinterior\tkeep_precision\tkeep_recall\ttrim_mae\tover_trim_rate\tunder_trim_rate\tfalse_keep_rate\tdrop_accuracy\tkept\tshould_keep\tscore\tseconds\tread_len\tmin_len_effective\n' > "$ROWS"
 
 # ---------------------------------------------------------------- the workers
 run_one() {

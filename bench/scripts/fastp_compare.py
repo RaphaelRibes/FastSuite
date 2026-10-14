@@ -101,13 +101,19 @@ def load_winners(path: str) -> dict[str, dict]:
 
 
 def winner_argv(w: dict) -> list[str]:
-    """Rebuild fastprep's argv from the winning config's columns."""
+    """Rebuild fastprep's argv from the winning config's columns.
+
+    min_len_effective is the value the sweep ACTUALLY passed (sweep.py scales an
+    integer grid value against the dataset's read_len), so it is used verbatim —
+    re-deriving it here would silently change the winner's behaviour if the two
+    ever disagreed. Falls back to the raw column for older rows.
+    """
     a = ["--min-run", str(w["min_run"]), "--mercy", str(w["mercy"]),
          "--phred-sat", str(w["phred_sat"]), "--gate-shape", str(w["gate_shape"]),
          "--mean-q", str(w["mean_q"]),
          "--adapter-error-rate", str(w["adapter_err"]),
          "--min-adapter-overlap", str(w["min_overlap"])]
-    ml = w["min_len"]
+    ml = w.get("min_len_effective") or w["min_len"]
     try:
         f = float(ml)
         a += ["--min-len", str(int(f)) if f.is_integer() else f"{f}L"]

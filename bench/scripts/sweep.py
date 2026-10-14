@@ -50,6 +50,11 @@ import time
 
 # ---------------------------------------------------------------- the grid
 # (min_run, mercy, phred_sat, gate_shape, min_len, mean_q, adapter_err, min_overlap, r2_reverse, interior)
+# min_len is a FRACTION of the read length for the fractions and a base count
+# for the integers. The integers are scaled by scale_min_len() below, because
+# the pilot's units are 110 bp: a hardcoded 30 means "keep 27% of a short read"
+# on 110 bp data and "20%" on 150 bp data, which would make the two read
+# regimes non-comparable.
 DEFAULTS = dict(min_run=12, mercy=3, phred_sat=20, gate_shape=1.0,
                 min_len=0.9, mean_q=25.0, adapter_err=0.2, min_overlap=14,
                 r2_reverse=False, interior=False)
@@ -99,7 +104,8 @@ ROW_FIELDS = ["domain", "run_accession", "variant", "config_id", "min_run", "mer
               "phred_sat", "gate_shape", "min_len", "mean_q", "adapter_err",
               "min_overlap", "r2_reverse", "interior", "keep_precision", "keep_recall",
               "trim_mae", "over_trim_rate", "under_trim_rate", "false_keep_rate",
-              "drop_accuracy", "kept", "should_keep", "score", "seconds"]
+              "drop_accuracy", "kept", "should_keep", "score", "seconds",
+              "read_len", "min_len_effective"]
 
 # PXMT record layout (little-endian, v3).
 MAGIC = b"PXMT"
@@ -274,7 +280,22 @@ def min_len_arg(v: float) -> str:
     return f"{v}L"
 
 
-def build_argv(cfg: dict, work: str, cid: int) -> list[str]:
+def scale_min_len(cfg: dict, read_len: int) -> float:
+    """Resolve a config's min_len against the ACTUAL read length.
+
+    A fraction (0.9) is passed through as `0.9L` and fastprep resolves it. An
+    integer in the grid is a base count authored against a 150 bp reference, so
+    it is converted to the equivalent fraction of read_len — otherwise 30 means
+    "keep 20% of the read" at 150 bp but "keep 27%" at 110 bp, and the two read
+    regimes would not be comparable.
+    """
+    ml = cfg["min_len"]
+    if isinstance(ml, int) or (isinstance(ml, float) and float(ml).is_integer()):
+        return round(float(ml) / read_len, 4) if read_len else float(ml)
+    return ml
+
+
+def build_argv(cfg: dict, work: str, cid: int, read_len: int = 150) -> list[str]:
     a = ["-1", os.path.join(work, "in_R1.fastq.gz"),
          "-2", os.path.join(work, "in_R2.fastq.gz"),
          "-o", os.path.join(work, f"c{cid}_R1.fastq.gz"),
@@ -286,7 +307,7 @@ def build_argv(cfg: dict, work: str, cid: int) -> list[str]:
          "--mercy", str(cfg["mercy"]),
          "--phred-sat", str(cfg["phred_sat"]),
          "--gate-shape", str(cfg["gate_shape"]),
-         "--min-len", min_len_arg(cfg["min_len"]),
+         "--min-len", min_len_arg(scale_min_len(cfg, read_len)),
          "--mean-q", str(cfg["mean_q"]),
          "--adapter-error-rate", str(cfg["adapter_err"]),
          "--min-adapter-overlap", str(cfg["min_overlap"]),
@@ -354,7 +375,7 @@ def main() -> int:
             n_done += 1
             continue
 
-        argv = [args.fastprep] + build_argv(cfg, work, cid) + ["-j", str(args.threads)]
+        argv = [args.fastprep] + build_argv(cfg, work, cid, read_len) + ["-j", str(args.threads)]
         t0 = time.time()
         p = subprocess.run(argv, capture_output=True, text=True)
         secs = time.time() - t0
@@ -374,7 +395,8 @@ def main() -> int:
                 f"{m['trim_mae']:.2f}", f"{m['over_trim_rate']:.4f}",
                 f"{m['under_trim_rate']:.4f}", f"{m['false_keep_rate']:.4f}",
                 f"{m['drop_accuracy']:.4f}",
-                m["kept"], m["should_keep"], f"{m['score']:.4f}", f"{secs:.2f}"]
+                m["kept"], m["should_keep"], f"{m['score']:.4f}", f"{secs:.2f}",
+                read_len, min_len_arg(scale_min_len(cfg, read_len))]
         line = "\t".join(str(v) for v in vals)
         with open(rowfile, "w") as fh:
             fh.write(line + "\n")
