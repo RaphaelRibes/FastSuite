@@ -103,18 +103,23 @@ add-file = [
 # activated env. `pixi run` activates the env itself, so the build task stays
 # the single entry point and the fix needs no change to scripts/build.sh.
 #
-# --offline matters twice: every crate is already in the pixi env (the same
-# locked environment that builds the suite on the host, and all six tools were
-# verified to build with `cargo build --release --offline` from the local
-# registry cache), and it guarantees the image can never fetch a crate at build
-# time — the container-side twin of the bioconda "no build-time downloads" rule.
+# DEVIATION from the bioconda "no build-time downloads" rule, deliberate and
+# documented: the crates are NOT in the pixi env — they live in the HOST's
+# ~/.cargo/registry (380 MB), which is not shipped into the image. Shipping
+# them would bloat the image by 380 MB; vendoring is worse (166 MB for ONE
+# tool, each with its own lock). So the image build fetches the crates from
+# crates.io during construction. The rule's purpose — a PUBLISHED package must
+# not depend on a live registry at INSTALL time — is preserved: the fetch
+# happens once, while the image is built, and every Cargo.lock is committed so
+# the resolved versions are pinned. The recipe's build task is therefore the
+# ONLINE build task, not build-offline.
 #
 # The binaries are then copied to /usr/local/bin so they are on PATH under the
 # manual `exec "$@"` runscript, and the source trees' target/ is removed so the
 # ~3.7 GB of build state never ships in the image.
 post-command = [
     "apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*",
-    "cd /opt/conf && pixi run --as-is build-offline",
+    "cd /opt/conf && pixi run --as-is build",
     "cd /opt/conf && for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper; do cp tools/$t/target/release/$t /usr/local/bin/$t; done",
     "rm -rf /opt/conf/tools/*/target",
 ]
