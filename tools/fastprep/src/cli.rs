@@ -43,16 +43,22 @@ pub struct Cli {
     // ------------------------------------------------------------------ I/O
     /// Input FASTQ for R1 (single-end: the only input).
     /// Compression inferred from extension (.gz, .zst, .bz2, .xz).
+    /// Not required with --auto-params: a recommendation query has no run.
+    // Option, not PathBuf: --auto-params is a query with no run, so in1/out1
+    // are absent there. They are checked manually in finalize() AFTER the
+    // auto-params refusal — a plain PathBuf is implicitly `required`, and
+    // clap forbids `required` together with `required_unless_present`.
     #[arg(short = '1', long = "in1", value_name = "PATH", help_heading = "Input / Output")]
-    pub in1: PathBuf,
+    pub in1: Option<PathBuf>,
 
     /// Input FASTQ for R2 (triggers paired-end mode).
     #[arg(short = '2', long = "in2", value_name = "PATH", help_heading = "Input / Output")]
     pub in2: Option<PathBuf>,
 
     /// Output FASTQ for R1 (single-end: the only output).
+    /// Not required with --auto-params: a recommendation query has no run.
     #[arg(short = 'o', long = "out1", value_name = "PATH", help_heading = "Input / Output")]
-    pub out1: PathBuf,
+    pub out1: Option<PathBuf>,
 
     /// Output FASTQ for R2 (required in paired-end mode).
     #[arg(short = 'p', long = "out2", value_name = "PATH", help_heading = "Input / Output")]
@@ -125,6 +131,25 @@ pub struct Cli {
     /// errors still print: -q never hides a reason a run went wrong.
     #[arg(long, short = 'q', help_heading = "Runtime")]
     pub quiet: bool,
+
+    // --------------------------------------------------- Model recommendation
+    /// Recommend the trimming config from a fastcheck QC report of the input
+    /// (`fastcheck --json qc.json R1 R2`). Requires --print-args.
+    ///
+    /// REFUSES until a Phase D model file exists: the shipped default is
+    /// already the swept winner on the current corpus, so there is nothing
+    /// to switch on (docs/AUTO-PARAMS.md). This is the honest surface for
+    /// `fastprep --auto-params <qc.json> --print-args` — the flag parses,
+    /// validates the QC path, and refuses with a message pointing at the
+    /// doc, exactly as CLI-SPEC §1 rule 4 requires of a correct refusal.
+    #[arg(long, value_name = "QC.json", help_heading = "Model Recommendation")]
+    pub auto_params: Option<PathBuf>,
+
+    /// With --auto-params: print the recommended argv instead of running.
+    /// The only mode --auto-params supports today, and the mode it will
+    /// always support: the recommendation is inspectable before it is used.
+    #[arg(long, requires = "auto_params", help_heading = "Model Recommendation")]
+    pub print_args: bool,
 
 
     /// Maximum mismatch rate for adapter sequence matching [0, 1].
@@ -450,7 +475,8 @@ impl Cli {
     /// committed. Used by the `--force` clobber check: refusing on the first
     /// one that exists is what makes the message name a real file.
     fn out_paths(&self) -> Vec<PathBuf> {
-        let mut v = vec![self.out1.clone()];
+        let mut v = Vec::new();
+        if let Some(p) = &self.out1 { v.push(p.clone()); }
         if let Some(p) = &self.out2 { v.push(p.clone()); }
         if let Some(p) = &self.singletons1 { v.push(p.clone()); }
         if let Some(p) = &self.singletons2 { v.push(p.clone()); }
@@ -459,7 +485,73 @@ impl Cli {
         v
     }
 
+    /// --auto-params: the honest refusal, checked before anything else runs.
+    ///
+    /// The model does not exist yet (docs/AUTO-PARAMS.md), so the flag cannot
+    /// recommend anything. What it CAN do is fail correctly and early: refuse
+    /// when the QC report is missing or unparseable, and refuse with a
+    /// message that names the reason and points at the doc. CLI-SPEC §1 rule
+    /// 4: a correct refusal is a non-zero exit with a message saying what to
+    /// do. When a Phase D model file ships, this becomes the tree-walk over
+    /// it — the checks above (path exists, parses, has `metrics`) are the same
+    /// ones the walk needs, so they stay.
+    fn validate_auto_params(&self) -> Result<()> {
+        let Some(qc) = self.auto_params.as_ref() else {
+            // --print-args without --auto-params: clap's `requires` already
+            // catches this; the guard is for safety in case that changes.
+            if self.print_args {
+                bail!("--print-args requires --auto-params <QC.json>");
+            }
+            return Ok(());
+        };
+        if !self.print_args {
+            bail!(
+                "--auto-params requires --print-args: the recommendation is \\
+                 inspectable before it is used, so there is no silent-apply mode"
+            );
+        }
+        let text = std::fs::read_to_string(qc)
+            .with_context(|| format!("reading QC report {}", qc.display()))?;
+        let doc: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", qc.display()))?;
+        let metrics = doc.get("metrics").and_then(|m| m.as_object());
+        if metrics.is_none() {
+            bail!(
+                "{} has no `metrics` block — pass a fastcheck QC report \\
+                 (`fastcheck --json qc.json R1 R2`), not an arbitrary JSON",
+                qc.display()
+            );
+        }
+        // The QC report parses and has the fields a model would read. The
+        // refusal is about the MODEL, not the input, so say so precisely.
+        bail!(
+            "--auto-params: no model is trained yet, so there is no \\
+             recommendation to print.\n  \
+             The shipped default IS the swept winner on the current corpus \\
+             (90/90 datasets, score median 0.969), so there is nothing to \\
+             switch on until a Phase D model trained on a larger corpus \\
+             exists and beats the default on held-out studies.\n  \
+             See docs/AUTO-PARAMS.md for what the flag would do and what \\
+             Phase D would change. Until then: run with the default, or \\
+             pass the ten knobs explicitly."
+        );
+    }
+
     pub fn finalize(self) -> Result<(Mode, Runtime)> {
+        // The recommendation refusal runs first: --auto-params is a query,
+        // not a run, and it must refuse before any output-path or adapter
+        // logic can fail for an unrelated reason.
+        self.validate_auto_params()?;
+
+        // --auto-params refused above when no model exists, so reaching here
+        // without it means a real run: in1/out1 are then mandatory, and the
+        // error names them the way the rest of the suite does.
+        let (in1, out1) = match (self.in1.clone(), self.out1.clone()) {
+            (Some(i), Some(o)) => (i, o),
+            (None, _) => bail!("missing required argument -1/--in1 (a run needs an input)"),
+            (_, None) => bail!("missing required argument -o/--out1 (a run needs an output)"),
+        };
+
         // Paired-end consistency.
         let paired = self.in2.is_some();
         if paired && self.out2.is_none() {
@@ -557,7 +649,7 @@ impl Cli {
             // under-trims (it is the END of the adapter fragment present, so
             // trimming from its position leaves the earlier bases behind).
             const PEEK: usize = 10_000;
-            let mut seqs = peek_sequences(&self.in1, PEEK)?;
+            let mut seqs = peek_sequences(&in1, PEEK)?;
             if let Some(p2) = self.in2.as_ref() {
                 // Both mates: TruSeq R1 and R2 diverge after a 13-base shared
                 // prefix, so a fingerprint from R1's divergent tail would
@@ -652,10 +744,10 @@ impl Cli {
         let dedup = if !(self.dedup && !self.no_dedup) {
             None
         } else {
-            let read_len = peek_sequences(&self.in1, 1)?
+            let read_len = peek_sequences(&in1, 1)?
                 .first()
                 .map_or(150, |s| s.len());
-            let est = estimate_records(&self.in1, read_len)?;
+            let est = estimate_records(&in1, read_len)?;
             let capacity = est.clamp(1, crate::memory::MAX_PREALLOC_ENTRIES);
             let bits: u32 = match self.dedup_bits.as_deref() {
                 Some("64") => 64,
@@ -715,9 +807,9 @@ impl Cli {
             let mut params_r2 = base;
             params_r2.direction = if self.r2_scan_reverse { Direction::Reverse } else { Direction::Forward };
             Mode::Paired {
-                in1: self.in1,
+                in1: in1.clone(),
                 in2: self.in2.unwrap(),
-                out1: self.out1,
+                out1: out1.clone(),
                 out2: self.out2.unwrap(),
                 singletons1: self.singletons1,
                 singletons2: self.singletons2,
@@ -727,7 +819,7 @@ impl Cli {
         } else {
             let mut params = base;
             params.direction = if self.scan_reverse { Direction::Reverse } else { Direction::Forward };
-            Mode::Single { in1: self.in1, out1: self.out1, params }
+            Mode::Single { in1, out1, params }
         };
 
         let runtime = Runtime {
@@ -778,6 +870,78 @@ fn build_match_rule(letters: &[char]) -> Result<MatchRule> {
 mod tests {
     use crate::algorithm::MinLen;
     use super::*;
+
+    fn base_cli(extra: &[&str]) -> Cli {
+        let mut argv = vec!["fastprep", "-1", "in.fq", "-o", "out.fq"];
+        argv.extend_from_slice(extra);
+        Cli::parse_from(argv)
+    }
+
+    #[test]
+    fn probe_parse() {
+        let r = Cli::try_parse_from(["fastprep", "--auto-params", "x.json", "--print-args"]);
+        eprintln!("PROBE: {:?}", r);
+    }
+
+    #[test]
+    fn auto_params_refuses_without_a_model() {
+        // A valid fastcheck QC report: the refusal is about the missing
+        // MODEL, not the input, so a good report must still refuse.
+        let dir = std::env::temp_dir().join("fastprep_autoparams_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let qc = dir.join("qc.json");
+        std::fs::write(&qc, r#"{"tool":"fastcheck","metrics":{"mean_len":150,"gc_fraction":0.5}}"#)
+            .unwrap();
+        let cli = base_cli(&["--auto-params", qc.to_str().unwrap(), "--print-args"]);
+        let err = cli.validate_auto_params().unwrap_err().to_string();
+        assert!(err.contains("no model is trained yet"),
+                "the refusal must name the missing model, got: {err}");
+        assert!(err.contains("docs/AUTO-PARAMS.md"),
+                "the refusal must point at the doc, got: {err}");
+    }
+
+    #[test]
+    fn auto_params_refuses_a_bad_qc_path() {
+        let cli = base_cli(&["--auto-params", "/nonexistent/qc.json", "--print-args"]);
+        assert!(cli.validate_auto_params().is_err(),
+                "a missing QC report must refuse, not silently recommend");
+    }
+
+    #[test]
+    fn auto_params_refuses_non_fastcheck_json() {
+        let dir = std::env::temp_dir().join("fastprep_autoparams_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let qc = dir.join("notqc.json");
+        std::fs::write(&qc, r#"{"hello":"world"}"#).unwrap();
+        let cli = base_cli(&["--auto-params", qc.to_str().unwrap(), "--print-args"]);
+        let err = cli.validate_auto_params().unwrap_err().to_string();
+        assert!(err.contains("metrics"),
+                "must name the missing metrics block, got: {err}");
+    }
+
+    #[test]
+    fn auto_params_requires_print_args() {
+        let cli = base_cli(&["--auto-params", "qc.json"]);
+        assert!(cli.validate_auto_params().is_err(),
+                "--auto-params without --print-args must refuse");
+    }
+
+    #[test]
+    fn print_args_requires_auto_params_at_clap_level() {
+        // clap's `requires = "auto_params"` rejects --print-args alone before
+        // validate_auto_params ever runs. parse_from would exit the process,
+        // so assert through try_parse_from, which returns the error instead.
+        let r = Cli::try_parse_from(["fastprep", "-1", "in.fq", "-o", "out.fq",
+                                     "--print-args"]);
+        assert!(r.is_err(), "clap must reject --print-args without --auto-params");
+    }
+
+    #[test]
+    fn no_auto_params_is_a_noop() {
+        // The refusal path must never fire on a normal run.
+        let cli = base_cli(&[]);
+        assert!(cli.validate_auto_params().is_ok());
+    }
 
     #[test]
     fn build_rule_empty_is_homopolymer() {
@@ -834,3 +998,4 @@ mod tests {
         assert!(cli.interior);
     }
 }  
+
