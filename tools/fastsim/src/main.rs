@@ -57,6 +57,15 @@ fn run(cfg: &cli::Config) -> Result<()> {
             bail!("--read-len {} does not match profile read_len {}", l, profile.read_len);
         }
     }
+    // The profile's measured dup_rate is the authority on the duplicate class
+    // when present: the closed loop compares the sim's QC against the real
+    // library's QC, and a sim pinned to --dup-rate's 0.02 default sits at
+    // 0.015-0.018 whatever the real library's rate is (measured dup_ratio up
+    // to 20x — the other GATE-2 cluster). An explicit CLI value still wins,
+    // so a harness can force a specific rate.
+    if profile.dup_rate.is_none() {
+        profile.dup_rate = Some(cfg.dup_rate);
+    }
     if cfg.insert_min > profile.read_len {
         bail!(
             "--insert-min ({}) should be <= the profile read_len ({})",
@@ -124,7 +133,8 @@ fn run(cfg: &cli::Config) -> Result<()> {
         //     the pair. The read is still read_len bases (adapter
         //     readthrough fills the rest) — we are simulating sequencer
         //     output, not the fragment.
-        let is_dup = cfg.dup_rate > 0.0 && rng.gen::<f64>() < cfg.dup_rate;
+        let dup_rate = profile.dup_rate.unwrap_or(cfg.dup_rate);
+        let is_dup = dup_rate > 0.0 && rng.gen::<f64>() < dup_rate;
         let is_drop = !is_dup && cfg.drop_rate > 0.0 && rng.gen::<f64>() < cfg.drop_rate;
         let (insert, insert_len): (Vec<u8>, u32) = if is_dup {
             match hist.sample(&mut rng) {

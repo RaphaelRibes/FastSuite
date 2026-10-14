@@ -66,6 +66,10 @@ pub struct Profile {
     /// and does not invent a shape the data cannot show.
     pub insert: Option<Cdf>,
     pub gc: f64,
+    /// Measured duplication level from the fitter's exact fingerprint counter
+    /// (`duplication_level`). When present it is the duplicate-class rate; the
+    /// CLI's --dup-rate is only the fallback for profiles without it.
+    pub dup_rate: Option<f64>,
     pub geometry: String,
     /// per-position [a,c,g,t] composition at the fragment 5′ end (from
     /// fastcheck `base_position`). When non-empty, the fragment's leading bases
@@ -338,6 +342,7 @@ impl Profile {
         Ok(Profile {
             read_len: raw.read_len,
             gc: raw.gc,
+            dup_rate: raw.dup_rate,
             geometry: raw.geometry,
             head_bias,
             tail_bias,
@@ -430,6 +435,9 @@ impl Profile {
 pub struct RawProfile {
     pub read_len: u32,
     pub gc: f64,
+    /// measured duplication level; absent in profiles fitted before the field
+    #[serde(default)]
+    pub dup_rate: Option<f64>,
     pub geometry: String,
     #[serde(default = "default_qual_noise")]
     pub qual_noise: f64,
