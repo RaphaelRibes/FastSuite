@@ -402,6 +402,12 @@ def main() -> int:
         line = "\t".join(str(v) for v in vals)
         with open(rowfile, "w") as fh:
             fh.write(line + "\n")
+        # append to the shared rows file too — this is the campaign's real
+        # input (aggregate.py reads it); without the append every chain ran
+        # and the aggregate saw only the header. O_APPEND makes concurrent
+        # chains safe: each row is one write, the chains never share a cursor.
+        with open(args.row, "a") as fh:
+            fh.write(line + "\n")
         print(line)
         n_done += 1
 
