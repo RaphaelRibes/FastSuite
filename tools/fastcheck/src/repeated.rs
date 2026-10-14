@@ -26,20 +26,40 @@ pub struct RepeatedCounter<K> {
     cap: usize,
     /// Total inserts seen (for the fraction).
     pub total: u64,
+    /// Map length at which the next singleton eviction fires. Keeps the
+    /// eviction amortized O(1) per insert (see `insert`).
+    evict_at: usize,
 }
 
 impl<K: Hash + Eq + Clone + Ord> RepeatedCounter<K> {
     pub fn new(cap: usize) -> Self {
-        Self { map: HashMap::with_capacity(cap.min(1 << 20)), cap, total: 0 }
+        Self {
+            map: HashMap::with_capacity(cap.min(1 << 20)),
+            cap,
+            total: 0,
+            evict_at: cap + cap / 4,
+        }
     }
 
     /// Record one occurrence of `key`, evicting singletons if over the cap.
+    ///
+    /// AMORTIZED EVICTION: running `retain` on every insert while over the
+    /// cap is O(n) per call — on a saturated k-mer space (100k reads x ~140
+    /// 12-mers against 4^12 = 16.7M keys) the map sits at the cap
+    /// permanently and every insert pays a full 1M-entry rehash: ~10^13
+    /// operations, an unbounded spin at ~200% CPU with flat RSS (measured on
+    /// DRR509062: 40 min of CPU on a 100k-pair unit, no output). Retain only
+    /// frees singletons, so re-checking on every insert buys nothing once the
+    /// map is diverse. Evict lazily instead: when the map grows `cap/4` past
+    /// the last eviction, drop to `cap` in one pass. Amortized O(1) per
+    /// insert, same memory bound, no pathological case.
     pub fn insert(&mut self, key: K) {
         self.total += 1;
         let e = self.map.entry(key).or_insert(0);
         *e += 1;
-        if self.map.len() > self.cap {
+        if self.map.len() > self.evict_at {
             self.map.retain(|_, c| *c > 1);
+            self.evict_at = self.map.len().max(self.cap) + self.cap / 4;
         }
     }
 
@@ -141,14 +161,17 @@ mod tests {
     #[test]
     fn eviction_costs_at_most_one_count_per_evicted_singleton() {
         let mut c = RepeatedCounter::new(4);
-        // 4 distinct singletons fill the cap; the 5th distinct key triggers an eviction
-        // that removes all four.
+        // 4 distinct singletons fill the cap; the eviction is amortized (fires at
+        // cap + cap/4 = 5), so the 5th and 6th distinct keys are the two that push
+        // the map past that threshold and trigger the retain(count > 1).
         for i in 0..4u8 {
             c.insert(vec![i]);
         }
         assert_eq!(c.len(), 4);
-        c.insert(vec![9]); // over the cap -> retain(count > 1) drops all four singletons
-        // The new key is itself a singleton, so the eviction takes it too: the map is
+        c.insert(vec![9]); // 5th key: at the threshold, not over it -> no eviction yet
+        assert_eq!(c.len(), 5);
+        c.insert(vec![10]); // 6th key: over the threshold -> retain drops all five singletons
+        // Every key was a singleton, so the eviction takes the new one too: the map is
         // empty, not "the just-inserted key survives". The bound is on the COST, not on
         // which key is kept — each evicted singleton had exactly one occurrence.
         assert_eq!(c.len(), 0, "every key was a singleton, so all are evicted");
