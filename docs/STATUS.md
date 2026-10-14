@@ -62,8 +62,11 @@ examples/demo.sh 20000` runs the whole chain (fastsim → fastdedup → fastprep
 2. **fastcheck's polyG detector** — reports 93.98% tail-free against a true
    66.01%, zero mass at t=3/t=15 (true 7.99%/6.99%). Reported in the fastsim
    paper §5.3 as a measured limitation.
-3. **fastprep's `--json` is the legacy raw stats object** — every other tool
-   emits the v1 wrapper; `fasthelper` adapts it with a note.
+3. ~~**fastprep's `--json` is the legacy raw stats object** — every other tool
+   emits the v1 wrapper; `fasthelper` adapts it with a note.~~ **Done
+   (PLAN.md §1.1):** fastprep now writes `fastsuite.report.v1` with the raw
+   stats preserved under `legacy`; the legacy branch is kept for
+   pre-wrapper files.
 
 ## Where each paper stands (local-only repos, never pushed)
 

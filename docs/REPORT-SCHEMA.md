@@ -63,12 +63,16 @@ fasthelper schema
 |---|---|---|
 | `fastdedup` | native v1 | `--json report.json` |
 | `fastsim` | native v1 | synthetic control: pairs, artefact/duplicate/must-drop rates |
-| `fastprep` | **legacy** | emits `{r1:{reads_in,…},r2:{…},pairs_out,…}`; `fasthelper` adapts it. Wrapper is a phase-1 task |
+| `fastprep` | native v1 | `--json report.json`; the raw stats object is preserved under `legacy` for one release |
 | `fastmaps` | **legacy** | emits `heatmap.json` (grid + `counts[_r1/_r2]`); adapter derives the corner fractions |
 
 ## Legacy adapter (what fasthelper accepts and derives)
 
 ### fastprep raw stats
+
+Only reached by report files written before fastprep emitted the v1
+wrapper (PLAN.md §1.1). A current `fastprep --json` file is a v1 report
+and keeps its raw object under `legacy`.
 
 | derived metric | source |
 |---|---|

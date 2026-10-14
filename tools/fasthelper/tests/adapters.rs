@@ -75,6 +75,73 @@ fn legacy_fastprep_stats_are_summed_across_mates() {
 }
 
 #[test]
+fn fastprep_v1_report_goes_through_the_v1_path_without_the_legacy_note() {
+    // The shape fastprep now writes (PLAN.md 1.1): the wrapper, with the raw
+    // stats object parked under `legacy`. The legacy adapter must NOT claim
+    // it — that note belongs to files written before the wrapper existed.
+    let doc = serde_json::json!({
+        "schema": "fastsuite.report.v1",
+        "tool": "fastprep",
+        "tool_version": "0.1.0",
+        "mode": "paired",
+        "dry_run": false,
+        "command": "fastprep -1 r1.fq -2 r2.fq -o o1.fq -p o2.fq -j 1",
+        "inputs": {"r1": "r1.fq", "r2": "r2.fq"},
+        "outputs": {"r1": "o1.fq", "r2": "o2.fq"},
+        "elapsed_s": 1.0,
+        "metrics": {
+            "reads_in": 200, "reads_out": 170, "reads_dropped": 30,
+            "r1_reads_in": 100, "r2_reads_in": 100,
+            "pairs_out": 85
+        },
+        "legacy": {
+            "r1": {"reads_in": 100, "reads_kept": 90, "reads_dropped": 10},
+            "r2": {"reads_in": 100, "reads_kept": 80, "reads_dropped": 20},
+            "pairs_out": 85
+        }
+    });
+    let path = tmp("prep_v1").join("fastprep.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+    let r = adapt_file(&path, None).unwrap().unwrap();
+    assert_eq!(r.tool, "fastprep");
+    assert_eq!(r.version.as_deref(), Some("0.1.0"));
+    // The whole point of the wrapper: no legacy note, metrics straight from
+    // the report.
+    assert!(
+        !r.notes.iter().any(|n| n.contains("legacy raw stats")),
+        "fastprep's v1 report must not be noted as legacy: {:?}",
+        r.notes
+    );
+    assert_eq!(r.metrics["reads_in"], 200.0);
+    assert_eq!(r.metrics["reads_out"], 170.0);
+    assert_eq!(r.metrics["r2_reads_in"], 100.0);
+    assert_eq!(r.metrics["pairs_out"], 85.0);
+    assert!((r.metrics["read_retention"] - 0.85).abs() < 1e-9);
+}
+
+#[test]
+fn legacy_fastprep_file_still_gets_the_legacy_note() {
+    // Files written before the wrapper existed keep the note: the branch is
+    // still reachable, and still warns that the numbers were derived.
+    let doc = serde_json::json!({
+        "r1": {"reads_in": 100, "reads_kept": 90, "reads_dropped": 10},
+        "r2": {"reads_in": 100, "reads_kept": 80, "reads_dropped": 20}
+    });
+    let path = tmp("prep_legacy").join("fastprep.json");
+    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let r = adapt_file(&path, None).unwrap().unwrap();
+    assert_eq!(r.tool, "fastprep");
+    assert!(
+        r.notes.iter().any(|n| n.contains("legacy raw stats")),
+        "the pre-wrapper file must still be noted: {:?}",
+        r.notes
+    );
+    assert_eq!(r.metrics["reads_in"], 200.0);
+}
+
+#[test]
 fn v1_wrapper_is_read_without_the_legacy_path() {
     let doc = serde_json::json!({
         "schema": "fastsuite.report.v1",

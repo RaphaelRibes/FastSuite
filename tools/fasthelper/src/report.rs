@@ -5,9 +5,9 @@
 //!
 //! Two shapes are understood, deliberately:
 //!   * `fastsuite.report.v1` — the canonical wrapper (schema/tool/metrics)
-//!   * legacy raw JSONs — fastprep's per-mate stats object and fastmaps'
-//!     heatmap.json grid — so FastHelper works with binaries that have not
-//!     been rewired yet.
+//!   * legacy raw JSONs — fastmaps' heatmap.json grid and pre-wrapper
+//!     fastprep stats objects, so FastHelper works with binaries (and
+//!     report files) that predate the wrapper.
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,13 +49,14 @@ Rules
    elapsed_s is top-level, none of the metric keys are mandatory.
 4. Adding a metric is a MINOR change; renaming/removing one is a MAJOR change
    (bump the schema string, keep the old key one release as an alias).
-5. FastHelper also accepts legacy raw JSON (fastprep stats object, fastmaps
-   heatmap.json) and derives the keys above; new tools must emit v1.
+5. FastHelper also accepts legacy raw JSON (pre-wrapper fastprep stats
+   objects, fastmaps heatmap.json) and derives the keys above; every new
+   tool emits v1.
 
 Producers today
 ---------------
   fastdedup   --json  -> v1 (native)
-  fastprep    --json  -> legacy raw stats (v1 wrapper is a Phase-1 task)
+  fastprep    --json  -> v1 (native)
   fastmaps    --json  -> heatmap.json in --output-dir (v1 wrapper planned)
   fastsim     -       -> no JSON yet (planned: --json with truth summary)
 "#;
@@ -259,6 +260,9 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
     }
 
     // --- fastprep legacy stats: {r1: {...}, r2: {...}, pairs_out, ...} ---
+    // Only reached by report files written before fastprep emitted the v1
+    // wrapper (PLAN.md 1.1). A v1 report is claimed by the branch above, so
+    // this note never lands on a current fastprep --json file.
     if let Some(r1) = v.get("r1").filter(|x| x.is_object()) {
         let r2 = v.get("r2").filter(|x| x.is_object());
         let mut metrics = BTreeMap::new();
