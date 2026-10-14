@@ -287,3 +287,32 @@ fn paired_stdin_r1_with_file_r2() {
         "R2 file must receive the same single pair"
     );
 }
+
+// ================================================================
+// Task 10: abundance mode streams (with --temp-dir)
+// ================================================================
+
+#[test]
+fn abundance_from_stdin_with_temp_dir_works() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let spill = temp_dir.child("spill");
+    spill.create_dir_all().unwrap();
+
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("--abundance")
+        .arg("--temp-dir")
+        .arg(spill.path())
+        .arg("-o")
+        .arg("-")
+        .write_stdin(FASTQ)
+        .assert()
+        .success();
+
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains(";size=2"),
+        "the duplicated read must be annotated with its abundance: {out}"
+    );
+}

@@ -445,7 +445,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
         let mut temp_writer = BufWriter::with_capacity(256 * 1024, temp_file);
 
         {
-            let mut reader = parse_fastx_file(input_path).context("Failed to read input file")?;
+            let mut reader = crate::stream::open_fastx(input_path)?;
             let mut is_fastq = false;
             let mut format_detected = false;
 
@@ -496,8 +496,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
         }
 
         // --- PASS 2: read temp file (raw, no decompression) ---
-        let output_path_bound = Path::new(output_path);
-        let (writer, output_format) = prepare_writer(output_path_bound, true, cfg.compression_level)?;
+        let (writer, output_format) = open_output(output_path, cfg)?;
         let buf_size = compute_write_buffer_size(cfg.read_length);
         let mut buffered_writer = BufWriter::with_capacity(buf_size, writer);
 
