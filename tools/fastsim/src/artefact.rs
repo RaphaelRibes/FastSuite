@@ -177,7 +177,14 @@ pub fn build_read<R: Rng + ?Sized>(
             seq[i] = non_g[rng.gen_range(0..3)];
         }
     }
-    if t < p.read_len {
+    // The 3' rule has the SAME shape as the 5' one and needs the SAME guard:
+    // it applies only when t > 0 (there is a real tail run to bound). Without
+    // it, `t < read_len` fires at t == 0 and forces the LAST base of every
+    // read non-G — real libraries are ~25% G at the last position, the
+    // simulator produced 0.000% (measured on the closed-loop pilot: position
+    // 90 G fraction 0.2529 real vs 0.0013 sim, g_frac_max_diff 0.25 on every
+    // dataset, 0/69 closed-loop passes).
+    if t > 0 && (t as usize) < l {
         let i = l - t as usize - 1;
         if seq[i] == b'G' {
             seq[i] = non_g[rng.gen_range(0..3)];
@@ -506,9 +513,13 @@ mod tests {
             let a = decide(&p, &mut rng);
             assert_eq!((a.t1, a.t2), (0, 0));
             let r1 = build_read(&p, &insert, 200, Mate::R1, &a, &mut rng);
-            // no tail injected -> measured run must be 0 (boundary replaced)
+            // NO tail injected (t=0): the last base is FREE to be G — the
+            // boundary rule only bounds an INJECTED run. Real libraries are
+            // ~25% G at the last position; forcing it non-G at t=0 made the
+            // simulator produce 0.000% (the closed-loop g_frac failure). The
+            // insert here ends in G, so the read ends in G and that is CORRECT.
             let run = r1.seq.iter().rev().take_while(|&&b| b == b'G').count();
-            assert_eq!(run, 0, "read must not end in G when t=0");
+            assert!(run >= 1, "t=0: the biological last base is not rewritten");
         }
         // with an injected tail t=5, measured run is exactly 5
         let a = Artefact {
