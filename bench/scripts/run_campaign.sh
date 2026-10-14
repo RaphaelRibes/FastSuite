@@ -60,8 +60,16 @@ run_one() {
     if [[ -s "$status" ]]; then
         return 0
     fi
+    # each variant gets its OWN work dir: with --jobs > 1 two variants of the
+    # same dataset run concurrently and would race on the shared sweep dir
+    # (fastprep's .part -> rename commit gets unlinked mid-flight by the other
+    # variant's cleanup — measured as "committing c41_R1.fastq.gz.part ... No
+    # such file or directory"). The per-variant files (sim.vN, sweep.vN) mean
+    # no output was ever actually shared.
+    vwork="$WORK/$domain/$acc/v$variant"
+    mkdir -p "$vwork"
     THREADS="$THREADS" CONFIGS="$CONFIGS" VARIANT="$variant" \
-        bash "$SCRIPTS/chain.sh" "$unit" "$WORK/$domain/$acc" "$ROWS" \
+        bash "$SCRIPTS/chain.sh" "$unit" "$vwork" "$ROWS" \
         >> "$RESULTS/status/$tag.log" 2>&1
     if [[ $? -eq 0 ]]; then
         date -Iseconds > "$status"
