@@ -2,6 +2,7 @@ mod cli;
 mod hasher;
 mod parallel;
 mod processor;
+mod stream;
 mod utils;
 mod writer;
 use crate::hasher::HashType;
