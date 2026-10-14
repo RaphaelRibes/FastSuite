@@ -204,8 +204,8 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
 ) -> Result<(usize, usize)> {
     let mut verifier = HashVerifier::<T>::new(cfg.estimated_capacity)?;
 
-    let mut reader_r1 = parse_fastx_file(input_r1_path).context("Failed to read R1")?;
-    let mut reader_r2 = parse_fastx_file(input_r2_path).context("Failed to read R2")?;
+    let mut reader_r1 = crate::stream::open_fastx(input_r1_path)?;
+    let mut reader_r2 = crate::stream::open_fastx(input_r2_path)?;
 
     let mut processed_sequences = 0;
     let mut duplicates = 0;
@@ -267,7 +267,13 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
     let is_gz_r1 = OutputFormat::is_gz(path_r1_bound);
     let is_gz_r2 = OutputFormat::is_gz(path_r2_bound);
 
-    if cfg.force {
+    if crate::stream::is_stream(output_r1_path) || crate::stream::is_stream(output_r2_path) {
+        // D-4: a stream is written fresh — nothing exists to preload hashes
+        // from and nothing to truncate. Resume is a file-only feature.
+        if cfg.verbose {
+            println!("Output is a stream: written fresh (no preload, no resume).");
+        }
+    } else if cfg.force {
         if cfg.verbose {
             println!("--force enabled: overwriting Paired-End outputs.");
         }
@@ -319,10 +325,8 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
     }
 
     // --- WRITER PREPARATION ---
-    let (writer_r1, output_format_r1) =
-        prepare_writer(path_r1_bound, cfg.force, cfg.compression_level)?;
-    let (writer_r2, output_format_r2) =
-        prepare_writer(path_r2_bound, cfg.force, cfg.compression_level)?;
+    let (writer_r1, output_format_r1) = open_output(output_r1_path, cfg)?;
+    let (writer_r2, output_format_r2) = open_output(output_r2_path, cfg)?;
 
     if output_format_r1 != output_format_r2 {
         bail!("Output files R1 and R2 must have the same format (FASTA or FASTQ)");

@@ -236,7 +236,7 @@ fn json_report_to_stdout_moves_summary_to_stderr() {
 
 #[test]
 fn json_and_fastq_on_stdout_is_refused() {
-    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let _temp_dir = assert_fs::TempDir::new().unwrap();
     cmd()
         .arg("-1")
         .arg("-")
@@ -248,4 +248,42 @@ fn json_and_fastq_on_stdout_is_refused() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--json (-)"));
+}
+
+// ================================================================
+// Task 9: paired-end serial path streams (stdin R1, stream outputs)
+// ================================================================
+
+#[test]
+fn paired_stdin_r1_with_file_r2() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let r2 = temp_dir.child("R2.fastq");
+    r2.write_str("@p1 2:N:0:ATGC\nTTTTTTTT\n+\nJJJJJJJJ\n").unwrap();
+    let out2 = temp_dir.child("out2.fastq");
+
+    let assert = cmd()
+        .arg("-1")
+        .arg("-")
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg("-")
+        .arg("-p")
+        .arg(out2.path())
+        .write_stdin(b"@p1 1:N:0:ATGC\nACGTACGT\n+\nIIIIIIII\n")
+        .assert()
+        .success();
+
+    let out1 = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        out1.lines().filter(|l| l.starts_with('@')).count(),
+        1,
+        "one unique pair survives"
+    );
+    let out2_body = fs::read_to_string(out2.path()).unwrap();
+    assert_eq!(
+        out2_body.lines().filter(|l| l.starts_with('@')).count(),
+        1,
+        "R2 file must receive the same single pair"
+    );
 }
