@@ -1,10 +1,13 @@
 //! CLI surface of fasthelper.
 //!
-//! Everything is one of four verbs:
-//!   run     — execute a FastSuite chain from a TOML config
-//!   report  — aggregate per-tool reports into one multi-sample report
-//!   doctor  — check that the suite binaries are present and working
-//!   schema  — print the report schema (for downstream tooling)
+//! Everything is one of six verbs:
+//!   run          — execute a FastSuite chain from a TOML config
+//!   concatenate  — aggregate per-sample reports into one multi-sample report
+//!   compare      — before/after side by side
+//!   check        — validate a config before the run starts
+//!   doctor       — check that the suite binaries are present and working
+//!   install      — symlink the binaries (plus legacy names) into a prefix
+//!   schema       — print the report schema (for downstream tooling)
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
