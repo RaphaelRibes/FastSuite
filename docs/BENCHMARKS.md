@@ -506,56 +506,47 @@ cannot be anchored at all, and that regime needs the adapter boundary.
 
 ---
 
-## Blocked on the mandrill profile refresh
+## The mandrill profile refresh (PLAN §6.1)
 
-**Status: the profile exists; the refresh has not been run.**
+**Status: the profile is fitted and committed; the bench re-cut is NOT done.**
 
-`~/hermes_scratch/fastsuite-local-artifacts/profiles/mandril_E.json` is present
-outside the repo (per D-11 — nothing dataset-derived may live in the published
-tree, and `.gitignore` line 41 enforces `tools/fastsim/profiles/*E.json`). It is
-the statistical profile measured from the Mandrillus Project E-dataset: head and
-tail G-run CDFs, per-position quality curves, GC = 0.4895,
-`full_length_rate` = 0.00217.
+`tools/fastsim/profiles/mandrill_E358.json` was fitted on 2026-10-14 from the
+real mandrill reads with `fastcheck --profile --insert-hist --insert-pairs 20000`
+(the fitter IS the profile builder — no Python fitter). It supersedes the old
+`mandril_E.json` and the synthetic profile on every axis that matters:
 
-**But every benchmark above was generated from the *synthetic* profile, not the
-mandrill one.** Verified directly: the profiles committed in
-`FastSim-Bench/data/profile/profile.json` and
-`FastMaps-Bench/data/profile/profile.json` are byte-identical to the repo's
-`tools/fastsim/profiles/synthetic_novaseq.json` (GC = 0.5,
-`full_length_rate` = 0.0), and distinct from `mandril_E.json`.
+| | read_len | GC | full_length_rate | insert bins | insert range | insert mode |
+|---|---|---|---|---|---|---|
+| **new mandrill_E358** | 150 | 0.4748 | 0.0 | **146** | 144–301 bp | 301 bp (12 498 / 20 000) |
+| old mandril_E | 150 | 0.4895 | 0.00217 | 0 (no insert block) | — | — |
+| synthetic_novaseq | 150 | 0.5 | 0.0 | 0 (no insert block) | — | — |
 
-What that means for the claims above:
+What the refresh changes:
 
-* The **timing, memory and drop-rate numbers are unaffected in kind** — the
-  artefacts being measured (adapter readthrough, duplicates, must-drop class,
-  polyG) are planted at fixed rates by the synthetic profile and are present in
-  both.
-* The **quality and recovery numbers are the ones that would move**. The
-  mandrill profile carries a non-zero `full_length_rate` (0.00217) and measured
-  rather than nominal artefact CDFs, so the drop-rate comparison in §1 and the
-  recovery table in §5 are the sections a refresh would re-cut.
-* **No number in this document is a mandrill measurement**, and none should be
-  read as one. `PLAN.md` §6.1 (regenerate/refresh the fastsim profile from the
-  mandrill data) is therefore still open.
+* **The insert distribution is real now.** The old and synthetic profiles carry
+  NO insert block, so every fastsim run before this fell back to the Gaussian
+  `--insert-mean/--insert-sd` model — which understates the real spread. The new
+  profile's 146-bin histogram has its mode at the 301 bp saturation ceiling,
+  meaning the E-dataset's inserts are longer than the measurement window and
+  saturate it (62.5% of sampled pairs censored above the measurable range).
+* **GC is measured, not nominal**: 0.4748 against the synthetic 0.50.
+* **The polyG run-length histograms are the measured shape** (head: 81% zero-run,
+  19% one-base; tail: 98% zero-run with a thin long tail). The old file's
+  head/tail blocks were also mis-scaled — raw counts in the billions against the
+  new profile's per-10 000 normalisation — so the old file was not usable as-is;
+  the new fit is the authoritative one.
 
-### TODO — the refresh, when the compute and the stats dir are available
+**What has NOT been re-measured:** every benchmark number in this document was
+generated from the synthetic profile. The timing and memory numbers are
+unaffected in kind (the artefact rates are planted identically), but the
+quality-axis numbers — §1's drop-rate comparison, §3's exactness and insert
+censoring split, §5's recovery table — will move once the benches run against
+`mandrill_E358.json`, because the Gaussian insert fallback is gone.
 
-1. Build a fresh profile from the E-dataset with
-   `tools/fastsim/scripts/build_profile.py STATS_DIR out.json` (the stats dir is
-   never shipped; it stays under the local-artifacts tree).
-2. Re-point the bench generators at the new profile and re-run, at the same
-   seed and the same core counts, the three comparisons whose quality axis
-   depends on the profile: **§1** (fastprep vs fastp/cutadapt drop rate vs
-   ground truth), **§3** (fastcheck exactness and the insert censoring split)
-   and **§5** (fastsim recovery and insert resolution).
-3. Re-cut the paper CSVs in `~/work/Fast{Prep,Check,Sim}-Paper/benchmark/`, then
-   update this document. Timing and memory sections may be re-verified but are
-   expected to be stable.
-4. Only then may any sentence in this file describe a measurement made on
-   mandrill-derived data.
-
-Until step 4 completes, the honest label for this document is:
-**measured on synthetic-profile libraries with planted, known-rate artefacts.**
+The honest label for every number above remains:
+**measured on synthetic-profile libraries with planted, known-rate artefacts** —
+until the three sections are re-run at the same seeds and core counts against
+the committed mandrill profile.
 
 ---
 
