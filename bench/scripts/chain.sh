@@ -123,8 +123,8 @@ fi
 # ------------------------------------------------------------- 3. the sweep
 # The grid lives in sweep.py (bench/scripts/sweep.py): 60 configs x 3 variants.
 # Each config is run once per variant; the row carries the variant id.
-SIM_R1="sim.v$VARIANT_R1.fastq.gz"
-SIM_R2="sim.v$VARIANT_R2.fastq.gz"
+SIM_R1="sim.v${VARIANT}_R1.fastq.gz"
+SIM_R2="sim.v${VARIANT}_R2.fastq.gz"
 python3 "$(dirname "$0")/sweep.py" \
     --acc "$ACC" --domain "$DOMAIN" --variant "$VARIANT" \
     --fastprep "$FASTPREP" \
