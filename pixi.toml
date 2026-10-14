@@ -29,6 +29,115 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER = "/usr/bin/cc"
 # NOTE: pixi executes tasks with sh/bash, NOT fish — write plain POSIX shell
 # (no `for ...; do ...; done` fish one-liner with parens, no `and`/`or`).
 # The `scripts/*.sh` wrappers are what the tasks call.
+
+# ---------------------------------------------------------------------------
+# pixitainer (D-3) — the suite container image.
+#
+# ONE image, not six. D-3's wording ("one pixitainer recipe per tool") mirrors
+# the bioconda split, but a per-tool image here would mean paying for the full
+# rust+cmake+compiler toolchain six times over (each image must *build* the
+# crate, since there is no published binary to pull) to ship 1-27 MB of
+# statically linked binary. The six tools share one CLI, one report schema and
+# one runner (fasthelper), and the suite's own build order is one command
+# (`pixi run build`), so a single image carrying all six binaries is both
+# cheaper to build and more useful: `fasthelper run` can drive the chain
+# without a second image.
+#
+# MANUAL MODE IS NOT OPTIONAL. Seamless mode sets the entrypoint to
+# `pixi run --locked --as-is -m /opt/conf/pixi.toml "$@"`, and `pixi run`
+# consumes its own flags before the payload: `pixi run --as-is --version`
+# fails with "unexpected argument '--version' found". A QC tool's contract is
+# `fastcheck --version`, so `manual = true` is what makes the image behave like
+# the installed binary.
+#
+# HOW THE BINARIES GET INTO THE IMAGE: pixitainer ships the manifest, the
+# lockfile and whatever `-a/--add-file` names — nothing else. So the six
+# `tools/<t>` source trees are added explicitly and the binaries are built
+# *inside* the image. That keeps the recipe honest about D-11: the image is
+# built from committed source and no prebuilt artifact (which could silently
+# carry data) is ever injected. tools/*/target/ is deliberately NOT added — it
+# holds 3.7 GB of local build state; the %files block lists each tool's
+# Cargo.toml/Cargo.lock/src individually, so target/ is excluded by
+# construction, not by a later cleanup step.
+# ---------------------------------------------------------------------------
+[tool.pixitainer]
+manual = true
+base-image = "ubuntu:24.04"
+output = "fastsuite.sif"
+env = ["default"]
+# Pin the in-image pixi to the host's version, so a future host pixi cannot
+# silently change how the frozen lockfile is installed.
+pixi-version = "0.73.0"
+keep-def = true
+
+# Six source trees, minus target/. .cargo/config.toml is repo-level and points
+# the final Rust link at /usr/bin/cc — hence gcc in the post-commands below.
+add-file = [
+    ".cargo/config.toml:/opt/conf/.cargo/config.toml",
+    "tools/fastcheck/Cargo.toml:/opt/conf/tools/fastcheck/Cargo.toml",
+    "tools/fastcheck/Cargo.lock:/opt/conf/tools/fastcheck/Cargo.lock",
+    "tools/fastcheck/src:/opt/conf/tools/fastcheck/src",
+    "tools/fastdedup/Cargo.toml:/opt/conf/tools/fastdedup/Cargo.toml",
+    "tools/fastdedup/Cargo.lock:/opt/conf/tools/fastdedup/Cargo.lock",
+    "tools/fastdedup/src:/opt/conf/tools/fastdedup/src",
+    "tools/fastprep/Cargo.toml:/opt/conf/tools/fastprep/Cargo.toml",
+    "tools/fastprep/Cargo.lock:/opt/conf/tools/fastprep/Cargo.lock",
+    "tools/fastprep/src:/opt/conf/tools/fastprep/src",
+    "tools/fastsim/Cargo.toml:/opt/conf/tools/fastsim/Cargo.toml",
+    "tools/fastsim/Cargo.lock:/opt/conf/tools/fastsim/Cargo.lock",
+    "tools/fastsim/src:/opt/conf/tools/fastsim/src",
+    "tools/fastmaps/Cargo.toml:/opt/conf/tools/fastmaps/Cargo.toml",
+    "tools/fastmaps/Cargo.lock:/opt/conf/tools/fastmaps/Cargo.lock",
+    "tools/fastmaps/src:/opt/conf/tools/fastmaps/src",
+    "tools/fasthelper/Cargo.toml:/opt/conf/tools/fasthelper/Cargo.toml",
+    "tools/fasthelper/Cargo.lock:/opt/conf/tools/fasthelper/Cargo.lock",
+    "tools/fasthelper/src:/opt/conf/tools/fasthelper/src",
+    "scripts/build.sh:/opt/conf/scripts/build.sh",
+]
+
+# `pixi run --as-is build-offline` — NOT `bash scripts/build.sh --offline`.
+# Verified in a throwaway probe image: pixitainer's %post does NOT activate the
+# pixi environment, so a bare `bash scripts/build.sh` dies immediately with
+# "cargo: command not found" — cargo lives at
+# /opt/conf/.pixi/envs/default/bin/cargo, which is only on PATH inside an
+# activated env. `pixi run` activates the env itself, so the build task stays
+# the single entry point and the fix needs no change to scripts/build.sh.
+#
+# --offline matters twice: every crate is already in the pixi env (the same
+# locked environment that builds the suite on the host, and all six tools were
+# verified to build with `cargo build --release --offline` from the local
+# registry cache), and it guarantees the image can never fetch a crate at build
+# time — the container-side twin of the bioconda "no build-time downloads" rule.
+#
+# The binaries are then copied to /usr/local/bin so they are on PATH under the
+# manual `exec "$@"` runscript, and the source trees' target/ is removed so the
+# ~3.7 GB of build state never ships in the image.
+post-command = [
+    "apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*",
+    "cd /opt/conf && pixi run --as-is build-offline",
+    "cd /opt/conf && for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper; do cp tools/$t/target/release/$t /usr/local/bin/$t; done",
+    "rm -rf /opt/conf/tools/*/target",
+]
+
+label = [
+    "Authors:RaphaelRibes",
+    "Description:FastSuite — Rust QC and preprocessing tools sharing one CLI, one report schema and one runner",
+    "License:MIT",
+    "Pixitainer_Manual:true",
+]
+
+# Docker: run unprivileged; the six binaries are on PATH, so the image is driven
+# by name (`docker run fastsuite fastcheck --version`). NOTE: pixitainer has no
+# entrypoint key — its manual-mode Dockerfile hardcodes
+# ENTRYPOINT ["/bin/bash","-c","exec \"$@\"","--"], so an entrypoint value here
+# would be silently ignored (unknown TOML keys are dropped without a warning).
+# Changing the entrypoint means editing the generated Dockerfile, which
+# keep-def = true leaves behind.
+[tool.pixitainer.docker]
+output = "fastsuite"
+user = "nobody"
+workdir = "/work"
+
 [tasks]
 # Build every tool in dependency order (fasthelper last).
 build = "bash scripts/build.sh"
