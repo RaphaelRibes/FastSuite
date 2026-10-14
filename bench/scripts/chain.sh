@@ -82,6 +82,26 @@ print(f"chain: insert hist {len(bins)} bins, {n} pairs, mode {mode}bp, range {lo
 PY
 
 # ------------------------------------------------------- 2. simulate from it
+# fastsim's CLI defaults assume 150 bp reads (--insert-min 150). The profile's
+# own read_len comes from the real data, so every length knob is derived from
+# it: fastsim REFUSES to run when insert-min > read_len, which is exactly what
+# a 110 bp dataset hits with the default. The insert floor is the profile's
+# measured minimum (an insert shorter than the reads cannot be overlapped), and
+# read_len is passed explicitly rather than left to the default.
+PROFILE_KNOBS=$(python3 - "$WORK/real.profile.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+rl = int(p.get("read_len") or 150)
+ins = p.get("insert") or {}
+lens = sorted(int(k) for k in ins) if ins else []
+# the measured insert floor, never below 1 and never above read_len
+imin = max(1, min(lens[0] if lens else 1, rl))
+print(f"{rl} {imin}")
+PY
+) || exit 1
+READ_LEN=$(echo "$PROFILE_KNOBS" | cut -d' ' -f1)
+INSERT_MIN=$(echo "$PROFILE_KNOBS" | cut -d' ' -f2)
+
 # A variant changes ONLY the non-identifiable fields (A4): the seed, so the
 # three variants are three independent draws from the same fitted profile —
 # the sweep then measures a config's mean score across draws, which is the
@@ -89,7 +109,8 @@ PY
 SEED=$(( 42 + VARIANT * 1000 ))
 if [[ ! -s "sim.v$VARIANT.gt.tsv" ]]; then
     "$FASTSIM" --pairs "$SIM_PAIRS" --profile real.profile.json \
-        --out "sim.v$VARIANT" --seed "$SEED" --force \
+        --out "sim.v$VARIANT" --seed "$SEED" \
+        --read-len "$READ_LEN" --insert-min "$INSERT_MIN" --force \
         > "sim.v$VARIANT.log" 2>&1
     rc=$?
     # fastsim prints a citation line on stderr at the end of every run: EXPECTED.
