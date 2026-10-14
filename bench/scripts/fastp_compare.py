@@ -59,17 +59,43 @@ FASTP_BEST = ["--cut_front", "--cut_front_window_size", "5",
               "--low_complexity_filter"]
 
 
-def peak_rss_mb() -> float:
-    """Peak RSS of this process AND its reaped children, in MB."""
-    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
-    return ru.ru_maxrss / 1024.0
+def _child_peak_rss_mb(pid: int) -> float:
+    """Peak RSS (VmHWM) of a live child, in MB; 0.0 once it is gone.
+
+    getrusage(RUSAGE_CHILDREN) cannot measure a single child: ru_maxrss is
+    the maximum over every reaped child the process EVER spawned -- a
+    running high-water mark that never resets -- so once one large child
+    has run, every later child reports that same value regardless of its
+    own footprint (measured: three different tools reporting an identical
+    1209.8 MB). Polling the child's own VmHWM while it lives is the only
+    per-run peak POSIX offers.
+    """
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) / 1024.0
+    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+        pass
+    return 0.0
 
 
-def run_timed(argv: list[str], log: str) -> tuple[int, float, str]:
+def run_timed(argv: list[str], log: str) -> tuple[int, float, str, float]:
+    """Run argv; return (rc, seconds, log_path, peak_rss_mb).
+
+    The peak is polled from the child's /proc VmHWM every 50 ms for the
+    child's whole life; the last non-zero reading is its high-water mark.
+    """
     t0 = time.time()
     with open(log, "w") as fh:
-        p = subprocess.run(argv, stdout=fh, stderr=subprocess.STDOUT)
-    return p.returncode, time.time() - t0, log
+        p = subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT)
+        peak = 0.0
+        while p.poll() is None:
+            peak = max(peak, _child_peak_rss_mb(p.pid))
+            time.sleep(0.05)
+        peak = max(peak, _child_peak_rss_mb(p.pid))
+        rc = p.returncode
+    return rc, time.time() - t0, log, peak
 
 
 def fastcheck_report(fastcheck: str, r1: str, r2: str | None, out_json: str,
@@ -158,7 +184,7 @@ def main() -> int:
                m.get("mean_read_mean_q", ""), m.get("gc_fraction", ""),
                m.get("polyx5_frac_gt_1", ""), m.get("polyx3_frac_gt_5", ""),
                m.get("duplication_level", ""),
-               f"{secs:.2f}", f"{peak_rss_mb():.1f}", status, note]
+               f"{secs:.2f}", f"{rss:.1f}", status, note]
         with open(args.row, "a", newline="") as fh:
             csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(row)
 
@@ -192,7 +218,7 @@ def main() -> int:
             o2 = os.path.join(d, "win_R2.fastq.gz")
             argv = [args.fastprep, "-1", r1, "-2", r2, "-o", o1, "-p", o2,
                     "-j", str(args.threads), "--force", "-q"] + winner_argv(w)
-            rc, secs, log = run_timed(argv, os.path.join(d, "win.log"))
+            rc, secs, log, rss = run_timed(argv, os.path.join(d, "win.log"))
             rep = fastcheck_report(args.fastcheck, o1, o2, os.path.join(d, "win.json"), args.threads) \
                 if rc == 0 else None
             emit(domain, acc, "fastprep-winner", w.get("config_id", ""), argv,
@@ -204,7 +230,7 @@ def main() -> int:
             o2 = os.path.join(d, "fp_R2.fastq.gz")
             argv = [args.fastp, "-i", r1, "-I", r2, "-o", o1, "-O", o2,
                     "-w", str(args.threads), "-z", str(GZ_LEVEL)]
-            rc, secs, log = run_timed(argv, os.path.join(d, "fp.log"))
+            rc, secs, log, rss = run_timed(argv, os.path.join(d, "fp.log"))
             rep = fastcheck_report(args.fastcheck, o1, o2, os.path.join(d, "fp.json"), args.threads) \
                 if rc == 0 else None
             emit(domain, acc, "fastp-default", "", argv, reads_in, rep, secs,
@@ -215,7 +241,7 @@ def main() -> int:
             o2 = os.path.join(d, "fpb_R2.fastq.gz")
             argv = [args.fastp, "-i", r1, "-I", r2, "-o", o1, "-O", o2,
                     "-w", str(args.threads), "-z", str(GZ_LEVEL)] + FASTP_BEST
-            rc, secs, log = run_timed(argv, os.path.join(d, "fpb.log"))
+            rc, secs, log, rss = run_timed(argv, os.path.join(d, "fpb.log"))
             rep = fastcheck_report(args.fastcheck, o1, o2, os.path.join(d, "fpb.json"), args.threads) \
                 if rc == 0 else None
             emit(domain, acc, "fastp-best", "", argv, reads_in, rep, secs,
