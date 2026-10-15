@@ -117,15 +117,24 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
 /// A duplicate re-sequences a stored fragment: same template, but fresh
 /// quality, sequencing errors and polyG artefacts are drawn independently,
 /// because dropout is a per-cluster failure. Emitting byte-identical copies
-/// would make dedup-before-trim look correct when it is not — a real
-/// duplicate diverges from its original in the same places any two reads
-/// of one fragment diverge.
+/// The duplicate pool holds FINISHED PAIRS, not bare inserts, and a sampled
+/// pair is replayed byte-for-byte. That is what makes a duplicate detectable
+/// the way a real one is.
 ///
-/// Only *fresh* (non-duplicate) inserts enter the pool, matching the
-/// measured semantics: a duplicate copies an original, and the original was
-/// itself sequenced once.
+/// Measured on real data before this change: fastsim drew the right number of
+/// duplicate pairs (ground truth said 1073) but fastcheck's exact sequence
+/// fingerprint could only see 913 of them, because the artefact and the
+/// substitution errors were redrawn for the copy. At per-base error 0.0055 a
+/// 150 bp read is error-free only 43.5% of the time, so most copies diverged.
+/// The measured rate came out at ~0.35 of the requested rate, independent of
+/// pool size (1024 -> 0.322, 1e6 -> 0.346), which rules the ring buffer itself
+/// out as the cause.
+///
+/// Only *fresh* (non-duplicate) pairs enter the pool, matching the measured
+/// semantics: a duplicate copies an original, and the original was itself
+/// sequenced once.
 pub struct History {
-    buf: Vec<Vec<u8>>,
+    buf: Vec<crate::artefact::PooledPair>,
     cap: usize,
     n: usize,
     w: usize,
@@ -141,19 +150,19 @@ impl History {
         }
     }
 
-    /// Store a fresh insert (overwrites the oldest when full).
-    pub fn push(&mut self, insert: Vec<u8>) {
+    /// Store a fresh pair (overwrites the oldest when full).
+    pub fn push(&mut self, pair: crate::artefact::PooledPair) {
         if self.n < self.cap {
-            self.buf.push(insert);
+            self.buf.push(pair);
             self.n += 1;
         } else {
-            self.buf[self.w] = insert;
+            self.buf[self.w] = pair;
         }
         self.w = (self.w + 1) % self.cap;
     }
 
-    /// Sample a stored insert uniformly; None when the pool is empty.
-    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Option<&[u8]> {
+    /// Sample a stored pair uniformly; None when the pool is empty.
+    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> Option<&crate::artefact::PooledPair> {
         if self.n == 0 {
             return None;
         }

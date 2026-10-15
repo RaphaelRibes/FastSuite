@@ -15,7 +15,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use fastsim::artefact::{build_read, decide};
+use fastsim::artefact::{build_read, decide, PooledPair};
 use fastsim::biology::{insert_from_reference, random_dna_bias, read_fasta, History};
 use fastsim::fastq::FastqWriter;
 use fastsim::profile::{AdapterMode, Mate, Profile};
@@ -136,25 +136,28 @@ fn run(cfg: &cli::Config) -> Result<()> {
         let dup_rate = profile.dup_rate.unwrap_or(cfg.dup_rate);
         let is_dup = dup_rate > 0.0 && rng.gen::<f64>() < dup_rate;
         let is_drop = !is_dup && cfg.drop_rate > 0.0 && rng.gen::<f64>() < cfg.drop_rate;
-        let (insert, insert_len): (Vec<u8>, u32) = if is_dup {
-            match hist.sample(&mut rng) {
-                Some(ins) => (ins.to_vec(), ins.len() as u32),
-                None => {
-                    // Pool not primed yet (first pairs): emit fresh instead.
-                    let l = profile.sample_insert(
-                        cfg.insert_mean,
-                        cfg.insert_sd,
-                        cfg.insert_min,
-                        &mut rng,
-                    );
-                    let i = match &contigs {
-                        Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
-                        None => random_dna_bias(l as usize, cfg.gc, Some(&profile.head_bias), Some(&profile.tail_bias), &mut rng),
-                    };
-                    (i, l)
+
+        // A duplicate REPLAYS a stored pair verbatim: same bases, same artefact,
+        // same substitution errors. This is what a real optical duplicate is
+        // (same tile, same cycle), and it is what makes the copy detectable by
+        // an exact sequence fingerprint — redrawing the artefact and the errors
+        // for the copy left the measured duplicate rate at ~0.35 of the
+        // requested rate, independent of pool size.
+        if is_dup {
+            if let Some(src) = hist.sample(&mut rng) {
+                let a = src.artefact;
+                w1.write_record(&w1.header(pair_idx, 1), &src.r1)?;
+                if let (Some(w2), Some(m2)) = (w2.as_mut(), src.r2.as_ref()) {
+                    w2.write_record(&w2.header(pair_idx, 2), m2)?;
                 }
+                gt.write_pair(pair_idx, src.insert_len, &a, true)?;
+                n_dup += 1;
+                continue;
             }
-        } else if is_drop {
+            // Pool not primed yet (first pairs): fall through and emit fresh.
+        }
+
+        let (insert, insert_len): (Vec<u8>, u32) = if is_drop {
             // Forced short fragment: I ~ U[1, drop_min_len). Short enough
             // that even with zero artefacts the kept window is < min_len.
             let l = rng.gen_range(1..=cfg.drop_min_len.saturating_sub(1).max(1));
@@ -174,7 +177,6 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
                 None => random_dna_bias(l as usize, cfg.gc, Some(&profile.head_bias), Some(&profile.tail_bias), &mut rng),
             };
-            hist.push(i.clone());
             (i, l)
         };
         if is_dup {
@@ -223,6 +225,18 @@ fn run(cfg: &cli::Config) -> Result<()> {
             w2.write_record(&w2.header(pair_idx, 2), m2)?;
         }
         gt.write_pair(pair_idx, insert_len, &a, is_dup)?;
+        // Pool the finished pair so a later duplicate replays these exact bytes.
+        // The forced-drop class is excluded: it is a contaminant model, not a
+        // library member, and must not seed the duplicate pool.
+        if !is_drop {
+            hist.push(PooledPair {
+                insert: insert.clone(),
+                insert_len,
+                artefact: a,
+                r1: m1,
+                r2: m2,
+            });
+        }
     }
 
     w1.finish().context("finish R1")?;

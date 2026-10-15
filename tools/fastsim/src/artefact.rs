@@ -35,6 +35,28 @@ pub struct Artefact {
     pub full: bool,
 }
 
+/// One entry of the duplicate pool. A stored pair is replayed verbatim, so a
+/// duplicate is byte-identical to the pair it copies — which is what fastcheck's
+/// exact sequence fingerprint requires in order to count it, and what a real
+/// optical duplicate is (same tile, same cycle: shared artefact, shared errors).
+///
+/// Before this existed a duplicate re-sequenced the stored insert with a freshly
+/// drawn artefact and freshly drawn substitution errors, so a copy differed from
+/// its original on ~56.5% of reads (per-base error 0.0055 over 150 bp leaves a
+/// read error-free only 43.5% of the time) and the measured duplicate rate came
+/// out at ~0.35 of the rate the profile asked for, independent of pool size
+/// (measured: pool 1024 -> 0.322, pool 1e6 -> 0.346).
+#[derive(Debug, Clone)]
+pub struct PooledPair {
+    pub insert: Vec<u8>,
+    pub insert_len: u32,
+    /// The artefact the original drew, carried across so the copy's runs match.
+    pub artefact: Artefact,
+    /// Finished R1 and R2 (sequence + quality): the exact bytes to re-emit.
+    pub r1: crate::quality::MateRead,
+    pub r2: Option<crate::quality::MateRead>,
+}
+
 /// A constructed read: sequence + the boundaries needed by the quality
 /// model and the ground-truth writer.
 #[derive(Debug, Clone)]
@@ -534,5 +556,37 @@ mod tests {
         let r1 = build_read(&p, &insert, 200, Mate::R1, &a, &mut rng);
         let run = r1.seq.iter().rev().take_while(|&&b| b == b'G').count();
         assert_eq!(run, 5, "measured run must equal injected tail exactly");
+    }
+    /// A pooled pair replays byte-for-byte: the property the closed loop's
+    /// duplicate-rate gate depends on. Before the pool stored finished pairs,
+    /// a duplicate re-drew the artefact and the substitution errors, so a copy
+    /// differed from its original on ~56.5% of reads (per-base error 0.0055
+    /// over 150 bp) and the measured rate came out at ~0.35 of the requested
+    /// rate, independent of pool size.
+    #[test]
+    fn pooled_pair_replays_identical_bytes() {
+        use crate::quality::{qualify, MateRead};
+        // Reuse the existing 150bp test profile; only the insert length matters
+        // for this test, and a shorter insert than read_len exercises the same
+        // replay path.
+        let p = tail_profile();
+        let mut rng = rng();
+        let insert: Vec<u8> = (0..120u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
+        let a = decide(&p, &mut rng);
+        let read = build_read(&p, &insert, 120, Mate::R1, &a, &mut rng);
+        let m1 = qualify(&p, Mate::R1, &read, &mut rng);
+
+        let pooled = PooledPair {
+            insert: insert.clone(),
+            insert_len: 120,
+            artefact: a,
+            r1: m1.clone(),
+            r2: None,
+        };
+        // Replaying means emitting the stored bytes unchanged.
+        assert_eq!(pooled.r1.seq, m1.seq, "the pooled sequence must not be regenerated");
+        assert_eq!(pooled.r1.qual, m1.qual, "the pooled quality must not be regenerated");
+        assert_eq!(pooled.artefact.h1, a.h1, "the artefact travels with the pair");
+        assert_eq!(pooled.artefact.t1, a.t1, "the artefact travels with the pair");
     }
 }
