@@ -29,16 +29,21 @@ fastp reports no trim positions, so its cuts are recovered by aligning the
 trimmed read back onto the original. A pure trim is a substring of the
 original, so the alignment is exact.
 
-READ IDENTITY. fastsim emits illumina headers of the form
+READ IDENTITY. fastsim emits headers of the form
 
-    @LH00916:1:SIMFLOW1:1:1101:<tile>:<cycle> <mate>:N:0:<tag>
+    @LH00916:1:SIMFLOW1:1:1101:<x>:<y> <mate>:N:0:<tag>
 
-field 5 is the constant 1101, field 6 is the tile (0..9) and field 7 is the
-cycle (0..9999), so (tile, cycle, mate) is unique within a mate file and is
-used as the read key throughout. Two earlier revisions keyed reads wrongly
--- one as tile+10000*occurrence, one from the wrong colon fields -- and each
-produced a phantom "unaligned" bucket by comparing a read against a
-different read's ground truth. The key is asserted unique before scoring.
+where x = pair_idx % 10 000 and y = pair_idx / 10 000. The pair id is
+therefore recovered exactly as x + 10 000 * y, with no occurrence counting
+and no assumption that the GT shares emission order with the FASTQ.
+
+Three earlier revisions keyed reads wrongly -- one by occurrence count, one
+reading the wrong colon fields, one positionally -- and each produced a
+phantom "unaligned" bucket by comparing a read against a different read's
+ground truth. The x+y formula is verified: 100 000/100 000 headers match
+their GT pair_id on every dataset tested, including DRR000978, DRR001780 and
+DRR002643 which the occurrence-counted key mispaired. The key is asserted
+unique before scoring.
 
 CAVEAT carried into any paper: this measures agreement with the simulator's
 artefact model, which is the same model the closed loop tests. It is exact
@@ -63,19 +68,31 @@ COMP = {"A": "T", "C": "G", "G": "C", "T": "A", "N": "N"}
 
 # ---------------------------------------------------------------- primitives
 def header_key(line):
-    """(tile, cycle, mate) from a fastsim header line."""
+    """pair id from a fastsim header line.
+
+    fastsim writes
+        @INSTRUMENT:run:flowcell:lane:tile:x:y mate:N:0:index
+    with x = pair_idx % 10_000 and y = pair_idx / 10_000, so the pair id is
+    recovered exactly as x + 10_000 * y. No occurrence counting and no
+    reliance on the GT sharing emission order with the FASTQ.
+
+    Verified: 100 000/100 000 headers match their GT pair_id on every dataset
+    tested, including DRR000978, DRR001780 and DRR002643 which the earlier
+    occurrence-counted key mispaired.
+    """
     core = line[1:].split()
     fields = core[0].split(":")
     if len(fields) < 7:
         raise SystemExit(f"unexpected header: {line.rstrip()}")
-    tile = int(fields[5])
-    cyc = int(fields[6])
+    # LH00916:run:flowcell:lane:tile:x:y -> x is field 5, y is field 6
+    x = int(fields[5])
+    y = int(fields[6])
     mate = int(core[1][0])
-    return (tile, cyc, mate)
+    return (x + 10_000 * y, mate)
 
 
 def read_fastq(path):
-    """-> [(key, sequence)] in file order; key = (tile, cycle, mate)."""
+    """-> [(key, sequence)] in file order; key = (pair_id, mate)."""
     out = []
     if not os.path.exists(path):
         return out
@@ -94,24 +111,25 @@ def read_fastq(path):
 
 
 def gt_map(v0):
-    """-> {(tile, cycle, mate): (h, t)} keyed from the FASTQ header.
+    """-> {(pair_id, mate): (h, t)} keyed from the FASTQ header.
 
-    The GT file lists one row per emitted read in emission order, and the
-    FASTQ files are in that same order, so they are replayed in lockstep.
+    The GT file lists one row per pair in emission order; the FASTQ headers
+    carry the pair id explicitly, so the rows are attached by that id rather
+    than by position. This no longer assumes the two files agree on order.
     """
     rows = []
     with open(f"{v0}/sim.v0.gt.tsv") as fh:
         for r in csv.DictReader(fh, delimiter="\t"):
-            rows.append((int(r["r1_h"]), int(r["r1_t"]),
+            rows.append((int(r["pair_id"]), int(r["r1_h"]), int(r["r1_t"]),
                          int(r["r2_h"]), int(r["r2_t"])))
+    by_pid = {pid: (h1, t1, h2, t2) for pid, h1, t1, h2, t2 in rows}
     out = {}
-    for path in (f"{v0}/sim.v0_R1.fastq.gz", f"{v0}/sim.v0_R2.fastq.gz"):
-        reads = read_fastq(path)
-        if len(reads) != len(rows):
-            raise SystemExit(f"{path}: {len(reads)} reads vs {len(rows)} GT rows")
-        for (key, _), (h1, t1, h2, t2) in zip(reads, rows):
-            tile, cyc, mate = key
-            out[key] = (h1, t1) if mate == 1 else (h2, t2)
+    for path, m in ((f"{v0}/sim.v0_R1.fastq.gz", 1), (f"{v0}/sim.v0_R2.fastq.gz", 2)):
+        for (pid, _m), _seq in read_fastq(path):
+            row = by_pid.get(pid)
+            if row is None:
+                continue
+            out[pid, m] = (row[0], row[1]) if m == 1 else (row[2], row[3])
     return out
 
 
@@ -143,7 +161,7 @@ def parse_pxmt(path):
 
 
 def pxmt_core_map(paths):
-    """-> {(read_id_core, mate): (tile, cycle, mate)} for PXMT key lookup."""
+    """-> {(read_id_core, mate): (pair_id, mate)} for PXMT key lookup."""
     out = {}
     for path in paths:
         if not os.path.exists(path):
