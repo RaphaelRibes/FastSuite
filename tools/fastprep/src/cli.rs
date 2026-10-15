@@ -525,14 +525,17 @@ impl Cli {
         // The QC report parses and has the fields a model would read. The
         // refusal is about the MODEL, not the input, so say so precisely.
         bail!(
-            "--auto-params: no model is trained yet, so there is no \\
+            "--auto-params: no model is trained yet, so there is no \
              recommendation to print.\n  \
-             The shipped default IS the swept winner on the current corpus \\
-             (90/90 datasets, score median 0.969), so there is nothing to \\
-             switch on until a Phase D model trained on a larger corpus \\
-             exists and beats the default on held-out studies.\n  \
-             See docs/AUTO-PARAMS.md for what the flag would do and what \\
-             Phase D would change. Until then: run with the default, or \\
+             The shipped default is a good CENTRAL configuration, not a \
+             validated universal one: on the 101 real ENA datasets the \
+             per-dataset winner beats it on 100 of 101, though the median \
+             gap is only 0.0049 and 66 of 101 sit inside a 0.01 margin. \
+             There is nothing to switch on until a Phase D model trained \
+             on a larger corpus exists and beats the default on held-out \
+             studies.\n  \
+             See docs/AUTO-PARAMS.md for what the flag would do and what \
+             Phase D would change. Until then: run with the default, or \
              pass the ten knobs explicitly."
         );
     }
