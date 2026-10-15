@@ -375,11 +375,24 @@ pub fn write_profile(
     // fastsim's --dup-rate default (0.02) and the sim sits at 0.015-0.018
     // whatever the real library's rate is (measured: real 0.001-0.014, sim
     // 0.015-0.018 -> dup_ratio up to 20x, the other GATE-2 cluster).
-    // duplication_level = 1 - distinct/reads over the whole read fingerprint.
-    if let Some(a) = accs.first() {
-        let reads = a.reads.max(1) as f64;
-        let distinct = a.seq_counts.distinct() as f64;
-        if reads > 0.0 && a.seq_counts.distinct() > 0 {
+    //
+    // Computed over the MERGED accumulator, exactly as `repeated_metrics`
+    // computes the report's `duplication_level`. Using only the first mate
+    // made the profile and the report disagree by construction: the two mates
+    // carry different duplicate rates (measured on DRR000466 — R1 0.0086,
+    // R2 0.0182, merged 0.0135, with only 15 sequences shared between them),
+    // so `accs.first()` reported whichever mate happened to be first. The
+    // closed loop then compared the sim (fed the first-mate rate) against the
+    // report's merged rate, inflating dup_ratio by a median factor of 1.39
+    // across 96 datasets and failing 144 of 306 comparisons.
+    if !accs.is_empty() {
+        let reads: f64 = accs.iter().map(|a| a.reads.max(1) as f64).sum();
+        let mut merged = crate::fingerprint::FingerprintTable::with_capacity(0);
+        for a in accs {
+            merged.merge(&a.seq_counts);
+        }
+        let distinct = merged.distinct() as f64;
+        if reads > 0.0 && distinct > 0.0 {
             let dup = (1.0 - distinct / reads).clamp(0.0, 1.0);
             prof.insert("dup_rate".into(), json!((dup * 10000.0).round() / 10000.0));
         }
@@ -537,5 +550,43 @@ mod tests {
         let a = acc_with(&[(b"ACGT", b"IIII")], 32);
         let m = fit_mate(&a, 0.25, 8, 33);
         assert_eq!(m.pos_q.len(), 8, "positions past the scan are padded, never dropped");
+    }
+
+    /// The profile's dup_rate must equal the report's duplication_level, i.e. it must be
+    /// computed over the MERGED accumulator and not over `accs.first()`.
+    ///
+    /// The two mates carry genuinely different duplicate rates: measured on DRR000466,
+    /// R1 alone 0.0086, R2 alone 0.0182, merged 0.0135, with only 15 sequences shared
+    /// between the mates. Reporting the first mate made the profile and the report
+    /// disagree by construction (median ratio 0.7184 profile/report, i.e. the report is
+    /// 1.392x the profile), and the closed loop then compared the sim — fed the first
+    /// mate's rate — against the report's merged rate, failing 144 of 306 comparisons on
+    /// dup_ratio alone.
+    #[test]
+    fn profile_dup_rate_is_the_merged_rate_not_the_first_mates() {
+        // R1: 4 reads, all distinct -> R1 level 0.
+        let r1 = acc_with(&[(b"AAAA", b"IIII"), (b"CCCC", b"IIII"),
+                            (b"GGGG", b"IIII"), (b"TTTT", b"IIII")], 16);
+        // R2: 4 reads, one sequence seen twice -> R2 level 0.25.
+        let r2 = acc_with(&[(b"AAAA", b"IIII"), (b"AAAA", b"IIII"),
+                            (b"GGGG", b"IIII"), (b"TTTT", b"IIII")], 16);
+        let accs: Vec<&Accum> = vec![&r1, &r2];
+
+        // What `accs.first()` used to report: R1's own level, 0.
+        let first_mate_level = 1.0 - accs[0].seq_counts.distinct() as f64
+            / accs[0].reads.max(1) as f64;
+        // What the report reports over the merged table.
+        let mut merged = crate::fingerprint::FingerprintTable::with_capacity(0);
+        for a in &accs {
+            merged.merge(&a.seq_counts);
+        }
+        let reads: f64 = accs.iter().map(|a| a.reads.max(1) as f64).sum();
+        let merged_level = 1.0 - merged.distinct() as f64 / reads;
+
+        assert_eq!(first_mate_level, 0.0, "R1 alone has no duplicates");
+        assert!((merged_level - 0.125).abs() < 1e-9,
+                "merged: 8 reads, 7 distinct -> 0.125, got {merged_level}");
+        assert!((merged_level - first_mate_level).abs() > 0.1,
+                "the merged rate must differ from the first mate's, or this test is vacuous");
     }
 }
