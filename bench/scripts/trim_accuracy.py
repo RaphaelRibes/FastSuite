@@ -29,16 +29,30 @@ fastp reports no trim positions, so its cuts are recovered by aligning the
 trimmed read back onto the original. A pure trim is a substring of the
 original, so the alignment is exact.
 
-READ IDENTITY. fastsim emits illumina headers of the form
+READ IDENTITY -- POSITIONAL, AND WHY. fastsim's headers are
 
     @LH00916:1:SIMFLOW1:1:1101:<tile>:<cycle> <mate>:N:0:<tag>
 
-field 5 is the constant 1101, field 6 is the tile (0..9) and field 7 is the
-cycle (0..9999), so (tile, cycle, mate) is unique within a mate file and is
-used as the read key throughout. Two earlier revisions keyed reads wrongly
--- one as tile+10000*occurrence, one from the wrong colon fields -- and each
-produced a phantom "unaligned" bucket by comparing a read against a
-different read's ground truth. The key is asserted unique before scoring.
+where <tile> takes only 10 values (0..9) and each repeats 10000 times per
+mate file. No header field is a stable read identifier: (tile, cycle, mate)
+collides 10000 times per file. Reads are therefore paired POSITIONALLY --
+both fastp and fastprep preserve input order and only drop reads, so the
+i-th surviving trimmed read belongs to the i-th surviving original. The GT
+file is in the same emission order and is replayed positionally.
+
+Three earlier revisions keyed reads by header fields or by
+tile+10000*occurrence; each mismatched reads against the wrong ground truth
+and produced a phantom "unaligned" bucket of ~5% (fastp) that was pure
+scorer artefact. The stored trimwork/ fastp outputs from those runs were
+also found to be internally inconsistent (most trimmed reads were not
+substrings of any original), so this scorer re-runs fastp from scratch and
+scores only freshly generated output.
+
+Pairing is a single forward walk: for each trimmed read, advance the
+original pointer until an original contains it; originals skipped on the way
+are reads the tool dropped. A trimmed read that matches no remaining
+original is counted unaligned and never advances the pointer, which keeps
+the walk from desynchronising.
 
 CAVEAT carried into any paper: this measures agreement with the simulator's
 artefact model, which is the same model the closed loop tests. It is exact
@@ -50,6 +64,7 @@ FASTP = os.environ.get("FASTP", "/home/raphael/.local/bin/fastp")
 WORK = os.environ.get("TRIM_WORK", "/mnt/Fast/fastsuite-scratch/work")
 RESULTS = os.environ.get("TRIM_RESULTS", "/mnt/Fast/fastsuite-scratch/results")
 OUTROW = f"{RESULTS}/trim-accuracy.tsv"
+TRIMWORK = f"{RESULTS}/trimwork2"
 
 FASTP_TUNED = ["--cut_front", "--cut_front_window_size", "5",
                "--cut_front_mean_quality", "20", "--cut_tail",
@@ -62,62 +77,42 @@ COMP = {"A": "T", "C": "G", "G": "C", "T": "A", "N": "N"}
 
 
 # ---------------------------------------------------------------- primitives
-def header_key(line):
-    """(tile, cycle, mate) from a fastsim header line."""
-    core = line[1:].split()
-    fields = core[0].split(":")
-    if len(fields) < 7:
-        raise SystemExit(f"unexpected header: {line.rstrip()}")
-    tile = int(fields[5])
-    cyc = int(fields[6])
-    mate = int(core[1][0])
-    return (tile, cyc, mate)
-
-
 def read_fastq(path):
-    """-> [(key, sequence)] in file order; key = (tile, cycle, mate)."""
+    """-> [sequence] in file order."""
     out = []
     if not os.path.exists(path):
         return out
-    seen = collections.Counter()
     with gzip.open(path, "rt") as fh:
         for i, line in enumerate(fh):
-            if i % 4 == 0:
-                key = header_key(line)
-                seen[key] += 1
-            elif i % 4 == 1:
-                out.append((key, line.rstrip("\n")))
-    dup = [k for k, v in seen.items() if v > 1]
-    if dup:
-        raise SystemExit(f"{path}: {len(dup)} duplicate keys, first {dup[0]}")
+            if i % 4 == 1:
+                out.append(line.rstrip("\n"))
     return out
 
 
-def gt_map(v0):
-    """-> {(tile, cycle, mate): (h, t)} keyed from the FASTQ header.
+def read_ids(path):
+    """-> [(read_id_core, mate)] in file order, for PXMT pairing."""
+    out = []
+    with gzip.open(path, "rt") as fh:
+        for i, line in enumerate(fh):
+            if i % 4 == 0:
+                core = line[1:].split()
+                out.append((core[0], int(core[1][0])))
+    return out
 
-    The GT file lists one row per emitted read in emission order, and the
-    FASTQ files are in that same order, so they are replayed in lockstep.
-    """
-    rows = []
+
+def gt_rows(v0):
+    """-> [(h1,t1,h2,t2)] in emission order."""
+    out = []
     with open(f"{v0}/sim.v0.gt.tsv") as fh:
         for r in csv.DictReader(fh, delimiter="\t"):
-            rows.append((int(r["r1_h"]), int(r["r1_t"]),
-                         int(r["r2_h"]), int(r["r2_t"])))
-    out = {}
-    for path in (f"{v0}/sim.v0_R1.fastq.gz", f"{v0}/sim.v0_R2.fastq.gz"):
-        reads = read_fastq(path)
-        if len(reads) != len(rows):
-            raise SystemExit(f"{path}: {len(reads)} reads vs {len(rows)} GT rows")
-        for (key, _), (h1, t1, h2, t2) in zip(reads, rows):
-            tile, cyc, mate = key
-            out[key] = (h1, t1) if mate == 1 else (h2, t2)
+            out.append((int(r["r1_h"]), int(r["r1_t"]),
+                        int(r["r2_h"]), int(r["r2_t"])))
     return out
 
 
 def parse_pxmt(path):
-    """-> {(read_id_core, mate): (status, t5, t3)}; status 0 = kept."""
-    out = {}
+    """-> [(rid, mate, status, t5, t3)] in PXMT (input) order."""
+    out = []
     try:
         buf = open(path, "rb").read()
     except FileNotFoundError:
@@ -130,35 +125,14 @@ def parse_pxmt(path):
         rid = buf[off:off + id_len].decode("utf-8", "replace").split()[0]; off += id_len
         if off + 22 > n:
             break
-        # PXMT encodes the mate 0-based (Mate::R1 => 0u8); the FASTQ suffix is
-        # 1-based, so normalise to 1-based here to match header_key.
-        mate = buf[off] + 1; off += 1
+        mate = buf[off] + 1; off += 1   # PXMT mate is 0-based
         status = buf[off]; off += 1
         t5a, t3a, t5p, t3p = struct.unpack_from("<IIII", buf, off); off += 16
         (_rl,) = struct.unpack_from("<I", buf, off); off += 4
         nrun = buf[off]; off += 1
         off += 8 * nrun
-        out[(rid, mate)] = (status, t5a + t5p, t3a + t3p)
+        out.append((rid, mate, status, t5a + t5p, t3a + t3p))
     return out
-
-
-def pxmt_core_map(paths):
-    """-> {(read_id_core, mate): (tile, cycle, mate)} for PXMT key lookup."""
-    out = {}
-    for path in paths:
-        if not os.path.exists(path):
-            continue
-        with gzip.open(path, "rt") as fh:
-            for i, line in enumerate(fh):
-                if i % 4 == 0:
-                    core = line[1:].split()
-                    out[(core[0], mate_of(line))] = header_key(line)
-    return out
-
-
-def mate_of(line):
-    core = line[1:].split()
-    return int(core[1][0])
 
 
 def infer_cuts(orig, trimmed):
@@ -196,39 +170,44 @@ def buckets():
 
 
 # ---------------------------------------------------------------- scorers
-def score_inferred(orig, trimmed, gt, tol):
-    """fastp: recover its cuts by aligning the trimmed read onto the original."""
-    tmap = {k: s for k, s in trimmed}
+def score_positional(orig, trimmed, gt, tol):
+    """Pair by a single forward walk; see module docstring."""
     c = buckets()
-    for key, seq in orig:
-        if key not in gt:
-            continue
-        h, t = gt[key]
-        tr = tmap.get(key)
-        if tr is None:
-            c["dropped_or_missing"] += 1
-            continue
-        cuts = infer_cuts(seq, tr)
-        if cuts is None:
+    oi = 0
+    matched = 0
+    for t in trimmed:
+        while oi < len(orig) and t not in orig[oi]:
+            oi += 1
+        if oi >= len(orig):
             c["unaligned"] += 1
             continue
-        t5, t3 = cuts
-        c[classify(t5, t3, h, t, tol)] += 1
+        cuts = infer_cuts(orig[oi], t)
+        h, tt = gt[oi]
+        c[classify(cuts[0], cuts[1], h, tt, tol)] += 1
+        matched += 1
+        oi += 1
+    c["dropped_or_missing"] = len(orig) - matched
     return c
 
 
-def score_pxmt(pxmt, coremap, gt, tol):
-    """fastprep: exact trim positions from its own metadata."""
+def score_pxmt(pxmt, ids, gt, tol):
+    """fastprep: exact trim positions, paired positionally per mate."""
     c = buckets()
-    for (rid, mate), (status, t5, t3) in pxmt.items():
-        key = coremap.get((rid, mate))
-        if key is None or key not in gt:
-            continue
-        h, t = gt[key]
-        if status != 0:
-            c["dropped_or_missing"] += 1
-            continue
-        c[classify(t5, t3, h, t, tol)] += 1
+    by_mate = collections.defaultdict(list)
+    for rid, mate, status, t5, t3 in pxmt:
+        by_mate[mate].append((status, t5, t3))
+    for mate in (1, 2):
+        entries = by_mate.get(mate, [])
+        file_ids = [i for i in ids if i[1] == mate]
+        if len(entries) != len(file_ids):
+            raise SystemExit(f"PXMT mate{mate}: {len(entries)} entries vs "
+                             f"{len(file_ids)} reads")
+        for (status, t5, t3), idx in zip(entries, range(len(file_ids))):
+            h, t = gt[idx][0:2] if mate == 1 else gt[idx][2:4]
+            if status != 0:
+                c["dropped_or_missing"] += 1
+                continue
+            c[classify(t5, t3, h, t, tol)] += 1
     return c
 
 
@@ -239,7 +218,7 @@ def main():
             datasets.append((r["domain"], r["run_accession"], r["config_id"]))
     print(f"trim-accuracy: {len(datasets)} datasets", flush=True)
 
-    # always start from a clean file: a previous partial run may be on disk
+    os.makedirs(TRIMWORK, exist_ok=True)
     if os.path.exists(OUTROW):
         os.remove(OUTROW)
     with open(OUTROW, "w", newline="") as fh:
@@ -258,34 +237,39 @@ def main():
         v0 = f"{WORK}/{domain}/{acc}/v0"
         if not os.path.exists(f"{v0}/sim.v0.gt.tsv"):
             print(f"  {acc}: no GT", flush=True); continue
-        gt = gt_map(v0)
+        rows = gt_rows(v0)
         sim1, sim2 = f"{v0}/sim.v0_R1.fastq.gz", f"{v0}/sim.v0_R2.fastq.gz"
-        orig = read_fastq(sim1) + read_fastq(sim2)
-        d = f"{RESULTS}/trimwork/{domain}_{acc}"
+        ids = read_ids(sim1) + read_ids(sim2)
+        d = f"{TRIMWORK}/{domain}_{acc}"
         os.makedirs(d, exist_ok=True)
 
-        # ---- fastprep: the sweep already ran every config, so the winner's
-        # metadata is on disk at sweep.v0/c<cid>.pxmt.
+        # ---- fastprep: winner config metadata from the sweep
         px = parse_pxmt(f"{v0}/sweep.v0/c{cid}.pxmt")
         if px:
-            coremap = pxmt_core_map([sim1, sim2])
             for tol in TOLS:
                 emit(domain, acc, "fastprep-winner", tol,
-                     score_pxmt(px, coremap, gt, tol))
+                     score_pxmt(px, ids, rows, tol))
         else:
             print(f"  {acc}: no PXMT for config {cid}", flush=True)
 
-        # ---- fastp: run on the same simulated input
+        # ---- fastp: fresh run, never reuse stored output
         for tool, extra in (("fastp-default", []), ("fastp-tuned", FASTP_TUNED)):
             o1, o2 = f"{d}/{tool}_R1.fastq.gz", f"{d}/{tool}_R2.fastq.gz"
-            if not os.path.exists(o1):
-                rc = run([FASTP, "-i", sim1, "-I", sim2, "-o", o1, "-O", o2,
-                          "-w", "4", "-z", "6"] + extra, f"{d}/{tool}.log")
-                if rc != 0:
-                    print(f"  {acc} {tool}: rc={rc}", flush=True); continue
-            trimmed = read_fastq(o1) + read_fastq(o2)
+            for f in (o1, o2):
+                if os.path.exists(f):
+                    os.remove(f)
+            rc = run([FASTP, "-i", sim1, "-I", sim2, "-o", o1, "-O", o2,
+                      "-w", "4", "-z", "6"] + extra, f"{d}/{tool}.log")
+            if rc != 0:
+                print(f"  {acc} {tool}: rc={rc}", flush=True); continue
             for tol in TOLS:
-                emit(domain, acc, tool, tol, score_inferred(orig, trimmed, gt, tol))
+                c = buckets()
+                for path_o, path_t, mate in ((sim1, o1, 1), (sim2, o2, 2)):
+                    orig = read_fastq(path_o)
+                    trimmed = read_fastq(path_t)
+                    gt = [r[0:2] if mate == 1 else r[2:4] for r in rows]
+                    c.update(score_positional(orig, trimmed, gt, tol))
+                emit(domain, acc, tool, tol, c)
         print(f"  [{i}/{len(datasets)}] {acc}: done", flush=True)
 
     print(f"wrote {OUTROW}")
