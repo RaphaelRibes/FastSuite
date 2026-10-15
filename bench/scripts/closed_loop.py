@@ -169,7 +169,16 @@ def main() -> int:
             continue
         for acc in sorted(os.listdir(dpath)):
             adir = os.path.join(dpath, acc)
+            # The REAL QC report sits at the dataset root only in the old
+            # (shared-dir) layout. run_campaign.sh's per-variant layout puts
+            # every artefact under v<variant>/, so the real report lives in
+            # v0/ there. Without this fallback the loop silently compared only
+            # the pilot-era datasets and reported 69 comparisons instead of 306.
             real_r = os.path.join(adir, "real.report.json")
+            if not os.path.exists(real_r):
+                alt = os.path.join(adir, "v0", "real.report.json")
+                if os.path.exists(alt):
+                    real_r = alt
             if not os.path.exists(real_r):
                 continue
             for variant in range(3):
