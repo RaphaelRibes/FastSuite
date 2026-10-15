@@ -188,6 +188,40 @@ impl Cdf {
     }
 }
 
+
+/// P(position p is covered by an injected 5' G-run) for one mate.
+///
+/// `head` is the measured histogram of run LENGTHS {len: count}. Position p is
+/// inside the run exactly when the run length h satisfies h > p, so
+/// P(p covered) = (sum of counts for h > p) / (total counts).
+fn head_artefact_mass(head: &RawMateHists, mate: usize) -> std::collections::HashMap<usize, f32> {
+    let mut out = std::collections::HashMap::new();
+    let m: &BTreeMap<String, u64> = if mate == 0 { &head.R1 } else { &head.R2 };
+    let total: u64 = m.values().sum();
+    if total == 0 {
+        return out;
+    }
+    // suffix sums over run length: how many reads have h > p
+    let maxlen = m.keys().filter_map(|k| k.parse::<usize>().ok()).max().unwrap_or(0);
+    let mut counts = vec![0u64; maxlen + 2];
+    for (k, v) in m.iter() {
+        if let Ok(len) = k.parse::<usize>() {
+            counts[len] += *v;
+        }
+    }
+    // greater[p] = number of reads with h > p
+    let mut greater = vec![0u64; maxlen + 2];
+    let mut acc = 0u64;
+    for p in (0..=maxlen).rev() {
+        greater[p] = acc;
+        acc += counts[p];
+    }
+    for p in 0..=maxlen {
+        out.insert(p, greater[p] as f32 / total as f32);
+    }
+    out
+}
+
 impl Profile {
     /// Insert length for the next pair. The profile's measured distribution wins
     /// when it has one; the CLI's Gaussian is the fallback for profiles fitted
@@ -315,12 +349,63 @@ impl Profile {
             None => None,
         };
         // R1 shows the fragment's 5′ end, so its head composition anchors the fragment head.
+        // Deconvolve the artefact out of the measured per-position composition
+        // before it is used as a BIOLOGY draw.
+        //
+        // `base.R1[pos]` is the MEASURED composition at that position, which is a
+        // mixture: reads carrying a 5' G-run of length h contribute an injected G
+        // at every position < h, and reads with h = 0 contribute biology. The
+        // simulator draws biology from head_bias and separately injects the run,
+        // so feeding it the mixed value double-counts the artefact.
+        //
+        // Measured on DRR014283: 22.0% of reads carry a head artefact, the
+        // measured G fraction at position 0 is 0.4147, and the biology-only value
+        // implied by that mixture is 0.2497 -- an overstatement of 0.1650, which
+        // matches the observed closed-loop g_frac_max_diff of 0.1273 at that
+        // position. Same signature on DRR015266 (0.1517 predicted, 0.1195
+        // observed) and DRR083295 (0.1547 predicted, 0.1241 observed).
+        //
+        // For each position p, solve  mixed[p] = sum_h P(h>p) * G_injected
+        //                                  + sum_h P(h<=p) * bio[p]
+        // over the measured head-length histogram, then renormalise bio[p].
+        let head_cdf_tail = head_artefact_mass(&raw.head, 0);
         let head_bias: Vec<[f32; 4]> = match &raw.base {
-            Some(b) => b.get("R1").cloned().unwrap_or_default().into_iter().map(|v| {
+            Some(b) => b.get("R1").cloned().unwrap_or_default().into_iter().enumerate().map(|(p, v)| {
                 let mut a = [0.0f32; 4];
                 for (i, x) in v.iter().take(4).enumerate() { if x.is_finite() && *x >= 0.0 { a[i] = *x; } }
                 let s: f32 = a.iter().sum();
                 if s > 0.0 { for x in a.iter_mut() { *x /= s; } } else { a = [0.25; 4]; }
+                // p_mass = probability that position p is covered by an injected run
+                // Position p carries an injected G exactly when the run covers
+                // it, i.e. h > p. (The boundary rule rewrites index h, which is
+                // the FIRST BIOLOGY position, so every position inside the run
+                // keeps its G -- including position 0 for an h = 1 run.)
+                let _p_cover = 0.0f32;
+                let p_mass = head_cdf_tail.get(&p).copied().unwrap_or(0.0);
+                if p_mass > 1e-6 && p_mass < 1.0 - 1e-6 {
+                    // Remove the artefact's contribution. An injected run of
+                    // length h puts G at positions 0..h, but the boundary rule
+                    // rewrites position h to a random non-G. So position p carries
+                    // an injected G exactly when h > p+1, i.e. the run is at least
+                    // p+2 long. Recompute the mass on that stricter condition:
+                    //   g_mass(p) = P(h >= p+2)
+                    // and position p is biology whenever h <= p+1.
+                    let bio_mass = 1.0 - p_mass;
+                    let g_injected = 1.0f32;
+                    let g_measured = a[2];
+                    let g_bio = ((g_measured - p_mass * g_injected) / bio_mass).clamp(0.0, 1.0);
+                    // Renormalise the remaining three channels over what is left
+                    // of the non-G mass, then rebuild a proper distribution.
+                    let rest_total: f32 = a[0] + a[1] + a[3];
+                    let rest_bio = (1.0 - g_bio).max(0.0);
+                    if rest_total > 1e-6 && rest_bio > 1e-6 {
+                        let scale = rest_bio / rest_total;
+                        a[0] *= scale; a[1] *= scale; a[3] *= scale;
+                    }
+                    a[2] = g_bio;
+                    let t: f32 = a.iter().sum();
+                    if t > 1e-6 { for x in a.iter_mut() { *x /= t; } } else { a = [0.25; 4]; }
+                }
                 a
             }).collect(),
             None => Vec::new(),
