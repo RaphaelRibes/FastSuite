@@ -567,9 +567,11 @@ mod tests {
         // R1: 4 reads, all distinct -> R1 level 0.
         let r1 = acc_with(&[(b"AAAA", b"IIII"), (b"CCCC", b"IIII"),
                             (b"GGGG", b"IIII"), (b"TTTT", b"IIII")], 16);
-        // R2: 4 reads, one sequence seen twice -> R2 level 0.25.
-        let r2 = acc_with(&[(b"AAAA", b"IIII"), (b"AAAA", b"IIII"),
-                            (b"GGGG", b"IIII"), (b"TTTT", b"IIII")], 16);
+        // R2: 4 reads, two of them duplicates of each other. The mates share
+        // NO sequence, so the merged distinct count is exactly the sum of the
+        // per-mate distinct counts minus nothing.
+        let r2 = acc_with(&[(b"ACAC", b"IIII"), (b"ACAC", b"IIII"),
+                            (b"TGTG", b"IIII"), (b"CACA", b"IIII")], 16);
         let accs: Vec<&Accum> = vec![&r1, &r2];
 
         // What `accs.first()` used to report: R1's own level, 0.
@@ -583,6 +585,7 @@ mod tests {
         let reads: f64 = accs.iter().map(|a| a.reads.max(1) as f64).sum();
         let merged_level = 1.0 - merged.distinct() as f64 / reads;
 
+        // R1 contributes 4 distinct, R2 contributes 3 (ACAC twice): 7 over 8.
         assert_eq!(first_mate_level, 0.0, "R1 alone has no duplicates");
         assert!((merged_level - 0.125).abs() < 1e-9,
                 "merged: 8 reads, 7 distinct -> 0.125, got {merged_level}");
