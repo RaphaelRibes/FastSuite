@@ -163,14 +163,24 @@ def main() -> int:
     ap.add_argument("--row", required=True)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--work", default=None, help="scratch dir (default: beside --row)")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite --row if it already exists (otherwise refuse)")
     args = ap.parse_args()
+
+    # Same contract as closed_loop.py: this is a generator over the same units,
+    # so it OVERWRITES and never appends. The old append-on-exists behaviour
+    # silently doubled the table on every re-run.
+    if os.path.exists(args.row) and not args.force:
+        n_old = sum(1 for _ in open(args.row, errors="ignore"))
+        print(f"fastp_compare: {args.row} exists ({n_old} lines) — refusing to append. "
+              f"Pass --force to overwrite it, or pick a new --row path.", file=sys.stderr)
+        return 2
 
     work = args.work or os.path.join(os.path.dirname(args.row) or ".", "c3work")
     os.makedirs(work, exist_ok=True)
     os.makedirs(os.path.dirname(args.row) or ".", exist_ok=True)
-    if not os.path.exists(args.row):
-        with open(args.row, "w", newline="") as fh:
-            csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(ROW_FIELDS)
+    with open(args.row, "w", newline="") as fh:
+        csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(ROW_FIELDS)
 
     winners = load_winners(args.winners)
     if not winners:

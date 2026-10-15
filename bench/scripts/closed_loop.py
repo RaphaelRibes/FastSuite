@@ -155,12 +155,30 @@ def main() -> int:
     ap.add_argument("--work", required=True, help="root holding <domain>/<acc>/")
     ap.add_argument("--row", required=True)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite --row if it already exists (otherwise refuse)")
     args = ap.parse_args()
 
+    # This script OVERWRITES the file it was given, it does not append.
+    #
+    # It used to append whenever --row existed, so every re-run silently doubled
+    # the table: the 306-comparison truth became 612 rows after one repeat run,
+    # and the pass rate was computed over rows that had been counted twice. A
+    # generator is idempotent by construction (it re-reads the same reports and
+    # recomputes the same verdicts), so re-running must reproduce the file, not
+    # grow it.
+    #
+    # Refusing by default (rather than silently truncating) matters because the
+    # old rows are the only record of a run that used different binaries.
+    if os.path.exists(args.row) and not args.force:
+        n_old = sum(1 for _ in open(args.row, errors="ignore"))
+        print(f"closed_loop: {args.row} exists ({n_old} lines) — refusing to append. "
+              f"Pass --force to overwrite it, or pick a new --row path.", file=sys.stderr)
+        return 2
+
     os.makedirs(os.path.dirname(args.row) or ".", exist_ok=True)
-    if not os.path.exists(args.row):
-        with open(args.row, "w", newline="") as fh:
-            csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(ROW_FIELDS)
+    with open(args.row, "w", newline="") as fh:
+        csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(ROW_FIELDS)
 
     n = 0
     for domain in sorted(os.listdir(args.work)):

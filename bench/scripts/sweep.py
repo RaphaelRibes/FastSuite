@@ -368,6 +368,19 @@ def main() -> int:
             read_len = len(line.rstrip("\n"))
             break
 
+    # Sweep is the ONE script here whose append is correct, and it must stay an
+    # append: run_campaign.sh launches one sweep process per (dataset, variant)
+    # chain CONCURRENTLY against a single shared rows file, so each chain owns a
+    # disjoint slice of the table and writes one line per config with O_APPEND.
+    # The header is written only by whoever creates the file (first chain in),
+    # which is safe because writerow of a single short line is atomic at this
+    # size under O_APPEND.
+    #
+    # The distinct failure this avoids is the one in closed_loop.py/fastp_compare.py:
+    # those are SEQUENTIAL generators over the same units, so a re-run must
+    # overwrite. Sweep is a parallel partitioner, so a re-run must append. Same
+    # file mode, opposite contracts — the caller decides, and neither script
+    # should guess.
     new_file = not os.path.exists(args.row)
     if new_file:
         with open(args.row, "w", newline="") as fh:
