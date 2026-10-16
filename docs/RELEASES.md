@@ -18,7 +18,7 @@ fasthelper) is Raphaël Ribes' own work. See each tool's `CITATION.cff`.
 | tool | version | maturity | notes |
 |---|---|---|---|
 | fastdedup | 1.3.0 | **WIP** | exact PCR-dedup by 64/128-bit fingerprints; published (bioRxiv 2026.04.29.721745) |
-| fastprep | 0.1.0 | WIP | swept-winner default configuration shipped (validated on 90/90 datasets) |
+| fastprep | 0.1.0 | WIP | swept-winner default configuration shipped; the 90/90 validation behind it did **not** reproduce on 101 real libraries (the default wins 1 of 101) — see `docs/AUTO-PARAMS.md`. `--head-dropout` later defaulted 4 → 0 (`3d76a31`), unreleased |
 | fastsim | 0.1.0 | WIP | measured insert CDF from the profile; single-end mode; ground-truth TSV |
 | fastcheck | 0.1.0 | WIP | exact one-pass QC; the Python differential harness; `--profile` fitter |
 | fastmaps | 0.1.0 | WIP | composition plane; `-j/--threads` added in this release |
@@ -44,9 +44,9 @@ fails on a missing output directory.
 * [x] Recipes download nothing at build time — every `meta.yaml` uses
       `source: path: ../../` (local checkout) plus the committed
       `Cargo.lock` (`--locked`); no URL, no crates fetched.
-* [ ] Every tool has a `LICENSE` (MIT; fastprep's carries the Mandrillus
-      Project copyright line).
-* [ ] Every tool has a `CITATION.cff`.
+* [x] Every tool has a `LICENSE` (MIT; fastprep's carries the Mandrillus
+      Project copyright line). Verified 2026-10-16: all six carry one.
+* [x] Every tool has a `CITATION.cff`. Verified 2026-10-16: all six carry one.
 * [x] The pixitainer suite image builds and runs (`pixi containerize -o
       fastsuite.sif`; all six binaries verified with `--version` inside the
       container, plus a real fastprep trim and `fasthelper schema`). The image
