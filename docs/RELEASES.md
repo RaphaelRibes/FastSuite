@@ -18,7 +18,7 @@ fasthelper) is Raphaël Ribes' own work. See each tool's `CITATION.cff`.
 | tool | version | maturity | notes |
 |---|---|---|---|
 | fastdedup | 1.3.0 | **WIP** | exact PCR-dedup by 64/128-bit fingerprints; published (bioRxiv 2026.04.29.721745) |
-| fastprep | 0.1.0 | WIP | swept-winner default configuration shipped; the 90/90 validation behind it did **not** reproduce on 101 real libraries (the default wins 1 of 101) — see `docs/AUTO-PARAMS.md`. `--head-dropout` later defaulted 4 → 0 (`3d76a31`), unreleased |
+| fastprep | 0.1.0 | WIP | swept-winner default configuration shipped; the 90/90 validation behind it did **not** reproduce on 101 real libraries (the default wins 1 of 101) — see `docs/AUTO-PARAMS.md` |
 | fastsim | 0.1.0 | WIP | measured insert CDF from the profile; single-end mode; ground-truth TSV |
 | fastcheck | 0.1.0 | WIP | exact one-pass QC; the Python differential harness; `--profile` fitter |
 | fastmaps | 0.1.0 | WIP | composition plane; `-j/--threads` added in this release |
@@ -29,6 +29,22 @@ CLI option set (gaps tracked in `docs/CLI-SPEC.md` §4, closed by the plans
 under `docs/plans/2026-10-12_*.md`), `fastcheck` is wired into
 `fasthelper doctor` and the run manifest, and `fasthelper compare` no longer
 fails on a missing output directory.
+
+---
+
+## FastSuite 2 (unreleased)
+
+Only `fastprep` moves; the other five are unchanged, which is the point of
+one semver per tool (D-2) — a change to one tool does not force a release of
+the rest.
+
+| tool | version | maturity | notes |
+|---|---|---|---|
+| fastprep | **0.2.0** | WIP | shipped `--head-dropout` default 4 → 0. A behaviour change, so a minor bump: a binary built from this tag trims differently from 0.1.0 on any library with leading biological G. Measured on the 101-library corpus against fastsim ground truth — 0 is the per-dataset winner on 100 datasets, 1 on the remaining one, 4 on none; corpus-wide total trim error 24.64% → 7.44%. The 24.6% at the old default was mostly the rule trimming runs that are pure biology. See `docs/OVERTRIM-CEILING.md` and `docs/TRIM-ACCURACY.md`. |
+
+Not yet tagged or pushed. `recipes/bioconda/` carries the submission-ready
+recipes for all six; `recipes/bioconda/README.md` has the tagging and
+submission steps.
 
 ---
 

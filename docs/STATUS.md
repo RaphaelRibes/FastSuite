@@ -13,7 +13,7 @@ suite is WIP: nothing here is production-ready** (see the README banner).
 | tool | version | tests | state | next plan |
 |---|---|---|---|---|
 | fastdedup | 1.3.0 | 104 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
-| fastprep | 0.1.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4; committed as `3d76a31`, no version bump, not released) | — |
+| fastprep | 0.2.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
 | fastsim | 0.1.0 | 59 | working — measured insert CDF, SE mode, **clap-migrated** | — |
 | fastmaps | 0.1.0 | 43 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads` | — |
 | fastcheck | 0.1.0 | 107 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
