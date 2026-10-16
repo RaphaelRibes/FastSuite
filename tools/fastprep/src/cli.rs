@@ -198,16 +198,19 @@ pub struct Cli {
     /// G-run with normal quality is removed exactly, no quality gate.
     /// Must be < --min-run so the scan stays in charge of long runs.
     ///
-    /// `0` disables the rule entirely. That matters because the rule is
-    /// unconditional: it trims any leading G-run of length 1..=N without
-    /// asking whether the G is artefact or biology, so on a library whose
-    /// first base is often a real G it removes real sequence. Measured
-    /// against fastsim ground truth, disabling it raises the strict-tolerance
-    /// exact rate by 12.6 pp on a profile with 5′ artefact on one mate only
-    /// (76.0% -> 88.6%), at the cost of leaving that mate's genuine artefact
-    /// untrimmed. Choose per library; the trade is stated in
-    /// docs/OVERTRIM-CEILING.md.
-    #[arg(long, value_name = "N", default_value = "4", help_heading = "PolyX Trimming")]
+    /// `0` IS the default: it disables the rule. The rule is a prior, not a
+    /// detector — a leading biological G is indistinguishable from a 1 bp
+    /// dropout by base identity — so on a real library trimming it is wrong
+    /// roughly three times in four. Measured on the 101-library corpus against
+    /// fastsim ground truth, `0` is the per-dataset winner on 100 of 101
+    /// datasets and `1` on the remaining one; `4` wins on none. Corpus-wide at
+    /// tolerance 0, of kept mates, `0` gives 92.56% exact / 0.07% overtrim /
+    /// 7.37% undertrim (total error 7.44%) against 75.36 / 23.64 / 1.00
+    /// (24.64%) at `4`: the same trade is 3.3x cheaper in total error when the
+    /// prior is off. Raise it only for a library known to drop its first-cycle
+    /// base. See docs/OVERTRIM-CEILING.md and
+    /// bench/results/phase-d/head-dropout-axis.tsv.
+    #[arg(long, value_name = "N", default_value = "0", help_heading = "PolyX Trimming")]
     pub head_dropout: Option<usize>,
 
     /// Target letter for anchored mode (repeatable, max 5 distinct).
@@ -1001,7 +1004,7 @@ mod tests {
         assert_eq!(cli.adapter_error_rate, 0.2, "--adapter-error-rate");
         assert_eq!(cli.min_adapter_overlap, 14, "--min-adapter-overlap");
         assert_eq!(cli.min_run, 12, "--min-run");
-        assert_eq!(cli.head_dropout, Some(4), "--head-dropout");
+        assert_eq!(cli.head_dropout, Some(0), "--head-dropout");
         assert_eq!(cli.mean_q, Some(25.0), "--mean-q");
         assert!(matches!(cli.min_len, MinLen::Frac(f) if (f - 0.9).abs() < 1e-9), "--min-len");
         assert!(cli.dedup, "--dedup ships on");
