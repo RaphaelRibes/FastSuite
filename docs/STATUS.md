@@ -13,7 +13,7 @@ suite is WIP: nothing here is production-ready** (see the README banner).
 | tool | version | tests | state | next plan |
 |---|---|---|---|---|
 | fastdedup | 1.3.0 | 104 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
-| fastprep | 0.1.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is **4**; a change to **0** is **in flight** (in the working copy of `tools/fastprep/src/cli.rs`, not committed, not released) | — |
+| fastprep | 0.1.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4; committed as `3d76a31`, no version bump, not released) | — |
 | fastsim | 0.1.0 | 59 | working — measured insert CDF, SE mode, **clap-migrated** | — |
 | fastmaps | 0.1.0 | 43 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads` | — |
 | fastcheck | 0.1.0 | 107 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
@@ -180,10 +180,11 @@ New and open (not defects of a measured component, but unresolved):
   virome, and those are the domains where its accuracy lead is measured on the
   smaller kept-set. This bounds how the result may be stated, not whether it is
   real.
-* **The `head_dropout` default change is in flight.** `0` is the measured right
-  default on this corpus (100/101), and the working copy of `tools/fastprep/src/cli.rs`
-  now carries `default_value = "0"`, but it is uncommitted and unreleased — the
-  shipped binary still trims at 4.
+* **The `head_dropout` default is now 0** (committed `3d76a31`), which is the
+  measured right default on this corpus (100/101 datasets; `1` on the remaining
+  one; `4` on none). No version bump, so this is committed-but-unreleased: a
+  binary built from `main` trims at 0, a released 0.1.0 tarball still trims
+  at 4.
 
 ## Where each paper stands (local-only repos, never pushed)
 
@@ -198,21 +199,24 @@ bioRxiv 2026.04.29.721745).
 committed.** `sect-real-ena.typ`'s trim-accuracy section (`@tbl-trim-acc`) was
 rewritten to conclude that the *shipped default* was the problem, not the
 algorithm: fastprep at `--head-dropout 4` is the worst of the four
-configurations (75.6% exact at tolerance 0) and fastprep with the rule off
+configurations (75.4% exact at tolerance 0) and fastprep with the rule off
 (92.6%) matches or beats fastp-default (92.2%). The reversal is commits
-`b408bae` (reverse Section 5.6) and `c089709` (make the drop asymmetry specific,
-it is not uniform across domains), in the clean FastPrep-Paper repo. The
-section is in the source and committed, but **`paper.pdf` has not been rebuilt**
-(mtime still 2026-10-15 01:53) — the updated prose is not yet in the built PDF.
+`b408bae` (reverse Section 5.6), `c089709` (drop asymmetry) and `f4a5425`
+(corrected numbers, the `--head-dropout 0` default, a stale closed-loop figure
+and a stale 90-of-90 claim) in the clean FastPrep-Paper repo. **`paper.pdf` is
+rebuilt** — 28 pages, mtime 2026-10-16 14:35 — so the updated prose is in the
+built PDF.
 Separately, the Phase D closed-loop numbers (167/306) are in
 `FastSim-Paper/benchmark/closed_loop.tsv` but are not yet reflected in the
 papers' prose.
 
-**Flagged inconsistency (paper-side, outside this document's scope):** the
-FastPrep paper's §5.6 lead-in (`sect-real-ena.typ`, ~lines 66–71) still cites an
-older closed-loop figure, "94-of-305", which disagrees with the current
-`bench/results/phase-d/closed_loop.tsv` (**167/306**). One of the two is stale;
-the STATUS number is the one re-read from the TSV this session.
+**Resolved (was flagged as a paper-side inconsistency):** the FastPrep paper's
+§5.6 lead-in (`sect-real-ena.typ`) cited a stale closed-loop figure,
+"94-of-305", together with the wrong dominant failure gate (it named
+duplicate-ratio; the TSV shows the per-position G-fraction at 120 of 139
+failing rows, against duplicate-ratio 18). Both were corrected in `f4a5425`.
+The authoritative figure is `bench/results/phase-d/closed_loop.tsv` —
+**167/306 = 54.6%**.
 
 ## What the suite refuses to do (D-12)
 
