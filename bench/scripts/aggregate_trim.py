@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Aggregate the trim-accuracy benchmark: overtrim / undertrim / exact.
 
+SUPERSEDED — do not cite the tables this prints as current. This reads
+bench/results/phase-d/trim-accuracy.tsv (606 rows), the original 3-tool run
+whose fastprep baseline (fastprep-winner, 66.5%) is under open investigation
+and does not reproduce (75.59% fresh). The current trim-accuracy measurement
+is bench/results/phase-d/overtrim-vs-fastp.tsv (all four tools under one
+harness), produced by bench/scripts/overtrim_vs_fastp.py and documented in
+docs/TRIM-ACCURACY.md. This script is kept only to reproduce the historical
+table.
+
 Reads bench/results/phase-d/trim-accuracy.tsv (or $1) and prints the
 tolerance-0 / tolerance-2 tables for every tool, plus per-domain exact
 rates. Deterministic: same input, same output.
