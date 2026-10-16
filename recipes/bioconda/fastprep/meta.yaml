@@ -1,0 +1,45 @@
+{% set name = "fastprep" %}
+{% set version = "0.2.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/RaphaelRibes/FastSuite/archive/refs/tags/fastprep-v0.2.0.tar.gz
+  sha256: FILL_ME
+
+build:
+  number: 0
+  script:
+    - cargo install --locked --path tools/fastprep --root $PREFIX
+  # Source is the tagged archive; every Cargo.lock is committed so
+  # --locked pins the dependency graph.
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - rust >=1.70
+    - cmake  # libz-ng-sys (flate2's zlib-ng feature) builds the vendored zlib-ng
+  run:
+    - zlib
+
+test:
+  commands:
+    - fastprep --version | grep -q "fastprep 0.2.0"
+    - >
+      mkdir -p fprep_t && printf '@r1\nACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@r2\nACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n' > fprep_t/s.fastq &&
+      fastprep -1 fprep_t/s.fastq -o fprep_t/o.fastq && test -s fprep_t/o.fastq
+
+about:
+  home: https://github.com/RaphaelRibes/FastSuite
+  dev_url: https://github.com/RaphaelRibes/FastSuite
+  doc_url: https://github.com/RaphaelRibes/FastSuite/tree/main/docs
+  license: MIT
+  license_family: MIT
+  license_file: tools/fastprep/LICENSE
+  summary: "Asymmetric quality-weighted polyX trimming for FASTQ/FASTA reads"
+
+extra:
+  recipe-maintainers:
+    - RaphaelRibes

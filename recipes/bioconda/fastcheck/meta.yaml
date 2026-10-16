@@ -1,0 +1,45 @@
+{% set name = "fastcheck" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/RaphaelRibes/FastSuite/archive/refs/tags/fastcheck-v0.1.0.tar.gz
+  sha256: FILL_ME
+
+build:
+  number: 0
+  script:
+    - cargo install --locked --path tools/fastcheck --root $PREFIX
+  # Source is the tagged archive; every Cargo.lock is committed so
+  # --locked pins the dependency graph.
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - rust >=1.70
+    - cmake  # libz-ng-sys (flate2's zlib-ng feature) builds the vendored zlib-ng
+  run:
+    - zlib
+
+test:
+  commands:
+    - fastcheck --version | grep -q "fastcheck 0.1.0"
+    - >
+      mkdir -p fcheck_t && printf '@r1\nACGTACGT\n+\nIIIIIIII\n@r2\nACGTACGA\n+\nIIIIIIII\n' > fcheck_t/s.fastq &&
+      fastcheck --json fcheck_t/r.json fcheck_t/s.fastq && test -s fcheck_t/r.json
+
+about:
+  home: https://github.com/RaphaelRibes/FastSuite
+  dev_url: https://github.com/RaphaelRibes/FastSuite
+  doc_url: https://github.com/RaphaelRibes/FastSuite/tree/main/docs
+  license: MIT
+  license_family: MIT
+  license_file: tools/fastcheck/LICENSE
+  summary: "Exact, one-pass FASTQ quality control: no sampling, no hidden thresholds, no verdicts"
+
+extra:
+  recipe-maintainers:
+    - RaphaelRibes

@@ -1,0 +1,43 @@
+{% set name = "fastsim" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/RaphaelRibes/FastSuite/archive/refs/tags/fastsim-v0.1.0.tar.gz
+  sha256: FILL_ME
+
+build:
+  number: 0
+  script:
+    - cargo install --locked --path tools/fastsim --root $PREFIX
+  # Source is the tagged archive; every Cargo.lock is committed so
+  # --locked pins the dependency graph.
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - rust >=1.70
+
+test:
+  commands:
+    - fastsim --version | grep -q "fastsim 0.1.0"
+    - >
+      mkdir -p fsim_t &&
+      fastsim --pairs 2 --profile {{ recipe_dir }}/../../tools/fastsim/profiles/test_small.json --out fsim_t/sim &&
+      test -s fsim_t/sim.gt.tsv && test -s fsim_t/sim_R1.fastq.gz
+
+about:
+  home: https://github.com/RaphaelRibes/FastSuite
+  dev_url: https://github.com/RaphaelRibes/FastSuite
+  doc_url: https://github.com/RaphaelRibes/FastSuite/tree/main/docs
+  license: MIT
+  license_family: MIT
+  license_file: tools/fastsim/LICENSE
+  summary: "FastSim: NovaSeq-like paired-end read simulator with full ground truth"
+
+extra:
+  recipe-maintainers:
+    - RaphaelRibes

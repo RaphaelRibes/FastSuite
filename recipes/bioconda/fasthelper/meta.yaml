@@ -1,0 +1,40 @@
+{% set name = "fasthelper" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/RaphaelRibes/FastSuite/archive/refs/tags/fasthelper-v0.1.0.tar.gz
+  sha256: FILL_ME
+
+build:
+  number: 0
+  script:
+    - cargo install --locked --path tools/fasthelper --root $PREFIX
+  # Source is the tagged archive; every Cargo.lock is committed so
+  # --locked pins the dependency graph.
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - rust >=1.70
+
+test:
+  commands:
+    - fasthelper --version | grep -q "fasthelper 0.1.0"
+    - fasthelper schema | grep -q "fastsuite.report.v1"
+
+about:
+  home: https://github.com/RaphaelRibes/FastSuite
+  dev_url: https://github.com/RaphaelRibes/FastSuite
+  doc_url: https://github.com/RaphaelRibes/FastSuite/tree/main/docs
+  license: MIT
+  license_family: MIT
+  license_file: tools/fasthelper/LICENSE
+  summary: "FastSuite orchestrator and report aggregator: one config in, one multi-sample report out"
+
+extra:
+  recipe-maintainers:
+    - RaphaelRibes
