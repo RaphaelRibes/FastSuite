@@ -4,8 +4,14 @@
 //! compute trim accuracy absolutely (not relative to another tool):
 //!
 //! ```text
-//! pair_id  insert  r1_h  r1_t  r2_h  r2_t  full_flag  is_dup
+//! pair_id  insert  r1_h  r1_t  r2_h  r2_t  r1_ad  r2_ad  full_flag  is_dup  r1_n  r2_n
 //! ```
+//!
+//! - `r1_n` / `r2_n`: ambiguous (`N`) bases the sequencing overlay injected
+//!   into that mate (0 when the profile carries no N model). An injected `N`
+//!   is an instrument no-call recorded INSIDE the keep window — it never
+//!   touches `h`/`t` — so the GT states it explicitly rather than letting a
+//!   reader mistake it for fragment biology.
 //!
 //! - `pair_id`: unique integer (matches the FASTQ coordinate x:y).
 //! - `insert`: true fragment length I.
@@ -56,21 +62,29 @@ impl GtWriter<BufWriter<std::fs::File>> {
             single,
         };
         w.out.write_all(if single {
-            b"pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\n"
+            b"pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\tr1_n\n"
         } else {
-            b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\n"
+            b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n\n"
         })?;
         Ok(w)
     }
 }
 
 impl<W: Write> GtWriter<W> {
+    /// `n1`/`n2` are the numbers of ambiguous (`N`) bases the sequencing
+    /// overlay injected into each mate. They are recorded so the GT names the
+    /// injected artefact instead of leaving a scorer to infer it from the
+    /// FASTQ: an injected N is an instrument no-call, not fragment biology, and
+    /// it sits inside the keep window (the overlay never touches `h`/`t`), so
+    /// it is visible here and nowhere else in the row.
     pub fn write_pair(
         &mut self,
         pair_idx: u64,
         insert_len: u32,
         a: &Artefact,
         is_dup: bool,
+        n1: u32,
+        n2: u32,
     ) -> Result<()> {
         // Clamp artefact lengths to read_len for display (full pairs may
         // have t = L).
@@ -80,7 +94,7 @@ impl<W: Write> GtWriter<W> {
         if self.single {
                     writeln!(
                         self.out,
-                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{full}\t{dup}",
+                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}",
                         a.h1.min(l),
                         a.t1.min(l),
                         a.a1.min(l)
@@ -88,7 +102,7 @@ impl<W: Write> GtWriter<W> {
                 } else {
                     writeln!(
                         self.out,
-                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}",
+                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}\t{n2}",
                         a.h1.min(l),
                         a.t1.min(l),
                         a.h2.min(l),
@@ -127,8 +141,9 @@ mod tests {
         let path = std::env::temp_dir().join("fastsim_gt.tsv");
         let mut w = GtWriter::open(&path, 150).unwrap();
         let a = artefact(2, 5, 0, 3, false);
-        w.write_pair(7, 300, &a, false).unwrap();
-        w.write_pair(8, 120, &artefact(0, 0, 0, 0, true), true)
+        // an injected N overlay on R1 only: the r1_n column must carry it
+        w.write_pair(7, 300, &a, false, 3, 0).unwrap();
+        w.write_pair(8, 120, &artefact(0, 0, 0, 0, true), true, 0, 0)
             .unwrap();
         w.finish().unwrap();
 
@@ -137,10 +152,10 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(
             lines[0],
-            "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup"
+            "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n"
         );
-        assert_eq!(lines[1], "7\t300\t2\t5\t0\t3\t0\t0\t0\t0");
-        assert_eq!(lines[2], "8\t120\t0\t0\t0\t0\t0\t0\t1\t1");
+        assert_eq!(lines[1], "7\t300\t2\t5\t0\t3\t0\t0\t0\t0\t3\t0");
+        assert_eq!(lines[2], "8\t120\t0\t0\t0\t0\t0\t0\t1\t1\t0\t0");
     }
 
     #[test]
@@ -148,12 +163,15 @@ mod tests {
         let path = std::env::temp_dir().join("fastsim_gt2.tsv");
         let mut w = GtWriter::open(&path, 150).unwrap();
         // full spike: t = L
-        w.write_pair(0, 300, &artefact(0, 150, 0, 150, true), false)
+        w.write_pair(0, 300, &artefact(0, 150, 0, 150, true), false, 0, 0)
             .unwrap();
         w.finish().unwrap();
         let s = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(s.lines().nth(1).unwrap(), "0\t300\t0\t150\t0\t150\t0\t0\t1\t0");
+        assert_eq!(
+            s.lines().nth(1).unwrap(),
+            "0\t300\t0\t150\t0\t150\t0\t0\t1\t0\t0\t0"
+        );
     }
 
     #[test]
@@ -162,7 +180,7 @@ mod tests {
         let mut w = GtWriter::open(&path, 150).unwrap();
         let n = 1000u64;
         for i in 0..n {
-            w.write_pair(i, 300, &artefact(0, 0, 0, 0, i % 7 == 0), false)
+            w.write_pair(i, 300, &artefact(0, 0, 0, 0, i % 7 == 0), false, 0, 0)
                 .unwrap();
         }
         w.finish().unwrap();

@@ -2,10 +2,23 @@
 
 > **Superseded (2026-10-16).** This is a point-in-time record from 2026-10-15.
 > The closed loop later reached **167/306 = 54.6%** (52 of 102 datasets passing
-> every variant), not the 113/306 recorded below, and the suite is now **466**
+> every variant), not the 113/306 recorded below, and the suite is now **471**
 > on the `scripts/test.sh` GRAND line (not 461). Authoritative closed-loop
 > figure: `bench/results/phase-d/closed_loop.tsv`. Current state:
 > `docs/STATUS.md`.
+>
+> **Update (2026-10-16): both named causes are now addressed, and part (a)'s
+> premise is corrected.** Cause (b) — a duplicate not being sequence-identical
+> to its original — was fixed in `781c396`. Cause (a) — the simulator emitting
+> no `N` — is now implemented profile-driven (see `docs/N-EMISSION.md`): the
+> emission exists, is calibrated from each library's measured no-call / padding
+> structure, and moves the simulated duplication level and multiplicity exactly
+> as the padding class requires. **But it does not close the 18 `dup_ratio`
+> failures, because those failures do not reproduce:** in `closed_loop.tsv` the
+> variant-1 and variant-2 rows are byte-identical in 100 of 102 datasets and
+> every one of the 18 failures is in that duplicated v1/v2 pair; freshly
+> regenerated simulations pass the duplicate gate. The N gap was real and is
+> closed; the 18 failures were a corpus artefact. See `docs/N-EMISSION.md` §6.
 
 Measurement-only analysis. No code changed by this document.
 
@@ -40,6 +53,13 @@ Measured: sim reads containing N = **0.00%**; real DRR000466 has 4772 of
 200,000. `random_dna_bias` draws only ACGT, and the adapter-padding path that
 would emit N is unreachable because the profile's insert CDF sits above the
 read length.
+
+**Now implemented (2026-10-16):** a profile-driven `n_run` model (read rate,
+run-length histogram, leading/trailing shares), fitted by fastcheck and emitted
+by fastsim, with the injected count recorded in the GT's `r1_n`/`r2_n` columns.
+On a synthetic padding profile it moves `duplication_level` 0.0199 → 0.0397 and
+`dup_multiplicity_max` 5 → 4014. Details and the (negative) closed-loop
+outcome: `docs/N-EMISSION.md`.
 
 ### (b) Fresh sequencing errors break duplicate identity
 

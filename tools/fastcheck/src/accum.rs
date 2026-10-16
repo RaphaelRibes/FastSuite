@@ -48,6 +48,16 @@ pub struct Accum {
     pub bases: u64,
     pub reads_with_n: u64,
     pub reads_over_max_len: u64,
+    /// Ambiguous-base (N/IUPAC) run-length histogram: `n_run_hist[len]` = number
+    /// of maximal ambiguous runs of that length. `n_run_leading` /
+    /// `n_run_trailing` count the runs touching the read's first / last base.
+    /// Together with `reads_with_n` these are the three measured terms the
+    /// simulator's N overlay is fitted from; the per-position `base_pos[..][4]`
+    /// plane cannot recover a run length, because a run is not a per-position
+    /// event.
+    pub n_run_hist: Vec<u64>,
+    pub n_run_leading: u64,
+    pub n_run_trailing: u64,
     /// read length -> count
     pub len_hist: Vec<u64>,
     /// ACGT count per read -> count (N and other codes excluded; the stated
@@ -127,6 +137,9 @@ impl Accum {
             reads: 0,
             bases: 0,
             reads_with_n: 0,
+            n_run_hist: Vec::new(),
+            n_run_leading: 0,
+            n_run_trailing: 0,
             reads_over_max_len: 0,
             len_hist: Vec::new(),
             acgt_hist: Vec::new(),
@@ -159,7 +172,21 @@ impl Accum {
         self.base_pos.len() * std::mem::size_of::<[u64; NT]>()
             + self.qual_pos.len() * std::mem::size_of::<[u64; QBINS]>()
             + (self.len_hist.len() + self.acgt_hist.len() + self.gc_hist.len()) * 8
+            + self.n_run_hist.len() * 8
             + 2 * QBINS * 8
+    }
+
+    /// Record one ambiguous run `[start, end)` of a read of length `read_len`.
+    fn record_n_run(&mut self, start: usize, end: usize, read_len: usize) {
+        let len = end - start;
+        grow(&mut self.n_run_hist, len + 1);
+        self.n_run_hist[len] += 1;
+        if start == 0 {
+            self.n_run_leading += 1;
+        }
+        if end >= read_len {
+            self.n_run_trailing += 1;
+        }
     }
 
     /// One record. `seq` and `qual` must have equal length (the scanner
@@ -181,6 +208,8 @@ impl Accum {
         }
 
         let (mut acgt, mut gc, mut has_n) = (0u64, 0u64, false);
+        let mut run_start: usize = 0; // first base of the ambiguous run in progress
+        let mut in_run = false;
         for (i, &raw) in seq.iter().enumerate() {
             let code = match raw.to_ascii_uppercase() {
                 b'A' => 0,
@@ -190,8 +219,16 @@ impl Accum {
                 _ => 4, // N and every other IUPAC code: counted, never folded into ACGT
             };
             if code == 4 {
+                if !in_run {
+                    in_run = true;
+                    run_start = i;
+                }
                 has_n = true;
             } else {
+                if in_run {
+                    self.record_n_run(run_start, i, len);
+                    in_run = false;
+                }
                 acgt += 1;
                 if code == 1 || code == 2 {
                     gc += 1;
@@ -200,6 +237,9 @@ impl Accum {
             if i < per_pos {
                 self.base_pos[i][code] += 1;
             }
+        }
+        if in_run {
+            self.record_n_run(run_start, len, len);
         }
         if has_n {
             self.reads_with_n += 1;
@@ -307,6 +347,9 @@ impl Accum {
         self.reads += o.reads;
         self.bases += o.bases;
         self.reads_with_n += o.reads_with_n;
+        self.n_run_leading += o.n_run_leading;
+        self.n_run_trailing += o.n_run_trailing;
+        add_hist(&mut self.n_run_hist, &o.n_run_hist);
         self.reads_over_max_len += o.reads_over_max_len;
         self.adapter_hits[0] += o.adapter_hits[0];
         self.adapter_hits[1] += o.adapter_hits[1];

@@ -65,7 +65,7 @@ fn smoke_run_produces_three_files() {
     let gt_text = std::fs::read_to_string(&gt).unwrap();
     assert_eq!(gt_text.lines().count(), 1001);
     let header = gt_text.lines().next().unwrap();
-    assert_eq!(header, "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup");
+    assert_eq!(header, "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n");
 
     // Cleanup.
         std::fs::remove_dir_all(&dir).unwrap();
@@ -96,10 +96,10 @@ fn smoke_run_produces_three_files() {
         assert_eq!(lines.len(), 501);
         assert_eq!(
             lines[0],
-            "pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup"
+            "pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\tr1_n"
         );
-        // every row has 7 fields
-        assert!(lines[1..].iter().all(|l| l.split('\t').count() == 7));
+        // every row has 8 fields
+        assert!(lines[1..].iter().all(|l| l.split('\t').count() == 8));
 
         // Adapter readthrough is labelled: some rows carry a nonzero r1_adapter
         // (the test profile has readthrough mode and short inserts).

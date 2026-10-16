@@ -19,12 +19,19 @@ use fastsim::artefact::{build_read, decide, PooledPair};
 use fastsim::biology::{insert_from_reference, random_dna_bias, read_fasta, History};
 use fastsim::fastq::FastqWriter;
 use fastsim::profile::{AdapterMode, Mate, Profile};
-use fastsim::quality::qualify;
+use fastsim::quality::{qualify, MateRead};
 use fastsim::truth::GtWriter;
 
 fn main() -> Result<()> {
     let cfg = cli::parse()?;
     run(&cfg)
+}
+
+/// Ambiguous (`N`) bases in one emitted mate: what the sequencing overlay
+/// (and, for the unreachable pad path, the adapter filler) put there. Counted
+/// from the emitted bytes so the GT records exactly what a scorer will see.
+fn n_bases(mr: &MateRead) -> u32 {
+    mr.seq.iter().filter(|&&b| b == b'N').count() as u32
 }
 
 fn run(cfg: &cli::Config) -> Result<()> {
@@ -122,6 +129,8 @@ fn run(cfg: &cli::Config) -> Result<()> {
     let mut n_adapter = 0u64;
     let mut n_dup = 0u64;
     let mut n_drop = 0u64;
+    let mut n_ambig = 0u64; // ambiguous (N) bases emitted across both mates
+    let mut n_ambig_reads = 0u64; // mates carrying at least one N
     for pair_idx in 0..cfg.pairs {
         // 1. Insert. Two orthogonal forced classes, then the ordinary draw:
         //   - PCR duplicate: re-sequence a stored fragment (only fresh
@@ -150,7 +159,10 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 if let (Some(w2), Some(m2)) = (w2.as_mut(), src.r2.as_ref()) {
                     w2.write_record(&w2.header(pair_idx, 2), m2)?;
                 }
-                gt.write_pair(pair_idx, src.insert_len, &a, true)?;
+                let (d1, d2) = (n_bases(&src.r1), src.r2.as_ref().map_or(0, n_bases));
+                n_ambig += (d1 + d2) as u64;
+                n_ambig_reads += (d1 > 0) as u64 + (d2 > 0) as u64;
+                gt.write_pair(pair_idx, src.insert_len, &a, true, d1, d2)?;
                 n_dup += 1;
                 continue;
             }
@@ -224,7 +236,10 @@ fn run(cfg: &cli::Config) -> Result<()> {
         if let (Some(w2), Some(m2)) = (w2.as_mut(), m2.as_ref()) {
             w2.write_record(&w2.header(pair_idx, 2), m2)?;
         }
-        gt.write_pair(pair_idx, insert_len, &a, is_dup)?;
+        let (n1, n2) = (n_bases(&m1), m2.as_ref().map_or(0, n_bases));
+        n_ambig += (n1 + n2) as u64;
+        n_ambig_reads += (n1 > 0) as u64 + (n2 > 0) as u64;
+        gt.write_pair(pair_idx, insert_len, &a, is_dup, n1, n2)?;
         // Pool the finished pair so a later duplicate replays these exact bytes.
         // The forced-drop class is excluded: it is a contaminant model, not a
         // library member, and must not seed the duplicate pool.
@@ -247,7 +262,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
 
     if !cfg.quiet {
         eprintln!(
-            "fastsim: {} pairs, read_len {}, full-artefact {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%)",
+            "fastsim: {} pairs, read_len {}, full-artefact {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%), ambiguous {} reads ({:.4}%) / {} N bases",
             cfg.pairs,
             profile.read_len,
             n_full,
@@ -258,6 +273,9 @@ fn run(cfg: &cli::Config) -> Result<()> {
             n_dup as f64 / cfg.pairs as f64 * 100.0,
             n_drop,
             n_drop as f64 / cfg.pairs as f64 * 100.0,
+            n_ambig_reads,
+            n_ambig_reads as f64 / (cfg.pairs as f64 * 2.0) * 100.0,
+            n_ambig,
         );
     }
     // Citation request (MIT stays permissive; this is the community-norm ask).
@@ -295,7 +313,10 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 "full_artefact_rate": n_full as f64 / cfg.pairs as f64,
                 "adapter_readthrough_rate": n_adapter as f64 / cfg.pairs as f64,
                 "duplicate_rate_observed": n_dup as f64 / cfg.pairs as f64,
-                "must_drop_rate": n_drop as f64 / cfg.pairs as f64
+                "must_drop_rate": n_drop as f64 / cfg.pairs as f64,
+                "ambiguous_bases": n_ambig,
+                "reads_with_ambiguous": n_ambig_reads,
+                "reads_with_ambiguous_rate": n_ambig_reads as f64 / (cfg.pairs as f64 * 2.0)
             }
         });
         std::fs::write(path, serde_json::to_string_pretty(&report)? + "\n")

@@ -53,6 +53,23 @@ Key effects reproduced:
 - **R1-specific quality collapse** (−11.4 Phred inside tails vs −1.6 for R2)
 - **Per-position quality curves** (R1/R2 separate) + **per-read variance**
 - **Adapter readthrough** when insert < read length (Nextera by default)
+- **Ambiguous bases (`N`)** from the profile's measured no-call / padding
+  model (`n_run`: read rate, run-length histogram, edge shares). Absent from a
+  profile → the simulator emits none (the pre-N behaviour, byte for byte).
+
+## The profile's N model
+
+```
+"n_run": { "read_rate": 0.024, "len": {"1": 9000, "150": 400},
+           "leading": 0.05, "trailing": 0.60 }
+```
+
+`read_rate` is the measured share of reads carrying an `N`, `len` the measured
+run-length histogram, `leading`/`trailing` the share of runs touching the
+read's first / last base (the rest interior). All four are measured by
+fastcheck's fitter (merged over both mates, like `dup_rate`); the standalone
+measurement lives in `bench/scripts/n_stats.py`. `r1_n`/`r2_n` in the GT say
+how many `N` the overlay put in each mate.
 
 ## Usage
 

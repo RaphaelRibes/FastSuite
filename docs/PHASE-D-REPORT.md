@@ -104,6 +104,17 @@ Re-running the loop silently duplicated rows (612 rows from a 306-row truth), be
 
 ## 2. The remaining duplicate-rate gap — diagnosed, not yet fixed
 
+> **Resolved (2026-10-16).** Both named causes are now addressed: the
+> duplicate-identity defect was fixed in `781c396`, and the missing ambiguous
+> base (`N`) emission is now implemented profile-driven (`docs/N-EMISSION.md`).
+> **The 18 `dup_ratio` failures this section reports do not reproduce:** in the
+> authoritative `closed_loop.tsv` the variant-1 and variant-2 rows are
+> byte-identical in 100 of 102 datasets, and all 18 failures are in that
+> duplicated v1/v2 pair; regenerated simulations pass the duplicate gate. So
+> the residual failures below are a corpus artefact, not the emission gap this
+> section names. The N gap was real and is closed; the failures were not the
+> evidence for it. See `docs/N-EMISSION.md` §6.
+
 122 rows still fail `dup_ratio`, and **the simulator is lower on all 122**, so this is a genuine model gap rather than residue from the fixed bugs. Two distinct causes, both verified by measurement.
 
 ### 2.1 The simulator emits no ambiguous bases at all

@@ -54,6 +54,15 @@ cli.rs ──► Config ──► main.rs loop  │
    - bases inside a G-run lose `tail_q_collapse` Phred;
    - substitution error per base at `10^(−q/10)` (uniform over other 3
      bases). The emitted base reflects the error → self-consistent FASTQ.
+   - ambiguous-base (N) overlay (`inject_ambiguous`), profile-driven: with
+     probability `n_run.read_rate` a read gets one N-run whose length is drawn
+     from `n_run.len` and whose start touches the biology window's 5′ edge,
+     its 3′ edge, or is interior, per `n_run.leading` / `n_run.trailing`. It is
+     the instrument's no-call / padding behaviour, and it is what makes a
+     padding-driven duplicate (`NNNN...`) exist. It never touches an injected
+     G-run, so `h`/`t` and the trim window are unchanged; the injected count is
+     recorded in the GT's `r1_n`/`r2_n` columns. A profile with no `n_run` key
+     draws nothing.
    - full-length reads use flat `full_length_q` (all bases are artefact).
 5. **Write** — `fastq.rs` (NovaSeq-style headers, per-pair unique
    coordinates, Phred+33), `truth.rs` (one GT row per pair).
@@ -61,7 +70,10 @@ cli.rs ──► Config ──► main.rs loop  │
 ## Ground-truth semantics
 
 The GT row `(insert, h1, t1, h2, t2, full_flag)` fully determines the correct
-trimmer output per mate:
+trimmer output per mate; `r1_n`/`r2_n` additionally record how many ambiguous
+(`N`) bases the sequencing overlay injected into each mate (an instrument
+no-call, not fragment biology — it sits inside the keep window and never moves
+`h`/`t`).
 
 ```
 [0, h)                5′ G-run            → trim

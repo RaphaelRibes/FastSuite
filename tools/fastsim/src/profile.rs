@@ -111,6 +111,8 @@ pub struct Profile {
     pub full_length_rate: f64,
     pub full_length_q: [u8; 2],
     pub adapter: Adapter,
+    /// measured ambiguous-base (N) emission; absent -> emit none (see NModel)
+    pub n_run: Option<NModel>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +125,33 @@ pub struct Adapter {
 pub enum AdapterMode {
     None,
     Readthrough,
+}
+
+/// Ambiguous-base (N) model, measured from the library's own output.
+///
+/// Real Illumina output carries `N` wherever the instrument could not make a
+/// base call. Two regimes coexist and their mix is strongly library-dependent:
+/// isolated no-calls sprinkled through the read, and — in a library with a
+/// failed-cluster / padding share — a long poly-N run at a read end
+/// (`NNNN...`, `GNNNN...`) that is often the single most-duplicated sequence in
+/// the file. `random_dna_bias` drew only ACGT, so the simulator emitted none of
+/// them and the padding-driven duplicates had no counterpart in the simulation.
+///
+/// * `read_rate`   — measured share of reads carrying at least one `N`.
+/// * `len`         — measured run-length distribution (a run's length).
+/// * `leading`     — share of runs touching the read's first base.
+/// * `trailing`    — share of runs touching the read's last base.
+///                   The remainder sit interior.
+///
+/// When the field is absent (a profile fitted before the model existed, or the
+/// hand-authored test profiles) the simulator draws NOTHING extra, so the RNG
+/// stream of every existing profile is unchanged.
+#[derive(Debug, Clone)]
+pub struct NModel {
+    pub read_rate: f64,
+    pub len: Cdf,
+    pub leading: f64,
+    pub trailing: f64,
 }
 
 /// 65×65 cumulative distribution (R1 length × R2 length, capped).
@@ -348,6 +377,23 @@ impl Profile {
             Some(m) => Some(Cdf::from_map(m)?),
             None => None,
         };
+        // N model: an all-zero rate (or an empty histogram) means "emit none",
+        // NOT an error — a library with no ambiguous bases is a real library
+        // (measured: human_gut/DRR425489 duplicates carry no N at all), and a
+        // profile without the field must keep the simulator's stream unchanged.
+        let n_run = match &raw.n_run {
+            Some(n) if n.read_rate > 0.0 && !n.len.is_empty() => {
+                let lead = n.leading.clamp(0.0, 1.0);
+                let trail = n.trailing.clamp(0.0, 1.0 - lead);
+                Some(NModel {
+                    read_rate: n.read_rate.clamp(0.0, 1.0),
+                    len: Cdf::from_map(&n.len)?,
+                    leading: lead,
+                    trailing: trail,
+                })
+            }
+            _ => None,
+        };
         // R1 shows the fragment's 5′ end, so its head composition anchors the fragment head.
         // Deconvolve the artefact out of the measured per-position composition
         // before it is used as a BIOLOGY draw.
@@ -456,6 +502,7 @@ impl Profile {
                 seq: raw.adapter.seq.into_bytes(),
                 mode,
             },
+            n_run,
         })
     }
 
@@ -556,6 +603,22 @@ pub struct RawProfile {
     /// per-position [a,c,g,t] fractions per mate (fastcheck `base_position`)
     #[serde(default)]
     pub base: Option<std::collections::HashMap<String, Vec<Vec<f32>>>>,
+    /// measured ambiguous-base (N) emission; absent in profiles fitted before
+    /// the N model existed, and then the simulator emits no N at all
+    #[serde(default)]
+    pub n_run: Option<RawNRun>,
+}
+
+/// Raw JSON shape of the N model (`len` is a `{length: count}` histogram like
+/// every other profile histogram).
+#[derive(Debug, Deserialize)]
+pub struct RawNRun {
+    pub read_rate: f64,
+    pub len: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub leading: f64,
+    #[serde(default)]
+    pub trailing: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,6 +796,38 @@ mod tests {
         // after {1,1} (flat index N + 1) cumulative = 0.72+0.24 = 0.96
         let cum_11 = p.joint_tail.cum[JointCdf::N + 1];
         assert!((cum_11 - 0.96).abs() < 1e-12);
+    }
+
+    #[test]
+    fn n_model_parses_and_absent_or_zero_is_none() {
+        // absent -> None (the simulator must then draw nothing)
+        let p = test_profile();
+        assert!(p.n_run.is_none());
+
+        // present -> the measured rate and run-length CDF are carried
+        let mut raw: RawProfile = serde_json::from_str(&sample_profile_json()).unwrap();
+        raw.n_run = Some(RawNRun {
+            read_rate: 0.024,
+            len: BTreeMap::from([("1".into(), 90u64), ("150".into(), 10)]),
+            leading: 0.1,
+            trailing: 0.6,
+        });
+        let p = Profile::from_raw(raw).unwrap();
+        let n = p.n_run.as_ref().expect("model present");
+        assert!((n.read_rate - 0.024).abs() < 1e-12);
+        assert_eq!(n.len.total, 100);
+        assert!((n.leading - 0.1).abs() < 1e-12);
+        assert!((n.trailing - 0.6).abs() < 1e-12);
+
+        // a zero rate is "no N", not an error: some libraries genuinely have none
+        let mut raw: RawProfile = serde_json::from_str(&sample_profile_json()).unwrap();
+        raw.n_run = Some(RawNRun {
+            read_rate: 0.0,
+            len: BTreeMap::from([("1".into(), 100u64)]),
+            leading: 0.0,
+            trailing: 0.0,
+        });
+        assert!(Profile::from_raw(raw).unwrap().n_run.is_none());
     }
 
     #[test]

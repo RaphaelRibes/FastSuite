@@ -12,6 +12,9 @@
 //! 5. Substitution error per base with p = 10^(−q/10) (uniform over the
 //!    other three bases). The emitted base reflects the error, so the FASTQ
 //!    is self-consistent: a Q30 base has a 1/1000 chance of being wrong.
+//! 6. Ambiguous-base (N) overlay, profile-driven: the instrument's no-call /
+//!    padding behaviour, placed inside the biology window only (see
+//!    `inject_ambiguous`). Absent from a profile -> nothing is drawn.
 //!
 //! Full-length (entirely artefact) reads use a flat `full_length_q`, no
 //! position curve.
@@ -121,8 +124,57 @@ pub fn qualify<R: Rng + ?Sized>(p: &Profile, mate: Mate, read: &Read, rng: &mut 
     }
 
     // 5. Substitutions.
-    let seq = apply_errors(&read.seq, &qual, rng);
+    let mut seq = apply_errors(&read.seq, &qual, rng);
+    // 6. Ambiguous bases: the instrument's no-call / padding overlay.
+    inject_ambiguous(p, read, &mut seq, rng);
     MateRead { seq, qual }
+}
+
+/// Overlay the profile's measured ambiguous-base (N) pattern on an emitted read.
+///
+/// The run is placed inside the BIOLOGY window `[h, h+bio_len)` only, never over
+/// an injected 5′/3′ G-run. The two are different artefacts: the G-runs are the
+/// two-colour dropout the trim ground truth's `[h, min(I, L−t))` contract is
+/// built on, while the N overlay is the instrument failing to make a call. An N
+/// inside the window therefore cannot change `h`, `t`, or the trim window, and
+/// the GT records the injected count in its own columns (see truth.rs) rather
+/// than letting the overlay silently rewrite the artefact truth.
+///
+/// The placement reproduces the measured shapes: a run touching either edge of
+/// the window gives the `NNNN...` / `GNNNN...` padding, and a run strictly
+/// inside gives the sparse no-calls. When the read has no biology window (a
+/// full-length artefact) or the profile carries no model, nothing is drawn, so
+/// the RNG stream of every profile without the field is unchanged.
+///
+/// Returns the number of N bases injected.
+fn inject_ambiguous<R: Rng + ?Sized>(p: &Profile, read: &Read, seq: &mut [u8], rng: &mut R) -> u32 {
+    let Some(n) = &p.n_run else {
+        return 0;
+    };
+    if read.full || read.bio_len == 0 || n.read_rate <= 0.0 {
+        return 0;
+    }
+    if rng.gen::<f64>() >= n.read_rate {
+        return 0;
+    }
+    let bio_len = read.bio_len as usize;
+    let len = (sample_cdf(&n.len, rng) as usize).clamp(1, bio_len);
+    let lo = read.h as usize; // first biology base
+    let hi = lo + bio_len; // one past the last biology base
+    let u: f64 = rng.gen();
+    let start = if u < n.leading {
+        lo
+    } else if u < n.leading + n.trailing {
+        hi - len
+    } else if bio_len > len + 1 {
+        lo + 1 + rng.gen_range(0..(bio_len - len - 1))
+    } else {
+        lo
+    };
+    for b in &mut seq[start..start + len] {
+        *b = b'N';
+    }
+    len as u32
 }
 
 /// Apply per-base substitution errors at probability 10^(−q/10).
@@ -199,6 +251,100 @@ mod tests {
             q = q150
         );
         Profile::from_raw(serde_json::from_str::<RawProfile>(&json).unwrap()).unwrap()
+    }
+
+    /// The q_profile shape plus an N model, so the overlay can be exercised.
+    fn n_profile(read_rate: f64, run_len: u32, leading: f64, trailing: f64) -> Profile {
+        let q150 = vec!["30"; 150].join(",");
+        let json = format!(
+            r#"{{
+            "read_len": 150, "gc": 0.5, "geometry": "tail3p_both",
+            "qual_noise": 0.0,
+            "head": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+            "tail": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+            "joint_tail": {{"0,0": 100}},
+            "tail_q_collapse": {{"R1": 0.0, "R2": 0.0}},
+            "pos_q": {{"R1": [{q}], "R2": [{q}]}},
+            "read_meanq": {{"R1": {{"30": 100}}, "R2": {{"30": 100}}}},
+            "full_length_rate": 0.0,
+            "full_length_q": {{"R1": 20, "R2": 20}},
+            "adapter": {{"seq": "CTGTCTCTTATACACATCT", "mode": "none"}},
+            "n_run": {{"read_rate": {rr}, "len": {{"{rl}": 100}}, "leading": {ld}, "trailing": {tr}}}
+        }}"#,
+            rr = read_rate,
+            rl = run_len,
+            ld = leading,
+            tr = trailing,
+            q = q150
+        );
+        Profile::from_raw(serde_json::from_str::<RawProfile>(&json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn ambiguous_overlay_is_absent_without_the_profile_field() {
+        // q_profile carries no n_run: not a single N may be emitted, which is
+        // also why the RNG stream of every pre-existing profile is unchanged.
+        let p = q_profile(10.0, 0.0);
+        assert!(p.n_run.is_none());
+        let mut rng = rng();
+        let r = read_with_tail(0);
+        for _ in 0..200 {
+            let mr = qualify(&p, Mate::R1, &r, &mut rng);
+            assert!(!mr.seq.contains(&b'N'), "no N without the model");
+        }
+    }
+
+    #[test]
+    fn ambiguous_overlay_rate_and_placement_follow_the_profile() {
+        // every read carries a 5 bp run at the 3' edge of the biology window
+        let p = n_profile(1.0, 5, 0.0, 1.0);
+        let mut rng = rng();
+        let r = read_with_tail(0); // h=0, t=0 -> window is the whole read
+        for _ in 0..100 {
+            let mr = qualify(&p, Mate::R1, &r, &mut rng);
+            assert_eq!(mr.seq.iter().filter(|&&b| b == b'N').count(), 5);
+            assert!(
+                mr.seq[145..150].iter().all(|&b| b == b'N'),
+                "a trailing run touches the 3' edge"
+            );
+        }
+        // a rate of 0.5 fires on about half the reads
+        let p = n_profile(0.5, 5, 0.0, 1.0);
+        let mut with_n = 0;
+        for _ in 0..2000 {
+            let mr = qualify(&p, Mate::R1, &r, &mut rng);
+            if mr.seq.contains(&b'N') {
+                with_n += 1;
+            }
+        }
+        let frac = with_n as f64 / 2000.0;
+        assert!((frac - 0.5).abs() < 0.05, "read rate {frac}");
+    }
+
+    #[test]
+    fn ambiguous_overlay_never_touches_the_artefact_runs() {
+        // h=5 head, t=10 tail: a leading run must sit between them, so the
+        // measured h/t (and the trim ground truth built on them) is unchanged
+        let p = n_profile(1.0, 5, 1.0, 0.0);
+        let mut rng = rng();
+        let r = Read {
+            seq: vec![b'A'; 150],
+            h: 5,
+            t: 10,
+            bio_len: 135,
+            adapter_len: 0,
+            full: false,
+        };
+        let mr = qualify(&p, Mate::R1, &r, &mut rng);
+        assert!(mr.seq[0..5].iter().all(|&b| b != b'N'), "head run untouched");
+        assert!(
+            mr.seq[140..150].iter().all(|&b| b != b'N'),
+            "tail run untouched"
+        );
+        assert!(
+            mr.seq[5..10].iter().all(|&b| b == b'N'),
+            "the leading run starts at the first biology base"
+        );
     }
 
     fn read_with_tail(t: u32) -> Read {

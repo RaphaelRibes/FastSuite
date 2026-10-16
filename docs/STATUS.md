@@ -14,7 +14,7 @@ suite is WIP: nothing here is production-ready** (see the README banner).
 |---|---|---|---|---|
 | fastdedup | 1.3.0 | 104 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
 | fastprep | 0.2.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
-| fastsim | 0.1.0 | 59 | working — measured insert CDF, SE mode, **clap-migrated** | — |
+| fastsim | 0.1.0 | 63 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`). This was the simulator's last-named composition gap: it emitted no `N` at all. See `docs/N-EMISSION.md` | — |
 | fastmaps | 0.1.0 | 43 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads` | — |
 | fastcheck | 0.1.0 | 108 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
 | fasthelper | 0.1.0 | 21 | working — fastcheck step, `check -c`, `--fail-on` | `plans/2026-10-12_fasthelper-hardening.md` — already done on disk: `run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on` (exit 2); the plan's open items are the *hardening* ones (5–8: `-P/--jobs`, resume/`--from`, `install --prefix`) |
@@ -90,6 +90,25 @@ scripts are under `bench/scripts/`, the fixtures under `bench/fixtures/`).
 The closed loop scores fastsim against each library's **fastcheck**-measured QC
 profile. It is **fastcheck-only** and independent of fastprep's trimming and of
 the sweep winners — the `head_dropout` work above does not move it.
+
+> **Caveat added 2026-10-16 — the v1/v2 rows are a duplicated artefact.**
+> In `closed_loop.tsv`, the variant-1 and variant-2 rows are **byte-identical**
+> in **100 of 102** datasets across `g_frac_max_diff`, `mean_q_diff`, `gc_diff`
+> and both duplicate rates (e.g. `generalised/DRR000426` v1 = v2). Two seeds
+> (1042, 2042) cannot produce identical statistics to six decimals, so the
+> stored v1 and v2 simulations are one artefact measured twice — consistent
+> with the campaign's own record that only `sim.v0` was regenerated after the
+> last simulator fix, combined with `chain.sh` re-simulating only when
+> `sim.vN.gt.tsv` is missing. Every one of the **18 duplicate-rate failures is
+> a v1/v2 row** (variant 0 has zero), and freshly regenerated 100 k-pair units
+> put the duplicate gate back on the real rate (rebuilt
+> human_gut/DRR425490, DRR425499 and metagenomics/DRR083326, DRR083353,
+> DRR083390 all pass on `dup_ratio`). So the duplicate gate is **already clear
+> on current-generation simulations** and the residual `dup_ratio` failures are
+> a corpus artefact, not a simulator emission gap. The 167/306 figure is
+> therefore a **lower bound** contaminated by the duplicated v1/v2 generation;
+> the loop must be re-run over regenerated sims before the rate is quoted as a
+> simulator-accuracy number. Full evidence: `docs/N-EMISSION.md` §6.
 
 | domain | pass rate |
 |---|---|

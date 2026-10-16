@@ -10,7 +10,8 @@
 //!
 //!   MEASURED  read_len, gc (fragment), the per-position mean-Q curve, the
 //!             duplicate rate, the adapter readthrough rate, the per-position
-//!             base composition, the insert distribution (--insert-hist),
+//!             base composition, the insert distribution (--insert-hist), and
+//!             the ambiguous-base (N) rate / run-length / edge model (`n_run`),
 //!             the head/tail G-run distributions, the flat in-run qualities,
 //!             and the out-of-run quality curve deconvolved from them
 //!   INVENTED  the insert SHAPE when no insert module ran, and the mate
@@ -599,6 +600,46 @@ pub fn write_profile(
             prof.insert("dup_rate".into(), json!((dup * 10000.0).round() / 10000.0));
         }
     }
+    // The ambiguous-base (N) model, measured over the MERGED accumulators so it
+    // describes the library exactly as `reads_with_non_acgt` and
+    // `duplication_level` describe it in the report (the closed loop compares
+    // the simulation against that merged report). A library with no ambiguous
+    // base emits NO `n_run` key at all: fastsim then draws nothing for it, so
+    // the field's presence is the simulator's signal to change its stream.
+    if !accs.is_empty() {
+        let reads: u64 = accs.iter().map(|a| a.reads).sum();
+        let with_n: u64 = accs.iter().map(|a| a.reads_with_n).sum();
+        if reads > 0 && with_n > 0 {
+            let runs: u64 = accs.iter().map(|a| a.n_run_hist.iter().sum::<u64>()).sum();
+            let mut hist: BTreeMap<String, u64> = BTreeMap::new();
+            for a in accs {
+                for (len, &c) in a.n_run_hist.iter().enumerate() {
+                    if c > 0 {
+                        *hist.entry(len.to_string()).or_insert(0) += c;
+                    }
+                }
+            }
+            let lead = if runs > 0 {
+                accs.iter().map(|a| a.n_run_leading).sum::<u64>() as f64 / runs as f64
+            } else {
+                0.0
+            };
+            let trail = if runs > 0 {
+                accs.iter().map(|a| a.n_run_trailing).sum::<u64>() as f64 / runs as f64
+            } else {
+                0.0
+            };
+            prof.insert(
+                "n_run".into(),
+                json!({
+                    "read_rate": ((with_n as f64 / reads as f64) * 1e6).round() / 1e6,
+                    "len": Value::Object(hist.into_iter().map(|(k, v)| (k, json!(v))).collect()),
+                    "leading": (lead * 1e6).round() / 1e6,
+                    "trailing": (trail * 1e6).round() / 1e6,
+                }),
+            );
+        }
+    }
     prof.insert("full_length_rate".into(), json!(0.0));
     prof.insert("full_length_q".into(), Value::Object(full_length_q));
     prof.insert(
@@ -643,6 +684,8 @@ pub fn write_profile(
             "readthrough": {"TruSeq": (rt[0] * 100000.0).round() / 100000.0,
                             "Nextera": (rt[1] * 100000.0).round() / 100000.0},
             "g_mean": (g_mean * 10000.0).round() / 10000.0,
+            "reads_with_non_acgt": accs.iter().map(|a| a.reads_with_n).sum::<u64>(),
+            "total_reads": accs.iter().map(|a| a.reads).sum::<u64>(),
         },
         "insert_measured": insert_summary,
         "fit_warnings": warnings,
@@ -802,6 +845,39 @@ mod tests {
         let a = acc_with(&[(b"G", b"I"), (b"C", b"I"), (b"N", b"I"), (b"N", b"I")], 16);
         let gf = g_fraction(&a);
         assert!((gf[0] - 0.25).abs() < 1e-9, "got {}", gf[0]);
+    }
+
+    /// The N model must travel from the accumulator into the profile: a library
+    /// whose reads carry ambiguous runs gets an `n_run` block with the measured
+    /// rate, run-length histogram and edge shares; a library with none gets no
+    /// block at all (so fastsim draws nothing for it).
+    #[test]
+    fn profile_carries_the_measured_n_model_only_when_reads_carry_n() {
+        // two reads: "NNNNAAA" (leading run of 4) and "ACGTACGT" (no N)
+        let a = acc_with(&[(b"NNNNAAA", b"IIIIIII"), (b"ACGTACGT", b"IIIIIIII")], 16);
+        let dir = std::env::temp_dir().join(format!("fc_nprof_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("p.json");
+        write_profile(&p, "test", &[&a], 33, None).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let n = &v["n_run"];
+        assert!((n["read_rate"].as_f64().unwrap() - 0.5).abs() < 1e-9, "1 of 2 reads: {n}");
+        assert_eq!(n["len"]["4"], serde_json::json!(1));
+        assert_eq!(n["leading"].as_f64().unwrap(), 1.0);
+        assert_eq!(n["trailing"].as_f64().unwrap(), 0.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // no ambiguous base anywhere -> the key must be absent
+        let b = acc_with(&[(b"ACGTACGT", b"IIIIIIII")], 16);
+        let dir = std::env::temp_dir().join(format!("fc_nprof2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("p.json");
+        write_profile(&p, "test", &[&b], 33, None).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(v.get("n_run").is_none(), "no N -> no n_run block");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
