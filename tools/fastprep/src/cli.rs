@@ -197,6 +197,16 @@ pub struct Cli {
     /// Trim the NovaSeq first-cycle 5′ G-dropout: a short (1..=N) leading
     /// G-run with normal quality is removed exactly, no quality gate.
     /// Must be < --min-run so the scan stays in charge of long runs.
+    ///
+    /// `0` disables the rule entirely. That matters because the rule is
+    /// unconditional: it trims any leading G-run of length 1..=N without
+    /// asking whether the G is artefact or biology, so on a library whose
+    /// first base is often a real G it removes real sequence. Measured
+    /// against fastsim ground truth, disabling it raises the strict-tolerance
+    /// exact rate by 12.6 pp on a profile with 5′ artefact on one mate only
+    /// (76.0% -> 88.6%), at the cost of leaving that mate's genuine artefact
+    /// untrimmed. Choose per library; the trade is stated in
+    /// docs/OVERTRIM-CEILING.md.
     #[arg(long, value_name = "N", default_value = "4", help_heading = "PolyX Trimming")]
     pub head_dropout: Option<usize>,
 
@@ -595,7 +605,9 @@ impl Cli {
         };
         if self.min_run < 2 { bail!("--min-run must be ≥ 2"); }
         if let Some(hd) = self.head_dropout {
-            if hd < 1 { bail!("--head-dropout must be ≥ 1"); }
+            // 0 disables the rule (see the field docs): the scan then owns
+            // every leading run, which is the only way to avoid trimming a
+            // leading G that is real biology.
             if hd >= self.min_run {
                 bail!("--head-dropout must be < --min-run (the scan owns runs ≥ min-run)");
             }
