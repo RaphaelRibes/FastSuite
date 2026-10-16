@@ -24,9 +24,9 @@ so accuracy is absolute, not relative to another tool. Scores per config:
                    (recall and precision both matter; over-trimming destroys
                    real biology and is penalised twice as hard as it is common)
 
-The grid: 55 authored configs x 3 variants (PLAN-ML-STEPS C1 said "60"; the
-authored grid is 55, and the count is reported against the authored length so
-a short grid is a visible mismatch, never a silent "55/60 failed"). fastprep's shipped
+The grid: 57 authored configs x 3 variants (PLAN-ML-STEPS C1 said "60"; the
+authored grid is 57, and the count is reported against the authored length so
+a short grid is a visible mismatch, never a silent "57/60 failed"). fastprep's shipped
 default (small-trim-rest-max) is known to be the swept winner from the earlier
 dedup bench, so the grid explores AROUND it on the axes that matter for the
 artefact regime the profile describes: polyX aggressiveness (min-run, mercy,
@@ -51,15 +51,19 @@ import sys
 import time
 
 # ---------------------------------------------------------------- the grid
-# (min_run, mercy, phred_sat, gate_shape, min_len, mean_q, adapter_err, min_overlap, r2_reverse, interior)
+# (min_run, mercy, phred_sat, gate_shape, min_len, mean_q, adapter_err, min_overlap, r2_reverse, interior, head_dropout)
 # min_len is a FRACTION of the read length for the fractions and a base count
 # for the integers. The integers are scaled by scale_min_len() below, because
 # the pilot's units are 110 bp: a hardcoded 30 means "keep 27% of a short read"
 # on 110 bp data and "20%" on 150 bp data, which would make the two read
 # regimes non-comparable.
+#
+# head_dropout defaults to 4, fastprep's shipped value, so a config that does
+# not mention it runs with the shipped 5'-rule. It is recorded per row so the
+# axis is measurable rather than inferred.
 DEFAULTS = dict(min_run=12, mercy=3, phred_sat=20, gate_shape=1.0,
                 min_len=0.9, mean_q=25.0, adapter_err=0.2, min_overlap=14,
-                r2_reverse=False, interior=False)
+                r2_reverse=False, interior=False, head_dropout=4)
 
 # The shipped default is config #0 and is always evaluated first.
 GRID = [
@@ -82,6 +86,10 @@ GRID = [
     # --- interior scan (off in the shipped default) ---
     dict(interior=True), dict(interior=True, min_run=10),
     # --- head dropout (NovaSeq first-cycle 5' G) ---
+    # A real axis: 0 disables the 5'-rule entirely, 1 trims only the first
+    # base. 0/1 sit on the shipped min_run=12 as single-axis moves off the
+    # shipped default; 4/6 probe the aggressive end on lower min_run.
+    dict(head_dropout=0), dict(head_dropout=1),
     dict(min_run=10, head_dropout=4), dict(min_run=8, head_dropout=6),
     # --- combinations that a per-axis sweep cannot reach ---
     dict(min_run=10, mercy=2, phred_sat=25),
@@ -104,7 +112,8 @@ GRID = [
 
 ROW_FIELDS = ["domain", "run_accession", "variant", "config_id", "min_run", "mercy",
               "phred_sat", "gate_shape", "min_len", "mean_q", "adapter_err",
-              "min_overlap", "r2_reverse", "interior", "keep_precision", "keep_recall",
+              "min_overlap", "r2_reverse", "interior", "head_dropout",
+              "keep_precision", "keep_recall",
               "trim_mae", "over_trim_rate", "under_trim_rate", "false_keep_rate",
               "drop_accuracy", "kept", "should_keep", "score", "seconds",
               "read_len", "min_len_effective"]
@@ -304,6 +313,21 @@ def scale_min_len(cfg: dict, read_len: int) -> float:
     return ml
 
 
+def effective_head_dropout(cfg: dict) -> int:
+    """The value actually passed to fastprep, after the min_run guard.
+
+    fastprep refuses `head_dropout >= min_run` (the scan owns runs at or above
+    min-run), so a low-min_run config cannot carry the shipped 4. Cap rather
+    than skip: every swept config must still produce a row, and the row must
+    say what ran. Kept next to `build_argv` so the emitted flag and the
+    recorded column cannot drift apart.
+    """
+    hd = int(cfg.get("head_dropout", 4))
+    # Floor 0, not 1: 0 is a real value (it disables the 5' hard trim) and the
+    # grid must be able to express it. Only the upper bound is a cap.
+    return max(0, min(hd, int(cfg["min_run"]) - 1))
+
+
 def build_argv(cfg: dict, work: str, cid: int, read_len: int = 150) -> list[str]:
     a = ["-1", os.path.join(work, "in_R1.fastq.gz"),
          "-2", os.path.join(work, "in_R2.fastq.gz"),
@@ -325,6 +349,16 @@ def build_argv(cfg: dict, work: str, cid: int, read_len: int = 150) -> list[str]
         a.append("--r2-scan-reverse")
     if cfg.get("interior"):
         a.append("--interior")
+    # The head-dropout axis. Emitted EXPLICITLY on every run, including when the
+    # grid did not set it: fastprep's CLI default is 4, so an axis that is
+    # invisible when it equals the default and applies when it does not leaves
+    # the authored values (0, 1, 4, 6) indistinguishable from the default in
+    # the results — the axis was authored, never measured, and never recorded.
+    #
+    # Route it through effective_head_dropout(), which is also what the row
+    # records, so the argv and the column cannot disagree. fastprep refuses
+    # head_dropout >= min_run, so a low-min_run config is capped, not skipped.
+    a += ["--head-dropout", str(effective_head_dropout(cfg))]
     return a
 
 
@@ -413,6 +447,7 @@ def main() -> int:
                 cfg["min_run"], cfg["mercy"], cfg["phred_sat"], cfg["gate_shape"],
                 cfg["min_len"], cfg["mean_q"], cfg["adapter_err"], cfg["min_overlap"],
                 int(cfg["r2_reverse"]), int(cfg["interior"]),
+                effective_head_dropout(cfg),
                 f"{m['keep_precision']:.4f}", f"{m['keep_recall']:.4f}",
                 f"{m['trim_mae']:.2f}", f"{m['over_trim_rate']:.4f}",
                 f"{m['under_trim_rate']:.4f}", f"{m['false_keep_rate']:.4f}",

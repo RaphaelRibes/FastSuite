@@ -129,8 +129,59 @@ check("C kept", m["kept"], 0)
 check("C keep_recall", m["keep_recall"], 0.0)
 check("C score", m["score"], 0.0)
 
+# ---- the head-dropout axis is emitted, not assumed -----------------------
+# The grid authors head_dropout 0/1/4/6. Before, build_argv never emitted
+# --head-dropout, so every config ran at fastprep's CLI default (4) and the
+# axis was never measured or recorded — and a min_run <= 4 config would have
+# aborted the whole sweep on the clap guard. effective_head_dropout() caps
+# rather than skips, so every config still produces a row that says what ran.
+import sweep as _sw
+_extra = 0
+def chk2(name, got, want):
+    global _extra
+    ok = got == want
+    if not ok: _extra += 1
+    print(("ok   " if ok else "FAIL ") + f"{name}: got {got} want {want}")
+
+chk2("hd authored 0 (expressible)", _sw.effective_head_dropout(
+    {"min_run": 12, "head_dropout": 0}), 0)
+chk2("hd authored 1", _sw.effective_head_dropout(
+    {"min_run": 12, "head_dropout": 1}), 1)
+chk2("hd authored 6, min_run 8", _sw.effective_head_dropout(
+    {"min_run": 8, "head_dropout": 6}), 6)
+chk2("hd authored 6, min_run 2 (capped)", _sw.effective_head_dropout(
+    {"min_run": 2, "head_dropout": 6}), 1)
+chk2("hd 0 survives the cap, min_run 2", _sw.effective_head_dropout(
+    {"min_run": 2, "head_dropout": 0}), 0)
+chk2("hd unset (shipped default 4)", _sw.effective_head_dropout(
+    {"min_run": 12}), 4)
+chk2("grid records the column", "head_dropout" in _sw.ROW_FIELDS, True)
+_axis = set()
+for _d in _sw.GRID:
+    _cfg = dict(_sw.DEFAULTS); _cfg.update(_d)
+    _axis.add(_sw.effective_head_dropout(_cfg))
+chk2("grid authors hd 0 and 1", {0, 1} <= _axis, True)
+for i, d in enumerate(_sw.GRID):
+    cfg = dict(_sw.DEFAULTS); cfg.update(d)
+    argv = _sw.build_argv(cfg, "/tmp", i, 150)
+    if "--head-dropout" not in argv:
+        chk2(f"grid {i} emits --head-dropout", False, True)
+        break
+else:
+    chk2("every grid config emits --head-dropout", True, True)
+# and the emitted value must equal the recorded value
+for i, d in enumerate(_sw.GRID):
+    cfg = dict(_sw.DEFAULTS); cfg.update(d)
+    argv = _sw.build_argv(cfg, "/tmp", i, 150)
+    emitted = argv[argv.index("--head-dropout") + 1]
+    if int(emitted) != _sw.effective_head_dropout(cfg):
+        chk2(f"grid {i} argv == row", False, True)
+        break
+else:
+    chk2("argv value and row value agree", True, True)
+
 print()
-if fails:
-    print(f"SCORER SELF-TEST FAILED: {fails}")
+if fails or _extra:
+    print(f"SCORER SELF-TEST FAILED: {len(fails) + _extra}")
     sys.exit(1)
 print("SCORER SELF-TEST PASSED")
