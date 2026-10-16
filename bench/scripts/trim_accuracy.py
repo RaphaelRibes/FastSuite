@@ -235,6 +235,30 @@ def score_inferred(orig, trimmed, gt, tol):
     return c
 
 
+def stale_pxmt(pxmt_path, sim_paths):
+    """True when a stored PXMT predates the sim it would be scored against.
+
+    A PXMT records the trims fastprep applied to ONE specific sim realisation.
+    The sweep is resumable and skips any config whose `c<cid>.row` exists, so
+    after the corpus is regenerated the old PXMTs are never refreshed; scoring
+    them against the new GT yields phantom over/under-trim, because two
+    independent draws of the same profile agree only within a bp or two. That
+    is the bug that published 66.50% where the fresh truth was 75.35%: a
+    measurement of the wrong draw is worse than no measurement, so refuse.
+    """
+    try:
+        pxmt_mtime = os.path.getmtime(pxmt_path)
+    except OSError:
+        return False  # missing PXMT is the caller's "no PXMT", not staleness
+    for p in sim_paths:
+        try:
+            if os.path.getmtime(p) > pxmt_mtime:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def score_pxmt(pxmt, coremap, gt, tol):
     """fastprep: exact trim positions from its own metadata."""
     c = buckets()
@@ -283,15 +307,23 @@ def main():
         os.makedirs(d, exist_ok=True)
 
         # ---- fastprep: the sweep already ran every config, so the winner's
-        # metadata is on disk at sweep.v0/c<cid>.pxmt.
-        px = parse_pxmt(f"{v0}/sweep.v0/c{cid}.pxmt")
-        if px:
-            coremap = pxmt_core_map([sim1, sim2])
-            for tol in TOLS:
-                emit(domain, acc, "fastprep-winner", tol,
-                     score_pxmt(px, coremap, gt, tol))
+        # metadata is on disk at sweep.v0/c<cid>.pxmt. Guard against a PXMT
+        # from a previous sim generation: it records the trims fastprep made on
+        # a different draw, so scoring it here is meaningless.
+        px_path = f"{v0}/sweep.v0/c{cid}.pxmt"
+        if stale_pxmt(px_path, (f"{v0}/sim.v0.gt.tsv", sim1, sim2)):
+            print(f"  {acc}: STALE PXMT {px_path} predates the sim it would be "
+                  f"scored against — refusing to score the fastprep row "
+                  f"(re-run the sweep on the current sim)", flush=True)
         else:
-            print(f"  {acc}: no PXMT for config {cid}", flush=True)
+            px = parse_pxmt(px_path)
+            if px:
+                coremap = pxmt_core_map([sim1, sim2])
+                for tol in TOLS:
+                    emit(domain, acc, "fastprep-winner", tol,
+                         score_pxmt(px, coremap, gt, tol))
+            else:
+                print(f"  {acc}: no PXMT for config {cid}", flush=True)
 
         # ---- fastp: run on the same simulated input
         for tool, extra in (("fastp-default", []), ("fastp-tuned", FASTP_TUNED)):

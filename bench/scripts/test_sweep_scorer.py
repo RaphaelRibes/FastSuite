@@ -180,6 +180,35 @@ for i, d in enumerate(_sw.GRID):
 else:
     chk2("argv value and row value agree", True, True)
 
+# ---- the resume key carries the sim inputs' identity ---------------------
+# Keying the resume cache on `c<cid>.row` existence alone survives a corpus
+# regeneration: the old rows are replayed and the campaign reports metrics
+# against a sim that no longer exists. input_identity() folds each input's
+# path/size/mtime in, so a changed corpus misses the cache.
+_tmp = tempfile.mkdtemp()
+_p1 = os.path.join(_tmp, "sim_R1.fastq.gz"); open(_p1, "wb").write(b"x")
+_p2 = os.path.join(_tmp, "sim_R2.fastq.gz"); open(_p2, "wb").write(b"y")
+_pg = os.path.join(_tmp, "sim.gt.tsv"); open(_pg, "wb").write(b"z")
+_id1 = _sw.input_identity(_p1, _p2, _pg)
+chk2("input identity is stable", _sw.input_identity(_p1, _p2, _pg), _id1)
+_t = os.path.getmtime(_pg) + 10
+os.utime(_pg, (_t, _t))
+chk2("identity changes when the GT is regenerated",
+     _sw.input_identity(_p1, _p2, _pg) != _id1, True)
+
+# ---- exit code compares against the ACTUAL grid length -------------------
+# The chain passes --configs 60 while the grid is 57, so a full 57/57 sweep
+# must exit 0. The expected count is min(requested, grid).
+chk2("expected count clamps to the grid", min(60, len(_sw.GRID)), len(_sw.GRID))
+
+# ---- the semantics overtrim_vs_fastp now reproduces ----------------------
+# An integer grid min_len is scaled to a fraction of the actual read length and
+# clamped to <= 1.0; the resolved string is what the harness must pass.
+chk2("scale_min_len clamps 50/36 to 1.0",
+     _sw.scale_min_len({"min_len": 50}, 36), 1.0)
+chk2("min_len_arg(1.0) is the literal base count '1'",
+     _sw.min_len_arg(_sw.scale_min_len({"min_len": 50}, 36)), "1")
+
 print()
 if fails or _extra:
     print(f"SCORER SELF-TEST FAILED: {len(fails) + _extra}")

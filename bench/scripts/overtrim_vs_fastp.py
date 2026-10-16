@@ -4,7 +4,7 @@ libraries, same ground truth, same harness.
 
 Why this exists: the published trim-accuracy table scored fastprep from the
 sweep's stored PXMT and fastp from its own run, and its fastprep baseline
-(66.5%) does not reproduce in a fresh harness (75.59%). Any claim of the form
+(66.5%) does not reproduce in a fresh harness (75.35%). Any claim of the form
 "fastp beats fastprep" has to be measured with one harness or it is comparing
 two methodologies, not two tools.
 
@@ -169,15 +169,29 @@ def eff_hd(cfg):
     return max(1, min(hd, int(cfg["min_run"]) - 1))
 
 
-def _minlen(v):
-    f = float(v)
-    return f"{v}L" if f < 1.0 else str(int(f))
+def _minlen(w):
+    """The exact `--min-len` value the sweep ran with, from winners.tsv.
+
+    sweep.py does NOT pass the grid's raw min_len. An integer grid value is a
+    base count authored against a 150 bp reference; `scale_min_len()` converts
+    it to a FRACTION of the actual read length, clamped to <= 1.0, and the
+    resolved string is recorded in the winner's `min_len_effective` column.
+    Passing the raw integer as a literal base count (the old `_minlen`) runs a
+    different configuration whenever the clamp bites — SRR19649201 as-swept
+    `--min-len 1` vs raw `--min-len 50` (75.9% vs 97.7% exact), DRR000432
+    (78.0% vs 99.7%). Read the recorded column so the harness reproduces the
+    swept run.
+    """
+    eff = w.get("min_len_effective")
+    if eff not in (None, ""):
+        return eff
+    raise SystemExit(f"winner {w.get('run_accession')}: no min_len_effective column")
 
 
 CONF = {
     "min_run": ("--min-run", str), "mercy": ("--mercy", str),
     "phred_sat": ("--phred-sat", str), "gate_shape": ("--gate-shape", str),
-    "min_len": ("--min-len", _minlen), "mean_q": ("--mean-q", str),
+    "mean_q": ("--mean-q", str),
     "adapter_err": ("--adapter-error-rate", str),
     "min_overlap": ("--min-adapter-overlap", str),
 }
@@ -231,6 +245,11 @@ def main():
         for key, (flag, conv) in CONF.items():
             if w.get(key) not in (None, ""):
                 base += [flag, conv(w[key])]
+        # min-len is resolved by sweep.py's scale_min_len and recorded as
+        # min_len_effective; reproduce the swept run from that column, not the
+        # raw grid integer.
+        if w.get("min_len") not in (None, ""):
+            base += ["--min-len", _minlen(w)]
         if w.get("r2_reverse") in ("True", "true", "1"):
             base += ["--r2-scan-reverse"]
         if w.get("interior") in ("True", "true", "1"):

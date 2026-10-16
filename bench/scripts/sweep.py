@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import struct
@@ -328,6 +329,26 @@ def effective_head_dropout(cfg: dict) -> int:
     return max(0, min(hd, int(cfg["min_run"]) - 1))
 
 
+def input_identity(r1: str, r2: str, gt: str) -> str:
+    """A short token identifying the exact sim inputs a sweep scored against.
+
+    The resume cache is one `c<cid>.row` per config. Keying it on existence
+    alone survives a corpus regeneration: the sim is redrawn, the old rows are
+    silently replayed, and the campaign reports metrics computed against a sim
+    that no longer exists — that is how a pre-regen sweep stayed "done" through
+    a regen and left stale PXMTs on disk. Fold the inputs' identity into the
+    key (path + size + mtime of each) so a regenerated corpus misses the cache.
+    """
+    h = hashlib.sha256()
+    for p in (r1, r2, gt):
+        try:
+            st = os.stat(p)
+            h.update(f"{os.path.realpath(p)}:{st.st_size}:{int(st.st_mtime)};".encode())
+        except OSError:
+            h.update(f"{p}:missing;".encode())
+    return h.hexdigest()[:16]
+
+
 def build_argv(cfg: dict, work: str, cid: int, read_len: int = 150) -> list[str]:
     a = ["-1", os.path.join(work, "in_R1.fastq.gz"),
          "-2", os.path.join(work, "in_R2.fastq.gz"),
@@ -379,6 +400,28 @@ def main() -> int:
 
     work = os.path.join(args.work, f"sweep.v{args.variant}")
     os.makedirs(work, exist_ok=True)
+
+    # Resume cache invalidation: the per-config `c<cid>.row` files are only
+    # valid for the sim inputs they were computed from. Record that identity and
+    # drop the cached rows when it changes, so a regenerated corpus is a cache
+    # miss rather than a silent replay of stale metrics.
+    identity = input_identity(args.r1, args.r2, args.gt)
+    idfile = os.path.join(work, "input.identity")
+    prev_identity = None
+    if os.path.exists(idfile):
+        with open(idfile) as fh:
+            prev_identity = fh.read().strip()
+    if prev_identity != identity:
+        if prev_identity is not None:
+            stale = [f for f in os.listdir(work)
+                     if f.startswith("c") and f.endswith(".row")]
+            for f in stale:
+                os.unlink(os.path.join(work, f))
+            print(f"sweep: sim inputs changed ({prev_identity[:8]} -> "
+                  f"{identity[:8]}); invalidated {len(stale)} cached rows",
+                  file=sys.stderr)
+        with open(idfile, "w") as fh:
+            fh.write(identity + "\n")
 
     # The simulated reads are the sweep's input; link them once.
     for src, dst in ((args.r1, "in_R1.fastq.gz"), (args.r2, "in_R2.fastq.gz")):
@@ -473,9 +516,14 @@ def main() -> int:
             except FileNotFoundError:
                 pass
 
-    print(f"sweep: {args.acc} v{args.variant}: {n_done}/{args.configs} configs scored "
+    # The chain passes --configs 60 while the authored grid is 57, so comparing
+    # against args.configs made a complete run exit 1 ("sweep failed") and
+    # masked real failures. Compare against the number of configs actually
+    # attempted: min(requested, grid).
+    n_expected = min(args.configs, len(GRID))
+    print(f"sweep: {args.acc} v{args.variant}: {n_done}/{n_expected} configs scored "
           f"(grid has {len(GRID)})", file=sys.stderr)
-    return 0 if n_done == args.configs else 1
+    return 0 if n_done == n_expected else 1
 
 
 if __name__ == "__main__":
