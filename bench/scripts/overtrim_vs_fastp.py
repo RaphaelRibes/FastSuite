@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""fastprep (hd=4 / hd=0) vs fastp (default / tuned) on the SAME 101 real
+libraries, same ground truth, same harness.
+
+Why this exists: the published trim-accuracy table scored fastprep from the
+sweep's stored PXMT and fastp from its own run, and its fastprep baseline
+(66.5%) does not reproduce in a fresh harness (75.59%). Any claim of the form
+"fastp beats fastprep" has to be measured with one harness or it is comparing
+two methodologies, not two tools.
+
+Scoring:
+  fastprep  exact per-mate trim positions, read back from its PXMT metadata.
+  fastp     reports no trim positions, so the trimmed read is aligned back
+            onto its original: a pure trim is a substring, so the offset and
+            the tail length are recovered exactly. Reads fastp dropped are
+            counted separately and excluded from the rates.
+
+Read keying is identical for both: the pair id comes from the sim header
+(x + 10000*y), verified against the GT, so neither tool is advantaged by the
+pairing.
+"""
+import argparse, collections, csv, gzip, os, struct, subprocess, sys
+
+W = "/mnt/Fast/fastsuite-scratch/work"
+R = "/mnt/Fast/fastsuite-scratch/results"
+FP = "/home/raphael/FastSuite/tools/fastprep/target/release/fastprep"
+FASTP = "/home/raphael/.local/bin/fastp"
+
+FASTP_TUNED = ["--cut_front", "--cut_front_window_size", "5",
+               "--cut_front_mean_quality", "20", "--cut_tail",
+               "--cut_tail_window_size", "5", "--cut_tail_mean_quality", "20",
+               "--qualified_quality_phred", "20", "--length_required", "30",
+               "--low_complexity_filter"]
+
+COMP = {"A": "T", "C": "G", "G": "C", "T": "A", "N": "N"}
+
+
+def gt_rows(path):
+    out = {}
+    with open(path) as fh:
+        for r in csv.DictReader(fh, delimiter="\t"):
+            out[int(r["pair_id"])] = (int(r["r1_h"]), int(r["r1_t"]),
+                                      int(r["r2_h"]), int(r["r2_t"]))
+    return out
+
+
+def read_fastq_keyed(path):
+    """-> [(pair_id, mate, seq)] keyed by the sim header's pair id."""
+    out = []
+    if not os.path.exists(path):
+        return out
+    pid = mate = None
+    with gzip.open(path, "rt") as fh:
+        for i, line in enumerate(fh):
+            if i % 4 == 0:
+                parts = line[1:].split()
+                f = parts[0].split(":")
+                pid = int(f[5]) + 10000 * int(f[6])
+                mate = int(parts[1][0])
+            elif i % 4 == 1 and pid is not None:
+                out.append((pid, mate, line.rstrip("\n")))
+    return out
+
+
+def core_to_pid(paths):
+    out = {}
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        with gzip.open(p, "rt") as fh:
+            for i, line in enumerate(fh):
+                if i % 4 == 0:
+                    core = line[1:].split()[0]
+                    f = core.split(":")
+                    out[(core, int(line.split()[1][0]))] = (
+                        int(f[5]) + 10000 * int(f[6]))
+    return out
+
+
+def parse_pxmt(path):
+    out = {}
+    try:
+        buf = open(path, "rb").read()
+    except FileNotFoundError:
+        return out
+    if buf[:4] != b"PXMT":
+        return out
+    off, n = 5, len(buf)
+    while off + 2 <= n:
+        (idlen,) = struct.unpack_from("<H", buf, off); off += 2
+        rid = buf[off:off + idlen].decode("utf-8", "replace").split()[0]
+        off += idlen
+        if off + 22 > n:
+            break
+        mate = buf[off] + 1; off += 1
+        status = buf[off]; off += 1
+        t5a, t3a, t5p, t3p = struct.unpack_from("<IIII", buf, off); off += 16
+        off += 4
+        nrun = buf[off]; off += 1
+        off += 8 * nrun
+        out[(rid, mate)] = (status, t5a + t5p, t3a + t3p)
+    return out
+
+
+def infer_cuts(orig, trimmed):
+    if trimmed == "":
+        return (len(orig), 0)
+    i = orig.find(trimmed)
+    if i >= 0:
+        return (i, len(orig) - i - len(trimmed))
+    rc = "".join(COMP.get(c, "N") for c in reversed(trimmed))
+    j = orig.find(rc)
+    if j >= 0:
+        return (j, len(orig) - j - len(rc))
+    return None
+
+
+def bucket(c, t5, t3, h, t, tol):
+    if t5 is None:
+        c["unaligned"] += 1
+    elif abs(t5 - h) <= tol and abs(t3 - t) <= tol:
+        c["exact"] += 1
+    elif t5 > h or t3 > t:
+        c["overtrim"] += 1
+    else:
+        c["undertrim"] += 1
+
+
+def newb():
+    return collections.Counter(exact=0, overtrim=0, undertrim=0,
+                               unaligned=0, dropped=0)
+
+
+def score_fastprep(pxmt, coremap, gt, tol):
+    c = newb()
+    for (rid, mate), (status, t5, t3) in pxmt.items():
+        pid = coremap.get((rid, mate))
+        if pid is None or pid not in gt:
+            continue
+        h, t = (gt[pid][0], gt[pid][1]) if mate == 1 else (gt[pid][2], gt[pid][3])
+        if status != 0:
+            c["dropped"] += 1
+            continue
+        bucket(c, t5, t3, h, t, tol)
+    return c
+
+
+def score_fastp(orig, trimmed, gt, tol):
+    tmap = {(p, m): s for p, m, s in trimmed}
+    c = newb()
+    for pid, mate, seq in orig:
+        if pid not in gt:
+            continue
+        h, t = (gt[pid][0], gt[pid][1]) if mate == 1 else (gt[pid][2], gt[pid][3])
+        tr = tmap.get((pid, mate))
+        if tr is None:
+            c["dropped"] += 1
+            continue
+        cuts = infer_cuts(seq, tr)
+        if cuts is None:
+            c["unaligned"] += 1
+            continue
+        bucket(c, cuts[0], cuts[1], h, t, tol)
+    return c
+
+
+def eff_hd(cfg):
+    hd = int(cfg.get("head_dropout") or 4)
+    return max(1, min(hd, int(cfg["min_run"]) - 1))
+
+
+def _minlen(v):
+    f = float(v)
+    return f"{v}L" if f < 1.0 else str(int(f))
+
+
+CONF = {
+    "min_run": ("--min-run", str), "mercy": ("--mercy", str),
+    "phred_sat": ("--phred-sat", str), "gate_shape": ("--gate-shape", str),
+    "min_len": ("--min-len", _minlen), "mean_q": ("--mean-q", str),
+    "adapter_err": ("--adapter-error-rate", str),
+    "min_overlap": ("--min-adapter-overlap", str),
+}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--offset", type=int, default=0)
+    a = ap.parse_args()
+
+    winners = list(csv.DictReader(open(f"{R}/winners.tsv"), delimiter="\t"))
+    winners = winners[a.offset::a.stride]
+    print(f"datasets: {len(winners)}", flush=True)
+
+    if a.offset == 0 and not os.path.exists(a.out):
+        with open(a.out, "w", newline="") as fh:
+            csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(
+                ["domain", "acc", "tool", "tol", "exact", "overtrim",
+                 "undertrim", "unaligned", "dropped", "scored"])
+    elif a.offset != 0:
+        import time
+        for _ in range(600):
+            if os.path.exists(a.out):
+                break
+            time.sleep(1)
+
+    def emit(dom, acc, tool, c):
+        for tol in (0, 2):
+            sub = c[tol]
+            tot = sub["exact"] + sub["overtrim"] + sub["undertrim"] + sub["unaligned"]
+            with open(a.out, "a", newline="") as fh:
+                csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(
+                    [dom, acc, tool, tol, sub["exact"], sub["overtrim"],
+                     sub["undertrim"], sub["unaligned"], sub["dropped"], tot])
+
+    for i, w in enumerate(winners, 1):
+        dom, acc = w["domain"], w["run_accession"]
+        v0 = f"{W}/{dom}/{acc}/v0"
+        gtp, s1, s2 = (f"{v0}/sim.v0.gt.tsv", f"{v0}/sim.v0_R1.fastq.gz",
+                       f"{v0}/sim.v0_R2.fastq.gz")
+        if not (os.path.exists(gtp) and os.path.exists(s1)):
+            continue
+        gt = gt_rows(gtp)
+        coremap = core_to_pid([s1, s2])
+        d = f"/tmp/ovf/{a.offset}_{dom}_{acc}"
+        os.makedirs(d, exist_ok=True)
+
+        base = ["--force", "-q", "--gz-level", "6"]
+        for key, (flag, conv) in CONF.items():
+            if w.get(key) not in (None, ""):
+                base += [flag, conv(w[key])]
+        if w.get("r2_reverse") in ("True", "true", "1"):
+            base += ["--r2-scan-reverse"]
+        if w.get("interior") in ("True", "true", "1"):
+            base += ["--interior"]
+
+        # ---- fastprep: shipped default, then head_dropout 0
+        for tag, hdv in (("fastprep-hd4", None), ("fastprep-hd0", 0)):
+            argv = list(base)
+            argv += ["--head-dropout", str(eff_hd(w) if hdv is None else hdv)]
+            px = f"{d}/{tag}.pxmt"
+            r = subprocess.run([FP, "-1", s1, "-2", s2, "-o", f"{d}/{tag}_R1.fq.gz",
+                                "-p", f"{d}/{tag}_R2.fq.gz", "--metadata", px]
+                               + argv, capture_output=True)
+            if r.returncode != 0:
+                print(f"  [{i}] {acc} {tag}: rc={r.returncode}", flush=True)
+                continue
+            p = parse_pxmt(px)
+            emit(dom, acc, tag, {t: score_fastprep(p, coremap, gt, t)
+                                 for t in (0, 2)})
+
+        # ---- fastp: shipped default and tuned, scored by alignment
+        orig = read_fastq_keyed(s1) + read_fastq_keyed(s2)
+        for tag, extra in (("fastp-default", []), ("fastp-tuned", FASTP_TUNED)):
+            o1, o2 = f"{d}/{tag}_R1.fastq.gz", f"{d}/{tag}_R2.fastq.gz"
+            r = subprocess.run([FASTP, "-i", s1, "-I", s2, "-o", o1, "-O", o2,
+                                "-w", "4", "-z", "6"] + extra,
+                               capture_output=True)
+            if r.returncode != 0:
+                print(f"  [{i}] {acc} {tag}: rc={r.returncode}", flush=True)
+                continue
+            trimmed = read_fastq_keyed(o1) + read_fastq_keyed(o2)
+            emit(dom, acc, tag, {t: score_fastp(orig, trimmed, gt, t)
+                                 for t in (0, 2)})
+        subprocess.run(["rm", "-rf", d], capture_output=True)
+        if i % 10 == 0:
+            print(f"  [{i}/{len(winners)}] {acc}", flush=True)
+    print("done", flush=True)
+
+
+if __name__ == "__main__":
+    main()
