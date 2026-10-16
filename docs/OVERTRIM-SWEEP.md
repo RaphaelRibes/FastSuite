@@ -1,9 +1,9 @@
 # The head_dropout axis: the sweep could not express 0, and 0 wins everywhere
 
-**Question.** The shipped `fastprep` default trims a fixed 5' dropout of
-`head_dropout=4` bases before the polyX scan. The config sweep never tested
-whether that default is right — so this phase measured it. Two bugs guaranteed
-the answer was invisible:
+**Question.** The shipped `fastprep` default at the time (4 — it is now 0,
+commit `3d76a31`) trims a fixed 5' dropout of `head_dropout=4` bases before the
+polyX scan. The config sweep never tested whether that default was right — so
+this phase measured it. Two bugs guaranteed the answer was invisible:
 
 1. `effective_head_dropout()` in `bench/scripts/sweep.py` floored the value at
    1 (`max(1, min(hd, min_run - 1))`), so the grid could **never** express
@@ -62,7 +62,7 @@ tolerance 0 (% of kept mates):
 | 1 | 80.27 % | 18.44 % | 1.29 % | 19.73 % | 3,638,828 |
 | 2 | 76.39 % | 22.54 % | 1.07 % | 23.61 % | 3,641,460 |
 | 3 | 75.53 % | 23.44 % | 1.03 % | 24.47 % | 3,642,980 |
-| 4 (shipped) | 75.36 % | 23.64 % | 1.00 % | 24.64 % | 3,643,718 |
+| 4 (then-shipped) | 75.36 % | 23.64 % | 1.00 % | 24.64 % | 3,643,718 |
 
 tolerance 2:
 
@@ -72,7 +72,7 @@ tolerance 2:
 | 1 | 99.69 % | 0.05 % | 0.25 % | 0.31 % |
 | 2 | 99.69 % | 0.06 % | 0.25 % | 0.31 % |
 | 3 | 98.82 % | 0.97 % | 0.21 % | 1.18 % |
-| 4 (shipped) | 98.65 % | 1.17 % | 0.18 % | 1.35 % |
+| 4 (then-shipped) | 98.65 % | 1.17 % | 0.18 % | 1.35 % |
 
 Per sim variant the numbers are within 0.05 pp of each other (v0 tol 0:
 hd=0 92.60 / 0.07 / 7.33, hd=4 75.35 / 23.64 / 1.00 — v1/v2 identical to two
@@ -117,8 +117,9 @@ its accuracy by discarding data.
   per-dataset selection:** `head_dropout 0` is the right default on this
   corpus (100/101 datasets, +17.2 pp exact at tol 0, 3.3x lower total error).
   The paper's configuration table should record `head_dropout=0` for fastprep,
-  and the shipped default of 4 is badly wrong for these artefact regimes —
-  it eats 23.4 % of kept windows.
+  and the default it shipped at the time (4) is badly wrong for these artefact
+  regimes — it eats 23.4 % of kept windows. (`0` has since become the shipped
+  default, `3d76a31`.)
 - The closed loop must treat `head_dropout` as a real axis from 0:
   `effective_head_dropout` now floors at 0, and any future sweep grid that
   authors 0 will actually run it. hd=1 is worth keeping as a candidate for

@@ -147,7 +147,8 @@ workdir = "/work"
 # Build every tool in dependency order (fasthelper last).
 build = "bash scripts/build.sh"
 build-offline = "bash scripts/build.sh --offline"
-# All six tool test suites (397 tests).
+# All six tool test suites plus the pathology corpus (466 on the GRAND line:
+# 465 cargo tests + 1 pathology aggregate line covering 9 assertions).
 test = "bash scripts/test.sh"
 doctor = "./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools"
 demo = "bash examples/demo.sh"

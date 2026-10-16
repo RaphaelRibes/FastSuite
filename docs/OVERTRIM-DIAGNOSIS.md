@@ -2,6 +2,9 @@
 
 Bench: strict-tolerance (tol 0) overtrim of 29.5% for `fastprep-winner`
 against fastsim's exact ground truth. fastp-default: 0.2%; fastp-tuned: 8.6%.
+(This 29.5% is the *published* cross-generation figure, since shown invalid —
+the corrected overtrim is 23.4%; see `docs/TRIM-ACCURACY-DISCREPANCY.md`. The
+mechanism below was re-verified on fresh measurements, so the analysis stands.)
 
 ## The cause, established by controlled experiment
 

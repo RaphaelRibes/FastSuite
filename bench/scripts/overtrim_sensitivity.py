@@ -145,11 +145,12 @@ def argv(cfg: dict, work: str, cid: int) -> list[str]:
     if cfg.get("interior"):
         a.append("--interior")
     if cfg.get("head_dropout") is None:
-        # The CLI default is 4, which fastprep refuses to combine with
-        # --min-run < 5. Always pin the value explicitly so every config in
-        # the grid is runnable and the default is a visible choice, not a
-        # silent clash: 1 means "only trim a 1 bp leading G-run", which for
-        # min_run <= 5 is what the scan would own anyway.
+        # fastprep refuses to combine a head-dropout >= min_run, which the old
+        # CLI default of 4 hit on --min-run < 5 (the default is now 0, commit
+        # 3d76a31). Always pin the value explicitly so every config in the grid
+        # is runnable and the value is a visible choice, not a silent clash:
+        # 1 means "only trim a 1 bp leading G-run", which for min_run <= 5 is
+        # what the scan would own anyway.
         a += ["--head-dropout", "1"]
     else:
         n = min(cfg["head_dropout"], max(1, cfg["min_run"] - 1))

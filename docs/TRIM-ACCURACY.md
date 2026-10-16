@@ -14,8 +14,16 @@ This is a **configuration finding, not an algorithmic one**. The loss is
 entirely attributable to one shipped default: `--head-dropout 4`, a rule that
 trims any leading G-run of length 1..=4 exactly, with no quality gate and no
 test of artefact versus biology. Turn the rule off and fastprep matches or
-beats fastp on every aggregate axis. The shipped default is still 4 as of this
-writing; a default change is pending.
+beats fastp on every aggregate axis. The shipped default was 4 when this was
+written; it is now **0** (commit `3d76a31`), so the `fastprep-hd-off` column is
+what a build from current `main` does by default.
+
+**Number note.** The tables below were measured before the min-len harness
+repair in `73c2385` (§4 of `docs/TRIM-ACCURACY-DISCREPANCY.md`): that moved the
+shipped-default `fastprep-shipped` row at tolerance 0 from 75.6% to **75.4%**
+exact. The earlier 66.5% is the invalid cross-generation figure and is *not*
+fastprep's accuracy. The `fastprep-hd-off` (92.6%) and fastp (92.2% / 84.1%)
+figures are unchanged.
 
 `bench/scripts/overtrim_vs_fastp.py` produces these numbers from
 `bench/results/phase-d/overtrim-vs-fastp.tsv` (809 lines: header + 808 rows,
@@ -52,9 +60,9 @@ truth, one read-keying scheme:
 - **fastp-tuned** — fastp with `--cut_front`/`--cut_tail` (window 5, mean
   quality 20), `--qualified_quality_phred 20`, `--length_required 30`,
   `--low_complexity_filter`.
-- **fastprep-shipped** — fastprep with its shipped default
-  `--head-dropout 4`: any leading G-run of length 1..=4 is trimmed exactly,
-  unconditionally.
+- **fastprep-shipped** — fastprep with the then-shipped default
+  `--head-dropout 4` (the shipped default is now 0): any leading G-run of
+  length 1..=4 is trimmed exactly, unconditionally.
 
 fastp reports no trim positions, so its cuts are recovered by aligning the
 trimmed read back onto the original. A pure trim is a substring of the
@@ -129,14 +137,16 @@ mates per tool per tolerance.
 Under the same harness, fastp's numbers reproduce to the digit from its own
 published table: **fastp-default 92.19% -> 92.19%** and **fastp-tuned 84.06%
 -> 84.06%**. fastprep's published baseline does **not** reproduce: **66.50%
-published vs 75.59% fresh**. That discrepancy is a separate, open
-investigation; the current measurement supersedes the published baseline
-rather than explaining it.
+published vs 75.59% fresh**. That discrepancy was a separate defect in the
+earlier harness — root-caused in `50e8373` and repaired in `73c2385` (see
+`docs/TRIM-ACCURACY-DISCREPANCY.md`) — so the current measurement supersedes
+the published baseline.
 
 ## Interpretation
 
-**The shipped default loses; the algorithm does not.** fastprep with
-`--head-dropout 4` is the worst of the four at tolerance 0 (75.6% exact,
+**The then-shipped default loses; the algorithm does not.** fastprep at the
+then-shipped default (`--head-dropout 4`) is the worst of the four at tolerance
+0 (75.6% exact,
 23.4% overtrim). With `--head-dropout 0` it is the best (92.6%, 0.1%
 overtrim). The single rule accounts for the entire gap: `--head-dropout 4`
 trims any leading G-run of length 1..=4 exactly, with no quality gate and no
@@ -144,9 +154,10 @@ test of artefact versus biology. On a library where roughly a quarter of reads
 start with a real G, that removes real sequence — 23.4% of kept mates are
 overtrim at tolerance 0, and even at tolerance 2 (which forgives off-by-one
 and off-by-two boundaries) 1.2% remain, because a run of 3–4 genuine leading
-G's is trimmed wholesale. The project's own sweep clamps `head_dropout` to
-`>= 1`, so the disabled alternative was inexpressible in the sweep and the
-default was never calibrated against it.
+G's is trimmed wholesale. The project's own sweep clamped `head_dropout` to
+`>= 1` at the time, so the disabled alternative was inexpressible in the sweep
+and the default was never calibrated against it — the floor is now 0
+(`c53dbd6`), and `--head-dropout 0` is the shipped default.
 
 **fastprep-hd-off is the strongest tool by this measurement**, but the margin
 over fastp-default is within noise at tolerance 2 (99.7% vs 99.6%) and slight
@@ -213,8 +224,9 @@ is not an apples-to-apples comparison.
   comparison are not equally direct.
 - The old published baseline (66.5% for fastprep-winner) does not reproduce
   under the current harness (75.59% for the same shipped configuration). This
-  is unresolved; the numbers here come from the single-harness run and should
-  be cited in preference to the older table.
+  was resolved in `73c2385` — the stored-PXMT staleness bug, see
+  `docs/TRIM-ACCURACY-DISCREPANCY.md`; the numbers here come from the
+  single-harness run and should be cited in preference to the older table.
 
 ## Reproducing
 

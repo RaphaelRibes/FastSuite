@@ -2,11 +2,12 @@
 """Does simply NOT hard-trimming short leading G-runs fix the overtrim?
 
 The claim under test: fastprep hard-trims leading G-runs of length 1..=n
-(head_dropout, default 4) unconditionally. On fastsim ground truth 64.4% of
-those r=1 cases are pure biology, so the hard trim overtrims them.
+(head_dropout — the shipped default was 4 when this was written; it is now 0,
+commit 3d76a31) unconditionally. On fastsim ground truth 64.4% of those r=1
+cases are pure biology, so the hard trim overtrims them.
 
 This runs fastsim from a profile, then fastprep in three configurations:
-  A  default            (head_dropout 4)
+  A  head_dropout 4     (pinned; the then-shipped default)
   B  head dropout off   (--head-dropout 0)
   C  boundary-anchored + head dropout off
 and scores exact / overtrim / undertrim against the GT.
@@ -128,12 +129,13 @@ def main():
     coremap = core_to_pid([sim1, sim2])
     print(f"profile={os.path.basename(a.profile)} pairs={a.pairs} gt={len(gt)}")
 
-    # NOTE: the CLI rejects --head-dropout 0 ("must be >= 1"), so a single
-    # leading G is ALWAYS hard-trimmed and the rule cannot be switched off
-    # through the CLI. --no-5 disables the whole 5' path including that hard
-    # trim, which is what we need to measure its cost.
+    # NOTE: --head-dropout 0 is now accepted (dfae9b7) and disables the rule.
+    # Variant A pins --head-dropout 4 explicitly rather than relying on "the
+    # default": 4 was the shipped default when this was written, but the
+    # shipped default is now 0 (commit 3d76a31), so an unpinned A would
+    # silently collapse into B.
     variants = [
-        ("A default head-dropout 4", []),
+        ("A head-dropout 4", ["--head-dropout", "4"]),
         ("B head-dropout 0 (rule disabled)", ["--head-dropout", "0"]),
         ("C head-dropout 1 (min)", ["--head-dropout", "1"]),
         ("D head-dropout 2", ["--head-dropout", "2"]),

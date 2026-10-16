@@ -4,15 +4,17 @@
 The Phase D bench scored the sweep winner at strict tolerance 0 by reading its
 PXMT metadata. This script re-scores a short list of candidate configs on the
 same synthetic profiles the sensitivity analysis uses, with the head-dropout
-value pinned EXPLICITLY on every run: fastprep's CLI default is 4, and pinning
-it matters because (a) the default is a real decision, not a zero, and (b)
-fastprep refuses head-dropout >= min-run, so a silent default changes the grid
-underneath you when min_run drops.
+value pinned EXPLICITLY on every run. Pinning it matters because (a) the value
+is a real decision, not a zero, and (b) fastprep refuses head-dropout >=
+min-run, so letting it fall through to the CLI default changes the grid
+underneath you when min_run drops. The unset pin is 4 — the value fastprep
+shipped when this list was authored; the shipped default is now 0 (commit
+3d76a31), so the explicit pin is what keeps this historical result reproducible.
 
 Candidate list (all scored at tol 0 and tol 2, plus the sweep's own score):
 
-  base                   the shipped default (min_run 12, mercy 3, min_len 0.9)
-  base+hd=1              the shipped default with head-dropout pinned to 1
+  base                   the historical shipped default (min_run 12, mercy 3, min_len 0.9, head-dropout 4)
+  base+hd=1              that base with head-dropout pinned to 1
   hd=2/3/4/6             the head-dropout axis alone
   min_run 9..16          the axis the Phase D winners actually sit on
   min_len 0.95..1.0      the length floor
@@ -45,7 +47,7 @@ def build(cfg: dict) -> list[str]:
     if cfg.get("head_dropout") is not None:
         a += ["--head-dropout", str(cfg["head_dropout"])]
     else:
-        a += ["--head-dropout", "4"]  # the shipped default, stated explicitly
+        a += ["--head-dropout", "4"]  # the then-shipped value, stated explicitly
     if cfg.get("r2_reverse"):
         a.append("--r2-scan-reverse")
     if cfg.get("interior"):

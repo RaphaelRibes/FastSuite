@@ -3,8 +3,9 @@
 
 SUPERSEDED — do not cite the tables this prints as current. This reads
 bench/results/phase-d/trim-accuracy.tsv (606 rows), the original 3-tool run
-whose fastprep baseline (fastprep-winner, 66.5%) is under open investigation
-and does not reproduce (75.59% fresh). The current trim-accuracy measurement
+whose fastprep baseline (fastprep-winner, 66.5%) was root-caused to a
+stale-PXMT scoring bug (50e8373) and repaired in 73c2385. 66.5% is the invalid
+cross-generation number — the valid shipped-default figure is 75.4%. The current trim-accuracy measurement
 is bench/results/phase-d/overtrim-vs-fastp.tsv (all four tools under one
 harness), produced by bench/scripts/overtrim_vs_fastp.py and documented in
 docs/TRIM-ACCURACY.md. This script is kept only to reproduce the historical

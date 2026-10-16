@@ -2,7 +2,9 @@
 
 Bench reference: `fastprep-winner` over 101 real libraries, strict tolerance 0
 = 66.5% exact / 29.5% overtrim / 4.0% undertrim; tolerance ±2 = 98.4 / 1.3 /
-0.3. `fastp` default: 92.2 / 0.2 / 7.6 at tolerance 0.
+0.3. `fastp` default: 92.2 / 0.2 / 7.6 at tolerance 0. (The 66.5% is the
+published cross-generation number, later shown invalid; the valid
+shipped-default figure is **75.4%** — see `docs/TRIM-ACCURACY-DISCREPANCY.md`.)
 
 Four independent investigations were run (ceiling, quality, paired-end,
 implementation). This is the consolidated answer to "fix the overtrim".
@@ -22,12 +24,13 @@ What the data actually shows is two separate errors:
    keeps walking into flanking non-run biology until the gap mass trips `mercy`,
    so a 12/16/20 bp run is cut at 14/18/22. This is a boundary-placement bug
    and it is fixable.
-2. **An unconditional leading-G hard trim.** `head_dropout` (default 4) trims
+2. **An unconditional leading-G hard trim.** `head_dropout` (the shipped
+   default 4 at the time; now 0) trims
    any leading G-run of length 1..=4 exactly, with no quality gate and no
    question of whether the G is artefact. On a library whose first base is often
    a real G, this removes real sequence.
 
-## Finding 1 — the default `head-dropout 4` is dominated by `1`
+## Finding 1 — the then-default `head-dropout 4` is dominated by `1`
 
 Measured per mate against fastsim ground truth, tolerance 0 (30k pairs, the
 `bench/fixtures/overtrim/` profiles):
@@ -106,8 +109,10 @@ error). See `docs/OVERTRIM-CEILING.md`.
 
 1. Ship `--boundary-anchored` (done, opt-in) — fixes the overshoot, free.
 2. Change the default `--head-dropout 4` → `1`, or make it per-mate. This is a
-   strictly-better default: +5–6 pp exact, no cost. **Not yet done** — it
-   changes shipped behaviour and should be a deliberate decision.
+   strictly-better default: +5–6 pp exact, no cost. **Superseded** — on the
+   full-corpus evidence the shipped default was instead set to `0`
+   (`3d76a31`), where `0` wins 100/101 datasets (`docs/OVERTRIM-SWEEP.md`);
+   `1` remains the recommended compromise for long-read regimes.
 3. Allow `--head-dropout 0` (done) and document that the right value is
    library-dependent.
 4. Do not ship the 3' quality rule on fastsim evidence alone.

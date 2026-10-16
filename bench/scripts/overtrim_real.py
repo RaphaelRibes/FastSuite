@@ -10,7 +10,9 @@ Inputs on the desktop:
   work/<domain>/<acc>/v0/sim.v0_*  the simulated pair + its ground truth
 
 Variants (all inherit the dataset's winning config for every other knob):
-  baseline          the shipped default (head_dropout 4)
+  baseline          the winner config at its recorded head_dropout (4 — the
+                    value shipped when the Phase D sweep ran; the shipped
+                    default is now 0, commit 3d76a31)
   hd1               --head-dropout 1
   hd0               --head-dropout 0
   ba                --boundary-anchored

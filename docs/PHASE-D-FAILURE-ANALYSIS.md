@@ -1,5 +1,11 @@
 # FastSuite Phase D — failure analysis and fixes
 
+> **Superseded (2026-10-16).** This is a point-in-time record from 2026-10-15.
+> The closed loop later reached **167/306 = 54.6%** (52 of 102 datasets passing
+> every variant), not the 113/306 recorded here, and the suite is now **466** on
+> the `scripts/test.sh` GRAND line (not 461). Authoritative closed-loop figure:
+> `bench/results/phase-d/closed_loop.tsv`. Current state: `docs/STATUS.md`.
+
 **Corpus:** 102 real ENA datasets × 55 configs × 3 variants = 306 (dataset, variant) comparisons.
 **Method:** closed loop — fastcheck fits a profile from the real library, fastsim simulates from that profile, fastcheck re-measures the simulation, and the two measurements are compared against tolerance.
 

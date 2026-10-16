@@ -68,9 +68,12 @@ What Phase D settles, and what it does not:
   `min-adapter-overlap 14` hold in **all 101** winners, and the interior scan
   stays off in 100 of 101 — the one point where the old campaign's verdict
   survives intact.
-* `head-dropout` is **not a swept knob** at all — it is absent from the Phase D
-  grid, so this campaign says nothing about it either way. It remains a
-  default carried from the earlier campaign, not a validated one.
+* `head-dropout` is **not one of the knobs the Phase D grid swept** — the
+  campaign's grid did not author it, so this campaign says nothing about it
+  either way. It was a default carried from the earlier campaign, not a
+  validated one. (The axis was added to the grid afterwards — `c53dbd6` — and
+  `0` then won 100/101 datasets; see `docs/OVERTRIM-SWEEP.md`. `0` is now the
+  shipped default, `3d76a31`.)
 
 Shipping the flag wired to the default would still be **dishonest**: on this
 corpus the default is not the winner, so a ranker that merely reproduces it
@@ -98,9 +101,9 @@ win a retention number.
 **Phase D's corpus is 101 datasets, not 500 — the sweep as run is narrower
 than planned.** The committed Phase D results are 101 real ENA datasets × 55
 configs × 3 variants (`bench/results/phase-d/winners.tsv`, 101 rows;
-`closed_loop.tsv`, 276 rows over 23 datasets), with the closed loop at a
-144-of-276 pass rate and the duplicate-ratio gate the dominant failure (120
-of 132). That is enough to establish the correction above — the default is
+`closed_loop.tsv`, 306 rows over 102 datasets), with the closed loop at
+**167/306 = 54.6%** and the per-position G-fraction gate the dominant failure
+(120 of 139 failing rows, against duplicate-ratio 18 of 139). That is enough to establish the correction above — the default is
 not the universal winner, and per-domain signal exists — but it is **not**
 enough to train and honestly evaluate a per-domain ranker: 101 datasets
 across six domains is roughly 17 per domain, and a group k-fold over that

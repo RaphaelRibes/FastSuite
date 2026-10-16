@@ -59,16 +59,21 @@ import time
 # on 110 bp data and "20%" on 150 bp data, which would make the two read
 # regimes non-comparable.
 #
-# head_dropout defaults to 4, fastprep's shipped value, so a config that does
-# not mention it runs with the shipped 5'-rule. It is recorded per row so the
+# head_dropout in DEFAULTS is 4 — the value fastprep shipped when this grid was
+# authored (commit 3d76a31 later changed the shipped default to 0). The grid is
+# kept frozen at 4 so the recorded Phase D sweep results keep meaning what they
+# meant; a config that does not mention head_dropout therefore runs the 5'-rule
+# at 4, not at the current shipped value. The value is recorded per row so the
 # axis is measurable rather than inferred.
 DEFAULTS = dict(min_run=12, mercy=3, phred_sat=20, gate_shape=1.0,
                 min_len=0.9, mean_q=25.0, adapter_err=0.2, min_overlap=14,
                 r2_reverse=False, interior=False, head_dropout=4)
 
-# The shipped default is config #0 and is always evaluated first.
+# Config #0 is the grid default — the *historical* shipped default (head_dropout
+# 4) — and is always evaluated first. It is not today's shipped default: that is
+# now head_dropout 0 (commit 3d76a31).
 GRID = [
-    DEFAULTS,                                        # 0  shipped default
+    DEFAULTS,                                        # 0  historical shipped default
     # --- polyX aggressiveness axis ---
     dict(min_run=8),  dict(min_run=10), dict(min_run=14), dict(min_run=16), dict(min_run=20),
     dict(mercy=1),    dict(mercy=2),   dict(mercy=5),    dict(mercy=8),
@@ -88,8 +93,9 @@ GRID = [
     dict(interior=True), dict(interior=True, min_run=10),
     # --- head dropout (NovaSeq first-cycle 5' G) ---
     # A real axis: 0 disables the 5'-rule entirely, 1 trims only the first
-    # base. 0/1 sit on the shipped min_run=12 as single-axis moves off the
-    # shipped default; 4/6 probe the aggressive end on lower min_run.
+    # base. 0/1 sit on the grid's min_run=12 as single-axis moves off config #0
+    # (head_dropout 4, the value shipped when this grid was authored — the
+    # shipped default is now 0); 4/6 probe the aggressive end on lower min_run.
     dict(head_dropout=0), dict(head_dropout=1),
     dict(min_run=10, head_dropout=4), dict(min_run=8, head_dropout=6),
     # --- combinations that a per-axis sweep cannot reach ---
@@ -371,10 +377,11 @@ def build_argv(cfg: dict, work: str, cid: int, read_len: int = 150) -> list[str]
     if cfg.get("interior"):
         a.append("--interior")
     # The head-dropout axis. Emitted EXPLICITLY on every run, including when the
-    # grid did not set it: fastprep's CLI default is 4, so an axis that is
-    # invisible when it equals the default and applies when it does not leaves
-    # the authored values (0, 1, 4, 6) indistinguishable from the default in
-    # the results — the axis was authored, never measured, and never recorded.
+    # grid did not set it: an axis whose emitted value silently tracked the CLI
+    # default would leave the authored values (0, 1, 4, 6) indistinguishable
+    # from that default in the results — the axis was authored, never measured,
+    # and never recorded. (The CLI default was 4 when this grid was authored and
+    # is 0 now, which is exactly why the value must be emitted, not assumed.)
     #
     # Route it through effective_head_dropout(), which is also what the row
     # records, so the argv and the column cannot disagree. fastprep refuses

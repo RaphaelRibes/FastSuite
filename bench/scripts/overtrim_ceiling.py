@@ -68,7 +68,8 @@ RMAX = 25          # largest observed run length bucket kept (rest -> "25+")
 CMAX = 25          # largest candidate cut considered by the Bayes rules
 TOLS = (0, 2)
 
-# fastprep reference config: the shipped default (bench/scripts/sweep.py base).
+# fastprep reference config: the historical Phase D shipped default (the
+# bench/scripts/sweep.py base, head_dropout 4 — the shipped default is now 0).
 FP_BASE = ["--min-run", "12", "--mercy", "3", "--phred-sat", "20",
            "--gate-shape", "1.0", "--min-len", "0.9L", "--mean-q", "25.0",
            "--adapter-error-rate", "0.2", "--min-adapter-overlap", "14",

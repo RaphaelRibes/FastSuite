@@ -85,7 +85,9 @@ verify. Consequently (fastsim datasets, 20k pairs each, production defaults,
 | **pooled** | **61.3 / 26.8 / 12.0** | **61.4 / 26.5 / 12.0** | **82.2 / 6.0 / 11.8** | **82.3 / 5.9 / 11.9** | **304** | **86** |
 
 (The published figure in docs/OVERTRIM-DIAGNOSIS.md — 66.5 / 29.5 / 4.0 at
-tol 0 — is the winner config's number; the closest reproduction here is
+tol 0 — is the winner config's number; it is the *published* cross-generation
+figure, since shown invalid — the corrected shipped-default figure is
+75.4 / 23.4 / 1.0, see `docs/TRIM-ACCURACY-DISCREPANCY.md`; the closest reproduction here is
 mandril with production defaults: 67.8 / 30.8 / 1.4. Configs differ in
 head-dropout and dedup; the before/after comparison above is internally
 consistent on one config.)

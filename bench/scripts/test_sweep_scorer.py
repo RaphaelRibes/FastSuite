@@ -153,7 +153,7 @@ chk2("hd authored 6, min_run 2 (capped)", _sw.effective_head_dropout(
     {"min_run": 2, "head_dropout": 6}), 1)
 chk2("hd 0 survives the cap, min_run 2", _sw.effective_head_dropout(
     {"min_run": 2, "head_dropout": 0}), 0)
-chk2("hd unset (shipped default 4)", _sw.effective_head_dropout(
+chk2("hd unset (grid DEFAULTS 4, the then-shipped value)", _sw.effective_head_dropout(
     {"min_run": 12}), 4)
 chk2("grid records the column", "head_dropout" in _sw.ROW_FIELDS, True)
 _axis = set()

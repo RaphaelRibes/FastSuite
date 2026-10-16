@@ -255,7 +255,7 @@ def main():
         if w.get("interior") in ("True", "true", "1"):
             base += ["--interior"]
 
-        # ---- fastprep: shipped default, then head_dropout 0
+        # ---- fastprep: the then-shipped value (head_dropout 4), then 0
         for tag, hdv in (("fastprep-hd4", None), ("fastprep-hd0", 0)):
             argv = list(base)
             argv += ["--head-dropout", str(eff_hd(w) if hdv is None else hdv)]

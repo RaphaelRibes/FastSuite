@@ -177,7 +177,9 @@ for overtrim removal with undertrim and vice versa.
 ## 6. Why the local baseline is not 66.5 / 29.5 / 4.0
 
 The Phase-D reference (desktop, 101 fitted real-library profiles,
-fastprep-winner: tol 0 = 66.5/29.5/4.0, tol 2 = 98.4/1.3/0.3) is quoted as
+fastprep-winner: tol 0 = 66.5/29.5/4.0, tol 2 = 98.4/1.3/0.3 — the *published*
+cross-generation figures, since shown invalid; the corrected shipped-default
+figure is 75.4/23.4/1.0, see `docs/TRIM-ACCURACY-DISCREPANCY.md`) is quoted as
 external context only; those datasets are on the unreachable desktop. The
 local fixtures are regime-shifted: `high` puts 4–20 bp tails on ~90% of
 mates against `min_run 12` (hence 53.8% undertrim), `low`/`mid` land at

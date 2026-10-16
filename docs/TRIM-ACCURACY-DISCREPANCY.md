@@ -156,23 +156,36 @@ Note also that `winners.tsv` (winner selection) is itself from the old
 generation's sweep rows; both tables inherit this, so both measure "the
 old-generation winner config" and the fastp-vs-fastprep comparison stands.
 
-## 7. Fix (documented, not applied)
+## 7. Fix (applied in `73c2385`)
 
 `trim-accuracy.tsv` is **proven corrupt as a fastprep measurement**: its
 fastprep-winner rows pair generation-1 trim decisions with generation-2 ground
-truth. Its fastp rows are valid. Rather than silently rewriting it:
+truth. Its fastp rows are valid.
 
-1. Regenerate the `fastprep-winner` rows by re-running each winner config on
-   the current sim (`trim_discrepancy_probe.py`'s C mode emits the as-swept
-   argv; fix `overtrim_vs_fastp.py::_minlen` first if that harness is reused),
-   or mark the table superseded by `overtrim-vs-fastp.tsv`.
-2. Add a staleness guard to `trim_accuracy.py`: refuse to score a PXMT older
-   than the sim it is scored against (or embed the sim hash in the PXMT run).
-3. Make `sweep.py`'s resume key include the input identity — `c<cid>.row`
-   existence alone survives a corpus regeneration and silently re-validates
-   stale metrics.
-4. Fix `sweep.py`'s exit code (`n_done == min(args.configs, len(GRID))`) so a
-   full sweep stops reporting failure.
+All four repairs below landed in commit `73c2385` ("bench: fix the three
+trim-accuracy defects; re-run the four-tool comparison"). `trim-accuracy.tsv`
+is left in place untouched as superseded; the authoritative table is
+`overtrim-vs-fastp.tsv`, regenerated over all 101 datasets at both tolerances.
+Its corrected tolerance-0 headline: **shipped default 75.35%** (was 75.59%
+before the `_minlen` repair), **fastprep-hd0 92.60%**, **fastp-default 92.19%**,
+**fastp-tuned 84.06%**.
+
+1. **Staleness guard — applied.** `trim_accuracy.py` now refuses to score a
+   PXMT older than the sim it is scored against (mtime guard), so a regenerated
+   corpus can no longer be scored against stored trim decisions from a
+   different draw.
+2. **Resume-key identity — applied.** `sweep.py`'s resume cache is keyed on the
+   inputs' identity (path + size + mtime of `r1`/`r2`/`gt`) instead of
+   `c<cid>.row` existence alone, and invalidates cached rows when the corpus
+   changes — a regenerated corpus no longer silently replays stale metrics.
+3. **Exit code — applied.** `sweep.py` now exits 0 on a full sweep by comparing
+   against `min(--configs, len(GRID))`, so the chain's `CONFIGS=60` over a
+   57-config grid no longer reports `sweep failed`.
+4. **`_minlen` semantics — applied.** `overtrim_vs_fastp.py::_minlen` reads
+   `min_len_effective` from `winners.tsv` instead of passing the grid's raw
+   integer as a base count, so it runs the same config the sweep ran (this is
+   what changed the tol-0 headline from 75.59% to 75.35%: it affected the two
+   clamped winners, `virome/SRR19649201` and `generalised/DRR000432`).
 
 Reproduce: `python3 bench/scripts/trim_discrepancy_probe.py <domain>/<acc> ...`
 on the desktop (paths and binary locations are module constants).

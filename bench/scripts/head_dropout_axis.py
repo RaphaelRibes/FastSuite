@@ -3,7 +3,8 @@
 
 The old sweep could never express head_dropout 0 (effective_head_dropout
 floored the value at 1) and never emitted --head-dropout at all, so every
-winning config was measured at fastprep's CLI default 4. This re-scores each
+winning config ran at whatever the CLI default was then — 4 (the shipped
+value at the time; it is now 0, commit 3d76a31). This re-scores each
 dataset's WINNING config from winners.tsv with ONLY head_dropout overridden
 (0..4) and scores the PXMT trim decisions against the sim ground truth per
 mate at tolerance 0 and 2 — the exact / overtrim / undertrim convention of
