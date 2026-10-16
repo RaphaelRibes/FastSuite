@@ -16,14 +16,17 @@ suite is WIP: nothing here is production-ready** (see the README banner).
 | fastprep | 0.2.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
 | fastsim | 0.1.0 | 59 | working — measured insert CDF, SE mode, **clap-migrated** | — |
 | fastmaps | 0.1.0 | 43 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads` | — |
-| fastcheck | 0.1.0 | 107 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
+| fastcheck | 0.1.0 | 108 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
 | fasthelper | 0.1.0 | 21 | working — fastcheck step, `check -c`, `--fail-on` | `plans/2026-10-12_fasthelper-hardening.md` — already done on disk: `run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on` (exit 2); the plan's open items are the *hardening* ones (5–8: `-P/--jobs`, resume/`--from`, `install --prefix`) |
 
-**465 cargo tests, 0 failures**, plus the **pathology corpus: 9 assertions
-passed, 0 failed** — **474 assertions in total**. Note that `scripts/test.sh`
-counts the pathology suite as one aggregate line, so its own `GRAND` reads
-**466** (465 + the one aggregate line); the 9 is the number of individual
-assertions inside it. `pixi run doctor` lists all six binaries; `bash
+**470 cargo tests, 0 failures**, plus the **pathology corpus: 9 assertions
+passed, 0 failed**. Note that `scripts/test.sh` counts the pathology suite as one
+aggregate line, so its own `GRAND` reads **471** (470 + the one aggregate line);
+the 9 is the number of individual assertions inside it. (Measured this run;
+the count moved up from the 465/466 recorded earlier because the tree gained
+tests in the same session, not from the detector fix, which removed three
+obsolete estimator tests and added three regression tests.) `pixi run doctor`
+lists all six binaries; `bash
 examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 `examples/runs/demo/report.html`, mtime 2026-10-15 21:40).
 
@@ -69,7 +72,7 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 | fastprep vs fastp (5M pairs, 1 core, gzip level 6 both) | 34.37 s vs 28.50 s — fastp LEADS this cell; fastprep leads at 100k/500k/1M and on 2 cores (25.84 vs 39.61 s) |
 | fastprep's drop rate tracks the injected must-drop + polyG | 7.7–7.9% drops vs the 4.7–4.8% injected (a retention check, not a trim-accuracy claim) — carried from the paper campaign, not re-measured this session |
 | fasthelper vs MultiQC | zero orchestration overhead (0.667 s vs 0.647 s) + manifest provenance; MultiQC v1.35 emits **no output** on `fastsuite.report.v1` (no module for it) — 0 report files at every N from 25 to 800 samples |
-| fastsim ground-truth recovery | 8/10 parameters exact; the two failures are fastcheck defects (below) |
+| fastsim ground-truth recovery | **10/10 parameters within tolerance** (was 8/10; the two failures were fastcheck fitter defects, now fixed — see "Known defects" 2–3) |
 | fastsim insert resolution | 94–95% measured exactly at 200–288 bp (18 982 of 20 000 at insert 200, p50 200); the 288 bp ceiling is geometry, not a defect |
 | trim accuracy vs simulator ground truth, tolerance 0 (101 real libraries, one harness) | **fastprep with `--head-dropout 0` leads**: 92.6% exact / 0.1% overtrim / 7.3% undertrim. fastp-default 92.2 / 0.2 / 7.6; fastp-tuned 84.1 / 8.6 / 7.3; **fastprep's shipped default (`--head-dropout 4`) is worst at 75.4 / 23.6 / 1.0**. Tolerance 2: 99.7 / 99.6 / 91.2 / 98.7. Aggregate of `bench/results/phase-d/overtrim-vs-fastp.tsv`; see `docs/TRIM-ACCURACY.md` |
 | `head_dropout` axis (1515 runs, 3030 rows = 101 datasets × 3 variants × hd {0,1,2,3,4}) | `0` is the per-dataset winner on **100 of 101** datasets, `1` on the remaining one, `4` on **none**. Corpus total error at tolerance 0: **7.44% at `0` vs 24.64% at `4` (3.3×)**. `docs/OVERTRIM-SWEEP.md`, `bench/results/phase-d/head-dropout-axis.tsv` |
@@ -133,12 +136,40 @@ as a result.
    boundary rule, nor the head-G deconvolution touched it: this is a
    **distinct, still-undiagnosed mechanism**, and it is the main remaining
    blocker to a publishable simulator accuracy number.
-2. **fastcheck's polyG detector** — reports 93.98% tail-free against a true
-   66.01%, zero mass at t=3/t=15 (true 7.99%/6.99%). Reported in the fastsim
-   paper §5.3 as a measured limitation. **Not fixed.**
-3. **fastcheck's worst 10-position quality block** — misses by 0.45 Phred
-   (mean passes at 0.12). **Not fixed.** Together with item 2 these two are
-   the whole of fastsim's 8/10 recovery score.
+2. ~~**fastcheck's polyG detector** — reports 93.98% tail-free against a true
+   66.01%, zero mass at t=3/t=15 (true 7.99%/6.99%).~~ **FIXED.** The profile
+   fitter estimated the head/tail distributions from the per-position G
+   fraction (`P(run >= k) ~= g_frac(k-1) - g_mean`), monotone-clamped and
+   **capped at 12 bases**, while the tool already held the exact per-base
+   run-length histograms (`polyx3`/`polyx5`) it publishes in its own report —
+   so a 15-base run could not be expressed at all and whole modes of a
+   multi-modal tail were lost to the clamp. It now reads the measured
+   histogram and subtracts the biological boundary run (geometric,
+   `(1-q) q^k`, q from the interior per-position G fraction). Measured against
+   the simulator's ground truth the fitted R1 tail is now
+   {0: 66.6%, 3: 7.98%, 5: 13.6%, 10: 4.75%, 15: 6.38%} against a true
+   {66.0%, 7.99%, 14.0%, 5.0%, 7.0%}: **TV 0.280 → 0.013** (tolerance 0.20).
+   The head row improves for the same reason, 0.025 → 0.005.
+3. ~~**fastcheck's worst 10-position quality block** — misses by 0.45 Phred
+   (mean passes at 0.12).~~ **FIXED (0.05 Phred).** The fitter stored the
+   *measured* per-position mean as `pos_q`, while fastsim consumes `pos_q` as
+   the **out-of-run** curve and applies the flat in-run mean to the run bases
+   itself, so every tail base's collapse was counted twice and the curve came
+   out 1.95 Phred low exactly in the block where the tails live. It now emits
+   the deconvolved out-of-run curve (`out[i] = (measured[i] − p_i·tail_q −
+   q_i·head_q) / (1 − p_i − q_i)`) plus the measured `run_q_mean`,
+   `deep_head_q` and `pos_q_uncond`. Worst block **1.95 → 0.05** Phred
+   (tolerance 1.5), curve mean 34.0 exactly.
+
+   **Items 2+3 were the whole of fastsim's recovery score: the re-run
+   recovers 10/10 parameters, up from 8/10.** Both fixes carry a regression
+   test that fails on the pre-fix code (the tail fixture makes the old fitter
+   emit `{"0": 7000, "12": 3000}` — no bin at 3, the 15-run folded into the
+   12-base cap). Note the recovery fixture itself was stale: regenerating it
+   with the current binaries moved the pre-fix score to 9/10 before the fix
+   landed (the tail row passed at 0.126 by accident on the new sim), so the
+   pre/post pair to quote is 0.280/1.95 against 0.013/0.05 on the same binary
+   pair, and 8/10 → 10/10 on the papers' fixture lineage.
 4. ~~**fastprep's `--json` was legacy raw stats** — every other tool emitted
    the v1 wrapper; `fasthelper` adapted it with a note.~~ **Fixed
    (PLAN.md §1.1):** fastprep now writes `fastsuite.report.v1` with the raw

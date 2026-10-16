@@ -78,6 +78,15 @@ pub struct Accum {
     /// `polyx5[base][len]` (leading 5′ run), base 0=A 1=C 2=G 3=T.
     pub polyx3: [Vec<u64>; 4],
     pub polyx5: [Vec<u64>; 4],
+    /// `(sum of raw quality bytes, base count)` for the bases lying INSIDE a
+    /// leading (5′) / trailing (3′) G-run. The profile's flat in-run quality is
+    /// the mean of these bytes minus the Phred offset — the same "store bytes,
+    /// apply the offset at report time" rule the other quality counters here
+    /// follow. Without them the fitted per-position curve cannot be split into
+    /// its out-of-run and in-run parts, which is exactly what the simulator's
+    /// quality model consumes (`pos_q` + `run_q_mean`).
+    pub run_q_head: (u64, u64),
+    pub run_q_tail: (u64, u64),
     /// The fastmaps-style heatmap grid (SIZE*SIZE, row-major y*SIZE+x).
     pub heatmap: Vec<u64>,
     /// Exact duplication counter over 64-bit fingerprints of the whole read. Quality is
@@ -132,6 +141,8 @@ impl Accum {
             track_profile: false,
             polyx3: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             polyx5: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            run_q_head: (0, 0),
+            run_q_tail: (0, 0),
             heatmap: vec![0; heatmap::SIZE * heatmap::SIZE],
             seq_counts: crate::fingerprint::FingerprintTable::with_capacity(1024),
             kmer_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
@@ -249,6 +260,20 @@ impl Accum {
             grow(&mut self.polyx3[tb], tl + 1);
             self.polyx3[tb][tl] += 1;
         }
+        // Quality INSIDE each G-run, per mate. The fitter subtracts this flat
+        // in-run mean out of the per-position curve to recover the out-of-run
+        // curve the simulator wants, so it has to be measured, not inferred.
+        const G: usize = 2; // polyx::base_code(b'G')
+        if lb == G {
+            let n = ll.min(qual.len());
+            self.run_q_head.0 += qual[..n].iter().map(|&b| b as u64).sum::<u64>();
+            self.run_q_head.1 += n as u64;
+        }
+        if tb == G {
+            let start = qual.len().saturating_sub(tl);
+            self.run_q_tail.0 += qual[start..].iter().map(|&b| b as u64).sum::<u64>();
+            self.run_q_tail.1 += (qual.len() - start) as u64;
+        }
 
         // Heatmap cell.
         let (hx, hy) = heatmap::encode(seq);
@@ -291,6 +316,10 @@ impl Accum {
             add_hist(&mut self.polyx3[b], &o.polyx3[b]);
             add_hist(&mut self.polyx5[b], &o.polyx5[b]);
         }
+        self.run_q_head.0 += o.run_q_head.0;
+        self.run_q_head.1 += o.run_q_head.1;
+        self.run_q_tail.0 += o.run_q_tail.0;
+        self.run_q_tail.1 += o.run_q_tail.1;
         for (i, &c) in o.heatmap.iter().enumerate() {
             self.heatmap[i] += c;
         }

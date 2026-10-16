@@ -438,29 +438,39 @@ profile at `--seed 7`.
 Memory grows 34.3 → 47.3 MB across a 50-fold range, because the simulator
 streams one pair at a time.
 
-### Profile recovery — 8 of 10 parameters within tolerance
+### Profile recovery — 10 of 10 parameters within tolerance
 
 | parameter | injected | recovered | abs. error | tolerance | pass |
 |---|---|---|---|---|---|
-| fragment GC | 0.48 | 0.4945 | 0.0145 | 0.02 | ✅ |
-| R1 mean-Q curve | 34.0 | 33.88 | 0.12 | 1.0 Phred | ✅ |
-| R1 worst 10-pos Q block | 0.0 | 1.95 | 1.95 | 1.5 Phred | ❌ |
-| R1 tail run-length distribution | 0.0 | 0.28 | 0.28 | 0.2 TV | ❌ |
-| R1 head run-length distribution | 0.0 | 0.025 | 0.025 | 0.2 TV | ✅ |
-| adapter readthrough (R1) | 0.0495 | 0.049019 | 0.00048 | 0.02 | ✅ |
-| duplicate rate | 0.02 | 0.0200385 | 0.0000385 | 0.005 | ✅ |
-| must-drop rate | 0.05 | 0.049019 | 0.00098 | 0.01 | ✅ |
-| censored share | 0.5576915 | 0.5275 | 0.0302 | 0.05 | ✅ |
-| censored tail share | 0.3402410 | 0.3399025 | 0.00034 | 0.1 | ✅ |
+| fragment GC | 0.48 | 0.4952 | 0.0152 | 0.02 | ✅ |
+| R1 mean-Q curve | 34.0 | 34.0 | 0.0 | 1.0 Phred | ✅ |
+| R1 worst 10-pos Q block | 0.0 | 0.05 | 0.05 | 1.5 Phred | ✅ |
+| R1 tail run-length distribution | 0.0 | 0.013 | 0.013 | 0.2 TV | ✅ |
+| R1 head run-length distribution | 0.0 | 0.005 | 0.005 | 0.2 TV | ✅ |
+| adapter readthrough (R1) | 0.0495 | 0.04895 | 0.00055 | 0.02 | ✅ |
+| duplicate rate | 0.02 | 0.01998 | 0.0000185 | 0.005 | ✅ |
+| must-drop rate | 0.05 | 0.04895 | 0.00105 | 0.01 | ✅ |
+| censored share | 0.5582 | 0.5318 | 0.0264 | 0.05 | ✅ |
+| censored tail share | 0.34024 | 0.34027 | 0.00013 | 0.1 | ✅ |
 
-**The two failures are measurement defects in `fastcheck`, quantified against
-ground truth, and no tolerance was widened to hide them.**
+**The three rows that ever failed were measurement defects in `fastcheck`,
+quantified against ground truth, and no tolerance was widened to hide them.
+All three are now fixed and the two detector fixes are recorded with their
+mechanisms:**
 
-* `tail_hist_R1_tv` — fastcheck's polyG detector reports 93.98 % of reads as
-  tail-free against a true 66.01 %, with zero mass at `t = 3` / `t = 15` where
-  the truth is 7.99 % / 6.99 %.
-* `max_q_block_dev_R1` — the worst 10-position quality block misses by 0.45
-  Phred (mean passes at 0.12).
+* `tail_hist_R1_tv` (**0.28 → 0.013**) — fastcheck's profile fitter estimated
+  the head/tail run-length distributions from the per-position G fraction,
+  monotone-clamped and capped at 12 bases, so it reported 93.98 % of reads as
+  tail-free against a true 66.01 % and had no bin at all at `t = 3` / `t = 15`
+  where the truth is 7.99 % / 6.99 %. It now reads the exact per-base G-run
+  histograms and subtracts the biological boundary run, giving
+  {0: 66.6 %, 3: 7.98 %, 5: 13.6 %, 10: 4.75 %, 15: 6.38 %} against the true
+  {66.0 %, 7.99 %, 14.0 %, 5.0 %, 7.0 %}.
+* `max_q_block_dev_R1` (**1.95 → 0.05 Phred**) — the fitter stored the measured
+  per-position mean as `pos_q`, but the simulator consumes `pos_q` as the
+  out-of-run curve and applies the flat in-run mean itself, so the tail
+  collapse was counted twice. It now emits the deconvolved out-of-run curve
+  plus the measured `run_q_mean` / `deep_head_q` / `pos_q_uncond`.
 
 `censored_share` is the **regression guard**: it failed on the pre-fix build
 (0.8075 against a true 0.5577 — a 25-point gap) and passes after the
@@ -496,9 +506,10 @@ cannot be anchored at all, and that regime needs the adapter boundary.
 
 ### Caveats
 
-* **Two known defects, both in the measurement, neither fixed:** the R1 tail
-  run-length distribution and the worst 10-position quality block. They are
-  reported as failures rather than hidden.
+* **The two detector defects are fixed** (R1 tail run-length distribution
+  0.28 → 0.013; worst 10-position quality block 1.95 → 0.05 Phred). They were
+  reported as failures while they were open; both now pass with the mechanism
+  recorded in §5.
 * **The insert ceiling is a property of paired-end sequencing**, not of any
   tool. Reported as such.
 * **fastsim is single-threaded** and its wall times should never be compared
@@ -561,15 +572,16 @@ propagated.
 | fastmaps vs FastQC, 5 M pairs | `docs/STATUS.md` "Measured this week" | 12.25 s / 143 MB vs 72.22 s / 375 MB | 9.17 s / 145.2 MB vs 16.1 s / 16.4 MB |
 | fastqc at 100 k | `FastMaps-Bench/.bench_run.log` | 4.36 s | 2.1 s (`FastMaps-Paper/benchmark/results.csv`) |
 | fastprep vs fastp, 5 M pairs | `docs/STATUS.md` | 32.9 s vs 84.7 s (2.58×) | 34.37 s vs 28.5 s — fastp **leads** this cell |
-| fastsim recovery | `docs/STATUS.md` | 7 / 10 parameters | 8 / 10 (`FastSim-Paper/benchmark/recovery.csv`) |
+| fastsim recovery | `docs/STATUS.md` | 7 / 10 parameters | 10 / 10 (`FastSim-Paper/benchmark/recovery.csv`) |
 | fasthelper orchestration | `FastHelper-Paper` abstract | "0.69 s vs 0.69 s" | 0.667 s vs 0.647 s |
 | fasthelper aggregation peak | `FastHelper-Paper` abstract | "~50 MB" | 0.02–3.89 MB (multiqc 137 MB) |
 
 Two of these are worth flagging beyond the arithmetic: **fastp leads the 5 M
 one-core cell** (so the STATUS.md "2.58×" win is not the committed result), and
-**fastsim recovery is 8/10, not 7/10** — the 7/10 figure is the older
-`FastSim-Bench` commit message, superseded by the final CSV and the paper's
-caption. The two papers whose CSV differs from their own `-Bench` repo's CSV
+**fastsim recovery is 10/10, not 7/10** — the 7/10 figure is the older
+`FastSim-Bench` commit message and the 8/10 one is the pre-fix fitter,
+superseded by the final CSV and the paper's caption. The two papers whose CSV
+differs from their own `-Bench` repo's CSV
 (FastPrep, FastHelper, FastSim) were resolved in favour of the paper per the
 rule above.
 

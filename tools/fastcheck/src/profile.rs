@@ -5,16 +5,23 @@
 //! the coupled path is `fastcheck --profile p.json` -> `fastsim --profile p.json`
 //! with no Python step in between.
 //!
-//! What is MEASURED, ESTIMATED and INVENTED is unchanged from the Python fitter
-//! and is recorded in the profile's `_comment`:
+//! What is MEASURED and what is INVENTED is recorded in the profile's
+//! `_comment`:
 //!
 //!   MEASURED  read_len, gc (fragment), the per-position mean-Q curve, the
 //!             duplicate rate, the adapter readthrough rate, the per-position
-//!             base composition, and the insert distribution (--insert-hist)
-//!   ESTIMATED the head/tail G-run distributions, from the per-position G
-//!             fraction: P(run >= k) ~= g_frac(k-1) - g_mean
+//!             base composition, the insert distribution (--insert-hist),
+//!             the head/tail G-run distributions, the flat in-run qualities,
+//!             and the out-of-run quality curve deconvolved from them
 //!   INVENTED  the insert SHAPE when no insert module ran, and the mate
 //!             tail correlation.
+//!
+//! The head/tail run-length distributions are the EXACT measured per-base G-run
+//! histograms with the biological boundary run subtracted (see
+//! `deconvolve_boundary_g`), not an estimate from the per-position G fraction.
+//! The estimate that used to sit here could not express a run longer than 12 at
+//! all and lost whole modes of a multi-modal tail, so the profile it produced
+//! had no mass at the tail lengths the library actually carried.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -57,47 +64,158 @@ fn g_fraction(acc: &Accum) -> Vec<f64> {
         .collect()
 }
 
-/// Head (from_start) or tail run-length distribution, as a weight map.
+/// Base code of G in the polyX histograms (0=A 1=C 2=G 3=T).
+const G_CODE: usize = 2;
+
+/// The MEASURED G-run histogram of one mate, as a distribution over reads.
 ///
-/// P(run >= k) ~= g_frac(k-1) - g_mean, so P(run == k) is the drop between
-/// successive values. Two physical constraints are enforced: P(run >= k) is
-/// non-increasing in k (a run of length k+1 implies one of k, so a spike is
-/// impossible and is clamped away by a cumulative minimum), and runs are capped
-/// at 12 with the excess folded back into "no run".
-fn run_length_cdf_from_gfraction(gf: &[f64], g_mean: f64, from_start: bool) -> BTreeMap<u32, f64> {
-    const MAX_RUN: usize = 12;
-    let l = gf.len();
-    let at = |i: usize| if from_start { gf[i] } else { gf[l - 1 - i] };
-
-    let upto = l.min(MAX_RUN + 1);
-    let raw: Vec<f64> = (0..upto).map(|k| (at(k) - g_mean).max(0.0)).collect();
-    let mut monotone = Vec::with_capacity(raw.len());
-    let mut running_min = f64::INFINITY;
-    for v in &raw {
-        running_min = running_min.min(*v);
-        monotone.push(running_min);
+/// `hist[k]` for `k >= 1` is the exact share of reads whose terminal (or
+/// initial) base is G inside a run of exactly `k` Gs, taken straight from the
+/// per-base run counter the report already publishes; `hist[0]` is every read
+/// whose terminal (or initial) base is not G. The whole vector sums to 1.
+///
+/// This is the run the SEQUENCER SHOWS, artefact plus any biological G at the
+/// boundary. `deconvolve_boundary_g` turns it into the artefact the simulator
+/// draws.
+fn observed_g_run_hist(acc: &Accum, from_start: bool) -> Vec<f64> {
+    let reads = acc.reads.max(1) as f64;
+    let src = if from_start { &acc.polyx5[G_CODE] } else { &acc.polyx3[G_CODE] };
+    let mut hist = vec![0.0f64; src.len() + 1];
+    let mut hit = 0u64;
+    for (len, &c) in src.iter().enumerate() {
+        hist[len] = c as f64 / reads;
+        hit += c;
     }
+    hist[0] = acc.reads.saturating_sub(hit) as f64 / reads;
+    hist
+}
 
-    let mut dist: BTreeMap<u32, f64> = BTreeMap::new();
-    dist.insert(0, (1.0 - monotone[0]).max(0.0));
-    for k in 1..monotone.len() {
-        let v = monotone[k - 1] - monotone[k];
-        if v > 0.0 {
-            *dist.entry(k as u32).or_insert(0.0) += v;
+/// Subtract the biological boundary run from an observed G-run histogram,
+/// leaving the ARTEFACT run-length distribution.
+///
+/// The observed terminal run is the injected artefact run *plus* any biological
+/// G that happens to sit at the boundary: a read with no artefact (`t = 0`) still
+/// shows a run whenever its last biological base is G, and a read with an
+/// artefact of `t` shows `t` exactly (the simulator rewrites that boundary base
+/// to non-G). With per-base G probability `q` the boundary run is geometric,
+/// `b(k) = (1 - q) q^k`, so
+///
+/// ```text
+/// observed(k) = artefact(k) + artefact(0) * b(k)   (k >= 1)
+/// observed(0) = artefact(0) * b(0)
+/// ```
+///
+/// which inverts in closed form. Without this step the no-run bin absorbs every
+/// artefact-free read whose last base is G - on the reference library that
+/// inflated "tail-free" from a true 66.0% to 50.6% and pushed the head row past
+/// its tolerance - and short artefacts vanish into that mass instead of being
+/// reported at their own lengths.
+fn deconvolve_boundary_g(obs: &[f64], q: f64) -> Vec<f64> {
+    let q = q.clamp(0.0, 0.95);
+    let p_base = 1.0 - q;
+    let a0 = if p_base > 1e-6 { (obs[0] / p_base).min(1.0) } else { obs[0] };
+    let mut out = vec![0.0f64; obs.len()];
+    out[0] = a0;
+    let mut b = p_base; // b(k) for the current k, starting at k = 1
+    for k in 1..obs.len() {
+        b *= q;
+        let v = obs[k] - a0 * b;
+        out[k] = if v > 0.0 { v } else { 0.0 };
+    }
+    let total: f64 = out.iter().sum();
+    if total > 0.0 {
+        for v in out.iter_mut() {
+            *v /= total;
+        }
+    } else {
+        out[0] = 1.0;
+    }
+    out
+}
+
+/// Per-base G probability of the read's BACKGROUND, measured away from the
+/// artefact runs: the median G fraction over the interior positions.
+///
+/// The first few positions carry the 5' head artefact and the last few the 3'
+/// tail artefact, so neither end can be read as background; the middle of the
+/// read cannot be reached by a run in any library this tool is used on. A
+/// median (not a mean) keeps a handful of very long full-length reads from
+/// dragging the estimate.
+fn background_g_fraction(acc: &Accum) -> f64 {
+    let gf = g_fraction(acc);
+    let l = gf.len();
+    if l == 0 {
+        return 0.25;
+    }
+    let lo = 4.min(l.saturating_sub(1));
+    let hi = (l / 2).max(lo + 1).min(l);
+    let mut mid: Vec<f64> = gf[lo..hi].to_vec();
+    if mid.is_empty() {
+        mid = gf.clone();
+    }
+    mid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    mid[mid.len() / 2].clamp(0.0, 0.9)
+}
+
+/// A run-length distribution as the profile's integer weight map (out of 10 000).
+fn dist_to_weights(dist: &[f64]) -> BTreeMap<u32, f64> {
+    let mut m: BTreeMap<u32, f64> = BTreeMap::new();
+    for (k, &p) in dist.iter().enumerate() {
+        let w = (p * 10000.0).round();
+        if w >= 1.0 {
+            m.insert(k as u32, w);
         }
     }
-    if l > MAX_RUN + 1 {
-        *dist.entry(0).or_insert(0.0) += (at(MAX_RUN + 1) - g_mean).max(0.0);
+    if m.is_empty() {
+        m.insert(0, 10000.0);
     }
+    m
+}
 
-    let total: f64 = dist.values().sum();
-    if total <= 0.0 {
-        return BTreeMap::from([(0, 100.0)]);
+/// Mean Phred of the bases inside one mate's G-runs, raw bytes minus the offset.
+fn run_q_mean(q: (u64, u64), offset: u8) -> Option<f64> {
+    if q.1 == 0 {
+        None
+    } else {
+        Some(q.0 as f64 / q.1 as f64 - offset as f64)
     }
-    dist.into_iter()
-        .filter(|(_, v)| v / total > 0.0005)
-        .map(|(k, v)| (k, v / total * 10000.0))
-        .collect()
+}
+
+/// The OUT-OF-RUN per-position curve, deconvolved from the measured one.
+///
+/// The measured per-position mean is a mixture: `measured[i] = (1 - p_i - q_i)
+/// out[i] + p_i tail_q + q_i head_q`, where `p_i` is the share of reads whose
+/// trailing run covers position `i` and `q_i` the share whose DEEPER head-run
+/// bases cover it. The simulator consumes `out[i]` and applies the flat in-run
+/// means itself, so handing it `measured[i]` collapses the run bases twice.
+/// The coverage shares come from the OBSERVED run histograms, because that is
+/// what covers the position in the data being measured.
+fn deconvolve_pos_q(
+    measured: &[f64],
+    obs_head: &[f64],
+    obs_tail: &[f64],
+    head_q: Option<f64>,
+    tail_q: Option<f64>,
+) -> Vec<f64> {
+    let l = measured.len();
+    let cover = |hist: &[f64], min_run: usize| -> f64 {
+        hist.iter().enumerate().filter(|(k, _)| *k >= min_run).map(|(_, &p)| p).sum()
+    };
+    let mut out = Vec::with_capacity(l);
+    for (i, &m) in measured.iter().enumerate() {
+        // position i is inside a trailing run of length k iff k >= l - i
+        let p_i = cover(obs_tail, l - i);
+        // position 0 of a head run is the normal curve; positions 1..h-1 are deep
+        let q_i = if i == 0 { 0.0 } else { cover(obs_head, i + 1) };
+        let denom = 1.0 - p_i - q_i;
+        let v = if denom <= 1e-6 {
+            m
+        } else {
+            (m - p_i * tail_q.unwrap_or(0.0) - q_i * head_q.unwrap_or(0.0)) / denom
+        };
+        out.push(v.max(0.0));
+    }
+    out
 }
 
 /// Median of a slice (does not need it sorted; small n by construction).
@@ -155,25 +273,73 @@ fn read_meanq(acc: &Accum, offset: u8) -> BTreeMap<String, i64> {
 struct Mate {
     head: BTreeMap<u32, f64>,
     tail: BTreeMap<u32, f64>,
-    pos_q: Vec<i64>,
+    /// the OUT-OF-RUN per-position curve (what the simulator consumes)
+    pos_q: Vec<f64>,
+    /// the measured per-position curve, kept as its own field so a reader can
+    /// tell the measurement from the deconvolution
+    pos_q_uncond: Vec<f64>,
+    /// measured flat mean Phred inside the G-runs (all run bases)
+    run_head_q: Option<f64>,
+    run_tail_q: Option<f64>,
+    /// head-run mean over the DEEP bases only (the first base of a head run is
+    /// the normal curve)
+    deep_head_q: Option<f64>,
     meanq: BTreeMap<String, i64>,
     body_q: f64,
     tail_q: f64,
     base: Vec<Vec<f64>>,
 }
 
-fn fit_mate(acc: &Accum, g_mean: f64, read_len: usize, offset: u8) -> Mate {
-    let gf = g_fraction(acc);
-    let head = run_length_cdf_from_gfraction(&gf, g_mean, true);
-    let tail = run_length_cdf_from_gfraction(&gf, g_mean, false);
+fn fit_mate(acc: &Accum, _g_mean: f64, read_len: usize, offset: u8) -> Mate {
+    // The measured run histograms, then the artefact distributions the profile
+    // carries: the simulator draws an artefact length and its boundary rule
+    // re-forms the observed run, so the biological boundary run must come out
+    // here rather than be baked in.
+    let obs_head = observed_g_run_hist(acc, true);
+    let obs_tail = observed_g_run_hist(acc, false);
+    let q_bg = background_g_fraction(acc);
+    let head = dist_to_weights(&deconvolve_boundary_g(&obs_head, q_bg));
+    let tail = dist_to_weights(&deconvolve_boundary_g(&obs_tail, q_bg));
 
     let mut q = per_position_mean_q(acc, offset);
     while q.len() < read_len {
         q.push(*q.last().unwrap_or(&30.0)); // pad if the run is shorter
     }
-    let pos_q: Vec<i64> = q[..read_len].iter().map(|x| x.round() as i64).collect();
+    q.truncate(read_len);
     let body_q = median(&q[..((read_len as f64 * 0.8) as usize).max(1)]);
     let tail_q = median(&q[((read_len as f64 * 0.9) as usize).min(q.len())..]);
+
+    // Flat in-run qualities, measured. `head_all` covers every head-run base,
+    // including the first of each run, which the simulator models with the
+    // normal curve — so the deep-base mean is recovered by removing one first
+    // base per head read and every full-length read (handled by the
+    // full-length path, not this mean).
+    let run_head_q = run_q_mean(acc.run_q_head, offset);
+    let run_tail_q = run_q_mean(acc.run_q_tail, offset);
+    let reads = acc.reads as f64;
+    let head_full = obs_head.get(read_len).copied().unwrap_or(0.0) * reads;
+    let mut head_non_full = 0.0f64;
+    let mut head_bases = 0.0f64;
+    for (k, &p) in obs_head.iter().enumerate() {
+        let cnt = p * reads;
+        head_bases += k as f64 * cnt;
+        if k >= 1 && k < read_len {
+            head_non_full += cnt;
+        }
+    }
+    let deep_n = head_bases - head_full * read_len as f64 - head_non_full;
+    let deep_head_q = match run_head_q {
+        Some(all) if deep_n > 0.0 => {
+            let sum_phred = acc.run_q_head.0 as f64 - offset as f64 * acc.run_q_head.1 as f64;
+            let first_q = q.first().copied().unwrap_or(all);
+            let full_q = run_tail_q.unwrap_or(20.0);
+            Some((sum_phred - head_full * read_len as f64 * full_q - head_non_full * first_q) / deep_n)
+        }
+        other => other,
+    };
+
+    let pos_q_uncond = q.clone();
+    let pos_q = deconvolve_pos_q(&pos_q_uncond, &obs_head, &obs_tail, deep_head_q, run_tail_q);
 
     // Located per-position composition, so the simulator can reproduce a
     // 5' dropout or any-position bias a G-run model cannot express.
@@ -187,7 +353,19 @@ fn fit_mate(acc: &Accum, g_mean: f64, read_len: usize, offset: u8) -> Mate {
         });
     }
 
-    Mate { head, tail, pos_q, meanq: read_meanq(acc, offset), body_q, tail_q, base }
+    Mate {
+        head,
+        tail,
+        pos_q,
+        pos_q_uncond,
+        run_head_q,
+        run_tail_q,
+        deep_head_q,
+        meanq: read_meanq(acc, offset),
+        body_q,
+        tail_q,
+        base,
+    }
 }
 
 /// The insert CDF, assembled from a measured histogram: censored-below pairs go
@@ -302,10 +480,12 @@ pub fn write_profile(
     };
 
     let comment = if insert_measured {
-        format!("fitted from {name} by fastcheck --profile (as-measured): head/tail estimated, \
+        format!("fitted from {name} by fastcheck --profile (as-measured): head/tail run lengths \
+                 MEASURED (per-base G-run histograms, biological boundary run deconvolved), \
                  insert distribution MEASURED by --insert-hist, mate tail correlation invented")
     } else {
-        format!("fitted from {name} by fastcheck --profile (as-observed): head/tail estimated, \
+        format!("fitted from {name} by fastcheck --profile (as-measured): head/tail run lengths \
+                 MEASURED (per-base G-run histograms, biological boundary run deconvolved), \
                  insert shape invented")
     };
 
@@ -335,6 +515,9 @@ pub fn write_profile(
     let mut head = Map::new();
     let mut tail = Map::new();
     let mut pos_q = Map::new();
+    let mut pos_q_uncond = Map::new();
+    let mut run_q_mean = Map::new();
+    let mut deep_head_q = Map::new();
     let mut read_meanq = Map::new();
     let mut tail_q_collapse = Map::new();
     let mut full_length_q = Map::new();
@@ -345,6 +528,17 @@ pub fn write_profile(
         head.insert(n.to_string(), map_json(&m.head));
         tail.insert(n.to_string(), map_json(&m.tail));
         pos_q.insert(n.to_string(), json!(m.pos_q));
+        pos_q_uncond.insert(n.to_string(), json!(m.pos_q_uncond));
+        run_q_mean.insert(
+            n.to_string(),
+            json!({
+                "head": m.run_head_q.map(|v| (v * 1000.0).round() / 1000.0),
+                "tail": m.run_tail_q.map(|v| (v * 1000.0).round() / 1000.0),
+            }),
+        );
+        if let Some(v) = m.deep_head_q {
+            deep_head_q.insert(n.to_string(), json!((v * 1000.0).round() / 1000.0));
+        }
         read_meanq.insert(n.to_string(), int_map_json(&m.meanq));
         tail_q_collapse.insert(
             n.to_string(),
@@ -369,6 +563,14 @@ pub fn write_profile(
     );
     prof.insert("tail_q_collapse".into(), Value::Object(tail_q_collapse));
     prof.insert("pos_q".into(), Value::Object(pos_q));
+    // The measured curve and the measured flat in-run qualities, so a reader
+    // can check the deconvolution instead of taking `pos_q` on faith, and so
+    // the simulator applies the collapse exactly once.
+    prof.insert("pos_q_uncond".into(), Value::Object(pos_q_uncond));
+    prof.insert("run_q_mean".into(), Value::Object(run_q_mean));
+    if !deep_head_q.is_empty() {
+        prof.insert("deep_head_q".into(), Value::Object(deep_head_q));
+    }
     prof.insert("read_meanq".into(), Value::Object(read_meanq));
     // The measured duplication level, so the chain can pass the profile's own
     // duplicate rate to the simulator. Without it the chain falls back to
@@ -466,38 +668,123 @@ mod tests {
         a
     }
 
-    #[test]
-    fn run_length_cdf_is_monotone_shaped_and_normalised() {
-        // A library whose 3' end is G-rich: g_frac rises above the mean at the
-        // last positions, which is exactly what a tail run looks like.
-        let mut gf = vec![0.25f64; 20];
-        gf[19] = 0.60;
-        gf[18] = 0.45;
-        let d = run_length_cdf_from_gfraction(&gf, 0.25, false);
-        let total: f64 = d.values().sum();
-        assert!((total - 10000.0).abs() < 1.0, "weights must sum to 10000, got {total}");
-        assert!(d.contains_key(&0), "a run of 0 is always a possible outcome");
-        assert!(d[&0] < 10000.0, "some mass must sit on a real run");
-        assert!(!d.contains_key(&13), "runs are capped at 12");
+    /// Write a profile for one accumulated fixture and read it back.
+    fn profile_json(tag: &str, accs: &[&Accum]) -> serde_json::Value {
+        let dir = std::env::temp_dir().join(format!("fc_prof_{}_{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("p.json");
+        write_profile(&p, "fixture", accs, 33, None).unwrap();
+        let v = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        v
     }
 
-    #[test]
-    fn run_length_cdf_folds_the_beyond_cap_excess_into_no_run() {
-        // A flat G-rich tail: every position is above the mean, so most of the
-        // mass belongs to runs longer than the cap and must land on 0.
-        let gf = vec![0.50f64; 20];
-        let d = run_length_cdf_from_gfraction(&gf, 0.25, false);
-        let total: f64 = d.values().sum();
-        assert!((total - 10000.0).abs() < 1.0);
-        assert!(d[&0] > 5000.0, "the capped excess belongs in the no-run bin");
+    /// A fixture read: `body` (no G) plus a homopolymer end of `end_base`, with
+    /// the run bases at `run_q` and the body at Q40 ('I' = 40, '5' = 20).
+    fn fixture_read(body: &[u8], end_base: u8, end_len: usize, run_q: u8) -> (Vec<u8>, Vec<u8>) {
+        let mut s = body.to_vec();
+        s.extend(std::iter::repeat(end_base).take(end_len));
+        let mut q = vec![b'I'; body.len()];
+        q.extend(std::iter::repeat(run_q).take(end_len));
+        (s, q)
     }
 
+    /// The fitted tail must report the run lengths the library actually carries,
+    /// at the shares it carries them in.
+    ///
+    /// This is the polyG-detector defect: the fitter used to read the
+    /// distribution off the per-position G fraction, capping runs at 12 and
+    /// folding the no-run mass into a monotone estimate. Measured against a
+    /// simulator ground truth it reported 93.98% of reads tail-free against a
+    /// true 66.01%, with zero mass at t = 3 and t = 15 where the truth was
+    /// 7.99% and 6.99%.
     #[test]
-    fn cdf_with_no_gt_baseline_is_all_no_run() {
-        let gf = vec![0.25f64; 20];
-        let d = run_length_cdf_from_gfraction(&gf, 0.25, false);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[&0], 10000.0);
+    fn fitted_tail_reports_the_run_lengths_and_shares_the_library_carries() {
+        // 40 reads end in a G-run of exactly 3, 30 in exactly 15, 30 in a
+        // non-G run. The body carries NO G, so the biological boundary
+        // contribution is zero and the expected distribution is exact.
+        const BODY: &[u8] = b"ACATACATACATACATAC";
+        let mut seqs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for _ in 0..40 {
+            seqs.push(fixture_read(BODY, b'G', 3, b'I'));
+        }
+        for _ in 0..30 {
+            seqs.push(fixture_read(BODY, b'G', 15, b'I'));
+        }
+        for _ in 0..30 {
+            seqs.push(fixture_read(BODY, b'T', 3, b'I'));
+        }
+        let refs: Vec<(&[u8], &[u8])> =
+            seqs.iter().map(|(s, q)| (s.as_slice(), q.as_slice())).collect();
+        let a = acc_with(&refs, 64);
+        let v = profile_json("tailruns", &[&a]);
+        let t = v["tail"]["R1"].as_object().unwrap();
+        let w = |k: &str| t.get(k).and_then(|x| x.as_i64()).unwrap_or(0) as f64 / 10000.0;
+        assert!((w("3") - 0.40).abs() < 0.03, "run of 3: {} in {t:?}", w("3"));
+        assert!((w("15") - 0.30).abs() < 0.03, "run of 15: {} in {t:?}", w("15"));
+        assert!((w("0") - 0.30).abs() < 0.03, "no run: {} in {t:?}", w("0"));
+        assert_eq!(w("1"), 0.0, "nothing ends in a 1-base run: {t:?}");
+        // The same histogram is the head CDF's sibling: a read that ends in G
+        // but begins in A has no head run at all.
+        assert_eq!(v["head"]["R1"]["0"], serde_json::json!(10000));
+    }
+
+    /// The fitted `pos_q` must be the OUT-OF-RUN curve, not the collapsed
+    /// measurement: the simulator applies the flat in-run mean itself, so a
+    /// curve that already contains the collapse is collapsed twice.
+    ///
+    /// This is the worst-10-position quality-block defect: the recovered curve
+    /// missed its block by 1.95 Phred because every tail base's collapse was
+    /// baked into the body curve the simulator then collapsed again.
+    #[test]
+    fn fitted_pos_q_is_the_out_of_run_curve_not_the_collapsed_measurement() {
+        const BODY: &[u8] = b"ACATACATACATACATAC";
+        let mut seqs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for _ in 0..50 {
+            // a 10-base 3' G-run whose bases are Q20
+            seqs.push(fixture_read(BODY, b'G', 10, b'5'));
+        }
+        for _ in 0..50 {
+            // same length, no G-run, every base Q40
+            seqs.push(fixture_read(BODY, b'T', 10, b'I'));
+        }
+        let refs: Vec<(&[u8], &[u8])> =
+            seqs.iter().map(|(s, q)| (s.as_slice(), q.as_slice())).collect();
+        let a = acc_with(&refs, 64);
+        let v = profile_json("posq", &[&a]);
+
+        // Half the reads cover the tail positions, so the MEASURED mean there
+        // is (40 + 20) / 2 = 30, and the out-of-run curve the simulator needs
+        // is 40.
+        let uncond = v["pos_q_uncond"]["R1"][20].as_f64().unwrap();
+        let out = v["pos_q"]["R1"][20].as_f64().unwrap();
+        assert!((uncond - 30.0).abs() < 0.5, "measured mean at the tail: {uncond}");
+        assert!(
+            (out - 40.0).abs() < 1.0,
+            "out-of-run curve at the tail must be 40, got {out} (measured {uncond})"
+        );
+        // ... and the flat in-run quality is measured, not inferred.
+        let run_tail = v["run_q_mean"]["R1"]["tail"].as_f64().unwrap();
+        assert!((run_tail - 20.0).abs() < 0.5, "in-run mean: {run_tail}");
+        // Position 0 has no head run, so it is the measurement itself.
+        assert!((v["pos_q"]["R1"][0].as_f64().unwrap() - 40.0).abs() < 0.5);
+    }
+
+    /// The boundary deconvolution: a library of clean reads whose last base is
+    /// G with probability q must NOT report those reads as carrying a tail.
+    #[test]
+    fn deconvolution_removes_the_biological_boundary_run() {
+        // observed: 70% no artefact, 20% a 4-base artefact, 10% a 9-base one,
+        // with the no-artefact reads' last base G with probability 0.25 (the
+        // background of this fixture).
+        let obs = vec![0.70 * 0.75, 0.70 * 0.75 * 0.25, 0.0, 0.20, 0.0, 0.0, 0.0, 0.0, 0.0, 0.10];
+        let out = deconvolve_boundary_g(&obs, 0.25);
+        let s: f64 = out.iter().sum();
+        assert!((s - 1.0).abs() < 1e-9, "weights must be a distribution, got {s}");
+        assert!((out[0] - 0.70).abs() < 0.02, "artefact-free share: {}", out[0]);
+        assert!((out[3] - 0.20).abs() < 0.02, "4-base artefact: {}", out[3]);
+        assert!((out[9] - 0.10).abs() < 0.02, "9-base artefact: {}", out[9]);
+        assert!(out[1] < 0.005 && out[2] < 0.005, "the biological run must be gone: {out:?}");
     }
 
     #[test]
@@ -538,7 +825,7 @@ mod tests {
         let a = acc_with(&[(seq, q), (seq, q)], 32);
         let m = fit_mate(&a, 0.25, 16, 33);
         assert_eq!(m.pos_q.len(), 16);
-        assert!(m.pos_q.iter().all(|&x| x == 40), "Phred+33 'I' is Q40: {:?}", m.pos_q);
+        assert!(m.pos_q.iter().all(|&x| x == 40.0), "Phred+33 'I' is Q40: {:?}", m.pos_q);
         assert_eq!(m.base.len(), 16);
         let row = &m.base[0];
         assert!((row.iter().sum::<f64>() - 1.0).abs() < 0.01, "rows are fractions: {row:?}");
