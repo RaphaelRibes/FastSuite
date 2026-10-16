@@ -154,7 +154,13 @@ as a result.
    over-tolerance error of 0.0529. Neither the dup model, nor the 3′
    boundary rule, nor the head-G deconvolution touched it: this is a
    **distinct, still-undiagnosed mechanism**, and it is the main remaining
-   blocker to a publishable simulator accuracy number.
+   blocker to a publishable simulator accuracy number. (Checked 2026-10-16: the
+   new ambiguous-base emission *does* move the metagenomics `g_frac` — e.g.
+   DRR083326 0.0532 → 0.0396, DRR083353 0.0455 → 0.0293, DRR083390 0.0490 →
+   0.0350 — but it does not close it (all still above the 0.02 bound) and the
+   movement is confounded with the RNG-stream shift the emission causes, so it
+   is not attributed to the N overlay. The metagenomics pass count is unchanged.
+   `docs/N-EMISSION.md` §6.2.)
 2. ~~**fastcheck's polyG detector** — reports 93.98% tail-free against a true
    66.01%, zero mass at t=3/t=15 (true 7.99%/6.99%).~~ **FIXED.** The profile
    fitter estimated the head/tail distributions from the per-position G
