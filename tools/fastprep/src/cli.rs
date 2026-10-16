@@ -235,6 +235,14 @@ pub struct Cli {
     #[arg(long, help_heading = "PolyX Trimming")]
     pub r2_scan_reverse: bool,
 
+    /// Boundary-anchored cut: place the polyX cut at the homopolymer run
+    /// boundary (the last matching base) instead of the mercy walk's end.
+    /// The mercy walk absorbs ~2 flanking non-run bases past a clean run
+    /// before Δ_m trips, so the default whole-run cut overshoots the run by
+    /// that much. This trims exactly the run extent, dropping the overshoot.
+    #[arg(long, help_heading = "PolyX Trimming")]
+    pub boundary_anchored: bool,
+
     // ------------------------------------------------------- Quality filtering
     /// Minimum whole-read mean Phred quality (raw, not ASCII offset).
     #[arg(long, value_name = "FLOAT", default_value = "25", help_heading = "Quality Filtering")]
@@ -728,6 +736,7 @@ impl Cli {
             scan_5: !self.no_5,
             scan_3: !self.no_3,
             scan_interior: self.interior || !self.no_interior,
+            boundary_anchored: self.boundary_anchored,
             direction: Direction::Forward,
             mean_q: if self.no_mean_q { None } else { self.mean_q },
             trim_5: self.trim_5,

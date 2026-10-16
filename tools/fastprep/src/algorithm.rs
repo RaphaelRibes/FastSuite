@@ -129,6 +129,12 @@ pub struct ScanResult {
     /// Used to threshold against `m_h`: a run qualifies iff
     /// `matches + 1 ≥ m_h` (the +1 counts the initial anchor base).
     pub matches: usize,
+    /// Boundary-anchored run extent in bases: `last_match_step + 2`, i.e.
+    /// the number of bases from `start` up to and including the far base of
+    /// the last matching step. This is the homopolymer run's true span — it
+    /// keeps error bases inside the run but excludes the flanking overshoot
+    /// the mercy walk absorbs. 0 when the scan saw no matching step.
+    pub run_span: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +168,17 @@ pub struct Params {
     pub scan_5: bool,
     pub scan_3: bool,
     pub scan_interior: bool,
+    /// Boundary-anchored cut (new algorithm, opt-in). When `true`, a polyX
+    /// scan that terminates by mercy trims only the homopolymer *run extent*
+    /// (start ..= last matching base) instead of `k_star`, the full mercy
+    /// walk. The mercy walk absorbs a few flanking non-run bases past the run
+    /// before the gap mass trips Δ_m — on a clean run followed by ordinary
+    /// biology that overshoots the boundary by ~2 bp (measured). Cutting the
+    /// run extent places the cut exactly at the run/flanking boundary, keeping
+    /// error bases *inside* the run (the last match sits past them) while
+    /// dropping the flanking overshoot. Default `false` preserves the shipped
+    /// whole-run/mercy cut.
+    pub boundary_anchored: bool,
     pub direction: Direction,
     pub mean_q: Option<f64>,
     pub trim_5: Option<usize>,
@@ -206,6 +223,7 @@ impl Default for Params {
             scan_5: true,
             scan_3: true,
             scan_interior: true,
+            boundary_anchored: false,
             direction: Direction::Forward,
             mean_q: None,
             trim_5: None,
@@ -328,6 +346,7 @@ pub fn scan(
     let mut gamma = 0.0f64;
     let mut k = 0usize;
     let mut matches = 0usize;
+    let mut run_span = 0usize;
 
     loop {
         // Boundary check: next pair would need index start + k + 1 ≤ upper.
@@ -336,6 +355,7 @@ pub fn scan(
                 k_star: k,
                 mode: StopMode::Boundary,
                 matches,
+                run_span,
             };
         }
         // Budget check (optional).
@@ -345,6 +365,7 @@ pub fn scan(
                     k_star: k,
                     mode: StopMode::Budget,
                     matches,
+                    run_span,
                 };
             }
         }
@@ -361,6 +382,13 @@ pub fn scan(
         gamma += gap;
         if is_match {
             matches += 1;
+            // The matching pair (start+k, start+k+1) confirms the run reaches
+            // offset k+1; the run extent from `start` is therefore k+2 bases.
+            // Only tracked when the boundary-anchored cut will consume it, so
+            // the default whole-run path does no extra work.
+            if params.boundary_anchored {
+                run_span = k + 2;
+            }
         }
         k += 1;
         if gamma > params.mercy {
@@ -368,6 +396,7 @@ pub fn scan(
                 k_star: k,
                 mode: StopMode::Mercy,
                 matches,
+                run_span,
             };
         }
     }
@@ -468,10 +497,14 @@ impl TrimResult {
 /// is `matches + 1` (the anchor base plus one matching neighbour per
 /// matching step).
 #[inline]
-fn resolve_trim(res: ScanResult, min_run: usize) -> usize {
+fn resolve_trim(res: ScanResult, min_run: usize, boundary_anchored: bool) -> usize {
     debug_assert!(res.mode != StopMode::Budget);
     if res.matches + 1 < min_run {
         0
+    } else if boundary_anchored {
+        // Cut the homopolymer run extent (start ..= last matching base),
+        // dropping the flanking overshoot the mercy walk absorbs.
+        res.run_span
     } else if res.mode == StopMode::Mercy {
         res.k_star
     } else {
@@ -515,6 +548,7 @@ fn streaming_walk<const FORWARD: bool>(
     let mut gamma = 0.0f64;
     let mut k_curr: usize = 0;
     let mut m_curr: usize = 0;
+    let mut run_span_curr: usize = 0;
     let mut sub_start_logical: usize = win_start;
     let mut first_subscan = true;
 
@@ -523,10 +557,19 @@ fn streaming_walk<const FORWARD: bool>(
     let mut runs: Vec<(usize, usize)> = Vec::new();
 
     #[inline]
-    fn resolve_subscan(k_star: usize, m_star: usize, mode: StopMode, min_run: usize) -> usize {
+    fn resolve_subscan(
+        k_star: usize,
+        m_star: usize,
+        mode: StopMode,
+        min_run: usize,
+        run_span: usize,
+        boundary_anchored: bool,
+    ) -> usize {
         debug_assert!(mode != StopMode::Budget);
         if m_star + 1 < min_run {
             0
+        } else if boundary_anchored {
+            run_span
         } else if mode == StopMode::Mercy {
             k_star
         } else {
@@ -576,6 +619,12 @@ fn streaming_walk<const FORWARD: bool>(
         gamma += gap;
         if is_match {
             m_curr += 1;
+            // Run reaches the pair's far base `i_logical`; extent from the
+            // sub-scan anchor is (i_logical - sub_start_logical + 1) bases.
+            // Only tracked for the boundary-anchored cut.
+            if params.boundary_anchored {
+                run_span_curr = i_logical - sub_start_logical + 1;
+            }
         }
         k_curr += 1;
 
@@ -591,7 +640,14 @@ fn streaming_walk<const FORWARD: bool>(
         }
 
         if gamma > params.mercy {
-            let sub_trim = resolve_subscan(k_curr, m_curr, StopMode::Mercy, params.min_run);
+            let sub_trim = resolve_subscan(
+                k_curr,
+                m_curr,
+                StopMode::Mercy,
+                params.min_run,
+                run_span_curr,
+                params.boundary_anchored,
+            );
             if first_subscan {
                 first_trim = sub_trim;
                 first_subscan = false;
@@ -612,6 +668,7 @@ fn streaming_walk<const FORWARD: bool>(
             gamma = 0.0;
             k_curr = 0;
             m_curr = 0;
+            run_span_curr = 0;
             sub_start_logical = i_logical + 1;
         }
     }
@@ -620,7 +677,14 @@ fn streaming_walk<const FORWARD: bool>(
     // 5′-end scan resolves into first_trim. Interior boundary-mode
     // sub-scans are not recorded (spec §1.9).
     if k_curr > 0 && first_subscan {
-        first_trim = resolve_subscan(k_curr, m_curr, StopMode::Boundary, params.min_run);
+        first_trim = resolve_subscan(
+            k_curr,
+            m_curr,
+            StopMode::Boundary,
+            params.min_run,
+            run_span_curr,
+            params.boundary_anchored,
+        );
     }
 
     StreamOut {
@@ -1027,7 +1091,7 @@ fn polyx_trim_inner(
                 runs: vec![],
             };
         }
-        resolve_trim(res, params.min_run)
+        resolve_trim(res, params.min_run, params.boundary_anchored)
     } else {
         0
     };
@@ -1692,6 +1756,105 @@ mod tests {
             TrimResult::Emit { t5_poly, .. } => {
                 assert_eq!(t5_poly, 0, "no dropout flag: head left alone");
             }
+            r => panic!("unexpected {:?}", r),
+        }
+    }
+
+    #[test]
+    fn boundary_anchored_places_cut_at_run_boundary() {
+        // A clean homopolymer run followed by non-run biology: the mercy walk
+        // absorbs a couple of flanking bases past the run before Δ_m trips, so
+        // the default cut overshoots by ~2. `boundary_anchored` must cut
+        // exactly the run extent.
+        for (t, min_run) in [(12usize, 12usize), (16, 12), (20, 12)] {
+            let l = 150usize;
+            let mut seq: Vec<u8> = Vec::new();
+            while seq.len() < l - t {
+                seq.extend_from_slice(b"ACGT");
+            }
+            seq.truncate(l - t);
+            for _ in 0..t {
+                seq.push(b'G');
+            }
+            let q = vec![40u8; l];
+            // default (whole-run/mercy): overshoots the clean run by 2.
+            let p = Params {
+                min_run,
+                scan_interior: false,
+                ..Default::default()
+            };
+            let over = match polyx_trim(&seq, &q, &p) {
+                TrimResult::Emit { t3_poly, .. } => t3_poly,
+                r => panic!("unexpected {:?}", r),
+            };
+            assert!(over >= t + 2, "default should overshoot: {} vs {}", over, t);
+            // boundary-anchored: exactly the run, no flanking overshoot.
+            let p = Params {
+                min_run,
+                scan_interior: false,
+                boundary_anchored: true,
+                ..Default::default()
+            };
+            let cut = match polyx_trim(&seq, &q, &p) {
+                TrimResult::Emit { t3_poly, .. } => t3_poly,
+                r => panic!("unexpected {:?}", r),
+            };
+            assert_eq!(cut, t, "boundary-anchored must cut exactly the run");
+        }
+    }
+
+    #[test]
+    fn boundary_anchored_keeps_internal_error_bases() {
+        // A run with a substitution error inside it is still one artefact run;
+        // the boundary-anchored cut reaches past the internal mismatch (the
+        // last match sits beyond it) and removes the whole run.
+        let l = 150usize;
+        let t = 14usize;
+        let mut seq: Vec<u8> = Vec::new();
+        while seq.len() < l - t {
+            seq.extend_from_slice(b"ACGT");
+        }
+        seq.truncate(l - t);
+        for i in 0..t {
+            seq.push(if i == 5 { b'A' } else { b'G' });
+        }
+        let q = vec![40u8; l];
+        let p = Params {
+            min_run: 12,
+            scan_interior: false,
+            boundary_anchored: true,
+            ..Default::default()
+        };
+        match polyx_trim(&seq, &q, &p) {
+            TrimResult::Emit { t3_poly, .. } => {
+                assert_eq!(t3_poly, t, "must include the internal error base");
+            }
+            r => panic!("unexpected {:?}", r),
+        }
+    }
+
+    #[test]
+    fn boundary_anchored_respects_min_run() {
+        // A run shorter than min_run is not polyX: no trim either way.
+        let l = 150usize;
+        let t = 8usize;
+        let mut seq: Vec<u8> = Vec::new();
+        while seq.len() < l - t {
+            seq.extend_from_slice(b"ACGT");
+        }
+        seq.truncate(l - t);
+        for _ in 0..t {
+            seq.push(b'G');
+        }
+        let q = vec![40u8; l];
+        let p = Params {
+            min_run: 12,
+            scan_interior: false,
+            boundary_anchored: true,
+            ..Default::default()
+        };
+        match polyx_trim(&seq, &q, &p) {
+            TrimResult::Emit { t3_poly, .. } => assert_eq!(t3_poly, 0),
             r => panic!("unexpected {:?}", r),
         }
     }
