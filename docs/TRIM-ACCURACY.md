@@ -1,14 +1,25 @@
 # Trim accuracy against simulator ground truth
 
-## Reading guide — the conclusion has flipped
+## Reading guide — the conclusion has flipped, twice
 
-The earlier revision of this document concluded that **fastp-default is the
-strongest tool** (92.2% exact at tolerance 0 against fastprep's 66.5%). That
-conclusion is **reversed**. Re-measured under a single harness, **fastprep's
-shipped default is the worst configuration at strict tolerance** — 75.6% exact
-with 23.4% overtrim — while **fastprep with the leading-G rule disabled
-(`--head-dropout 0`) is the strongest tool** (92.6% exact at tolerance 0,
-99.7% at tolerance 2), marginally ahead of fastp-default (92.2% / 99.6%).
+The earliest revision of this document concluded that **fastp-default is the
+strongest tool** (92.2% exact at tolerance 0 against fastprep's 66.5% — the
+66.5% being an invalid cross-generation figure, see §4 of
+`docs/TRIM-ACCURACY-DISCREPANCY.md`). That conclusion was **reversed** on a
+single harness: **fastprep's shipped default was the worst configuration at
+strict tolerance** (75.5% exact with 22.5% overtrim) while **fastprep with the
+leading-G rule disabled (`--head-dropout 0`) is the strongest tool** (89.1%
+exact at tolerance 0, 99.1% at tolerance 2), marginally ahead of fastp-default
+(88.6% / 98.5%). The reversal stands.
+
+**Everything here was then re-measured again** on the regenerated corpus
+(`docs/CLOSED-LOOP-RERUN.md`): fastcheck's polyG fitter fix and fastsim's new
+ambiguous-base emission both changed the simulated reads. The **ordering did
+not move** — not one of the four tools changed rank, at either tolerance — but
+the *level* dropped roughly 3 points and **undertrim roughly doubled**
+(fastprep-hd-off 7.3% → 10.3%): no trimmer removes an N-run, so reads now end
+up under-trimmed rather than over-trimmed. Pre-regeneration values are quoted
+alongside the current ones in the tables below.
 
 This is a **configuration finding, not an algorithmic one**. The loss is
 entirely attributable to one shipped default: `--head-dropout 4`, a rule that
@@ -18,16 +29,11 @@ beats fastp on every aggregate axis. The shipped default was 4 when this was
 written; it is now **0** (commit `3d76a31`), so the `fastprep-hd-off` column is
 what a build from current `main` does by default.
 
-**Number note.** The tables below were measured before the min-len harness
-repair in `73c2385` (§4 of `docs/TRIM-ACCURACY-DISCREPANCY.md`): that moved the
-shipped-default `fastprep-shipped` row at tolerance 0 from 75.6% to **75.4%**
-exact. The earlier 66.5% is the invalid cross-generation figure and is *not*
-fastprep's accuracy. The `fastprep-hd-off` (92.6%) and fastp (92.2% / 84.1%)
-figures are unchanged.
-
 `bench/scripts/overtrim_vs_fastp.py` produces these numbers from
-`bench/results/phase-d/overtrim-vs-fastp.tsv` (809 lines: header + 808 rows,
-101 datasets, four tools, two tolerances).
+`bench/results/phase-d/overtrim-vs-fastp.tsv` (817 lines: header + 816 rows,
+102 datasets, four tools, two tolerances). The script refuses to overwrite an
+existing `--out` unless `--force` is passed: it appends, so a second run would
+silently mix two corpora in one file.
 
 ## What is measured
 
@@ -100,37 +106,40 @@ and the surviving counts match fastp's real drop counts (9 289 on DRR000978).
 
 ## Results
 
-101 datasets, scored by `bench/scripts/overtrim_vs_fastp.py`; 18.8–19.8 M
-mates per tool per tolerance.
+102 datasets, scored by `bench/scripts/overtrim_vs_fastp.py`; 18.9–19.8 M
+mates per tool per tolerance. Re-measured on the regenerated corpus.
 
 ### Tolerance 0 (strict)
 
 | tool             | mates      | exact     | overtrim | undertrim | dropped   |
 |------------------|------------|-----------|----------|-----------|-----------|
-| fastprep-hd-off  | 18 846 688 | **92.6%** | 0.1%     | 7.3%      | 1 353 312 |
-| fastp-default    | 19 810 648 | 92.2%     | 0.2%     | 7.6%      | 389 352   |
-| fastp-tuned      | 19 810 632 | 84.1%     | 8.6%     | 7.3%      | 389 368   |
-| fastprep-shipped | 18 769 306 | 75.6%     | 23.4%    | 1.0%      | 1 430 694 |
+| fastprep-hd-off  | 18,945,051 | **89.1%** | 0.6%     | 10.3%     | 1,454,949 |
+| fastp-default    | 19,834,186 | 88.6%     | 0.8%     | 10.6%     | 565,814   |
+| fastp-tuned      | 19,849,862 | 80.4%     | 9.6%     | 10.0%     | 550,138   |
+| fastprep-shipped | 18,928,152 | 75.5%     | 22.5%    | 2.0%      | 1,471,848 |
 
 ### Tolerance 2 (forgiving)
 
 | tool             | exact     | overtrim | undertrim |
 |------------------|-----------|----------|-----------|
-| fastprep-hd-off  | **99.7%** | 0.0%     | 0.3%      |
-| fastp-default    | 99.6%     | 0.1%     | 0.3%      |
-| fastp-tuned      | 91.2%     | 8.6%     | 0.2%      |
-| fastprep-shipped | 98.7%     | 1.2%     | 0.2%      |
+| fastprep-hd-off  | **99.1%** | 0.1%     | 0.9%      |
+| fastp-default    | 98.5%     | 0.7%     | 0.9%      |
+| fastp-tuned      | 90.2%     | 9.1%     | 0.7%      |
+| fastprep-shipped | 98.5%     | 1.1%     | 0.4%      |
 
 ### Per-domain exact rate (tol 0 / tol 2)
 
 | domain            | fastprep-hd-off | fastp-default  | fastp-tuned    | fastprep-shipped |
 |-------------------|-----------------|----------------|----------------|------------------|
-| bacterial_isolate | 96.3% / 99.8%   | 96.2% / 99.8%  | 80.8% / 83.5%  | 77.7% / 98.9%    |
-| generalised       | 96.5% / 99.7%   | 96.5% / 99.8%  | 76.1% / 79.2%  | 78.9% / 98.7%    |
-| human_gut         | 99.8% / 99.9%   | 99.8% / 99.9%  | 99.8% / 99.9%  | 76.8% / 98.7%    |
-| metagenomics      | 83.7% / 99.8%   | 83.6% / 99.8%  | 83.6% / 99.8%  | 72.9% / 99.1%    |
-| rna_seq           | 85.7% / 99.4%   | 85.3% / 99.3%  | 84.9% / 98.9%  | 73.0% / 98.5%    |
-| virome            | 93.8% / 99.4%   | 92.1% / 99.1%  | 78.4% / 84.7%  | 74.1% / 98.0%    |
+| bacterial_isolate | 93.4% / 99.2%   | 93.3% / 99.2%  | 77.6% / 82.7%  | 77.2% / 98.4%    |
+| generalised       | 94.2% / 98.5%   | 94.2% / 98.6%  | 74.0% / 78.7%  | 77.8% / 97.9%    |
+| human_gut         | 98.9% / 99.9%   | 98.8% / 99.8%  | 98.8% / 99.8%  | 76.7% / 98.8%    |
+| metagenomics      | 79.4% / 99.2%   | 79.2% / 99.1%  | 79.2% / 99.1%  | 73.9% / 99.1%    |
+| rna_seq           | 81.0% / 98.4%   | 80.7% / 98.4%  | 80.4% / 98.1%  | 75.4% / 98.6%    |
+| virome            | 87.3% / 99.1%   | 86.0% / 95.8%  | 71.7% / 81.6%  | 71.6% / 97.9%    |
+
+The ordering is identical to the pre-regeneration run in all six domains;
+only the levels moved.
 
 ### Harness validation
 
@@ -146,12 +155,12 @@ the published baseline.
 
 **The then-shipped default loses; the algorithm does not.** fastprep at the
 then-shipped default (`--head-dropout 4`) is the worst of the four at tolerance
-0 (75.6% exact,
-23.4% overtrim). With `--head-dropout 0` it is the best (92.6%, 0.1%
+0 (75.5% exact,
+22.5% overtrim). With `--head-dropout 0` it is the best (89.1%, 0.6%
 overtrim). The single rule accounts for the entire gap: `--head-dropout 4`
 trims any leading G-run of length 1..=4 exactly, with no quality gate and no
 test of artefact versus biology. On a library where roughly a quarter of reads
-start with a real G, that removes real sequence — 23.4% of kept mates are
+start with a real G, that removes real sequence — 22.5% of kept mates are
 overtrim at tolerance 0, and even at tolerance 2 (which forgives off-by-one
 and off-by-two boundaries) 1.2% remain, because a run of 3–4 genuine leading
 G's is trimmed wholesale. The project's own sweep clamped `head_dropout` to
@@ -160,28 +169,29 @@ and the default was never calibrated against it — the floor is now 0
 (`c53dbd6`), and `--head-dropout 0` is the shipped default.
 
 **fastprep-hd-off is the strongest tool by this measurement**, but the margin
-over fastp-default is within noise at tolerance 2 (99.7% vs 99.6%) and slight
-at tolerance 0 (92.6% vs 92.2%). Both are effectively at the boundary-jitter
+over fastp-default is within noise at tolerance 2 (99.1% vs 98.5%) and slight
+at tolerance 0 (89.1% vs 88.6%). Both are effectively at the boundary-jitter
 ceiling; the honest claim is parity, not dominance. fastp-default's remaining
-weakness is undertrim (7.6% at tolerance 0, falling to 0.3% at tolerance 2 —
+weakness is undertrim (10.6% at tolerance 0, falling to 0.9% at tolerance 2 —
 largely boundary jitter), and fastprep-hd-off is barely better on that axis
-(7.3% / 0.3%). Neither tool meaningfully removes real biology (0.1–0.2%
+(10.3% / 0.9%). Neither tool meaningfully removes real biology (0.6–0.8%
 overtrim).
 
 **fastp's tuned mode is worse than fastp's default and the only configuration
 where tuning hurt.** Its aggressive `--cut_front`/`--cut_tail` raised overtrim
-from 0.2% to 8.6% and lowered exactness from 92.2% to 84.1%. The overtrim does
-*not* decay with tolerance (8.6% at both 0 and 2), so unlike boundary jitter
+from 0.8% to 9.6% and lowered exactness from 88.6% to 80.4%. The overtrim does
+*not* decay with tolerance (9.6% at tolerance 0 against 9.1% at 2), so unlike
+boundary jitter
 these are genuine over-trims of several bases. Note the domain split:
-fastp-tuned matches fastp-default exactly on human_gut (99.8%) but is far
-worse on bacterial_isolate (80.8% vs 96.2%) and virome (78.4% vs 92.1%) —
+fastp-tuned matches fastp-default exactly on human_gut (98.8%) but is far
+worse on bacterial_isolate (77.6% vs 93.3%) and virome (71.7% vs 86.0%) —
 polyG-heavy libraries.
 
 **fastprep-shipped's one axis of strength is undertrim, and it is bought.**
-1.0% undertrim against fastp-default's 7.6% — but at the cost of 23.4%
+2.0% undertrim against fastp-default's 10.6% — but at the cost of 22.5%
 overtrim, because trimming leading G-runs unconditionally removes artefact
 that a quality-gated rule would leave behind along with real biology. It is
-not a favourable trade: at tolerance 0 the configuration destroys 23.4% of
+not a favourable trade: at tolerance 0 the configuration destroys 22.5% of
 kept mates' real sequence to recover 6.6 points of undertrim.
 
 ## Drop asymmetry (caveat)
@@ -191,17 +201,17 @@ on different kept-sets. Share of each domain's reads dropped at tolerance 0:
 
 | domain            | fastprep-hd-off | fastp-default |
 |-------------------|-----------------|---------------|
-| bacterial_isolate | 3.8%            | 5.1%          |
+| bacterial_isolate | 5.6%            | 8.7%          |
 | generalised       | 7.3%            | 4.5%          |
 | human_gut         | 2.5%            | 0.0%          |
 | metagenomics      | 0.4%            | 0.0%          |
-| rna_seq           | 10.8%           | 2.1%          |
-| virome            | 15.2%           | 0.0%          |
+| rna_seq           | 12.2%           | 2.3%          |
+| virome            | 18.2%           | 0.3%          |
 
-The bacterial_isolate tie (96.3% vs 96.2%) is meaningful — comparable
+The bacterial_isolate tie (93.4% vs 93.3%) is meaningful — comparable
 kept-sets, and fastp drops slightly *more* there. The largest apparent
-fastprep-hd-off win (virome, 93.8% vs 92.1%) is measured on a kept-set roughly
-one sixth smaller (15.2% of virome reads dropped against fastp's 0.0%), so it
+fastprep-hd-off win (virome, 87.3% vs 86.0%) is measured on a kept-set roughly
+substantially smaller (18.2% of virome reads dropped against fastp's 0.3%), so it
 is not an apples-to-apples comparison.
 
 ## Caveats

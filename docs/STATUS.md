@@ -74,7 +74,7 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 | fasthelper vs MultiQC | zero orchestration overhead (0.667 s vs 0.647 s) + manifest provenance; MultiQC v1.35 emits **no output** on `fastsuite.report.v1` (no module for it) — 0 report files at every N from 25 to 800 samples |
 | fastsim ground-truth recovery | **10/10 parameters within tolerance** (was 8/10; the two failures were fastcheck fitter defects, now fixed — see "Known defects" 2–3) |
 | fastsim insert resolution | 94–95% measured exactly at 200–288 bp (18 982 of 20 000 at insert 200, p50 200); the 288 bp ceiling is geometry, not a defect |
-| trim accuracy vs simulator ground truth, tolerance 0 (102 real libraries, one harness) | **fastprep with `--head-dropout 0` leads**: 89.1% exact / 0.6% overtrim / 10.3% undertrim. fastp-default 88.6 / 0.8 / 10.6; fastp-tuned 80.4 / 9.6 / 10.0; **fastprep's historical default (`--head-dropout 4`) is worst at 75.5 / 22.6 / 2.0**. Tolerance 2: 99.1 / 98.5 / 90.2 / 98.5. Re-measured on the regenerated corpus (see above); the ordering is unchanged but the level dropped ~3pp and undertrim roughly doubled, because the simulator now emits N-runs that no trimmer removes. Aggregate of `bench/results/phase-d/overtrim-vs-fastp.tsv`; see `docs/TRIM-ACCURACY.md` |
+| trim accuracy vs simulator ground truth, tolerance 0 (102 real libraries, one harness) | **fastprep with `--head-dropout 0` leads**: 89.1% exact / 0.6% overtrim / 10.3% undertrim. fastp-default 88.6 / 0.8 / 10.6; fastp-tuned 80.4 / 9.6 / 10.0; **fastprep's historical default (`--head-dropout 4`) is worst at 75.5 / 22.5 / 2.0**. Tolerance 2: 99.1 / 98.5 / 90.2 / 98.5. Re-measured on the regenerated corpus (see above); the ordering is unchanged but the level dropped ~3pp and undertrim roughly doubled, because the simulator now emits N-runs that no trimmer removes. Aggregate of `bench/results/phase-d/overtrim-vs-fastp.tsv`; see `docs/TRIM-ACCURACY.md` |
 | `head_dropout` axis (1515 runs, 3030 rows = 101 datasets × 3 variants × hd {0,1,2,3,4}) | `0` is the per-dataset winner on **100 of 101** datasets, `1` on the remaining one, `4` on **none**. Corpus total error at tolerance 0: **7.44% at `0` vs 24.64% at `4` (3.3×)**. `docs/OVERTRIM-SWEEP.md`, `bench/results/phase-d/head-dropout-axis.tsv` |
 | drop asymmetry (the caveat under the trim result) | fastprep drops more reads than fastp at tolerance 0, unevenly: virome **18.2% vs 0.3%**, RNA-seq 12.2% vs 2.3%, while on bacterial_isolate fastprep drops *fewer* (5.6% vs 8.7%). So the largest fastprep accuracy win (virome, 87.3% vs 86.0%) sits on a kept-set substantially smaller and is not apples-to-apples; the bacterial_isolate comparison is. Re-derived from the regenerated corpus (the pre-rebuild figures were virome 15.2%/0.0%, RNA-seq 10.8%/2.1%, bacterial 3.8%/5.1%). `docs/TRIM-ACCURACY.md` §Drop asymmetry |
 
@@ -273,8 +273,8 @@ New and open (not defects of a measured component, but unresolved):
 ## Where each paper stands (local-only repos, never pushed)
 
 All five papers are **written** and were sent to Discord on 2026-10-15. Page
-counts from the rebuilt PDFs: FastPrep **28 p**, FastCheck **18 p**, FastSim
-**23 p**, FastMaps 14 p, FastHelper 16 p. Each has its
+counts from the rebuilt PDFs: FastPrep **28 p**, FastCheck **19 p**, FastSim
+**24 p**, FastMaps 14 p, FastHelper 16 p. Each has its
 `-Bench` repo (committed `results.csv`, seeded generator, VmHWM peak-RSS
 harness; reads gitignored). The FastDedup paper is separate and older (28 p,
 bioRxiv 2026.04.29.721745).
