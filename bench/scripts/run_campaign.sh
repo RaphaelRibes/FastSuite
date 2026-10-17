@@ -45,8 +45,17 @@ WORK="$RESULTS/../work"
 mkdir -p "$RESULTS" "$WORK" "$RESULTS/status"
 
 ROWS="$RESULTS/sweep_rows.tsv"
-[[ -s "$ROWS" ]] || # Same columns as sweep.py's ROW_FIELDS, in the same order.
-printf 'domain\trun_accession\tvariant\tconfig_id\tmin_run\tmercy\tphred_sat\tgate_shape\tmin_len\tmean_q\tadapter_err\tmin_overlap\tr2_reverse\tinterior\tkeep_precision\tkeep_recall\ttrim_mae\tover_trim_rate\tunder_trim_rate\tfalse_keep_rate\tdrop_accuracy\tkept\tshould_keep\tscore\tseconds\tread_len\tmin_len_effective\n' > "$ROWS"
+# Derive the header from sweep.py's ROW_FIELDS. It used to be restated here and
+# went stale when the head_dropout axis landed (c53dbd6): one field short, so
+# every column from head_dropout onward shifted and `score` read `should_keep`.
+# sweep.py writes the header only when it creates the file, so a wrong header
+# here silently corrupts every row of the run.
+if [[ ! -s "$ROWS" ]]; then
+    python3 -c "
+import sys; sys.path.insert(0, '$SCRIPTS')
+import sweep; print('\t'.join(sweep.ROW_FIELDS))
+" > "$ROWS" || { echo "run_campaign: cannot read sweep.ROW_FIELDS" >&2; exit 1; }
+fi
 
 # ---------------------------------------------------------------- the workers
 run_one() {

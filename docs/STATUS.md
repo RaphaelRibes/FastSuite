@@ -78,51 +78,69 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 | `head_dropout` axis (1515 runs, 3030 rows = 101 datasets × 3 variants × hd {0,1,2,3,4}) | `0` is the per-dataset winner on **100 of 101** datasets, `1` on the remaining one, `4` on **none**. Corpus total error at tolerance 0: **7.44% at `0` vs 24.64% at `4` (3.3×)**. `docs/OVERTRIM-SWEEP.md`, `bench/results/phase-d/head-dropout-axis.tsv` |
 | drop asymmetry (the caveat under the trim result) | fastprep drops more reads than fastp at tolerance 0 (1.35 M vs 0.39 M), unevenly: virome **15.2% vs 0.0%**, RNA-seq 10.8% vs 2.1%, while on bacterial_isolate fastprep drops *fewer* (3.8% vs 5.1%). So the largest fastprep accuracy win (virome, 93.8% vs 92.1%) sits on a kept-set roughly one sixth smaller and is not apples-to-apples; the bacterial_isolate tie is. `docs/TRIM-ACCURACY.md` §Drop asymmetry |
 
-## Phase D — the closed loop is complete
+## Phase D — the closed loop, re-measured
 
-The campaign ran the full corpus: **102 real ENA datasets × 55 configs ×
-3 variants = 306 comparisons** (re-read this week from
-`bench/results/phase-d/closed_loop.tsv`; the aggregation and campaign
-scripts are under `bench/scripts/`, the fixtures under `bench/fixtures/`).
+The campaign ran the full corpus: **102 real ENA datasets × 57 configs ×
+3 variants = 306 comparisons**. Earlier revisions said 55 configs; the authored
+grid is **57** (`sweep.py::GRID`, which now carries the `head_dropout` axis).
 
-**PASS 167/306 = 54.6%**, 52 datasets passing every variant.
+**PASS 142/306 = 46.4%**, 47 datasets passing every variant.
+
+> **Re-measured 2026-10-16 — this replaces 167/306 = 54.6%.** That figure was
+> inflated by a corpus artefact: `sim.v1.gt.tsv` and `sim.v2.gt.tsv` were
+> **byte-identical in 100 of 102 datasets**, written in the same second, because
+> `chain.sh` guards every artefact with `if [[ ! -s file ]]` and
+> `run_campaign.sh` skips any `(dataset, variant)` with a status file — so when
+> v0 was regenerated after an earlier fix, v1 and v2 were silently reused. All
+> 18 duplicate-rate failures were that duplicated pair, and v0 had none.
+> Rebuilt with `bench/scripts/rerun-campaign.sh`, which deletes each work dir
+> before rebuilding: **`v1==v2` now 0/102, duplicate-rate failures 0.** Full
+> analysis: `docs/CLOSED-LOOP-RERUN.md`. Evidence of the old state:
+> `results/STALE-BEFORE-RERUN.txt`.
 
 The closed loop scores fastsim against each library's **fastcheck**-measured QC
 profile. It is **fastcheck-only** and independent of fastprep's trimming and of
-the sweep winners — the `head_dropout` work above does not move it.
+the sweep winners.
 
-> **Caveat added 2026-10-16 — the v1/v2 rows are a duplicated artefact.**
-> In `closed_loop.tsv`, the variant-1 and variant-2 rows are **byte-identical**
-> in **100 of 102** datasets across `g_frac_max_diff`, `mean_q_diff`, `gc_diff`
-> and both duplicate rates (e.g. `generalised/DRR000426` v1 = v2). Two seeds
-> (1042, 2042) cannot produce identical statistics to six decimals, so the
-> stored v1 and v2 simulations are one artefact measured twice — consistent
-> with the campaign's own record that only `sim.v0` was regenerated after the
-> last simulator fix, combined with `chain.sh` re-simulating only when
-> `sim.vN.gt.tsv` is missing. Every one of the **18 duplicate-rate failures is
-> a v1/v2 row** (variant 0 has zero), and freshly regenerated 100 k-pair units
-> put the duplicate gate back on the real rate (rebuilt
-> human_gut/DRR425490, DRR425499 and metagenomics/DRR083326, DRR083353,
-> DRR083390 all pass on `dup_ratio`). So the duplicate gate is **already clear
-> on current-generation simulations** and the residual `dup_ratio` failures are
-> a corpus artefact, not a simulator emission gap. The 167/306 figure is
-> therefore a **lower bound** contaminated by the duplicated v1/v2 generation;
-> the loop must be re-run over regenerated sims before the rate is quoted as a
-> simulator-accuracy number. Full evidence: `docs/N-EMISSION.md` §6.
+| domain | pass rate | |
+|---|---|---|
+| human_gut | 94.1% (48/51) | |
+| bacterial_isolate | 64.7% (33/51) | |
+| generalised | 58.8% (30/51) | |
+| virome | 35.3% (18/51) | 3′-biased |
+| rna_seq | 19.6% (10/51) | 3′-biased |
+| metagenomics | **5.9% (3/51)** | |
 
-| domain | pass rate |
-|---|---|
-| human_gut | 92.2% (47/51) |
-| bacterial_isolate | 76.5% (39/51) |
-| generalised | 64.7% (33/51) |
-| virome | 47.1% (24/51) |
-| rna_seq | 41.2% (21/51) |
-| metagenomics | **5.9% (3/51)** |
+**`g_frac` is now the sole blocker**: it appears in **all 164 failing rows**.
+Every other gate is noise by comparison (mean_q 8, gc 5), and the duplicate
+gate is clear.
 
-The pass rate moved through four bug fixes, and **not monotonically** — the
-single most important result in the campaign (stage counts as recorded during
-the campaign; the final 167/306 and the domain split above are re-read from
-`closed_loop.tsv`):
+### The rate went *down* when the contamination was removed
+
+On v0 — the variant that was never duplicated — the rebuild gives **14
+pass→fail and 0 fail→pass**, with the `g_frac` mismatch 3–6× worse
+(e.g. `DRR463958` 0.0033 → 0.0213, `SRR38668091` 0.0064 → 0.0400).
+
+**The polyG fitter fix is the cause, not the N emission.** Isolated by
+stripping `n_run` from the profile and re-running at the same seed, **12 of 14
+still fail with the emission removed entirely**, at 0.0205–0.0395, with the
+values barely moving. The emission tips 2 marginal cases.
+
+The mechanism is the one `docs/OVERTRIM-CEILING.md` warned about: the fitter's
+boundary deconvolution assumes terminal bases are i.i.d. at the measured
+background G rate — *exact* for the simulator's random DNA (hence recovery
+8/10 → 10/10), an *approximation* on real libraries with strong 3′ bias. The
+closed loop fits from real data, and the failure lands on the read's last base.
+`DRR001194` moves 0.0069 → 0.0198 from the fitter alone.
+
+**The fitter became better at the metric it was tuned against and worse at the
+metric the closed loop scores.** The fix direction is a per-position boundary
+model, not a constant and not a wider tolerance.
+
+### The path, for the record
+
+Stages as recorded during the campaign. These were measured on the corpus that
+turned out to be contaminated, so they are history, not a current baseline:
 
 | stage | pass rate |
 |---|---|
@@ -130,7 +148,8 @@ the campaign; the final 167/306 and the domain split above are re-read from
 | after the 3′ boundary-rule fix alone | 86/306 = 28.1% (the fix *lowered* it — it exposed a GC under-model that had been partially cancelling) |
 | after the merged dup_rate fix | 113/306 = 36.9% |
 | after the duplicate-replay fix | 131/306 = 42.8% |
-| after head-G deconvolution | **167/306 = 54.6%** |
+| after head-G deconvolution | 167/306 = 54.6% (contaminated) |
+| **after the corpus rebuild** | **142/306 = 46.4%** |
 
 Median residual over the final run: `g_frac_max_diff` 0.0140, `mean_q_diff`
 0.1503, `gc_diff` 0.0002, `dup_ratio` 1.25, `polyx5_diff` 0.0215.
@@ -245,8 +264,8 @@ New and open (not defects of a measured component, but unresolved):
 ## Where each paper stands (local-only repos, never pushed)
 
 All five papers are **written** and were sent to Discord on 2026-10-15. Page
-counts measured from the built PDFs (as of 2026-10-15, not re-measured): FastCheck
-17 p, FastPrep 24 p, FastMaps 14 p, FastHelper 16 p, FastSim 22 p. Each has its
+counts from the rebuilt PDFs: FastPrep **28 p**, FastCheck **18 p**, FastSim
+**23 p**, FastMaps 14 p, FastHelper 16 p. Each has its
 `-Bench` repo (committed `results.csv`, seeded generator, VmHWM peak-RSS
 harness; reads gitignored). The FastDedup paper is separate and older (28 p,
 bioRxiv 2026.04.29.721745).
@@ -262,9 +281,11 @@ configurations (75.4% exact at tolerance 0) and fastprep with the rule off
 and a stale 90-of-90 claim) in the clean FastPrep-Paper repo. **`paper.pdf` is
 rebuilt** — 28 pages, mtime 2026-10-16 14:35 — so the updated prose is in the
 built PDF.
-Separately, the Phase D closed-loop numbers (167/306) are in
-`FastSim-Paper/benchmark/closed_loop.tsv` but are not yet reflected in the
-papers' prose.
+Separately, the Phase D closed-loop numbers have been re-measured to
+**142/306 = 46.4%** (was 167/306 = 54.6%, inflated by the duplicated v1/v2
+corpus rows — see `docs/CLOSED-LOOP-RERUN.md`). `bench/results/phase-d/closed_loop.tsv`
+is the 46.4% file; `FastSim-Paper/benchmark/closed_loop.tsv` has been refreshed
+from it and the FastSim and FastCheck prose updated.
 
 **Resolved (was flagged as a paper-side inconsistency):** the FastPrep paper's
 §5.6 lead-in (`sect-real-ena.typ`) cited a stale closed-loop figure,
@@ -272,7 +293,7 @@ papers' prose.
 duplicate-ratio; the TSV shows the per-position G-fraction at 120 of 139
 failing rows, against duplicate-ratio 18). Both were corrected in `f4a5425`.
 The authoritative figure is `bench/results/phase-d/closed_loop.tsv` —
-**167/306 = 54.6%**.
+**142/306 = 46.4%** (re-measured; see above).
 
 ## What the suite refuses to do (D-12)
 
@@ -284,9 +305,11 @@ semantics (arrays, resume), per-tile modules (until built), long reads (D-7).
 Io is gone (2026-10-12); the plan is `docs/PLAN-ML-LOCAL.md` — all benchmark
 compute on the desktop (16 cores, 48 GB), laptop interactive-only. **The
 pilot is done and the full campaign ran** — 306 comparisons over 102 real
-ENA datasets, at 54.6% closed-loop pass (fastcheck-only; see above). The sweep
-results stand independently: `winners.tsv` (101 winning configs, 16 distinct of
-the 55-grid) and `fastp-comparison.tsv` (303 rows at gz6, 4 threads) —
+ENA datasets, at **46.4%** closed-loop pass (fastcheck-only; see above). The sweep
+results stand independently: `winners.tsv` (102 rows, **11 distinct configs of
+the 57-grid**, the winner being config 37 — the shipped default with
+`head_dropout=0` — on 53 of them) and `fastp-comparison.tsv` (303 rows at gz6,
+4 threads) —
 fastprep-winner is faster on 100/101 datasets (median 2.00×) and lighter on
 101/101 (34.3 MB median vs fastp's 1134.7 MB). The trim-accuracy benchmark
 (`docs/TRIM-ACCURACY.md`, `bench/scripts/overtrim_vs_fastp.py`) is a separate
