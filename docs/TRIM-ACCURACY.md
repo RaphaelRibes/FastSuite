@@ -238,6 +238,72 @@ is not an apples-to-apples comparison.
   `docs/TRIM-ACCURACY-DISCREPANCY.md`; the numbers here come from the
   single-harness run and should be cited in preference to the older table.
 
+## What the undertrim figure actually contains
+
+**Read this before quoting the undertrim rate.** It is 10.3% for fastprep-hd-off
+at tolerance 0 — but almost none of it is a trimmer failure, and the raw number
+overstates the deficiency by roughly two orders of magnitude.
+
+`bench/scripts/trim_attribution.py` buckets each failing mate by cause, using the
+ground truth's per-mate columns (`r{1,2}_adapter`, `r{1,2}_n`). Over the corpus:
+
+| cause of undertrim | share of 1,951,258 |
+|---|---|
+| **G-run** (no adapter, no N) | **97.0%** |
+| N-run | 2.9% |
+| adapter | 0.1% |
+
+| end | share |
+|---|---|
+| 5′ only | 76.7% |
+| 3′ only | 19.9% |
+| both | 3.3% |
+
+So the question becomes whether those G-runs are *detectable*. The GT records
+`r1_h` / `r1_t` — the run length the simulator **injected** — which a real
+trimmer cannot see. `bench/scripts/trim_posterior.py` computes
+`P(artefact | observed run length)` from the reads plus that column, which is
+the ceiling for any run-length rule. On the regenerated corpus:
+
+```
+ 5'   r    artefact    biology   P(artefact|r)    3'   P(artefact|r)
+      1   1,329,574  3,538,296      0.273              0.071
+      2     322,766    765,543      0.297              0.107
+      3      66,903    168,272      0.284              0.156
+      4      15,636     38,409      0.289              0.236
+      5       5,527      9,154      0.376              0.384
+      6       1,673      2,345      0.416              0.536  <- crosses
+      7       1,037        615      0.628              0.698
+      9+       ~900        ~60      0.92-0.98          0.79-0.91
+
+  Bayes-optimal recovery from run length alone:
+    5'  0.3% of injected runs        3'  34.0% of injected runs
+```
+
+**The 5′ dropout is not detectable, only decidable.** `P(artefact)` sits at
+~0.27–0.29 for r=1–4, so trimming a short leading G-run is wrong about **73%** of
+the time, and it crosses 0.5 only at r≥7 (1.5% of cases). The artefact and the
+biology are the same base with the same quality; the simulator knows which is
+which only because it injected one. Keeping those bases is the **correct**
+decision, and the loop counts it as error.
+
+Decomposed, the 10.3% is:
+
+| | share of undertrim | verdict |
+|---|---|---|
+| 5′ r=1–4 | ~54% | irreducible — trimming would be wrong ~73% of the time |
+| 3′ r=1–5 | ~40% | irreducible — P = 0.07–0.38 |
+| **3′ r≥6 that the scan missed** | **~0.9%** (~17,700 mates) | **genuinely recoverable** |
+
+The default `min_run` is 12, so 3′ runs of 6–11 fall below it even though
+P > 0.5 from r=6. Recovering all of them would move the tolerance-0 exact rate
+by about **0.09 pp**.
+
+**Consequence for the paper:** quote the undertrim rate with this decomposition
+attached, or it misrepresents the trimmer by ~100×. The defensible claim is
+that the trimmer keeps those bases because they are majority biology, and that
+the ground truth can label them artefact only because a simulator injected them.
+
 ## Reproducing
 
 ```bash
@@ -245,7 +311,18 @@ python3 bench/scripts/overtrim_vs_fastp.py   # writes bench/results/phase-d/over
 ```
 
 The tables above are aggregates of that file (tool x domain x accession x
-tolerance). `bench/scripts/aggregate_trim.py` still reproduces the
+tolerance). Two further scripts back the undertrim decomposition:
+
+```bash
+python3 bench/scripts/trim_attribution.py    # bucket each failing mate by cause
+python3 bench/scripts/trim_posterior.py --end 5   # P(artefact | observed run length)
+python3 bench/scripts/trim_posterior.py --end 3
+```
+
+Both re-run fastprep and re-parse its PXMT, so their totals reproduce the TSV
+above. `overtrim_vs_fastp.py` **refuses to overwrite** an existing `--out`
+unless `--force` is given (it appends, so a second run would mix two corpora in
+one file); the other two only read. `bench/scripts/aggregate_trim.py` still reproduces the
 **superseded** 3-tool table from `bench/results/phase-d/trim-accuracy.tsv`
 (606 rows, fastprep-winner baseline) — it is kept for the historical record
 and its output must not be cited as current. `bench/scripts/trim_accuracy.py`
