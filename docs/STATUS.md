@@ -151,16 +151,25 @@ turned out to be contaminated, so they are history, not a current baseline:
 | after head-G deconvolution | 167/306 = 54.6% (contaminated) |
 | **after the corpus rebuild** | **142/306 = 46.4%** |
 
-Median residual over the final run: `g_frac_max_diff` 0.0140, `mean_q_diff`
-0.1503, `gc_diff` 0.0002, `dup_ratio` 1.25, `polyx5_diff` 0.0215.
+Median residual over the re-measured run: `g_frac_max_diff` **0.0218** (now
+just *outside* the 0.02 bound), `mean_q_diff` 0.1735, `gc_diff` 0.0005,
+`dup_ratio` 1.0154, `polyx5_diff` 0.0100. (The previous run's medians —
+0.0140 / 0.1503 / 0.0002 / 1.25 / 0.0215 — are history, not a baseline.)
 
-**The fitter is fixed**, and the pilot is long past — the "gated on the fitter"
-framing in earlier revisions of this document no longer applies. The profile
-fitter's `BASE_POSITIONS` was raised from 60 to 512 (commit `430117a`) so a
-high-GC library's position-wise G ramp is no longer halved, alongside a
-measured `dup_rate`; those were the two lossy terms behind the GATE-2 fitter
-failures. fastsim's insert-size resolution went 0.5078 → 0.9491 at insert 200
-as a result.
+**The fitter is improved, but not unambiguously.** The "gated on the fitter"
+framing in earlier revisions no longer applies: `BASE_POSITIONS` was raised
+from 60 to 512 (`430117a`) so a high-GC library's position-wise G ramp is no
+longer halved, alongside a measured `dup_rate`, and fastsim's insert-size
+resolution went 0.5078 → 0.9491 at insert 200 as a result.
+
+**But the later polyG run-length fix is a trade, not a win.** It made the
+fitter's own recovery score 8/10 → 10/10 while *lowering* the closed loop,
+because its boundary deconvolution assumes terminal bases are i.i.d. at the
+measured background G rate — exact for the simulator's random DNA, approximate
+on real 3′-biased libraries. That is the 54.6% → 46.4% drop above. Do not read
+"the fitter is fixed" as a settled claim: it is better at the metric it was
+tuned against and worse at the one the loop scores. See
+`docs/CLOSED-LOOP-RERUN.md` §3.
 
 ## Known defects (measured, not guessed)
 
