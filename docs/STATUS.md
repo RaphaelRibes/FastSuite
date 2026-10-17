@@ -74,9 +74,9 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 | fasthelper vs MultiQC | zero orchestration overhead (0.667 s vs 0.647 s) + manifest provenance; MultiQC v1.35 emits **no output** on `fastsuite.report.v1` (no module for it) — 0 report files at every N from 25 to 800 samples |
 | fastsim ground-truth recovery | **10/10 parameters within tolerance** (was 8/10; the two failures were fastcheck fitter defects, now fixed — see "Known defects" 2–3) |
 | fastsim insert resolution | 94–95% measured exactly at 200–288 bp (18 982 of 20 000 at insert 200, p50 200); the 288 bp ceiling is geometry, not a defect |
-| trim accuracy vs simulator ground truth, tolerance 0 (101 real libraries, one harness) | **fastprep with `--head-dropout 0` leads**: 92.6% exact / 0.1% overtrim / 7.3% undertrim. fastp-default 92.2 / 0.2 / 7.6; fastp-tuned 84.1 / 8.6 / 7.3; **fastprep's shipped default (`--head-dropout 4`) is worst at 75.4 / 23.6 / 1.0**. Tolerance 2: 99.7 / 99.6 / 91.2 / 98.7. Aggregate of `bench/results/phase-d/overtrim-vs-fastp.tsv`; see `docs/TRIM-ACCURACY.md` |
+| trim accuracy vs simulator ground truth, tolerance 0 (102 real libraries, one harness) | **fastprep with `--head-dropout 0` leads**: 89.1% exact / 0.6% overtrim / 10.3% undertrim. fastp-default 88.6 / 0.8 / 10.6; fastp-tuned 80.4 / 9.6 / 10.0; **fastprep's historical default (`--head-dropout 4`) is worst at 75.5 / 22.6 / 2.0**. Tolerance 2: 99.1 / 98.5 / 90.2 / 98.5. Re-measured on the regenerated corpus (see above); the ordering is unchanged but the level dropped ~3pp and undertrim roughly doubled, because the simulator now emits N-runs that no trimmer removes. Aggregate of `bench/results/phase-d/overtrim-vs-fastp.tsv`; see `docs/TRIM-ACCURACY.md` |
 | `head_dropout` axis (1515 runs, 3030 rows = 101 datasets × 3 variants × hd {0,1,2,3,4}) | `0` is the per-dataset winner on **100 of 101** datasets, `1` on the remaining one, `4` on **none**. Corpus total error at tolerance 0: **7.44% at `0` vs 24.64% at `4` (3.3×)**. `docs/OVERTRIM-SWEEP.md`, `bench/results/phase-d/head-dropout-axis.tsv` |
-| drop asymmetry (the caveat under the trim result) | fastprep drops more reads than fastp at tolerance 0 (1.35 M vs 0.39 M), unevenly: virome **15.2% vs 0.0%**, RNA-seq 10.8% vs 2.1%, while on bacterial_isolate fastprep drops *fewer* (3.8% vs 5.1%). So the largest fastprep accuracy win (virome, 93.8% vs 92.1%) sits on a kept-set roughly one sixth smaller and is not apples-to-apples; the bacterial_isolate tie is. `docs/TRIM-ACCURACY.md` §Drop asymmetry |
+| drop asymmetry (the caveat under the trim result) | fastprep drops more reads than fastp at tolerance 0, unevenly: virome **18.2% vs 0.3%**, RNA-seq 12.2% vs 2.3%, while on bacterial_isolate fastprep drops *fewer* (5.6% vs 8.7%). So the largest fastprep accuracy win (virome, 87.3% vs 86.0%) sits on a kept-set substantially smaller and is not apples-to-apples; the bacterial_isolate comparison is. Re-derived from the regenerated corpus (the pre-rebuild figures were virome 15.2%/0.0%, RNA-seq 10.8%/2.1%, bacterial 3.8%/5.1%). `docs/TRIM-ACCURACY.md` §Drop asymmetry |
 
 ## Phase D — the closed loop, re-measured
 
@@ -283,8 +283,10 @@ bioRxiv 2026.04.29.721745).
 committed.** `sect-real-ena.typ`'s trim-accuracy section (`@tbl-trim-acc`) was
 rewritten to conclude that the *shipped default* was the problem, not the
 algorithm: fastprep at `--head-dropout 4` is the worst of the four
-configurations (75.4% exact at tolerance 0) and fastprep with the rule off
-(92.6%) matches or beats fastp-default (92.2%). The reversal is commits
+configurations (75.5% exact at tolerance 0) and fastprep with the rule off
+(89.1%) matches or beats fastp-default (88.6%). Those figures are the
+re-measured ones — the pre-regeneration values were 75.4 and 92.6/92.2. The
+reversal is commits
 `b408bae` (reverse Section 5.6), `c089709` (drop asymmetry) and `f4a5425`
 (corrected numbers, the `--head-dropout 0` default, a stale closed-loop figure
 and a stale 90-of-90 claim) in the clean FastPrep-Paper repo. **`paper.pdf` is

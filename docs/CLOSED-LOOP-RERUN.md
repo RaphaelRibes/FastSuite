@@ -98,3 +98,24 @@ different realisation. The staleness guard and the input-identity resume key
 added in `73c2385` turn that into a refusal rather than a silently wrong
 number, but any sim FASTQ, `sweep.c*.pxmt`, or trim-accuracy row produced
 before this re-run must be regenerated, not reused.
+
+## 6. The tooling lesson: three silencers, one shape
+
+Every wrong number in this re-run came from a tool that **quietly reused or
+mixed state instead of refusing**. That is a pattern, not bad luck, and each
+case has now been closed:
+
+| tool | what it did | guard |
+|---|---|---|
+| `chain.sh` | `if [[ ! -s file ]]` — reused any existing artefact, which is how v1/v2 survived a fix | `rerun-campaign.sh` deletes each work dir before rebuilding |
+| `closed_loop.py` | refused to overwrite `--row`, so a re-score that never ran printed the *previous* run's numbers as if fresh | already had `--force`; the re-run must pass it |
+| `overtrim_vs_fastp.py` | `emit` opens `--out` in mode `"a"`, so a second run **appended** to the first — a file where every key appeared twice, once per corpus | now refuses unless `--force`, checked *before* any work |
+
+The general rule these three arrived at: **a script must fail loudly when its
+output already exists.** An artefact that silently outlives its inputs is
+indistinguishable from a correct one, and the cost of finding out is a full
+campaign rebuild — as this one required.
+
+Anything else added under `bench/scripts/` that writes a result should refuse
+by default and take an explicit overwrite flag.
+

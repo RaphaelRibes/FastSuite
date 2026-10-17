@@ -202,18 +202,41 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--offset", type=int, default=0)
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing --out instead of refusing")
     a = ap.parse_args()
+
+    # Refuse to append — checked FIRST, before any work, so a re-run against an
+    # existing output costs nothing. `emit` below opens --out in mode "a" so
+    # that sharded runs (--stride/--offset) can share one file. The consequence,
+    # when the file already exists from a previous run, is that this run's rows
+    # are SILENTLY MIXED with that run's. That is not hypothetical: it produced
+    # a file in which every key appeared twice — once from the stale
+    # pre-regeneration corpus and once from the new one — and aggregating it
+    # returned numbers that were a blend of two different corpora. Same class of
+    # silent-stale-data bug as the chain.sh artefact reuse.
+    if a.offset == 0 and os.path.exists(a.out) and not a.force:
+        sys.exit(
+            f"overtrim_vs_fastp: {a.out} already exists and this script APPENDS "
+            f"to its output (sharded runs share one file), so re-running would "
+            f"mix the old rows with the new ones. Delete it, pass a new --out, "
+            f"or pass --force to overwrite."
+        )
+    if a.offset == 0 and a.force and os.path.exists(a.out):
+        os.remove(a.out)
 
     winners = list(csv.DictReader(open(f"{R}/winners.tsv"), delimiter="\t"))
     winners = winners[a.offset::a.stride]
     print(f"datasets: {len(winners)}", flush=True)
 
-    if a.offset == 0 and not os.path.exists(a.out):
+    # Write the header (the append-refusal happens at the top of main(), before
+    # any work, so that a re-run against an existing path costs nothing).
+    if a.offset == 0:
         with open(a.out, "w", newline="") as fh:
             csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(
                 ["domain", "acc", "tool", "tol", "exact", "overtrim",
                  "undertrim", "unaligned", "dropped", "scored"])
-    elif a.offset != 0:
+    else:
         import time
         for _ in range(600):
             if os.path.exists(a.out):
