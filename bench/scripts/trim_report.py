@@ -211,6 +211,10 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
     if limit:
         winners = winners[:limit]
     c = collections.defaultdict(collections.Counter)      # (tool,tol) -> Counter
+    # MEASUREMENT-ONLY: per-domain counters, so a config's retention can be
+    # read per domain (the kept-set question is concentrated: virome/rna_seq).
+    # Written to $FASTPREP_DOMAIN_TSV when set; inert otherwise.
+    cdom = collections.defaultdict(collections.Counter)   # (tool,tol,domain)
     for i, w in enumerate(winners, 1):
         dom, acc = w["domain"], w["run_accession"]
         v0 = f"{work}/{dom}/{acc}/v0"
@@ -229,7 +233,8 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
         for key, (flag, conv) in H.CONF.items():
             if w.get(key) not in (None, ""):
                 base += [flag, conv(w[key])]
-        if w.get("min_len") not in (None, ""):
+        has_minlen = w.get("min_len") not in (None, "")
+        if has_minlen:
             base += ["--min-len", H._minlen(w)]
         if str(w.get("r2_reverse")) in ("True", "true", "1"):
             base += ["--r2-scan-reverse"]
@@ -243,10 +248,20 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
                     ("fastprep-hd4", ["--head-dropout", str(H.eff_hd(w))])]
         fp_tools += [(tag, ["--head-dropout", "0"] + args) for tag, args in VARIANTS]
         for tag, hd_args in fp_tools:
+            argv = list(base) + list(hd_args)
+            # A VARIANT may carry its own `--min-len` to OVERRIDE the winner's
+            # (a min-len LADDER is expressed this way). clap rejects a duplicate
+            # `--min-len` (rc=2), and the append hook cannot express an override,
+            # so the winner's `--min-len <val>` pair is dropped for that variant
+            # only. Inert when the variant has no `--min-len`: argv == base +
+            # hd_args, so the published baselines keep their exact argv.
+            if has_minlen and "--min-len" in hd_args:
+                k = argv.index("--min-len")
+                del argv[k:k + 2]
             px = f"{d}/{tag}.pxmt"
             r = subprocess.run([H.FP, "-1", s1, "-2", s2, "-o", f"{d}/{tag}_1.fq.gz",
                                 "-p", f"{d}/{tag}_2.fq.gz", "--metadata", px]
-                               + base + hd_args,
+                               + argv,
                                capture_output=True)
             if r.returncode != 0:
                 print(f"  [{i}] {acc} {tag}: rc={r.returncode}", file=sys.stderr,
@@ -266,6 +281,7 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
                         t5, t3, h, t, ad, n, leading_g(raw.get((pid, mate), "")),
                         trailing_g(raw.get((pid, mate), "")), p5, p3, tol)
                     c[(tag, tol)][k] += 1
+                    cdom[(tag, tol, dom)][k] += 1
 
         # ---- fastp-default and fastp-tuned (cuts recovered by alignment) ----
         for tag, extra in ((("fastp-default", []), ("fastp-tuned", H.FASTP_TUNED))
@@ -290,22 +306,26 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
                 if tr is None:
                     c[(tag, 0)]["dropped"] += 1
                     c[(tag, 2)]["dropped"] += 1
+                    cdom[(tag, 0, dom)]["dropped"] += 1
+                    cdom[(tag, 2, dom)]["dropped"] += 1
                     continue
                 cuts = H.infer_cuts(seq, tr)
                 for tol in (0, 2):
                     if cuts is None:
                         c[(tag, tol)]["unaligned"] += 1
+                        cdom[(tag, tol, dom)]["unaligned"] += 1
                         continue
-                    c[(tag, tol)][classify(cuts[0], cuts[1], h, t, ad, n,
-                                           leading_g(seq), trailing_g(seq),
-                                           p5, p3, tol)] += 1
+                    k = classify(cuts[0], cuts[1], h, t, ad, n,
+                                 leading_g(seq), trailing_g(seq), p5, p3, tol)
+                    c[(tag, tol)][k] += 1
+                    cdom[(tag, tol, dom)][k] += 1
         # measurement-only: every config's PXMT/FASTQ for this dataset has been
         # scored above, so free it — a 102-dataset × 6-config run otherwise
         # fills /tmp (overtrim_vs_fastp.py does the same). Numbers unaffected.
         subprocess.run(["rm", "-rf", d], capture_output=True)
         if i % 10 == 0:
             print(f"  [{i}/{len(winners)}] {acc}", file=sys.stderr, flush=True)
-    return c
+    return c, cdom
 
 
 # --------------------------------------------------------------------------
@@ -389,7 +409,8 @@ def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
           f"3' crossing at r={next((r for r in sorted(p3) if p3[r] > 0.5), None)}",
           file=sys.stderr, flush=True)
     print("running tools ...", file=sys.stderr, flush=True)
-    c = decomp(winners, work, results, p5, p3, limit, run_fastp=run_fastp)
+    c, cdom = decomp(winners, work, results, p5, p3, limit,
+                     run_fastp=run_fastp)
 
     lines = []
     lines.append("=== UNDERTRIM DECOMPOSITION (per tool) ===")
@@ -423,6 +444,26 @@ def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
         wr.writerow(hdr)
         wr.writerows(tsv_rows)
     print(f"\nwrote {out} ({len(tsv_rows)} rows)")
+
+    # MEASUREMENT-ONLY per-domain retention (kept = scored), when requested.
+    dtsv = os.environ.get("FASTPREP_DOMAIN_TSV", "").strip()
+    if dtsv:
+        drows = []
+        for (tag, tol, dom), s in cdom.items():
+            kept = (s["exact"] + s["overtrim"] + s["rec"] + s["irr"]
+                    + s["unaligned"])
+            dr = s["dropped"]
+            if kept + dr == 0:
+                continue
+            drows.append([dom, tag, tol, kept, dr, kept + dr,
+                          f"{100 * kept / (kept + dr):.2f}"])
+        drows.sort(key=lambda r: (r[0], r[2], r[1]))
+        with open(dtsv, "w", newline="") as fh:
+            wr = csv.writer(fh, delimiter="\t", lineterminator="\n")
+            wr.writerow(["domain", "tool", "tol", "kept", "dropped", "total",
+                         "retention_pct"])
+            wr.writerows(drows)
+        print(f"wrote {dtsv} ({len(drows)} rows)")
     return p5, p3
 
 

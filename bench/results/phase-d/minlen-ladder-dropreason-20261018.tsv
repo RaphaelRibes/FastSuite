@@ -1,0 +1,13 @@
+domain	acc	config	mates_evaluated	kept	kept_pct	drop_reason_histogram
+virome	SRR20754397	hd0 (winner + --head-dropout 0)	200000	32838	16.42	Duplicate=167162
+virome	SRR20754397	hd0 --no-dedup	200000	200000	100.00	(none)
+virome	SRR20754397	hd0 --min-len 15	200000	32838	16.42	Duplicate=167162
+virome	SRR20754397	hd0 --no-dedup --min-len 15	200000	200000	100.00	(none)
+virome	SRR19649201	hd0 (winner + --head-dropout 0)	200000	104031	52.02	Duplicate=95510 Poly5=442 Poly3=12 MeanQ=5
+virome	SRR19649201	hd0 --no-dedup	200000	199111	99.56	Poly5=853 Poly3=28 MeanQ=8
+virome	SRR19649201	hd0 --min-len 15	200000	103994	52.00	Duplicate=95510 Poly5=475 Poly3=20 MeanQ=1
+virome	SRR19649201	hd0 --no-dedup --min-len 15	200000	199034	99.52	Poly5=920 Poly3=45 MeanQ=1
+rna_seq	DRR015139	hd0 (winner + --head-dropout 0)	200000	167862	83.93	Duplicate=32138
+rna_seq	DRR015139	hd0 --no-dedup	200000	200000	100.00	(none)
+rna_seq	DRR015139	hd0 --min-len 15	200000	167862	83.93	Duplicate=32138
+rna_seq	DRR015139	hd0 --no-dedup --min-len 15	200000	200000	100.00	(none)
