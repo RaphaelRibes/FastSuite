@@ -19,6 +19,8 @@ use gzp::deflate::Bgzf;
 use gzp::par::decompress::ParDecompressBuilder;
 
 use crate::accum::Accum;
+use crate::cli::Modules;
+use crate::gated::Work;
 
 const INPUT_BUFFER: usize = 1 << 20;
 
@@ -37,6 +39,10 @@ pub struct ScanResult {
     /// `None` when the whole file was read.
     pub stopped: Option<&'static str>,
     pub decompress: &'static str,
+    /// Measurement work done per read. All zero on the ungated path, which does
+    /// not count it: the counters exist for the gated run, where "did gating
+    /// actually skip the work?" has to be answerable from outside.
+    pub work: Work,
 }
 
 /// Counts bytes pulled from the underlying file, shared with the decoder so
@@ -159,8 +165,24 @@ pub(crate) fn read_line(rdr: &mut dyn BufRead, out: &mut Vec<u8>) -> io::Result<
     Ok(n)
 }
 
-/// Read one file into `acc`, one pass, honouring the budgets.
-pub fn scan_file(path: &Path, gz_threads: usize, limits: Limits, acc: &mut Accum) -> Result<ScanResult> {
+/// Read one file into `acc`, one pass, honouring the budgets, measuring the modules
+/// `gate` enables.
+///
+/// `None` is the ungated path — every per-read measurement runs (`Accum::observe`),
+/// which is what any run without a gating flag takes, so its numbers are exactly what
+/// they were before `--only` existed. `Some(modules)` runs `Accum::observe_gated`: the
+/// quality line is still read and length-checked (it is part of the record's framing,
+/// and a short quality line is an error, not a thing to guess at), but it is never
+/// decoded, no position row is grown for a module that is off, and the grid, the polyX
+/// runs, the fingerprint table and the k-mer counter are only touched when their module
+/// is on.
+pub fn scan_file_gated(
+    path: &Path,
+    gz_threads: usize,
+    limits: Limits,
+    acc: &mut Accum,
+    gate: Option<Modules>,
+) -> Result<ScanResult> {
     let from_stdin = path.as_os_str() == "-";
     // A named file must have a plausible FASTQ extension, so a .bam/.bz2/.xz
     // gets a clear message instead of being parsed as text. A stream has no
@@ -191,6 +213,7 @@ pub fn scan_file(path: &Path, gz_threads: usize, limits: Limits, acc: &mut Accum
     );
     let mut reads: u64 = 0;
     let mut stopped = None;
+    let mut work = Work::default();
 
     loop {
         if let Some(m) = limits.max_reads {
@@ -256,7 +279,16 @@ pub fn scan_file(path: &Path, gz_threads: usize, limits: Limits, acc: &mut Accum
             );
         }
 
-        acc.observe(&seq, &qual);
+        // The record is measured here: gated when a module subset was selected, the
+        // ungated (unchanged) path otherwise.
+        let w = match &gate {
+            Some(m) => acc.observe_gated(&seq, &qual, m),
+            None => {
+                acc.observe(&seq, &qual);
+                Work::default()
+            }
+        };
+        work.add(&w);
         reads += 1;
     }
 
@@ -264,6 +296,7 @@ pub fn scan_file(path: &Path, gz_threads: usize, limits: Limits, acc: &mut Accum
         bytes_read: counter.0.load(Ordering::Relaxed),
         stopped,
         decompress: mode,
+        work,
     })
 }
 
@@ -292,7 +325,7 @@ mod tests {
         let d = tmpdir("plain");
         let p = write(&d, "a.fastq", FASTQ);
         let mut acc = Accum::new(64);
-        let r = scan_file(&p, 1, Limits::default(), &mut acc).unwrap();
+        let r = scan_file_gated(&p, 1, Limits::default(), &mut acc, None).unwrap();
         assert_eq!(acc.reads, 2);
         assert_eq!(acc.bases, 16);
         assert_eq!(r.stopped, None);
@@ -304,7 +337,7 @@ mod tests {
         let d = tmpdir("budget");
         let p = write(&d, "a.fastq", FASTQ);
         let mut acc = Accum::new(64);
-        let r = scan_file(
+        let r = scan_file_gated(
             &p,
             1,
             Limits {
@@ -312,6 +345,7 @@ mod tests {
                 max_bytes: None,
             },
             &mut acc,
+            None,
         )
         .unwrap();
         assert_eq!(acc.reads, 1, "exactly the budget, no more");
@@ -324,7 +358,7 @@ mod tests {
         let d = tmpdir("fasta");
         let p = write(&d, "a.fastq", b">r1\nACGT\n");
         let mut acc = Accum::new(64);
-        let err = scan_file(&p, 1, Limits::default(), &mut acc).unwrap_err();
+        let err = scan_file_gated(&p, 1, Limits::default(), &mut acc, None).unwrap_err();
         assert!(err.to_string().contains("FASTA"), "{err}");
     }
 
@@ -333,7 +367,7 @@ mod tests {
         let d = tmpdir("ext");
         let p = write(&d, "a.bam", b"not a fastq");
         let mut acc = Accum::new(64);
-        let err = scan_file(&p, 1, Limits::default(), &mut acc).unwrap_err();
+        let err = scan_file_gated(&p, 1, Limits::default(), &mut acc, None).unwrap_err();
         assert!(err.to_string().contains("plain FASTQ"), "{err}");
     }
 
@@ -342,7 +376,7 @@ mod tests {
         let d = tmpdir("wrapped");
         let p = write(&d, "a.fastq", b"@r1\nACGT\nACGT\n+\nIIII\nIIII\n");
         let mut acc = Accum::new(64);
-        let err = scan_file(&p, 1, Limits::default(), &mut acc).unwrap_err();
+        let err = scan_file_gated(&p, 1, Limits::default(), &mut acc, None).unwrap_err();
         assert!(err.to_string().contains("wrapped"), "{err}");
     }
 
@@ -370,9 +404,9 @@ mod tests {
         let mut a = Accum::new(64);
         let mut b = Accum::new(64);
         let mut c = Accum::new(64);
-        let rp = scan_file(&plain, 1, Limits::default(), &mut a).unwrap();
-        let rg = scan_file(&gz, 4, Limits::default(), &mut b).unwrap();
-        let rb = scan_file(&bgzf, 4, Limits::default(), &mut c).unwrap();
+        let rp = scan_file_gated(&plain, 1, Limits::default(), &mut a, None).unwrap();
+        let rg = scan_file_gated(&gz, 4, Limits::default(), &mut b, None).unwrap();
+        let rb = scan_file_gated(&bgzf, 4, Limits::default(), &mut c, None).unwrap();
         assert_eq!(rp.decompress, "plain");
         assert_eq!(rg.decompress, "gzip-serial");
         assert_eq!(rb.decompress, "bgzf-parallel");
@@ -388,5 +422,39 @@ mod tests {
         }
         assert_eq!(a.qual_byte, b.qual_byte);
         assert_eq!(a.qual_byte, c.qual_byte);
+    }
+
+    /// The gated scan measures what its modules say and nothing else, and the ungated
+    /// scan counts no work at all (it does not keep counters).
+    #[test]
+    fn gated_scan_measures_only_the_selected_modules() {
+        let d = tmpdir("gated");
+        let p = write(&d, "a.fastq", FASTQ);
+
+        let mut acc = Accum::new(64);
+        let m = Modules { dup: true, ..Modules::none() };
+        let r = scan_file_gated(&p, 1, Limits::default(), &mut acc, Some(m)).unwrap();
+        assert_eq!(acc.reads, 2, "reads are always counted");
+        assert_eq!(acc.bases, 16);
+        assert_eq!(r.work.fingerprints, 2, "dup fingerprints every read");
+        assert_eq!(r.work.base_cells, 0, "no composition row was grown");
+        assert_eq!(r.work.quality_bytes, 0, "no quality byte was decoded");
+        assert_eq!(acc.base_pos.len(), 0, "bases off: no row allocated");
+        assert_eq!(acc.qual_pos.len(), 0, "quality off: no row allocated");
+        assert_eq!(acc.len_hist.len(), 0, "length off: no histogram");
+        assert_eq!(acc.reads_with_n, 0, "the fixture has no N");
+
+        let mut u = Accum::new(64);
+        let ru = scan_file_gated(&p, 1, Limits::default(), &mut u, None).unwrap();
+        assert_eq!(ru.work, Work::default(), "the ungated path keeps no counters");
+        assert_eq!(u.base_pos.len(), 8, "and measures everything, as it always did");
+        assert_eq!(u.qual_pos.len(), 8);
+        assert_eq!(u.len_hist[8], 2);
+
+        // The quality line is still part of the framing: a gated run cannot skip it.
+        let bad = write(&d, "bad.fastq", b"@r1\nACGTACGT\n+\nIIII\n");
+        let mut acc = Accum::new(64);
+        let err = scan_file_gated(&bad, 1, Limits::default(), &mut acc, Some(m)).unwrap_err();
+        assert!(err.to_string().contains("quality length"), "{err}");
     }
 }

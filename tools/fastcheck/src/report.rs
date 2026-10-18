@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::accum::{quantile, Accum, OffsetVerdict, QBINS};
+use crate::cli::Modules;
 use crate::reader::ScanResult;
 
 pub struct FileReport {
@@ -129,7 +130,7 @@ fn write_out(path: &Path, body: &str) -> Result<()> {
 }
 
 fn base_position_json(a: &Accum) -> serde_json::Value {
-    let n = a.covered_positions();
+    let n = measured_positions(a);
     let mut rows = serde_json::Map::with_capacity(n);
     for pos in 0..n {
         rows.insert(
@@ -145,6 +146,19 @@ fn base_position_json(a: &Accum) -> serde_json::Value {
     serde_json::Value::Object(rows)
 }
 
+/// Positions the per-position matrices cover. Measured from the quality rows (grown
+/// to the longest read, and every read contributes to both planes), falling back to
+/// the composition rows when the quality module did not run. `q_pos > 0` whenever a
+/// read was measured, so the fallback only ever applies to a gated run.
+fn measured_positions(a: &Accum) -> usize {
+    let q = a.covered_positions();
+    if q > 0 {
+        q
+    } else {
+        a.base_pos.iter().filter(|r| r.iter().any(|&c| c > 0)).count()
+    }
+}
+
 pub fn write_report(
     path: &Path,
     files: &[FileReport],
@@ -158,19 +172,56 @@ pub fn write_report(
     overrep: crate::overrep::OverrepMode,
     overrep_min_count: u32,
     adapter_content: Option<(&crate::adapter_pos::AdapterPos, f64, usize)>,
+    modules: Option<&Modules>,
 ) -> Result<()> {
     let offset = verdict.offset;
     let (byte_min, byte_max) = byte_range(&total.qual_byte);
     let bytes_read: u64 = files.iter().map(|f| f.scan.bytes_read).sum();
 
+    // Module gating. `None` means no gating flag was given and every field below is
+    // emitted exactly as it was before `--only` existed; `Some(m)` emits only what the
+    // enabled modules measured. An absent field means "not measured" — never "measured
+    // as zero" — which is the rule the adapter_content block already follows. The one
+    // always-reported number is `phred_offset`: with the quality module off it is the
+    // stated default 33, and the report says so in `assumptions`.
+    let on = |f: fn(&Modules) -> bool| modules.map_or(true, |m| f(m));
+    let (
+        bases_on,
+        q_on,
+        len_on,
+        gc_on,
+        hm_on,
+        dup_on,
+        polyx_on,
+        kmer_on,
+    ) = (
+        on(|m| m.bases),
+        on(|m| m.quality),
+        on(|m| m.length),
+        on(|m| m.gc),
+        on(|m| m.heatmap),
+        on(|m| m.dup),
+        on(|m| m.polyx),
+        on(|m| m.kmer),
+    );
+
     let mut notes = vec![
-        format!("Phred offset: {} ({})", offset, verdict.reason),
-        format!(
+        if q_on {
+            format!("Phred offset: {} ({})", offset, verdict.reason)
+        } else {
+            format!(
+                "Phred offset: {offset} (stated default: the quality module did not run, \
+                 so no byte census decided it)"
+            )
+        },
+    ];
+    if gc_on {
+        notes.push(format!(
             "%-GC denominators exclude N: {} of {} bases are non-ACGT",
             bases_other(total),
             total.bases
-        ),
-    ];
+        ));
+    }
     if verdict.malformed {
         notes.push(format!(
             "quality bytes below 33 observed (min {byte_min}): the file is not valid Phred+33"
@@ -280,12 +331,22 @@ pub fn write_report(
     // D-6: every assumption this run rests on, stated as data rather than as
     // prose, so a consumer can act on it.
     let mut assumptions: Vec<serde_json::Value> = Vec::new();
-    if !verdict.certain {
+    if !verdict.certain && q_on {
         assumptions.push(json!({
             "what": "phred_offset",
             "value": offset,
             "basis": verdict.reason,
             "consequence": "quality-derived metrics use this offset; they are wrong by 31 if the file is Phred+64",
+        }));
+    }
+    if !q_on {
+        assumptions.push(json!({
+            "what": "quality",
+            "value": "not measured",
+            "basis": "--no-quality (or --only without quality) skipped the quality accumulators; \
+                      the bytes were read for framing but never decoded",
+            "consequence": "no quality-derived metric is reported; the Phred offset is the stated \
+                            default 33, not a measurement",
         }));
     }
 
@@ -362,6 +423,104 @@ pub fn write_report(
         doc["adapter_content"] = ap.to_json(error_rate, min_overlap);
     }
 
+    // Gating: a module that did not run leaves no key behind. The values for gated-out
+    // blocks were computed from empty accumulators, so they are dropped rather than
+    // published — a consumer must never read an absent block as a measured zero. The
+    // `modules` array is itself only emitted when a gating flag was given: with every
+    // module on (or no flag at all) there is nothing to declare, and the default report
+    // stays byte for byte what it was.
+    if let Some(m) = modules {
+        doc["modules"] = json!(m.enabled_names());
+
+        // (key, the module that owns it)
+        let blocks: [(&str, bool); 9] = [
+            ("base_composition", bases_on),
+            ("base_position", bases_on),
+            ("read_length_hist", len_on),
+            ("read_mean_q_hist", q_on),
+            ("polyx", polyx_on),
+            ("repeated_sequences", dup_on),
+            ("overrep", dup_on),
+            ("kmer_spectrum", kmer_on),
+            ("heatmap", hm_on),
+        ];
+        let metrics_keys: [(&str, bool); 30] = [
+            ("bases_acgt", gc_on),
+            ("bases_non_acgt", gc_on),
+            ("gc_fraction", gc_on),
+            ("min_len", len_on),
+            ("max_len", len_on),
+            ("median_len", len_on),
+            ("mean_read_mean_q", q_on),
+            ("reads_q20_frac", q_on),
+            ("reads_q30_frac", q_on),
+            ("phred_offset_certain", q_on),
+            ("quality_byte_min", q_on),
+            ("quality_byte_max", q_on),
+            ("head_g_frac", bases_on),
+            ("head_dropout", bases_on),
+            ("polyx3_max", polyx_on),
+            ("polyx5_max", polyx_on),
+            ("polyx3_frac_gt_5", polyx_on),
+            ("polyx5_frac_gt_1", polyx_on),
+            ("distinct_seqs", dup_on),
+            ("duplication_level", dup_on),
+            ("total_deduplicated_pct", dup_on),
+            ("dup_multiplicity_max", dup_on),
+            ("dup_singletons", dup_on),
+            ("repeated_seq_count", dup_on),
+            ("repeated_seq_frac", dup_on),
+            ("kmer_top_count", kmer_on),
+            ("kmer_top_frac", kmer_on),
+            ("heatmap_peak", hm_on),
+            ("heatmap_peak_x", hm_on),
+            ("heatmap_peak_y", hm_on),
+        ];
+
+        let obj = doc.as_object_mut().expect("the report is an object");
+        for (k, live) in blocks {
+            if !live {
+                obj.remove(k);
+            }
+        }
+        if let Some(metrics) = obj.get_mut("metrics").and_then(|v| v.as_object_mut()) {
+            for (k, live) in metrics_keys {
+                if !live {
+                    metrics.remove(k);
+                }
+            }
+        }
+        // The processed side ran under the same gate and loses the same fields.
+        for side in ["per_file", "processed"] {
+            let Some(side) = obj.get_mut(side) else { continue };
+            let objects: Vec<&mut serde_json::Map<String, serde_json::Value>> = match side {
+                serde_json::Value::Array(a) => a.iter_mut().filter_map(|v| v.as_object_mut()).collect(),
+                serde_json::Value::Object(o) => vec![o],
+                _ => Vec::new(),
+            };
+            for o in objects {
+                if !q_on {
+                    o.remove("mean_read_mean_q");
+                }
+                if !gc_on {
+                    o.remove("gc_fraction");
+                }
+                for (k, live) in blocks {
+                    if !live {
+                        o.remove(k);
+                    }
+                }
+                if let Some(metrics) = o.get_mut("metrics").and_then(|v| v.as_object_mut()) {
+                    for (k, live) in metrics_keys {
+                        if !live {
+                            metrics.remove(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let text = serde_json::to_string_pretty(&doc)? + "\n";
     write_out(path, &text)?;
     Ok(())
@@ -372,8 +531,14 @@ pub fn write_positions_tsv(
     total: &Accum,
     offset: u8,
     adapter_pos: Option<&crate::adapter_pos::AdapterPos>,
+    modules: Option<&Modules>,
 ) -> Result<()> {
-    let n_pos = total.covered_positions();
+    // Per-position columns travel with their module, the way the adapter columns
+    // already do: with `--no-quality` the file carries the composition and no quality
+    // column at all, rather than four columns of zeros that read like measurements.
+    let on = |f: fn(&Modules) -> bool| modules.map_or(true, |m| f(m));
+    let (bases_on, q_on, polyx_on) = (on(|m| m.bases), on(|m| m.quality), on(|m| m.polyx));
+    let n_pos = measured_positions(total);
     let reads = total.reads.max(1) as f64;
     // Per-position polyX reach: the fraction of reads whose trailing (3') or
     // leading (5') homopolymer run reaches this position, summed over bases.
@@ -402,9 +567,22 @@ pub fn write_positions_tsv(
     let adapter_cols: Vec<(String, Vec<u64>)> =
         adapter_pos.map(|ap| ap.tsv_columns()).unwrap_or_default();
     let mut out = String::with_capacity(64 * (n_pos + 1));
-    out.push_str(
-        "pos\ta\tc\tg\tt\tn\tdepth\tmean_q\tq10\tq50\tq90\tg_frac\tpolyx3_frac\tpolyx5_frac",
-    );
+    out.push_str("pos");
+    if bases_on {
+        out.push_str("\ta\tc\tg\tt\tn");
+    }
+    if bases_on || q_on {
+        out.push_str("\tdepth");
+    }
+    if q_on {
+        out.push_str("\tmean_q\tq10\tq50\tq90");
+    }
+    if bases_on {
+        out.push_str("\tg_frac");
+    }
+    if polyx_on {
+        out.push_str("\tpolyx3_frac\tpolyx5_frac");
+    }
     for (name, _) in &adapter_cols {
         out.push('\t');
         out.push_str(name);
@@ -412,30 +590,44 @@ pub fn write_positions_tsv(
     out.push('\n');
     for pos in 0..n_pos {
         let row = total.qual_at(pos);
-        let depth: u64 = row.iter().sum();
-        let (mean, q10, q50, q90) = pos_stats(&row, offset);
-        let g_frac = if depth > 0 {
-            total.base_at(pos, 2) as f64 / depth as f64
+        let depth: u64 = if q_on {
+            row.iter().sum()
         } else {
-            0.0
+            (0..crate::accum::NT).map(|c| total.base_at(pos, c)).sum()
         };
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.0}\t{:.0}\t{:.0}\t{:.4}\t{:.4}\t{:.4}",
-            pos + 1,
-            total.base_at(pos, 0),
-            total.base_at(pos, 1),
-            total.base_at(pos, 2),
-            total.base_at(pos, 3),
-            total.base_at(pos, 4),
-            depth,
-            mean,
-            q10,
-            q50,
-            q90,
-            g_frac,
-            p3_reach[pos] as f64 / reads,
-            p5_reach[pos] as f64 / reads,
-        ));
+        out.push_str(&(pos + 1).to_string());
+        if bases_on {
+            out.push_str(&format!(
+                "\t{}\t{}\t{}\t{}\t{}",
+                total.base_at(pos, 0),
+                total.base_at(pos, 1),
+                total.base_at(pos, 2),
+                total.base_at(pos, 3),
+                total.base_at(pos, 4),
+            ));
+        }
+        if bases_on || q_on {
+            out.push_str(&format!("\t{depth}"));
+        }
+        if q_on {
+            let (mean, q10, q50, q90) = pos_stats(&row, offset);
+            out.push_str(&format!("\t{mean:.4}\t{q10:.0}\t{q50:.0}\t{q90:.0}"));
+        }
+        if bases_on {
+            let g_frac = if depth > 0 {
+                total.base_at(pos, 2) as f64 / depth as f64
+            } else {
+                0.0
+            };
+            out.push_str(&format!("\t{g_frac:.4}"));
+        }
+        if polyx_on {
+            out.push_str(&format!(
+                "\t{:.4}\t{:.4}",
+                p3_reach[pos] as f64 / reads,
+                p5_reach[pos] as f64 / reads,
+            ));
+        }
         for (_, counts) in &adapter_cols {
             out.push('\t');
             out.push_str(&counts.get(pos).copied().unwrap_or(0).to_string());

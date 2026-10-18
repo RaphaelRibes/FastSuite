@@ -8,6 +8,7 @@
 
 mod accum;
 mod cli;
+mod gated;
 mod heatmap;
 mod html;
 mod polyx;
@@ -30,7 +31,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use accum::{offset_verdict, Accum};
-use cli::Cli;
+use cli::{Cli, Modules};
+use gated::Work;
 use reader::Limits;
 use report::FileReport;
 
@@ -42,6 +44,17 @@ fn main() -> Result<()> {
         max_reads: cli.reads,
         max_bytes: cli.bytes,
     };
+
+    // Module gating is resolved and validated before a single byte is read: an unknown
+    // `--only` name, or an output whose inputs the selected modules will not
+    // materialise, must not cost a scan. `None` means no gating flag was given, and the
+    // whole run takes the ungated path — today's behaviour, byte for byte.
+    let modules = cli.modules()?;
+    let gate = if cli.gating_requested() { Some(modules) } else { None };
+    let overrep = cli.overrep_mode()?;
+    if let Some(m) = &gate {
+        check_outputs(&cli, m, overrep)?;
+    }
 
     if cli.profile.is_some() && !(1..=2).contains(&cli.files.len()) {
         anyhow::bail!(
@@ -56,45 +69,58 @@ fn main() -> Result<()> {
     // The per-read profile scan (adapter prefix + fragment GC) is only paid for
     // when a profile was asked for.
     let track_profile = cli.profile.is_some();
+    // With the dup module off, nothing is fingerprinted: the table is neither
+    // projected nor admission-checked, and the memory the check guards is simply not
+    // allocated.
+    let track_dup = gate.map_or(true, |m| m.dup);
 
     // The duplication fingerprint set is the only state whose size is a function of the
     // dataset, so it is projected and admission-checked before the scan starts. The
     // estimate is deliberately conservative on compressed input (a 4x ratio under-counts,
     // so the table is under-sized and grows rather than over-allocating): getting it wrong
     // costs a rehash, not correctness. Copied from fastprep's estimate_records (D-1).
-    let est_records: usize = cli
-        .files
-        .iter()
-        .map(|p| {
-            // `-` is stdin, whose size is unknowable before reading; the estimate then
-            // floors at the clamp minimum and the table simply grows as reads arrive.
-            let bytes = if p.as_os_str() == "-" {
-                0
-            } else {
-                std::fs::metadata(p)
-                    .with_context(|| format!("sizing {}", p.display()))?
-                    .len()
-            };
-            // Read length comes from the profile fit's own length histogram later; 150 is
-            // the short-read default and only scales the estimate.
-            let per_record = (150u64 * 2 + 50).max(1);
-            let compressed = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| matches!(e, "gz" | "zst" | "zstd" | "bz2" | "xz"));
-            let raw = if compressed { bytes.saturating_mul(4) } else { bytes };
-            Ok::<usize, anyhow::Error>((raw / per_record) as usize)
-        })
-        .sum::<anyhow::Result<usize>>()?;
-    let fp_capacity = est_records.clamp(1, memory::MAX_PREALLOC_ENTRIES);
-    let fp_proj = memory::project(fp_capacity, 8); // 64-bit fingerprints
-    eprintln!(
-        "fastcheck: duplication fingerprint table projected at {:.1} MB for ~{} reads \
-         ({} buckets, 64-bit fingerprints)",
-        memory::mib(fp_proj.bytes),
-        fp_capacity,
-        fp_proj.buckets,
-    );
+    let fp_projected = if track_dup {
+        let est_records: usize = cli
+            .files
+            .iter()
+            .map(|p| {
+                // `-` is stdin, whose size is unknowable before reading; the estimate then
+                // floors at the clamp minimum and the table simply grows as reads arrive.
+                let bytes = if p.as_os_str() == "-" {
+                    0
+                } else {
+                    std::fs::metadata(p)
+                        .with_context(|| format!("sizing {}", p.display()))?
+                        .len()
+                };
+                // Read length comes from the profile fit's own length histogram later; 150 is
+                // the short-read default and only scales the estimate.
+                let per_record = (150u64 * 2 + 50).max(1);
+                let compressed = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "gz" | "zst" | "zstd" | "bz2" | "xz"));
+                let raw = if compressed { bytes.saturating_mul(4) } else { bytes };
+                Ok::<usize, anyhow::Error>((raw / per_record) as usize)
+            })
+            .sum::<anyhow::Result<usize>>()?;
+        let fp_capacity = est_records.clamp(1, memory::MAX_PREALLOC_ENTRIES);
+        let fp_proj = memory::project(fp_capacity, 8); // 64-bit fingerprints
+        eprintln!(
+            "fastcheck: duplication fingerprint table projected at {:.1} MB for ~{} reads \
+             ({} buckets, 64-bit fingerprints)",
+            memory::mib(fp_proj.bytes),
+            fp_capacity,
+            fp_proj.buckets,
+        );
+        Some((fp_capacity, fp_proj))
+    } else {
+        eprintln!(
+            "fastcheck: the dup module is off: no fingerprint table is projected, built or \
+             admission-checked, and no read is fingerprinted"
+        );
+        None
+    };
 
     // An explicit --max-mem overrides discovery, but only DOWNWARDS: it cannot authorise
     // exceeding a cgroup limit. (fastprep's rule, D-1 copy.)
@@ -118,9 +144,9 @@ fn main() -> Result<()> {
     // admission-checked with the same rule as the fingerprint table it builds on. It is
     // checked FIRST: refusing on the mode the user asked for, with the cheaper modes
     // named, is more useful than a refusal about the table they get either way.
-    let overrep = cli.overrep_mode()?;
     let adapter_set = cli.adapter_set()?;
     let table_proj = if overrep == overrep::OverrepMode::Table {
+        let fp_capacity = fp_projected.map_or(0, |(c, _)| c);
         let proj = overrep::table_projection(fp_capacity, 150);
         eprintln!(
             "fastcheck: over-representation table projected at {:.1} MB for ~{} unique sequences",
@@ -152,43 +178,47 @@ fn main() -> Result<()> {
         None
     };
 
-    match memory::admit(fp_proj.bytes, limit.as_ref()) {
-        memory::Admission::Refuse { projected, limit, source } => {
-            // In table mode the sequence table is the larger allocation, so name it.
-            if let Some(tp) = table_proj {
+    // The fingerprint table is only admission-checked when it is going to exist.
+    if let Some((_, fp_proj)) = &fp_projected {
+        match memory::admit(fp_proj.bytes, limit.as_ref()) {
+            memory::Admission::Refuse { projected, limit, source } => {
+                // In table mode the sequence table is the larger allocation, so name it.
+                if let Some(tp) = table_proj {
+                    anyhow::bail!(
+                        "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
+                         and --overrep-mode table needs ~{:.1} MB of packed unique sequences on top\n\
+                         but this process is limited to {:.1} MB ({})\n\
+\n\
+                         --max-mem <MB>                    raise the ceiling (it cannot exceed the cgroup limit)\n\
+                         --overrep-mode fingerprint        exact multiplicities at 8 B per unique read\n\
+                         --overrep-mode none               duplication levels only, zero cost",
+                        memory::mib(projected),
+                        fp_proj.buckets,
+                        memory::mib(tp),
+                        memory::mib(limit),
+                        source,
+                    )
+                }
                 anyhow::bail!(
                     "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
-                     and --overrep-mode table needs ~{:.1} MB of packed unique sequences on top\n\
                      but this process is limited to {:.1} MB ({})\n\
 \n\
-                     --max-mem <MB>                    raise the ceiling (it cannot exceed the cgroup limit)\n\
-                     --overrep-mode fingerprint        exact multiplicities at 8 B per unique read\n\
-                     --overrep-mode none               duplication levels only, zero cost",
+                     --max-mem <MB>           raise the ceiling (it cannot exceed the cgroup limit)\n\
+                     --overrep-mode none      run without the duplication table entirely\n\
+                     reread the file with a smaller --reads budget to bound the estimate",
                     memory::mib(projected),
                     fp_proj.buckets,
-                    memory::mib(tp),
                     memory::mib(limit),
                     source,
                 )
             }
-            anyhow::bail!(
-            "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
-             but this process is limited to {:.1} MB ({})\n\
-             --max-mem <MB>           raise the ceiling (it cannot exceed the cgroup limit)\n\
-             --overrep-mode none      run without the duplication table entirely\n\
-             reread the file with a smaller --reads budget to bound the estimate",
-            memory::mib(projected),
-            fp_proj.buckets,
-            memory::mib(limit),
-            source,
-        )
+            memory::Admission::ProceedWithWarning { headroom_bytes } => eprintln!(
+                "fastcheck: warning: fingerprint table projected at {:.1} MB, leaving only {:.1} MB headroom",
+                memory::mib(fp_proj.bytes),
+                memory::mib(headroom_bytes),
+            ),
+            memory::Admission::Proceed => {}
         }
-        memory::Admission::ProceedWithWarning { headroom_bytes } => eprintln!(
-            "fastcheck: warning: fingerprint table projected at {:.1} MB, leaving only {:.1} MB headroom",
-            memory::mib(fp_proj.bytes),
-            memory::mib(headroom_bytes),
-        ),
-        memory::Admission::Proceed => {}
     }
 
     // A single file already has all the parallelism it can use inside the
@@ -196,7 +226,7 @@ fn main() -> Result<()> {
     let reports: Vec<FileReport> = if files.len() == 1 || threads <= 1 {
         let mut out = Vec::with_capacity(files.len());
         for path in &files {
-            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content)?);
+            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, gate)?);
         }
         out
     } else {
@@ -210,7 +240,7 @@ fn main() -> Result<()> {
             handles.push(std::thread::spawn(move || -> Result<Vec<FileReport>> {
                 let mut out = Vec::with_capacity(chunk.len());
                 for path in &chunk {
-                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content)?);
+                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, gate)?);
                 }
                 Ok(out)
             }));
@@ -227,9 +257,11 @@ fn main() -> Result<()> {
 
     let mut total = Accum::new(cli.max_read_len);
     let mut stopped: Option<&'static str> = None;
+    let mut work = Work::default();
     for r in &reports {
         total.merge(&r.acc);
         stopped = stopped.or(r.scan.stopped);
+        work.add(&r.scan.work);
     }
 
     // Memory projection, printed before the numbers: what this run's analysis
@@ -241,6 +273,14 @@ fn main() -> Result<()> {
         reports.len(),
         cli.max_read_len
     );
+
+    // Only when a gating flag was given: what ran, and the work the run actually
+    // performed. A module that is off contributes nothing to these counters because
+    // its loop never ran — that is the claim, and this is the measurement of it.
+    if let Some(m) = &gate {
+        eprintln!("fastcheck: modules: {}", m.enabled_names().join(", "));
+        eprintln!("fastcheck: measurement work: {}", work.summary());
+    }
 
     // Insert size is a property of a PAIR, and the main path scans files
     // independently, so this is a separate opt-in lockstep pass over a sample.
@@ -275,7 +315,7 @@ fn main() -> Result<()> {
             pfiles.push(p2.clone());
         }
         for path in &pfiles {
-            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content)?);
+            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, gate)?);
         }
         for r in &processed_reports {
             processed_total.merge(&r.acc);
@@ -304,6 +344,7 @@ fn main() -> Result<()> {
             total.adapter_pos.as_ref().map(|ap| {
                 (ap, cli.adapter_error_rate, cli.min_adapter_overlap)
             }),
+            gate.as_ref(),
         )?;
     }
     if let Some(p) = &cli.html {
@@ -313,7 +354,13 @@ fn main() -> Result<()> {
                          else { Some((&processed_reports, &processed_total)) })?;
     }
     if let Some(p) = &cli.positions_tsv {
-        report::write_positions_tsv(p, &total, verdict.offset, total.adapter_pos.as_ref())?;
+        report::write_positions_tsv(
+            p,
+            &total,
+            verdict.offset,
+            total.adapter_pos.as_ref(),
+            gate.as_ref(),
+        )?;
     }
     if let Some(p) = &cli.profile {
         let name = files
@@ -327,23 +374,36 @@ fn main() -> Result<()> {
     }
 
     if !cli.quiet {
-        let gc = 100.0 * report_gc(&total);
-        let mean_q = report_mean_q(&total, verdict.offset);
+        // The summary line carries only what was measured: with the quality module off
+        // there is no mean read Q to print, and with gc off no GC. Building it from
+        // parts keeps the ungated line byte for byte what it was.
+        let mut parts = vec![
+            format!("{} file(s)", reports.len()),
+            format!("{} reads", total.reads),
+            format!("{} bases", total.bases),
+            format!(
+                "mean length {:.1}",
+                if total.reads == 0 {
+                    0.0
+                } else {
+                    total.bases as f64 / total.reads as f64
+                }
+            ),
+        ];
+        if gate.map_or(true, |m| m.gc) {
+            parts.push(format!("GC {:.2}%", 100.0 * report_gc(&total)));
+        }
+        if gate.map_or(true, |m| m.quality) {
+            parts.push(format!(
+                "mean read Q {:.2} (Phred+{}{})",
+                report_mean_q(&total, verdict.offset),
+                verdict.offset,
+                if verdict.certain { "" } else { ", uncertain" },
+            ));
+        }
         let line = format!(
-            "fastcheck: {} file(s), {} reads, {} bases, mean length {:.1}, GC {:.2}%, \
-             mean read Q {:.2} (Phred+{}{}), {:.2}s{}",
-            reports.len(),
-            total.reads,
-            total.bases,
-            if total.reads == 0 {
-                0.0
-            } else {
-                total.bases as f64 / total.reads as f64
-            },
-            gc,
-            mean_q,
-            verdict.offset,
-            if verdict.certain { "" } else { ", uncertain" },
+            "fastcheck: {}, {:.2}s{}",
+            parts.join(", "),
             elapsed,
             stopped.map(|s| format!(" [{s}]")).unwrap_or_default()
         );
@@ -372,6 +432,7 @@ fn scan_one(
     overrep: overrep::OverrepMode,
     adapter_set: &crate::adapter::AdapterSet,
     adapter_content: bool,
+    gate: Option<Modules>,
 ) -> Result<FileReport> {
     let mut acc = Accum::new(max_pos);
     acc.track_profile = track_profile;
@@ -380,12 +441,77 @@ fn scan_one(
     if adapter_content {
         acc.adapter_pos = Some(crate::adapter_pos::AdapterPos::new(adapter_set));
     }
-    let scan = reader::scan_file(path, gz_threads, limits, &mut acc)?;
+    let scan = reader::scan_file_gated(path, gz_threads, limits, &mut acc, gate)?;
     Ok(FileReport {
         path: path.clone(),
         acc,
         scan,
     })
+}
+
+/// Refuse an output whose inputs the selected modules will not materialise.
+///
+/// Gating means "not measured", and an artifact rendered from an accumulator that was
+/// never filled would read as a measurement of zero. The JSON report can say so field
+/// by field (an absent key is not a zero) and the per-position TSV travels with its
+/// columns, but a rendered HTML page and a fitted profile cannot: those are refused
+/// while they are still cheap to refuse, naming the module that would have to run.
+/// (`--insert-hist` needs no module — it is a separate lockstep pass over the pair of
+/// files, and it builds no accumulator.)
+fn check_outputs(cli: &Cli, m: &Modules, overrep: overrep::OverrepMode) -> Result<()> {
+    let need = |what: &str, needed: &[(&str, bool)]| -> Result<()> {
+        let missing: Vec<&str> =
+            needed.iter().filter(|(_, on)| !*on).map(|(name, _)| *name).collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{} needs the {} module{}: --only/--no-quality/--no-heatmap disabled {} \
+             (add {} to --only, or drop the gating flag)",
+            what,
+            missing.join(", "),
+            if missing.len() > 1 { "s" } else { "" },
+            if missing.len() > 1 { "them" } else { "it" },
+            if missing.len() > 1 { "them" } else { "it" },
+        )
+    };
+    if cli.html.is_some() {
+        need(
+            "--html",
+            &[
+                ("bases", m.bases),
+                ("quality", m.quality),
+                ("length", m.length),
+                ("gc", m.gc),
+                ("heatmap", m.heatmap),
+                ("dup", m.dup),
+                ("polyx", m.polyx),
+                ("kmer", m.kmer),
+            ],
+        )?;
+    }
+    if cli.profile.is_some() {
+        need(
+            "--profile",
+            &[
+                ("bases", m.bases),
+                ("quality", m.quality),
+                ("length", m.length),
+                ("polyx", m.polyx),
+                ("dup", m.dup),
+            ],
+        )?;
+    }
+    if cli.positions_tsv.is_some() && !(m.bases || m.quality) {
+        anyhow::bail!(
+            "--positions-tsv needs one of the bases/quality modules: --only/--no-quality \
+             selected neither, so no per-position row was materialised"
+        );
+    }
+    if overrep != overrep::OverrepMode::None {
+        need("--overrep-mode", &[("dup", m.dup)])?;
+    }
+    Ok(())
 }
 
 // The two helpers below exist only for the summary line; the report module

@@ -131,6 +131,24 @@ pub struct Cli {
     #[arg(long, default_value_t = 14, value_name = "N")]
     pub min_adapter_overlap: usize,
 
+    /// Run only these modules (comma-separated): bases, quality, length, gc, heatmap,
+    /// dup, polyx, kmer, adapter. The parser then materialises only what the enabled
+    /// modules need, so `--only dup` touches neither the quality bytes nor the heatmap
+    /// grid, and skips the per-read loops entirely. Absent = every module on, which is
+    /// byte for byte the pre--only behaviour; `adapter` stays opt-in either way.
+    #[arg(long, value_name = "MODULE[,MODULE...]")]
+    pub only: Option<String>,
+
+    /// Disable the per-base quality accumulators. The quality line is still read for
+    /// framing, but no quality byte is decoded: every quality-derived metric is absent
+    /// from the report and the Phred offset becomes a stated default, not a measurement.
+    #[arg(long)]
+    pub no_quality: bool,
+
+    /// Never build the composition grid (the 256x256 heatmap).
+    #[arg(long)]
+    pub no_heatmap: bool,
+
     /// Suppress the end-of-run summary line.
     #[arg(short = 'q', long)]
     pub quiet: bool,
@@ -182,6 +200,160 @@ impl Cli {
             self.adapter_error_rate,
             self.min_adapter_overlap,
         ))
+    }
+
+    /// True when the run was asked to measure a subset of the modules — i.e. when a
+    /// gating flag was given. Absent everywhere, the ungated path (and the unchanged
+    /// report) is taken; the report only carries a `modules` array when this is true.
+    pub fn gating_requested(&self) -> bool {
+        self.only.is_some() || self.no_quality || self.no_heatmap
+    }
+
+    /// Which modules this run measures.
+    ///
+    /// `--only` is an allow-list; `--no-quality` and `--no-heatmap` are deny-list entries
+    /// that also apply on top of it. An unknown name, an empty selection, or a selection
+    /// whose every entry is disabled is refused: running no modules at all and writing an
+    /// empty report is the one outcome this must never produce silently.
+    pub fn modules(&self) -> anyhow::Result<Modules> {
+        let mut m = match &self.only {
+            None => Modules::defaults(self.adapter_content),
+            Some(list) => {
+                let names: Vec<&str> =
+                    list.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                if names.is_empty() {
+                    anyhow::bail!(
+                        "--only: no module named (known: {})",
+                        MODULE_NAMES.join(", ")
+                    );
+                }
+                let mut m = Modules::none();
+                for name in names {
+                    match name {
+                        "bases" => m.bases = true,
+                        "quality" => m.quality = true,
+                        "length" => m.length = true,
+                        "gc" => m.gc = true,
+                        "heatmap" => m.heatmap = true,
+                        "dup" => m.dup = true,
+                        "polyx" => m.polyx = true,
+                        "kmer" => m.kmer = true,
+                        // `adapter` is the --adapter-content module: naming it here does not
+                        // switch that module on, it only says it may run.
+                        "adapter" => m.adapter = self.adapter_content,
+                        other => anyhow::bail!(
+                            "--only: unknown module {other:?} (known: {})",
+                            MODULE_NAMES.join(", ")
+                        ),
+                    }
+                }
+                m
+            }
+        };
+        if self.no_quality {
+            m.quality = false;
+        }
+        if self.no_heatmap {
+            m.heatmap = false;
+        }
+        if self.adapter_content && self.only.is_some() && !m.adapter {
+            anyhow::bail!(
+                "--adapter-content is not selected by --only: add `adapter` to the list, \
+                 or drop --adapter-content"
+            );
+        }
+        if !m.any() {
+            anyhow::bail!(
+                "--only: nothing left to run — the selection was empty, or every module in it \
+                 was disabled by --no-quality/--no-heatmap, or `adapter` was named without \
+                 --adapter-content (known: {})",
+                MODULE_NAMES.join(", ")
+            );
+        }
+        Ok(m)
+    }
+}
+
+/// Every module name, in the order they are reported. An unknown name in `--only` is
+/// refused against this list rather than ignored.
+pub const MODULE_NAMES: &[&str] = &[
+    "bases", "quality", "length", "gc", "heatmap", "dup", "polyx", "kmer", "adapter",
+];
+
+/// Which modules a run measures.
+///
+/// `bases` owns the per-position composition, `quality` the per-position quality and the
+/// byte census, `length` the read-length histogram, `gc` the ACGT/GC histograms, `dup`
+/// the exact fingerprint table, `polyx` the homopolymer runs, `kmer` the 12-mer counter,
+/// `heatmap` the composition grid, `adapter` the per-position adapter content. Modules
+/// left off are not measured *and* not reported: an absent field never reads as a zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Modules {
+    pub bases: bool,
+    pub quality: bool,
+    pub length: bool,
+    pub gc: bool,
+    pub heatmap: bool,
+    pub dup: bool,
+    pub polyx: bool,
+    pub kmer: bool,
+    pub adapter: bool,
+}
+
+impl Modules {
+    /// No module at all — the starting point of a `--only` selection.
+    pub fn none() -> Self {
+        Self {
+            bases: false,
+            quality: false,
+            length: false,
+            gc: false,
+            heatmap: false,
+            dup: false,
+            polyx: false,
+            kmer: false,
+            adapter: false,
+        }
+    }
+
+    /// Today's default: every module except the opt-in adapter content.
+    pub fn defaults(adapter_content: bool) -> Self {
+        Self {
+            bases: true,
+            quality: true,
+            length: true,
+            gc: true,
+            heatmap: true,
+            dup: true,
+            polyx: true,
+            kmer: true,
+            adapter: adapter_content,
+        }
+    }
+
+    /// At least one module runs. A run that measures nothing is refused up front.
+    pub fn any(&self) -> bool {
+        !self.enabled_names().is_empty()
+    }
+
+    /// The enabled names, in `MODULE_NAMES` order.
+    pub fn enabled_names(&self) -> Vec<&'static str> {
+        MODULE_NAMES
+            .iter()
+            .copied()
+            .filter(|n| match *n {
+                "bases" => self.bases,
+                "quality" => self.quality,
+                "length" => self.length,
+                "gc" => self.gc,
+                "heatmap" => self.heatmap,
+                "dup" => self.dup,
+                "polyx" => self.polyx,
+                "kmer" => self.kmer,
+                "adapter" => self.adapter,
+                _ => false,
+            })
+            .collect()
     }
 }
 

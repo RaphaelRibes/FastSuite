@@ -687,3 +687,335 @@ fn adapter_content_honours_the_error_rate_and_overlap_flags() {
     assert_eq!(per_pos["121"], 2);
     assert_eq!(v["adapter_content"]["min_overlap"], 18);
 }
+
+// ---------------------------------------------------------------------------
+// Task 12: --only / --no-quality / --no-heatmap module gating.
+//
+// The gating contract has three parts, and each is tested below: (1) with no
+// gating flag the report is exactly what it was before --only existed; (2) a
+// selected module's fields are present and the others' are absent, never zero;
+// (3) the work those modules own is not performed at all.
+// ---------------------------------------------------------------------------
+
+/// Every module that a bare run measures. `adapter` is excluded: it is opt-in
+/// behind --adapter-content, and stays so under --only.
+const EVERY_MODULE: &str = "bases,quality,length,gc,heatmap,dup,polyx,kmer";
+
+/// The blocks and metrics a run with every module measures. Listing them here (rather
+/// than anywhere near the report writer) keeps the "default is unchanged" test honest:
+/// if the default report ever stops carrying one of them, this fails.
+const ALL_BLOCKS: &[&str] = &[
+    "base_composition",
+    "base_position",
+    "read_length_hist",
+    "read_mean_q_hist",
+    "polyx",
+    "repeated_sequences",
+    "overrep",
+    "kmer_spectrum",
+    "heatmap",
+];
+
+const ALL_METRICS: &[&str] = &[
+    "min_len", "max_len", "median_len", "bases_acgt", "bases_non_acgt", "gc_fraction",
+    "mean_read_mean_q", "reads_q20_frac", "reads_q30_frac", "phred_offset_certain",
+    "quality_byte_min", "quality_byte_max", "head_g_frac", "head_dropout", "polyx3_max",
+    "polyx5_max", "distinct_seqs", "duplication_level", "kmer_top_count", "heatmap_peak",
+];
+
+/// Blank the two fields that legitimately differ between two runs of the same input.
+fn blank_run_variance(v: &mut serde_json::Value) {
+    v["elapsed_s"] = serde_json::json!(0.0);
+    v["command"] = serde_json::json!("");
+    v["metrics"]["elapsed_s"] = serde_json::json!(0.0);
+}
+
+#[test]
+fn without_a_gating_flag_the_report_is_todays_report() {
+    let d = tmpdir("only_absent");
+    let fq = write_fixture(&d);
+    let json = d.join("r.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
+    let v = read_json(&json);
+    assert!(v.get("modules").is_none(), "no --only flag, no modules array");
+    for b in ALL_BLOCKS {
+        assert!(v.get(b).is_some(), "default report lost block {b}");
+    }
+    for k in ALL_METRICS {
+        assert!(v["metrics"].get(k).is_some(), "default report lost metric {k}");
+    }
+    assert!(v["metrics"]["phred_offset_certain"].is_u64());
+    assert!(v["assumptions"].as_array().unwrap().is_empty());
+
+    // And the whole-module path measures exactly the default path: listing every module
+    // changes nothing but the declaration that it was listed.
+    let listed = d.join("l.json");
+    run(&d, &[fq.to_str().unwrap(), "--only", EVERY_MODULE, "--json", listed.to_str().unwrap(), "-q"]);
+    let mut vl = read_json(&listed);
+    assert_eq!(
+        vl["modules"].as_array().unwrap().len(),
+        8,
+        "the array must name the modules that ran"
+    );
+    vl.as_object_mut().unwrap().remove("modules");
+    let mut vd = v.clone();
+    blank_run_variance(&mut vl);
+    blank_run_variance(&mut vd);
+    assert_eq!(vl, vd, "--only with every module must measure today's report exactly");
+}
+
+#[test]
+fn only_dup_runs_the_duplication_module_and_nothing_else() {
+    let d = tmpdir("only_dup");
+    let fq = write_fixture(&d);
+    let json = d.join("d.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--only", "dup", "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&json);
+    let mods = v["modules"].as_array().unwrap();
+    assert!(mods.iter().any(|m| m == "dup"), "dup must be enabled: {mods:?}");
+    assert!(!mods.iter().any(|m| m == "quality"), "{mods:?}");
+    assert!(!mods.iter().any(|m| m == "heatmap"), "{mods:?}");
+    // Duplication is still exact, and the gated-out modules are absent, not zero.
+    assert!(v["metrics"]["distinct_seqs"].is_u64());
+    assert!(v.get("heatmap").is_none(), "the heatmap must not be built");
+    assert!(v.get("base_position").is_none(), "no per-position matrices were materialised");
+    assert!(v.get("polyx").is_none());
+    assert!(v.get("kmer_spectrum").is_none());
+    assert!(v.get("read_length_hist").is_none());
+    // The metrics that belong to a gated-out module are absent rather than zero, which
+    // is what distinguishes "not measured" from "measured and empty".
+    for k in ["mean_read_mean_q", "gc_fraction", "min_len", "heatmap_peak", "polyx3_max", "kmer_top_count"] {
+        assert!(v["metrics"].get(k).is_none(), "gated-out metric {k} must be absent");
+    }
+    // Reads and bases are always counted: a run that reports no reads is not a run.
+    assert_eq!(v["metrics"]["reads"], 6);
+    assert_eq!(v["metrics"]["bases"], 60);
+    assert_eq!(v["metrics"]["phred_offset"], 33, "a stated default, not a measurement");
+    assert!(v["assumptions"].as_array().unwrap().iter().any(|a| a["what"] == "quality"));
+}
+
+#[test]
+fn only_bases_keeps_the_composition_and_drops_the_quality() {
+    let d = tmpdir("only_bases");
+    let fq = write_fixture(&d);
+    let json = d.join("b.json");
+    let tsv = d.join("b.tsv");
+    let (_, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--only", "bases", "--json", json.to_str().unwrap(),
+          "--positions-tsv", tsv.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&json);
+    assert_eq!(v["modules"].as_array().unwrap(), &vec![serde_json::json!("bases")]);
+    // The composition is measured, with one row per position even though the quality
+    // rows (which normally define the coverage) were never grown.
+    assert_eq!(v["base_position"].as_object().unwrap().len(), 10, "10 positions");
+    assert_eq!(v["base_position"]["1"][0], 3, "3 reads start with A");
+    assert!(v["metrics"].get("head_g_frac").is_some());
+    assert!(v.get("read_mean_q_hist").is_none());
+    assert!(v["metrics"].get("quality_byte_min").is_none());
+    assert!(v["metrics"].get("phred_offset_certain").is_none());
+
+    // The per-position TSV carries only the columns whose module ran — the same rule
+    // the adapter columns already follow.
+    let text = std::fs::read_to_string(&tsv).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "pos\ta\tc\tg\tt\tn\tdepth\tg_frac", "only the measured columns");
+    assert_eq!(lines.len(), 11, "header + 10 positions");
+    for l in &lines[1..] {
+        assert_eq!(l.split('\t').count(), 8, "{l}");
+        assert_eq!(l.split('\t').nth(6).unwrap(), "6", "depth in {l}");
+    }
+}
+
+#[test]
+fn no_quality_skips_the_quality_accumulators_but_keeps_the_framing() {
+    let d = tmpdir("no_quality");
+    let fq = write_fixture(&d);
+    let json = d.join("q.json");
+    let (_, _, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--no-quality", "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0);
+    let v = read_json(&json);
+    // Length and composition are unaffected; quality is absent rather than zero.
+    assert_eq!(v["metrics"]["reads"], 6);
+    assert_eq!(v["metrics"]["bases"], 60);
+    assert!(v["metrics"].get("mean_read_mean_q").is_none());
+    assert!(v.get("base_position").is_some(), "composition is not a quality module");
+    assert_eq!(v["metrics"]["phred_offset"], 33, "a stated default, not a measurement");
+    // The report must say the offset was not measured.
+    assert!(v["assumptions"].as_array().unwrap().iter().any(|a| a["what"] == "quality"));
+    // The quality line is still read for framing, so a record with a short quality
+    // string is still an error rather than silent nonsense.
+    let bad = d.join("bad.fastq");
+    std::fs::write(&bad, b"@r1\nACGTACGT\n+\nIIII\n").unwrap();
+    let (_, stderr, code) = run(&d, &[bad.to_str().unwrap(), "--no-quality", "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("quality length"), "{stderr}");
+}
+
+#[test]
+fn no_heatmap_never_builds_the_grid() {
+    let d = tmpdir("no_heatmap");
+    let fq = write_fixture(&d);
+    let json = d.join("h.json");
+    let (_, _, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--no-heatmap", "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0);
+    let v = read_json(&json);
+    assert!(v.get("heatmap").is_none());
+    assert!(v["metrics"].get("heatmap_peak").is_none());
+    assert_eq!(v["metrics"]["reads"], 6, "everything else still runs");
+    assert!(v.get("polyx").is_some(), "one module off does not gate the others");
+}
+
+#[test]
+fn only_rejects_an_unknown_or_empty_module_list() {
+    let d = tmpdir("only_bad");
+    let fq = write_fixture(&d);
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--only", "bogus", "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("bogus"), "{stderr}");
+    assert!(stderr.contains("dup") && stderr.contains("adapter"), "{stderr}");
+
+    // An empty list is refused, not read as "no modules, empty report".
+    for list in ["", ",", " , "] {
+        let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--only", list, "-q"]);
+        assert_ne!(code, 0, "--only {list:?} must be refused");
+        assert!(stdout.is_empty(), "no report may be printed on refusal: {stdout}");
+        assert!(stderr.contains("no module named"), "{list:?}: {stderr}");
+    }
+
+    // A selection that --no-quality empties is refused too...
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--only", "quality", "--no-quality", "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("nothing left to run"), "{stderr}");
+    // ... as is --adapter-content left out of an --only list, rather than silently ignored.
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--only", "dup", "--adapter-content", "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--adapter-content") && stderr.contains("adapter"), "{stderr}");
+}
+
+#[test]
+fn gating_skips_the_work_it_disables() {
+    let d = tmpdir("only_work");
+    let fq = write_fixture(&d);
+
+    // No gating flag: the counters are not even printed, because nothing was skipped.
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("measurement work"), "opt-in only: {stderr}");
+    assert!(stderr.contains("duplication fingerprint table projected"), "{stderr}");
+
+    // --only dup fingerprints every read and never touches a position row, the quality
+    // bytes, the grid or the k-mer counter. These are the operations themselves, counted
+    // where they happen: a zero here is a loop that did not run.
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--only", "dup", "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("modules: dup"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "6 reads measured: 0 base cells, 0 quality cells, 0 quality bytes, 6 fingerprints, \
+             0 polyX reads, 0 heatmap cells, 0 12-mer windows"
+        ),
+        "{stderr}"
+    );
+
+    // --only bases measures the per-position composition, and nothing else — and with
+    // no dup module there is no fingerprint table at all: not projected, not built.
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--only", "bases", "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains(
+            "6 reads measured: 60 base cells, 0 quality cells, 0 quality bytes, 0 fingerprints"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("the dup module is off"), "{stderr}");
+    assert!(!stderr.contains("fingerprint table projected"), "no table is projected: {stderr}");
+
+    // --no-quality keeps every other measurement and drops exactly the quality work.
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--no-quality", "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("60 base cells, 0 quality cells, 0 quality bytes, 6 fingerprints"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn gating_survives_the_multi_file_thread_split() {
+    let d = tmpdir("only_threads");
+    let a = write_fixture(&d);
+    let b = d.join("second.fastq");
+    std::fs::write(&b, &FASTQ[..FASTQ.len() / 2]).unwrap();
+    let j1 = d.join("g1.json");
+    let j8 = d.join("g8.json");
+    run(&d, &[a.to_str().unwrap(), b.to_str().unwrap(), "--only", "length,gc",
+              "--json", j1.to_str().unwrap(), "-j", "1", "-q"]);
+    run(&d, &[a.to_str().unwrap(), b.to_str().unwrap(), "--only", "length,gc",
+              "--json", j8.to_str().unwrap(), "-j", "8", "-q"]);
+    let mut v1 = read_json(&j1);
+    let mut v8 = read_json(&j8);
+    blank_run_variance(&mut v1);
+    blank_run_variance(&mut v8);
+    assert_eq!(v1, v8, "-j must not change a gated report either");
+    assert_eq!(v8["modules"].as_array().unwrap().len(), 2);
+    assert!(v8["metrics"]["min_len"].is_number(), "length ran");
+    assert!(v8["metrics"]["gc_fraction"].is_number(), "gc ran");
+    assert!(v8["metrics"].get("mean_read_mean_q").is_none(), "quality did not");
+    assert!(v8["metrics"].get("distinct_seqs").is_none(), "dup did not");
+}
+
+#[test]
+fn gating_refuses_an_output_whose_modules_are_off() {
+    let d = tmpdir("only_outputs");
+    let fq = write_fixture(&d);
+    let fq = fq.to_str().unwrap();
+
+    // A rendered page, a fitted profile and a per-position table cannot say "not
+    // measured" field by field, so they are refused while it is still cheap.
+    let html = d.join("h.html");
+    let (_, stderr, code) = run(&d, &[fq, "--only", "dup", "--html", html.to_str().unwrap(), "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--html") && stderr.contains("quality"), "{stderr}");
+    assert!(!html.exists(), "nothing may be rendered from empty accumulators");
+
+    let prof = d.join("p.json");
+    let (_, stderr, code) = run(&d, &[fq, "--only", "dup", "--profile", prof.to_str().unwrap(), "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--profile") && stderr.contains("quality"), "{stderr}");
+
+    let tsv = d.join("x.tsv");
+    let (_, stderr, code) = run(&d, &[fq, "--only", "length", "--positions-tsv", tsv.to_str().unwrap(), "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("--positions-tsv"), "{stderr}");
+
+    // --overrep-mode builds on the fingerprint table, so it needs the dup module.
+    let (_, stderr, code) = run(&d, &[fq, "--only", "length", "--overrep-mode", "table", "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("dup"), "{stderr}");
+
+    // The refusals are specific, and they name what is missing: --no-heatmap costs the
+    // heatmap section of the page, so the page is refused and says why...
+    let (_, stderr, code) = run(&d, &[fq, "--no-heatmap", "--html", html.to_str().unwrap(), "-q"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("heatmap"), "{stderr}");
+    assert!(!html.exists());
+
+    // ... while a selection that keeps every module the page renders is allowed, and the
+    // page says which modules produced it.
+    let all = d.join("all.html");
+    let (_, stderr, code) = run(&d, &[fq, "--only", EVERY_MODULE, "--html", all.to_str().unwrap(), "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(all.exists());
+}
