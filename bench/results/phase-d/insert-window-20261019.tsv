@@ -1,0 +1,10 @@
+# Phase 0 survey: insert distribution per domain
+# read_len=150  anchor=12  ceiling=2L-12=288
+# buckets: below_L (I<L), window (L<=I<=ceiling), censored (I>ceiling)
+domain	files	pairs	below_L	window	censored	readthrough	pct_below_L	pct_window	pct_censored	pct_readthrough
+bacterial_isolate	17	1700000	199707	1239440	260853	1539	11.75	72.91	15.34	0.09
+generalised	17	1700000	414350	1285650	0	497	24.37	75.63	0.00	0.03
+human_gut	17	1700000	14120	595979	1089901	102	0.83	35.06	64.11	0.01
+metagenomics	17	1700000	415803	1237656	46541	4462	24.46	72.80	2.74	0.26
+rna_seq	17	1700000	434514	1265486	0	4007	25.56	74.44	0.00	0.24
+virome	17	1700000	144411	400066	1155523	788	8.49	23.53	67.97	0.05
