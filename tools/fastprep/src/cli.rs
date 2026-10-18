@@ -206,8 +206,20 @@ pub struct Cli {
     /// P(artefact | run length) at the 3′ terminus crosses 0.5 by r=6
     /// (0.54), so a --min-run sized to reject short 5′ biology (12) leaves
     /// genuine 3′ artefacts of 6–11 behind, while lowering the global value
-    /// would start trimming 5′ biology (P ≈ 0.28). Lower this to ~6 to
-    /// recover those 3′ runs. See docs/TRIM-ACCURACY.md.
+    /// would start trimming 5′ biology (P ≈ 0.28).
+    ///
+    /// MEASURED NEGATIVE — DO NOT RAISE WITHOUT RE-MEASURING. The trade
+    /// above is real for **G** runs, but this threshold is generic polyX, so
+    /// it also licenses trimming terminal A/C/T runs, which are artefacts
+    /// once in ~2000 (P = 0.0002–0.0007 at r=6; G is 0.536). On the
+    /// 102-dataset simulator corpus at tolerance 0, `--min-run-3p 6` moved
+    /// 35,196 mates out of undertrim but cost 236,779 overtrim for a net
+    /// **−1.07 pp** of exact rate (and −1.60 pp combined with
+    /// --trim-terminal-n); a second effect compounds it — a lower 3′
+    /// threshold shrinks the 3′ rejection window, so the reverse scan
+    /// engages on reads it previously rejected and overshoots boundaries
+    /// that were already correct. The whole recoverable class was worth at
+    /// most +0.094 pp. See docs/TRIM-ACCURACY.md §"the two opt-in flags".
     #[arg(long, value_name = "N", help_heading = "PolyX Trimming")]
     pub min_run_3p: Option<usize>,
 
@@ -231,10 +243,21 @@ pub struct Cli {
     pub head_dropout: Option<usize>,
 
     /// Trim runs of N at the 5′ and/or 3′ terminus only (off by default).
-    /// A terminal N-run is an emission artefact that no trimmer removes, so
-    /// it drives the undertrim rate; this removes exactly the terminal run
-    /// as a hard trim, at both ends. An *interior* N-run is never touched —
-    /// N is a valid ambiguity code inside biology. See docs/TRIM-ACCURACY.md.
+    /// An *interior* N-run is never touched — N is a valid ambiguity code
+    /// inside biology.
+    ///
+    /// MEASURED NEGATIVE — DO NOT ENABLE WITHOUT RE-MEASURING. It was added
+    /// on the observation that 2.9% of the undertrim bucket is N-runs, but
+    /// that inference does not hold: this simulator places N *inside* the
+    /// biology window (`quality.rs::inject_ambiguous`, `truth.rs`), so a
+    /// terminal N-run is never labelled an artefact to remove. Census over
+    /// 20.4 M mates: 66,583 mate-ends carry a terminal N-run and the ground
+    /// truth moves that boundary for **0** of them, so trimming the run is
+    /// always an overtrim. On the corpus it costs **−0.53 pp** of exact rate
+    /// at tolerance 0 and converts zero mates to exact. It may still be
+    /// defensible on a real library whose terminal N-runs are mask/failure
+    /// padding, which this benchmark cannot show. See
+    /// docs/TRIM-ACCURACY.md §"the two opt-in flags".
     #[arg(long, help_heading = "PolyX Trimming")]
     pub trim_terminal_n: bool,
 
