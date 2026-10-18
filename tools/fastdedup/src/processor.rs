@@ -354,16 +354,8 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
             format_validated = true;
         }
 
-        let base_id_r1 = seq_r1
-            .id()
-            .split(|&b| b == b' ')
-            .next()
-            .unwrap_or(seq_r1.id());
-        let base_id_r2 = seq_r2
-            .id()
-            .split(|&b| b == b' ')
-            .next()
-            .unwrap_or(seq_r2.id());
+        let base_id_r1 = base_read_id(seq_r1.id());
+        let base_id_r2 = base_read_id(seq_r2.id());
 
         if base_id_r1 != base_id_r2 {
             bail!(

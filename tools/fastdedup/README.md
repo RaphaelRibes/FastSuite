@@ -49,7 +49,7 @@ fdedup [OPTIONS] --input <INPUT>
 
 - `-1, --input <INPUT>`: Path to the input FASTA/FASTQ/GZ file (R1 or Single-End).
 - `-2, --input-r2 <INPUT_R2>`: Path to the input R2 file (Optional, enables Paired-End mode).
-- `-o, --output <OUTPUT>`: Path to the output file (R1 or Single-End). Defaults to `output_R1.fastq.gz`.
+- `-o, --output <OUTPUT>`: Path to the output file (R1 or Single-End). Required unless `--dry-run` is set.
 - `-p, --output-r2 <OUTPUT_R2>`: Path to the output R2 file (Required if `-2` is provided).
 - `-f, --force`: Overwrite the output file if it exists (instead of pre-loading hashes and appending).
 - `-v, --verbose`: Print processing stats, such as execution time, number of sequences, and duplication rates.

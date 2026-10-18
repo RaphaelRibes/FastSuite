@@ -1,7 +1,5 @@
 use std::hash::{BuildHasher, Hash};
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -9,7 +7,7 @@ use needletail::parse_fastx_reader;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::hasher::SequenceHasher;
-use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
+use crate::utils::{base_read_id, compute_write_buffer_size};
 use crate::writer::{OutputFormat, prepare_writer, write_fasta_record, StreamCompression};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -249,20 +247,16 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     let (hash_tx, hash_rx): (Sender<HashedRecord<T>>, Receiver<HashedRecord<T>>) =
         crossbeam_channel::unbounded();
 
-    let has_quality_flag = Arc::new(AtomicBool::new(false));
-
     // --- READER THREAD ---
     let reader_handle = std::thread::spawn({
         let chunk_tx = chunk_tx.clone();
         let input_owned = input_path.to_string();
-        let has_quality_flag = Arc::clone(&has_quality_flag);
         move || -> Result<usize> {
             let reader = open_input_reader(&input_owned)?;
             let mut fastx =
                 parse_fastx_reader(reader).map_err(|e| anyhow::anyhow!("Parse error: {e}"))?;
 
             let mut total = 0;
-            let mut has_quality = false;
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
 
             while let Some(record) = fastx.next() {
@@ -271,16 +265,11 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
                 let seq = rec.seq().to_vec();
                 let qual = rec.qual().map(|q| q.to_vec()).unwrap_or_default();
 
-                if !has_quality {
-                    has_quality = rec.qual().is_some_and(|q| !q.is_empty());
-                }
-
                 chunk.push(RawRecord { id, seq, qual });
                 total += 1;
 
                 if chunk.len() >= CHUNK_SIZE {
                     if chunk_tx.send(chunk).is_err() {
-                        has_quality_flag.store(has_quality, Ordering::Relaxed);
                         return Ok(total);
                     }
                     chunk = Vec::with_capacity(CHUNK_SIZE);
@@ -289,7 +278,6 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
             if !chunk.is_empty() {
                 let _ = chunk_tx.send(chunk);
             }
-            has_quality_flag.store(has_quality, Ordering::Relaxed);
 
             Ok(total)
         }
@@ -329,9 +317,6 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     )?;
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buffered_writer = BufWriter::with_capacity(buf_size, writer);
-
-    let output_has_quality = output_format == OutputFormat::Fastq;
-    validate_format_compatibility(output_has_quality, output_format)?;
 
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
     let mut duplicates = 0;
@@ -421,14 +406,11 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     let (hash_tx, hash_rx): (Sender<HashedPair<T>>, Receiver<HashedPair<T>>) =
         crossbeam_channel::unbounded();
 
-    let has_quality_flag = Arc::new(AtomicBool::new(false));
-
     // --- READER THREAD ---
     let reader_handle = std::thread::spawn({
         let chunk_tx = chunk_tx.clone();
         let r1_owned = input_r1_path.to_string();
         let r2_owned = input_r2_path.to_string();
-        let has_quality_flag = Arc::clone(&has_quality_flag);
         move || -> Result<usize> {
             let reader1 = open_input_reader(&r1_owned)?;
             let reader2 = open_input_reader(&r2_owned)?;
@@ -439,7 +421,6 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
                 parse_fastx_reader(reader2).map_err(|e| anyhow::anyhow!("Parse error: {e}"))?;
 
             let mut total = 0;
-            let mut has_quality = false;
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
 
             while let Some(r1) = reader_r1.next() {
@@ -447,7 +428,6 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
                 let r2 = match reader_r2.next() {
                     Some(r) => r.context("Invalid R2 sequence")?,
                     None => {
-                        has_quality_flag.store(has_quality, Ordering::Relaxed);
                         bail!("Desynchronization: R1 has more records than R2");
                     }
                 };
@@ -456,16 +436,11 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
                 let base_r1 = base_read_id(r1.id()).to_vec();
                 let base_r2 = base_read_id(r2.id()).to_vec();
                 if base_r1 != base_r2 {
-                    has_quality_flag.store(has_quality, Ordering::Relaxed);
                     bail!(
                         "Desynchronization: R1 base ID {:?} != R2 base ID {:?}",
                         String::from_utf8_lossy(&base_r1),
                         String::from_utf8_lossy(&base_r2)
                     );
-                }
-
-                if !has_quality {
-                    has_quality = r1.qual().is_some_and(|q| !q.is_empty());
                 }
 
                 let pair = RawPair {
@@ -486,7 +461,6 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
 
                 if chunk.len() >= CHUNK_SIZE {
                     if chunk_tx.send(chunk).is_err() {
-                        has_quality_flag.store(has_quality, Ordering::Relaxed);
                         return Ok(total);
                     }
                     chunk = Vec::with_capacity(CHUNK_SIZE);
@@ -495,14 +469,12 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
 
             // Check for R2 having extra records
             if reader_r2.next().is_some() {
-                has_quality_flag.store(has_quality, Ordering::Relaxed);
                 bail!("Desynchronization: R2 has more records than R1");
             }
 
             if !chunk.is_empty() {
                 let _ = chunk_tx.send(chunk);
             }
-            has_quality_flag.store(has_quality, Ordering::Relaxed);
 
             Ok(total)
         }
@@ -552,9 +524,6 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buf_r1 = BufWriter::with_capacity(buf_size, writer_r1);
     let mut buf_r2 = BufWriter::with_capacity(buf_size, writer_r2);
-
-    let output_has_quality = output_format == OutputFormat::Fastq;
-    validate_format_compatibility(output_has_quality, output_format)?;
 
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
     let mut duplicates = 0;

@@ -1184,6 +1184,140 @@ fn test_paire_desynchronisee_en_tete_bloquee() {
         ));
 }
 
+/// Régression : les en-têtes pré-CASAVA (`/1` `/2`) doivent être acceptés par le
+/// chemin d'écriture sérial. Le chemin parallèle les acceptait déjà ; les deux
+/// doivent produire exactement la même sortie.
+#[test]
+fn test_paire_entetes_pre_casava_serial_et_parallele() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+
+    // 2 paires uniques + 1 paire dupliquée = 3 paires, 1 duplicat PCR.
+    let mut contenu_r1 = String::new();
+    let mut contenu_r2 = String::new();
+    for (i, dup) in [(0usize, false), (1, false), (0, true)] {
+        contenu_r1.push_str(&format!(
+            "@read{}/1\n{}\n+\n{}\n",
+            i + 1,
+            generer_sequence(i, 0),
+            generer_qualite(i + if dup { 1000 } else { 0 })
+        ));
+        contenu_r2.push_str(&format!(
+            "@read{}/2\n{}\n+\n{}\n",
+            i + 1,
+            generer_sequence(i, 9999),
+            generer_qualite(i + 500)
+        ));
+    }
+    let r1_in = temp_dir.child("precasava_R1.fastq");
+    let r2_in = temp_dir.child("precasava_R2.fastq");
+    r1_in.write_str(&contenu_r1).unwrap();
+    r2_in.write_str(&contenu_r2).unwrap();
+
+    let serial_r1_path = temp_dir.child("serial_R1.fastq");
+    let serial_r2_path = temp_dir.child("serial_R2.fastq");
+    let par_r1_path = temp_dir.child("par_R1.fastq");
+    let par_r2_path = temp_dir.child("par_R2.fastq");
+
+    // Chemin sérial (-j 1) : c'est lui qui rejetait ces en-têtes comme désync.
+    cmd()
+        .arg("-1")
+        .arg(r1_in.path())
+        .arg("-2")
+        .arg(r2_in.path())
+        .arg("-o")
+        .arg(serial_r1_path.path())
+        .arg("-p")
+        .arg(serial_r2_path.path())
+        .arg("-j")
+        .arg("1")
+        .assert()
+        .success();
+
+    // Chemin parallèle (-j 4) : référence (il acceptait déjà ces en-têtes).
+    cmd()
+        .arg("-1")
+        .arg(r1_in.path())
+        .arg("-2")
+        .arg(r2_in.path())
+        .arg("-o")
+        .arg(par_r1_path.path())
+        .arg("-p")
+        .arg(par_r2_path.path())
+        .arg("-j")
+        .arg("4")
+        .assert()
+        .success();
+
+    let serial_r1 = fs::read_to_string(serial_r1_path.path()).unwrap();
+    let serial_r2 = fs::read_to_string(serial_r2_path.path()).unwrap();
+    let par_r1 = fs::read_to_string(par_r1_path.path()).unwrap();
+    let par_r2 = fs::read_to_string(par_r2_path.path()).unwrap();
+
+    // Le duplicat PCR est éliminé : 2 paires uniques écrites de chaque côté.
+    assert_eq!(compter_sequences_fastq(&serial_r1), 2);
+    assert_eq!(compter_sequences_fastq(&serial_r2), 2);
+
+    // Le suffixe /1 /2 de l'entrée est préservé tel quel en sortie.
+    assert!(serial_r1.contains("@read1/1"));
+    assert!(serial_r2.contains("@read1/2"));
+
+    // Sérial et parallèle doivent produire exactement le même résultat.
+    assert_eq!(serial_r1, par_r1, "R1 sérial != R1 parallèle");
+    assert_eq!(serial_r2, par_r2, "R2 sérial != R2 parallèle");
+}
+
+/// Le chemin d'écriture sérial doit toujours refuser une VRAIE désynchronisation
+/// (IDs de base réellement différents) avec des en-têtes pré-CASAVA `/1` `/2` :
+/// les deux premiers appariements passent, le troisième diverge.
+#[test]
+fn test_paire_entetes_pre_casava_desync_reelle_bloquee() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+
+    let mut contenu_r1 = String::new();
+    let mut contenu_r2 = String::new();
+    for i in 0..5 {
+        let n = i + 1;
+        contenu_r1.push_str(&format!(
+            "@read{}/1\n{}\n+\n{}\n",
+            n,
+            generer_sequence(i, 0),
+            generer_qualite(i)
+        ));
+        let id_r2 = if n == 3 {
+            format!("other{n}")
+        } else {
+            format!("read{n}")
+        };
+        contenu_r2.push_str(&format!(
+            "@{}/2\n{}\n+\n{}\n",
+            id_r2,
+            generer_sequence(i, 9999),
+            generer_qualite(i + 500)
+        ));
+    }
+    let r1_in = temp_dir.child("precasava_desync_R1.fastq");
+    let r2_in = temp_dir.child("precasava_desync_R2.fastq");
+    r1_in.write_str(&contenu_r1).unwrap();
+    r2_in.write_str(&contenu_r2).unwrap();
+
+    cmd()
+        .arg("-1")
+        .arg(r1_in.path())
+        .arg("-2")
+        .arg(r2_in.path())
+        .arg("-o")
+        .arg(temp_dir.child("desync_out_R1.fastq").path())
+        .arg("-p")
+        .arg(temp_dir.child("desync_out_R2.fastq").path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("Critical desynchronization detected at pair #3")
+                .and(predicate::str::contains("read3"))
+                .and(predicate::str::contains("other3")),
+        );
+}
+
 /// Vérifie la détection de désynchronisation de fin de fichier quand R1 > R2.
 #[test]
 fn test_paire_desync_fin_fichier_r1_plus_long() {
