@@ -1,0 +1,64 @@
+=== metagenomics/DRR083326 read_len=101 ins_min=94 pairs=50000
+  real   p1=0.2952 (R1 0.4099 R2 0.1804) last=0.4245  head={"R1": {"0": 7799, "1": 1754, "2": 375, "3": 71, "4": 2}, "R2": {"0": 10000}}  tail={"R1": {"0": 7607, "1": 1875, "2": 392, "3": 98, "4": 19, "5": 4, "6": 2, "7": 1}, "R2": {"0": 9999}}
+  asis           n=0   pool@p1=0.2963 (R1 0.4114, R2 0.1811) poollast=0.3862 (R1 0.5292) | GAte pooled=0.0383@101  lengthmatched=0.1047@101
+  r1tail_bio     n=7   pool@p1=0.2952 (R1 0.4124, R2 0.1779) poollast=0.3276 (R1 0.4140) | GAte pooled=0.0969@101  lengthmatched=0.0288@100
+  r1tail_exact   n=6   pool@p1=0.2961 (R1 0.4087, R2 0.1834) poollast=0.3863 (R1 0.5286) | GAte pooled=0.0381@101  lengthmatched=0.1041@101
+  r2head_bio     skipped: that run-length block is empty for this library
+  r2tail_bio     skipped: that run-length block is empty for this library
+  fixed_planes   n=7   pool@p1=0.2952 (R1 0.4124, R2 0.1779) poollast=0.3276 (R1 0.4140) | GAte pooled=0.0969@101  lengthmatched=0.0288@100
+=== metagenomics/DRR083082 read_len=101 ins_min=96 pairs=50000
+  real   p1=0.3930 (R1 0.3913 R2 0.3946) last=0.1862  head={"R1": {"0": 7514, "1": 2002, "2": 400, "3": 82, "4": 2}, "R2": {"0": 7471, "1": 2045, "2": 405, "3": 75, "4": 4}}  tail={"R1": {"0": 10000}, "R2": {"0": 9941, "1": 19, "2": 28, "3": 7, "4": 1, "5": 3, "6": 1}}
+  asis           n=0   pool@p1=0.4678 (R1 0.3896, R2 0.5461) poollast=0.1900 (R1 0.1785) | GAte pooled=0.0749@1  lengthmatched=0.0750@1
+  r1tail_bio     skipped: that run-length block is empty for this library
+  r1tail_exact   skipped: that run-length block is empty for this library
+  r2head_bio     n=4   pool@p1=0.3932 (R1 0.3931, R2 0.3934) poollast=0.1901 (R1 0.1779) | GAte pooled=0.0401@11  lengthmatched=0.0401@11
+  r2tail_bio     n=6   pool@p1=0.4678 (R1 0.3896, R2 0.5461) poollast=0.1885 (R1 0.1785) | GAte pooled=0.0749@1  lengthmatched=0.0750@1
+  fixed_planes   n=10  pool@p1=0.3937 (R1 0.3935, R2 0.3939) poollast=0.1894 (R1 0.1781) | GAte pooled=0.0406@11  lengthmatched=0.0406@11
+=== metagenomics/DRR083438 read_len=101 ins_min=93 pairs=50000
+  real   p1=0.4091 (R1 0.4044 R2 0.4138) last=0.2548  head={"R1": {"0": 7728, "1": 1824, "2": 367, "3": 71, "4": 6, "5": 1, "6": 1, "7": 1}, "R2": {"0": 7601, "1": 1959, "2": 353, "3": 75, "4": 7, "5": 2, "6": 1, "7": 1}}  tail={"R1": {"0": 9923, "1": 76}, "R2": {"0": 9106, "1": 539, "2": 275, "3": 48, "4": 8, "5": 13, "6": 7, "7": 2, "8": 1}}
+  asis           n=0   pool@p1=0.4767 (R1 0.4016, R2 0.5518) poollast=0.2862 (R1 0.2193) | GAte pooled=0.0677@1  lengthmatched=0.0677@1
+  r1tail_bio     n=1   pool@p1=0.4768 (R1 0.4016, R2 0.5519) poollast=0.2836 (R1 0.2142) | GAte pooled=0.0677@1  lengthmatched=0.0677@1
+  r1tail_exact   skipped: that run-length block is empty for this library
+  r2head_bio     n=7   pool@p1=0.4096 (R1 0.4077, R2 0.4115) poollast=0.2851 (R1 0.2191) | GAte pooled=0.0403@11  lengthmatched=0.0403@11
+  r2tail_bio     n=8   pool@p1=0.4785 (R1 0.4053, R2 0.5517) poollast=0.2635 (R1 0.2147) | GAte pooled=0.0694@1  lengthmatched=0.0694@1
+  fixed_planes   n=16  pool@p1=0.4101 (R1 0.4072, R2 0.4130) poollast=0.2605 (R1 0.2109) | GAte pooled=0.0404@11  lengthmatched=0.0404@11
+=== metagenomics/DRR083073 read_len=101 ins_min=90 pairs=50000
+  real   p1=0.3282 (R1 0.3496 R2 0.3068) last=0.1580  head={"R1": {"0": 8439, "1": 1454, "2": 104, "3": 2}, "R2": {"0": 9094, "1": 528, "2": 235, "3": 96, "4": 34, "5": 5, "6": 4, "7": 2, "8": 1}}  tail={"R1": {"0": 9997, "5": 2}, "R2": {"0": 9835, "1": 131, "4": 11, "5": 10, "6": 4, "7": 3, "8": 1, "9": 1}}
+  asis           n=0   pool@p1=0.3558 (R1 0.3462, R2 0.3654) poollast=0.2083 (R1 0.1582) | GAte pooled=0.1030@97  lengthmatched=0.0372@98
+  r1tail_bio     n=5   pool@p1=0.3558 (R1 0.3462, R2 0.3654) poollast=0.2082 (R1 0.1580) | GAte pooled=0.1030@97  lengthmatched=0.0370@98
+  r1tail_exact   n=4   pool@p1=0.3558 (R1 0.3462, R2 0.3654) poollast=0.2083 (R1 0.1582) | GAte pooled=0.1030@97  lengthmatched=0.0370@98
+  r2head_bio     n=8   pool@p1=0.3308 (R1 0.3524, R2 0.3091) poollast=0.2084 (R1 0.1582) | GAte pooled=0.1024@97  lengthmatched=0.0342@98
+  r2tail_bio     skipped: that run-length block is empty for this library
+  fixed_planes   n=13  pool@p1=0.3308 (R1 0.3524, R2 0.3091) poollast=0.2082 (R1 0.1580) | GAte pooled=0.1024@97  lengthmatched=0.0341@98
+=== metagenomics/DRR083063 read_len=101 ins_min=95 pairs=50000
+  real   p1=0.2915 (R1 0.4043 R2 0.1788) last=0.4166  head={"R1": {"0": 7831, "1": 1754, "2": 295, "3": 111, "4": 5, "6": 2, "7": 1, "8": 1}, "R2": {"0": 10000}}  tail={"R1": {"0": 7664, "1": 1892, "2": 351, "3": 68, "4": 15, "5": 5, "6": 2, "7": 1, "8": 1}, "R2": {"0": 9992, "10": 1, "4": 2, "5": 1, "6": 1, "7": 1, "9": 1}}
+  asis           n=0   pool@p1=0.2931 (R1 0.4059, R2 0.1804) poollast=0.3877 (R1 0.5265) | GAte pooled=0.0289@101  lengthmatched=0.1099@101
+  r1tail_bio     n=8   pool@p1=0.2919 (R1 0.4007, R2 0.1830) poollast=0.3303 (R1 0.4111) | GAte pooled=0.0863@101  lengthmatched=0.0297@100
+  r1tail_exact   n=7   pool@p1=0.2939 (R1 0.4064, R2 0.1814) poollast=0.3859 (R1 0.5243) | GAte pooled=0.0307@101  lengthmatched=0.1076@101
+  r2head_bio     skipped: that run-length block is empty for this library
+  r2tail_bio     n=8   pool@p1=0.2931 (R1 0.4059, R2 0.1804) poollast=0.3877 (R1 0.5265) | GAte pooled=0.0289@101  lengthmatched=0.1099@101
+  fixed_planes   n=16  pool@p1=0.2919 (R1 0.4007, R2 0.1830) poollast=0.3303 (R1 0.4111) | GAte pooled=0.0863@101  lengthmatched=0.0297@100
+=== metagenomics/DRR083295 read_len=101 ins_min=92 pairs=50000
+  real   p1=0.3890 (R1 0.3863 R2 0.3918) last=0.1986  head={"R1": {"0": 7612, "1": 1922, "2": 375, "3": 78, "4": 8, "5": 2, "6": 1, "7": 1}, "R2": {"0": 7538, "1": 2001, "2": 376, "3": 74, "4": 7, "5": 1, "6": 1, "7": 1}}  tail={"R1": {"0": 9907, "1": 93}, "R2": {"0": 9725, "1": 262, "2": 9, "5": 3, "6": 1}}
+  asis           n=0   pool@p1=0.4625 (R1 0.3860, R2 0.5389) poollast=0.2123 (R1 0.1930) | GAte pooled=0.0735@1  lengthmatched=0.0735@1
+  r1tail_bio     n=1   pool@p1=0.4631 (R1 0.3862, R2 0.5399) poollast=0.2084 (R1 0.1849) | GAte pooled=0.0740@1  lengthmatched=0.0741@1
+  r1tail_exact   skipped: that run-length block is empty for this library
+  r2head_bio     n=7   pool@p1=0.3895 (R1 0.3862, R2 0.3927) poollast=0.2118 (R1 0.1911) | GAte pooled=0.0399@11  lengthmatched=0.0399@11
+  r2tail_bio     n=6   pool@p1=0.4625 (R1 0.3860, R2 0.5389) poollast=0.2070 (R1 0.1930) | GAte pooled=0.0735@1  lengthmatched=0.0735@1
+  fixed_planes   n=14  pool@p1=0.3891 (R1 0.3863, R2 0.3919) poollast=0.2033 (R1 0.1854) | GAte pooled=0.0398@11  lengthmatched=0.0398@11
+
+# --- group B: the head_none control arm, four datasets (20261018-1815) ---
+# head_none = head.<mate> = {0}: no 5' run injected anywhere, so both the
+# R2-head double count and the frame shift are absent, at the cost of the artefact.
+=== metagenomics/DRR083082 read_len=101 ins_min=96 pairs=50000
+  asis           n=0   pool@p1=0.4678 (R1 0.3896, R2 0.5461) poollast=0.1900 (R1 0.1785) | GAte pooled=0.0749@1  lengthmatched=0.0750@1
+  head_none      n=0   pool@p1=0.3897 (R1 0.3910, R2 0.3884) poollast=0.1928 (R1 0.1846) | GAte pooled=0.0066@101  lengthmatched=0.0066@101
+=== metagenomics/DRR083295 read_len=101 ins_min=92 pairs=50000
+  asis           n=0   pool@p1=0.4625 (R1 0.3860, R2 0.5389) poollast=0.2123 (R1 0.1930) | GAte pooled=0.0735@1  lengthmatched=0.0735@1
+  head_none      n=0   pool@p1=0.3885 (R1 0.3850, R2 0.3921) poollast=0.2137 (R1 0.1907) | GAte pooled=0.0151@101  lengthmatched=0.0151@101
+=== metagenomics/DRR083438 read_len=101 ins_min=93 pairs=50000
+  asis           n=0   pool@p1=0.4767 (R1 0.4016, R2 0.5518) poollast=0.2862 (R1 0.2193) | GAte pooled=0.0677@1  lengthmatched=0.0677@1
+  head_none      n=0   pool@p1=0.4072 (R1 0.4015, R2 0.4129) poollast=0.2836 (R1 0.2144) | GAte pooled=0.0288@101  lengthmatched=0.0287@101
+=== metagenomics/DRR070915 read_len=150 ins_min=144 pairs=50000
+  asis           n=0   pool@p1=0.4864 (R1 0.4121, R2 0.5607) poollast=0.2360 (R1 0.2302) | GAte pooled=0.0668@1  lengthmatched=0.0667@1
+  head_none      n=0   pool@p1=0.4197 (R1 0.4182, R2 0.4212) poollast=0.2376 (R1 0.2311) | GAte pooled=0.0054@123  lengthmatched=0.0054@123

@@ -1,13 +1,32 @@
 #!/usr/bin/env python3
-import json
-real = json.load(open("/mnt/Fast/fastsuite-scratch/work/bacterial_isolate/DRR014283/v0/real.report.json"))
-sim = json.load(open("/tmp/gfracverify2/sim.json"))
-def g0(r):
-    bp = r.get("base_position") or {}
-    row = bp.get("1")
-    if not row: return None
-    t = sum(row)
-    return row[2] / t if t else None
-rg, sg = g0(real), g0(sim)
-print(f"DRR014283  G@pos0 real={rg:.4f} sim={sg:.4f} diff={abs(rg-sg):.4f}")
-print(f"  (was 0.1273 before the deconvolution, 0.0636 in the stale-output run)")
+"""SUPERSEDED — use `bench/scripts/gfrac_attribution.py`.
+
+This script printed one number (position-1 G fraction, real vs sim) for one
+hard-coded dataset, from a hard-coded corpus path and a `/tmp` sim report. It
+was the first probe of the metagenomics g_frac blocker and it is kept only as a
+pointer: it answered "is the head deconvolved" and nothing else, and the
+answer to the blocker is not one number.
+
+What replaced it, and what each prints:
+
+  gfrac_attribution.py     per (dataset, variant): the real/sim per-position G
+                           curve, the diff, its argmax and zone means, the
+                           per-mate read lengths, the per-mate terminal G, the
+                           LENGTH-MATCHED counterfactual gate, the fitted
+                           parameters that drive the G curve, and the N-overlay
+                           control. Writes a TSV; refuses to overwrite.
+  gfrac_mechanism_summary.py
+                           joins that TSV with the fitted run rates and the
+                           run-structure agreement (TV) so each candidate
+                           mechanism's contribution is one column.
+  probe_plane_arms.py      mutates one block of the fitted profile, re-simulates
+                           at the same seed and measures the gate -- the
+                           counterfactual for each proposed fix.
+  probe_frame_shift.py     tests whether the simulated curve is the real one
+                           convolved with the head-run distribution.
+
+Findings: docs/GFRAC-MECHANISM.md.
+"""
+import sys
+
+sys.exit(__doc__)
