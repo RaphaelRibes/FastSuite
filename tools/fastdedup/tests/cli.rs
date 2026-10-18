@@ -818,6 +818,79 @@ fn test_entree_fasta_sortie_fastq_non_supporte() {
         ));
 }
 
+/// Single-end : le chemin parallèle doit rendre le MÊME verdict que le sérial
+/// sur une entrée FASTA sans qualité -> sortie FASTQ, à tout nombre de threads.
+/// Le bug ne touchait que le chemin parallèle : `-j 1` refusait mais `-j 2`/`-j 4`
+/// écrivaient une FASTQ invalide (ligne de qualité vide) avec un code de sortie 0.
+#[test]
+fn test_single_end_parallele_entree_fasta_sortie_fastq_non_supporte() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fasta(&temp_dir, "entree.fasta", 10, 0);
+
+    for threads in ["1", "2", "4"] {
+        let sortie = temp_dir.child(format!("sortie_{threads}.fastq"));
+        cmd()
+            .arg("-1")
+            .arg(entree.path())
+            .arg("-o")
+            .arg(sortie.path())
+            .arg("-j")
+            .arg(threads)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "FASTA → FASTQ conversion not supported",
+            ));
+
+        // Aucun fichier FASTQ non vide ne doit subsister après le refus.
+        let contenu = fs::read_to_string(sortie.path()).unwrap_or_default();
+        assert!(
+            contenu.is_empty(),
+            "-j {threads} : le refus ne doit laisser aucun FASTQ non vide, obtenu {contenu:?}"
+        );
+    }
+}
+
+/// Le garde-fou de format ne doit PAS être un refus général : une entrée FASTQ
+/// vers une sortie FASTQ reste acceptée et produit un résultat identique en
+/// sérial (-j 1) et en parallèle (-j 4), lignes de qualité préservées.
+#[test]
+fn test_single_end_sortie_fastq_serial_et_parallele_identique() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 20, 5);
+    let sortie_ser = temp_dir.child("ser.fastq");
+    let sortie_par = temp_dir.child("par.fastq");
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie_ser.path())
+        .arg("-j")
+        .arg("1")
+        .assert()
+        .success();
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie_par.path())
+        .arg("-j")
+        .arg("4")
+        .assert()
+        .success();
+
+    let contenu_ser = fs::read_to_string(sortie_ser.path()).unwrap();
+    let contenu_par = fs::read_to_string(sortie_par.path()).unwrap();
+    assert_eq!(contenu_ser, contenu_par, "sérial != parallèle");
+    assert_eq!(compter_sequences_fastq(&contenu_ser), 20);
+    // 0=@id, 1=seq, 2='+', 3=qualité — la ligne de qualité doit être présente et non vide.
+    assert!(
+        contenu_ser.lines().nth(3).is_some_and(|l| !l.is_empty()),
+        "la ligne de qualité FASTQ ne doit pas être vide"
+    );
+}
+
 // ================================================================
 // TESTS SINGLE-END — COMPORTEMENT --force ET REPRISE
 // ================================================================
@@ -1405,6 +1478,45 @@ fn test_paire_entree_fasta_sortie_fastq_non_supporte() {
         .stderr(predicate::str::contains(
             "FASTA → FASTQ conversion not supported",
         ));
+}
+
+/// Le chemin parallèle (-j 4) doit refuser une conversion FASTA -> FASTQ
+/// exactement comme le chemin sérial, sinon le verdict dépend du nombre de
+/// threads. Le bug écrivait une FASTQ invalide (ligne de qualité vide, « +\n\n »)
+/// avec un code de sortie 0.
+#[test]
+fn test_paire_parallele_entree_fasta_sortie_fastq_non_supporte() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1, r2) = generer_fasta_paire(&temp_dir, "R1.fasta", "R2.fasta", 10, 0);
+    let sortie_r1 = temp_dir.child("par_R1.fastq");
+    let sortie_r2 = temp_dir.child("par_R2.fastq");
+
+    cmd()
+        .arg("-1")
+        .arg(r1.path())
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg(sortie_r1.path())
+        .arg("-p")
+        .arg(sortie_r2.path())
+        .arg("-j")
+        .arg("4")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "FASTA → FASTQ conversion not supported",
+        ));
+
+    // Aucune FASTQ valide (donc aucune ligne de qualité vide) ne doit subsister :
+    // le refus doit intervenir avant toute écriture.
+    for sortie in [&sortie_r1, &sortie_r2] {
+        let contenu = fs::read_to_string(sortie.path()).unwrap_or_default();
+        assert!(
+            contenu.is_empty(),
+            "le refus ne doit laisser aucun FASTQ non vide, obtenu {contenu:?}"
+        );
+    }
 }
 
 // ================================================================

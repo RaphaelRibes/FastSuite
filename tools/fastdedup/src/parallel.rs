@@ -7,7 +7,7 @@ use needletail::parse_fastx_reader;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::hasher::SequenceHasher;
-use crate::utils::{base_read_id, compute_write_buffer_size};
+use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
 use crate::writer::{OutputFormat, prepare_writer, write_fasta_record, StreamCompression};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -247,6 +247,12 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     let (hash_tx, hash_rx): (Sender<HashedRecord<T>>, Receiver<HashedRecord<T>>) =
         crossbeam_channel::unbounded();
 
+    // The reader reports, off the first record, whether the input carries
+    // quality scores (FASTQ) or not (FASTA). The writer validates the
+    // input/output format pairing before writing any record, so the threaded
+    // verdict is identical to the serial path's.
+    let (fmt_tx, fmt_rx): (Sender<bool>, Receiver<bool>) = bounded(1);
+
     // --- READER THREAD ---
     let reader_handle = std::thread::spawn({
         let chunk_tx = chunk_tx.clone();
@@ -258,9 +264,15 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
 
             let mut total = 0;
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+            let mut format_reported = false;
 
             while let Some(record) = fastx.next() {
                 let rec = record.context("Invalid sequence")?;
+                if !format_reported {
+                    let has_quality = rec.qual().is_some_and(|q| !q.is_empty());
+                    let _ = fmt_tx.send(has_quality);
+                    format_reported = true;
+                }
                 let id = rec.id().to_vec();
                 let seq = rec.seq().to_vec();
                 let qual = rec.qual().map(|q| q.to_vec()).unwrap_or_default();
@@ -317,6 +329,14 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     )?;
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buffered_writer = BufWriter::with_capacity(buf_size, writer);
+
+    // Match the serial path: refuse a FASTA -> FASTQ conversion before any
+    // record is written, rather than emitting FASTQ with an empty quality line.
+    // `recv` fails only on an empty input (reader closed without a record), in
+    // which case there is nothing to validate and nothing to write.
+    if let Ok(has_quality) = fmt_rx.recv() {
+        validate_format_compatibility(has_quality, output_format)?;
+    }
 
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
     let mut duplicates = 0;
@@ -406,6 +426,11 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     let (hash_tx, hash_rx): (Sender<HashedPair<T>>, Receiver<HashedPair<T>>) =
         crossbeam_channel::unbounded();
 
+    // Same as the single-end path: the reader reports whether R1 carries
+    // quality scores, and the writer validates the format pairing before
+    // writing, so the threaded verdict matches the serial one.
+    let (fmt_tx, fmt_rx): (Sender<bool>, Receiver<bool>) = bounded(1);
+
     // --- READER THREAD ---
     let reader_handle = std::thread::spawn({
         let chunk_tx = chunk_tx.clone();
@@ -422,6 +447,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
 
             let mut total = 0;
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+            let mut format_reported = false;
 
             while let Some(r1) = reader_r1.next() {
                 let r1 = r1.context("Invalid R1 sequence")?;
@@ -431,6 +457,14 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
                         bail!("Desynchronization: R1 has more records than R2");
                     }
                 };
+
+                // The serial PE path validates against R1's quality only; do the
+                // same here so both paths reach the same verdict.
+                if !format_reported {
+                    let has_quality = r1.qual().is_some_and(|q| !q.is_empty());
+                    let _ = fmt_tx.send(has_quality);
+                    format_reported = true;
+                }
 
                 // Validate pair synchronization
                 let base_r1 = base_read_id(r1.id()).to_vec();
@@ -524,6 +558,12 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buf_r1 = BufWriter::with_capacity(buf_size, writer_r1);
     let mut buf_r2 = BufWriter::with_capacity(buf_size, writer_r2);
+
+    // Match the serial PE path: refuse a FASTA -> FASTQ conversion before any
+    // record is written, rather than emitting FASTQ with an empty quality line.
+    if let Ok(has_quality) = fmt_rx.recv() {
+        validate_format_compatibility(has_quality, output_format)?;
+    }
 
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
     let mut duplicates = 0;
