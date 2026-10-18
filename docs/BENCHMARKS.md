@@ -213,17 +213,19 @@ equivalence on the image axis.
 
   | run | peak RSS before | peak RSS after |
   |---|---|---|
-  | shipped defaults | 202.6 MB | 141.2 MB |
-  | `--buffer-mb 8` | 100.5 MB | 36.1 MB |
+  | shipped buffer (512 MB until 2026-10-18; 8 MB since) | 202.6 MB | 141.2 MB |
+  | `--buffer-mb 8` (now the default) | 100.5 MB | 36.1 MB |
   | `--preview-reads 0` | 126.3 MB | 126.3 MB |
   | `--buffer-mb 1 --preview-reads 0` | 16.5 MB | 16.0 MB |
 
   The terms are ~8 MB of process base, the worker index buffer, and the preview
-  payloads. The index buffer holds one 12-byte `(x, y, file_id, read_num)` entry
-  per read until `--buffer-mb` (default 512 MB, divided across workers) is
-  reached; with two input files each worker's share is 256 MB, so an entire
-  5 M-read file (~60 MB of entries, ~110 MB with `Vec` growth) is retained and
-  nothing spills — the "budget" never binds. The preview store used to keep
+  payloads. The index buffer holds one **8-byte** `(x, y, file_id, read_num)`
+  entry per read (2+2+4; the budget charges 16) until `--buffer-mb` (default
+  **8 MB**, divided across workers) is
+  reached. At the old 512 MB default with two input files each worker's share was
+  256 MB, so an entire
+  5 M-read file (~60 MB of entries, ~110 MB with `Vec` growth) was retained and
+  nothing spilled — the "budget" never bound. The preview store used to keep
   `preview_n` full read payloads per (pixel, mate) for the whole run (~76 MB,
   ≈15 MB per `--preview-reads` step). FastQC keeps neither a per-read record
   nor a read payload, and that is the whole 9×.
@@ -235,9 +237,12 @@ equivalence on the image axis.
   **byte-identical** `heatmap.data` / `.preview` / `.json` / `.png` on the same
   inputs (only `heatmap_3d.html` varies, and it already varied run-to-run
   because it serialises a `HashMap`). The remaining term is the index buffer,
-  a `--buffer-mb` policy: at the shipped 512 MB default a 5 M-pair run is
-  ~141 MB; at `--buffer-mb 8` it is ~36 MB with wall time unchanged
-  (5.3–5.9 s both, i.e. within run-to-run noise).
+  a `--buffer-mb` policy, and the policy was pulled on 2026-10-18: at the old
+  512 MB default a 5 M-pair run was ~141 MB, while the shipped 8 MB default
+  gives ~36 MB with wall time unchanged (5.3–5.9 s both, i.e. within
+  run-to-run noise). Measured independently on a 2 M-read library: 48.6 MB at
+  512 MB against **22.7 MB at the shipped 8 MB**, 1.0 s both, outputs
+  byte-identical.
 * **What stays structural.** One 8-byte index record per read is written to a
   per-row temp file and re-read to build `heatmap.data` — that is the tool's
   contract (every read is addressable in the grid), so fastmaps cannot reach
