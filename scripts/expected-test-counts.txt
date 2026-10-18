@@ -36,7 +36,7 @@ fastcheck  127
 fastdedup   109
 fastprep    130
 fastsim      67
-fastmaps     45
+fastmaps     47
 fasthelper   40
 pathology     1
-GRAND       519
+GRAND       521

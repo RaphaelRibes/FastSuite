@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn report_v1_written_and_parseable() {
+    fn report_v1_parses_with_expected_values() {
         let dir = std::env::temp_dir().join(format!("maps_v1_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -223,13 +223,30 @@ mod tests {
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"schema\": \"fastsuite.report.v1\""), "{text}");
-        assert!(text.contains("\"tool\": \"fastmaps\""));
-        assert!(text.contains("\"mode\": \"composition\""));
-        assert!(text.contains("\"elapsed_s\": 0.42"));
-        assert!(text.contains("\"polyT_frac\": 0.25"));
-        assert!(text.contains("\"r2_polyG_frac\": 0.5"));
-        assert!(text.contains("\"a_R1.fq.gz\""));
+
+        // Actually parse the emitted document: a stray brace, a trailing comma
+        // or a duplicate key would all make this fail, which the old
+        // substring checks could not catch.
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("report JSON must parse: {e}\n---\n{text}"));
+
+        assert_eq!(v["schema"], "fastsuite.report.v1");
+        assert_eq!(v["tool"], "fastmaps");
+        assert_eq!(v["tool_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["mode"], "composition");
+        assert_eq!(v["command"], "fastmaps a_R1.fq.gz a_R2.fastq.gz -j 2");
+        assert!((v["elapsed_s"].as_f64().unwrap() - 0.42).abs() < 1e-12);
+        assert_eq!(v["inputs"]["files"], serde_json::json!(["a_R1.fq.gz", "a_R2.fastq.gz"]));
+        assert_eq!(v["metrics"]["total_reads"].as_f64().unwrap(), 4.0);
+        assert_eq!(v["metrics"]["polyT_frac"].as_f64().unwrap(), 0.25);
+        assert_eq!(v["metrics"]["r2_polyG_frac"].as_f64().unwrap(), 0.5);
+        assert_eq!(v["grid"]["format"], "heatmap.json");
+
+        // Still-meaningful substring contract: fmt_f64 renders integral
+        // floats compactly, so total_reads is `4`, never `4.0`.
+        assert!(text.contains("\"total_reads\": 4"), "{text}");
+        assert!(!text.contains("\"total_reads\": 4.0"), "{text}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

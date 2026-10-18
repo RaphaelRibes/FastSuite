@@ -3,6 +3,21 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+/// Normalised log-count `t` in `[0, 1]` for the heat scale: `ln(c) / ln(max)`.
+///
+/// The degenerate case `max_count <= 1` (every occupied pixel holds exactly
+/// one read, so `ln(max) == ln(1) == 0`) is special-cased to `1.0`: every
+/// occupied pixel *is* the maximum there, so it maps to the top of the scale
+/// rather than the `0/0` NaN that blacked out the PNG/SVG and emitted an
+/// invalid `color: [NaN]` array into the Plotly page.
+fn log_norm(count: u64, max_count: u64) -> f64 {
+    if max_count <= 1 {
+        1.0
+    } else {
+        (count as f64).ln() / (max_count as f64).ln()
+    }
+}
+
 fn heat_color(t: f64) -> [u8; 3] {
     const STOPS: &[[f64; 3]] = &[
         [0.0, 0.0, 0.0],
@@ -59,7 +74,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
             let py = view_h - (margin + (y + 1) * cell);
             let (r, g, b) = match counts.get(&(x, y)) {
                 Some((c, _)) => {
-                    let t = (*c as f64).ln() / (max_count as f64).ln();
+                    let t = log_norm(*c, max_count);
                     let [r, g, b] = heat_color(t);
                     (r, g, b)
                 }
@@ -157,7 +172,7 @@ pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
     let h = max_y + 1;
     let mut pixels = vec![[0u8; 3]; w * h];
     for (&(x, y), &(c, _)) in counts {
-        let t = (c as f64).ln() / (max_count as f64).ln();
+        let t = log_norm(c, max_count);
         pixels[y as usize * w + x as usize] = heat_color(t);
     }
 
@@ -181,7 +196,7 @@ pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
 /// Write an interactive Plotly 3-D scatter HTML to `output_dir/heatmap_3d.html`.
 /// z = mean Phred quality, colour = log(count).
 pub fn write_html(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
-    let max_count = counts.values().map(|(c, _)| *c).max().unwrap() as f64;
+    let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
     let total: u64 = counts.values().map(|(c, _)| c).sum();
 
     let mut xs = Vec::new();
@@ -193,7 +208,7 @@ pub fn write_html(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, q
         xs.push(x);
         ys.push(y);
         zs.push(cq / c as f64);
-        cs.push((c as f64).ln() / max_count.ln());
+        cs.push(log_norm(c, max_count));
     }
 
     let fmt_vec = |v: &[f64]| v.iter().map(|n| format!("{n:.4}")).collect::<Vec<_>>().join(",");
@@ -249,5 +264,40 @@ Plotly.newPlot('plot', [trace], layout, {{responsive: true}});
     f.write_all(html.as_bytes()).unwrap();
     if !quiet {
         println!("Saved heatmap_3d.html");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a grid whose busiest pixel holds exactly one read used to
+    /// divide by `ln(1) == 0`, yielding `0/0 == NaN` — a uniformly black PNG /
+    /// SVG and an invalid `color: [NaN]` array in the Plotly page.
+    ///
+    /// `log_norm` special-cases `max_count <= 1` to `1.0` (the occupied pixels
+    /// are all the maximum), so the value is finite and maps to a visible
+    /// colour instead of black.
+    #[test]
+    fn single_read_grid_normalises_finite() {
+        let max_count = 1u64; // every occupied pixel holds exactly one read
+        let t = log_norm(1, max_count);
+        assert!(t.is_finite(), "normalised log-count must be finite, got {t}");
+        assert_eq!(t, 1.0, "single-read pixel is the maximum → top of scale");
+        assert_ne!(
+            heat_color(t),
+            [0, 0, 0],
+            "the single-read pixel must not render black"
+        );
+    }
+
+    /// The fix must not disturb the ordinary case: with a real `max > 1` the
+    /// normalisation stays `ln(c) / ln(max)` (min → 0, max → 1).
+    #[test]
+    fn log_norm_unchanged_for_normal_grids() {
+        assert!((log_norm(10, 10) - 1.0).abs() < 1e-12);
+        assert!((log_norm(1, 10) - 0.0).abs() < 1e-12);
+        let mid = log_norm(5, 100);
+        assert!((mid - (5f64.ln() / 100f64.ln())).abs() < 1e-12);
     }
 }
