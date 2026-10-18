@@ -34,6 +34,7 @@ use clap::Parser;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use needletail::parse_fastx_file;
+use fastprep::metadata;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -117,7 +118,7 @@ struct Args {
     limit: usize,
 
     /// Sequence view mode: overlay input sequences with trim annotations
-    #[arg(long, conflicts_with_all = &["summary", "json", "export-fasta", "out-folder"])]
+    #[arg(long, conflicts_with_all = &["summary", "json", "export_fasta", "out_folder"])]
     view: bool,
 
     /// Input R1 FASTQ (required with --view, --export-fasta, or --out-folder)
@@ -141,13 +142,13 @@ struct Args {
     hard_trim_3: usize,
 
     /// Export matching reads to a FASTA file (requires --in-r1)
-    #[arg(long, conflicts_with_all = &["summary", "json", "view", "out-folder"])]
+    #[arg(long, conflicts_with_all = &["summary", "json", "view", "out_folder"])]
     export_fasta: Option<PathBuf>,
 
     /// Export all categories to separate FASTA files in a directory (requires --in-r1).
     /// Creates: hardtrimmed5.fa, polyx5.fa, polyx3.fa, polyx_interior.fa,
-    /// meanq.fa, adapter.fa, kept.fa, clean.fa
-    #[arg(long, conflicts_with_all = &["summary", "json", "view", "export-fasta"])]
+    /// meanq.fa, adapter.fa, duplicate.fa, kept.fa, clean.fa
+    #[arg(long, conflicts_with_all = &["summary", "json", "view", "export_fasta"])]
     out_folder: Option<PathBuf>,
 }
 
@@ -178,6 +179,7 @@ enum StatusFilter {
     PolyInt,
     MeanQ,
     Adapter,
+    Duplicate,
 }
 
 impl std::str::FromStr for StatusFilter {
@@ -192,8 +194,9 @@ impl std::str::FromStr for StatusFilter {
             "poly_int" | "polyint" | "interior" => Ok(StatusFilter::PolyInt),
             "meanq" | "mean-q" | "mean_q" => Ok(StatusFilter::MeanQ),
             "adapter" => Ok(StatusFilter::Adapter),
+            "duplicate" | "dup" => Ok(StatusFilter::Duplicate),
             _ => Err(format!(
-                "invalid status {:?}, use: kept|dropped|hard|poly5|poly3|poly_int|meanq|adapter",
+                "invalid status {:?}, use: kept|dropped|hard|poly5|poly3|poly_int|meanq|adapter|duplicate",
                 s
             )),
         }
@@ -227,6 +230,7 @@ impl Record {
             4 => "poly_int",
             5 => "meanq",
             6 => "adapter",
+            7 => "duplicate",
             _ => "unknown",
         }
     }
@@ -298,6 +302,7 @@ struct Summary {
     reason_poly_int: u64,
     reason_meanq: u64,
     reason_adapter: u64,
+    reason_duplicate: u64,
     r1: u64,
     r2: u64,
     reads_with_adapter: u64,
@@ -340,10 +345,14 @@ impl<R: Read> PxmtReader<R> {
         }
         let mut version = [0u8; 1];
         buf.read_exact(&mut version)?;
-        if version[0] != 2 {
+        if version[0] != metadata::VERSION {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("unsupported PXMT version {}, expected 2", version[0]),
+                format!(
+                    "unsupported PXMT version {}, expected {}",
+                    version[0],
+                    metadata::VERSION
+                ),
             ));
         }
         Ok(Self { buf })
@@ -449,6 +458,7 @@ fn update_summary(s: &mut Summary, rec: &Record) {
             4 => s.reason_poly_int += 1,
             5 => s.reason_meanq += 1,
             6 => s.reason_adapter += 1,
+            7 => s.reason_duplicate += 1,
             _ => {}
         }
     } else {
@@ -549,9 +559,14 @@ fn print_summary(s: &Summary) {
             pct_str(s.reason_meanq, s.total)
         );
         eprintln!(
-            "    └─ adapter:         {:>10}  {}",
+            "    ├─ adapter:         {:>10}  {}",
             fmt_num(s.reason_adapter),
             pct_str(s.reason_adapter, s.total)
+        );
+        eprintln!(
+            "    └─ duplicate:       {:>10}  {}",
+            fmt_num(s.reason_duplicate),
+            pct_str(s.reason_duplicate, s.total)
         );
     }
     eprintln!(
@@ -716,6 +731,7 @@ fn build_filter(args: &Args, hard_trim_5: usize, hard_trim_3: usize) -> impl Fn(
                 StatusFilter::PolyInt => r.status == 4,
                 StatusFilter::MeanQ => r.status == 5,
                 StatusFilter::Adapter => r.status == 6,
+                StatusFilter::Duplicate => r.status == 7,
             };
             if !ok {
                 return false;
@@ -1119,7 +1135,7 @@ fn export_categories(
         None => None,
     };
 
-    let names = ["hardtrimmed5", "polyx5", "polyx3", "polyx_interior", "meanq", "adapter", "kept", "clean"];
+    let names = ["hardtrimmed5", "polyx5", "polyx3", "polyx_interior", "meanq", "adapter", "duplicate", "kept", "clean"];
     let mut files: Vec<Option<BufWriter<std::fs::File>>> = names
         .iter()
         .map(|name| {
@@ -1136,11 +1152,12 @@ fn export_categories(
     const PI: usize = 3;
     const MQ: usize = 4;
     const AD: usize = 5;
-    const KP: usize = 6;
-    const CL: usize = 7;
+    const DP: usize = 6;
+    const KP: usize = 7;
+    const CL: usize = 8;
 
     let mut total = 0u64;
-    let mut counts: [u64; 8] = [0; 8];
+    let mut counts: [u64; 9] = [0; 9];
 
     loop {
         let Some(rec) = pxmt.read_one()? else { break };
@@ -1178,6 +1195,7 @@ fn export_categories(
                 4 => PI,
                 5 => MQ,
                 6 => AD,
+                7 => DP,
                 _ => continue,
             }
         } else if rec.t5_adapter == 0 && rec.t3_adapter == 0

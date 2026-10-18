@@ -908,12 +908,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_parse() {
-        let r = Cli::try_parse_from(["fastprep", "--auto-params", "x.json", "--print-args"]);
-        eprintln!("PROBE: {:?}", r);
-    }
-
-    #[test]
     fn auto_params_refuses_without_a_model() {
         // A valid fastcheck QC report: the refusal is about the missing
         // MODEL, not the input, so a good report must still refuse.

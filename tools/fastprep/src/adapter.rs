@@ -399,68 +399,8 @@ pub fn load_fasta(path: &Path) -> Result<Vec<Adapter>> {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-detection.
-// ---------------------------------------------------------------------------
-
-/// Sample up to 10 k reads, count 12-mers at the 3′ end, return the top
-/// candidates (up to 3) that appear in ≥ 1 % of reads.
-///
-/// Returns an empty Vec when no adapter signal is detectable (e.g. all
-
-// ---------------------------------------------------------------------------
 // Sequence matching (SE / PE-fallback).
 // ---------------------------------------------------------------------------
-
-/// Find the best 3′ adapter match in `seq`.
-///
-/// Scans each adapter across the full read from left to right, taking
-/// the leftmost (most-trimming) valid match per adapter, then reporting
-/// the globally most-trimming match across all adapters.
-///
-/// Three cases handled:
-///   1. Adapter fully inside read (short insert): adapter starts at p,
-///      everything from p onward is trimmed.
-///   2. Adapter partially overlapping the 3′ tail: only k = L − p
-///      bases are compared (k < adapter length).
-///   3. No match: returns `None`.
-///
-/// Each position uses an early-exit mismatch counter so non-matching
-/// positions bail after ~max_mm+1 comparisons on average (O(L) total
-/// with a small constant, same as the old tail-only path but now
-/// covering the full read).
-/// Below this a pigeonhole chunk stops being selective and the filter costs
-/// more than it saves: a 4-mer occurs by chance in a 150-base read about 43%
-/// of the time. Measured rejection on clean reads with the illumina preset:
-/// 100% at epsilon = 0, 91% at 0.1, and 1.4% at 0.2 where chunks fall to 4
-/// bases. Below the threshold the filter is simply skipped.
-const FILTER_MIN_CHUNK: usize = 6;
-
-/// Pigeonhole rejection test for full-length alignments.
-///
-/// If `seq[p..p+a]` matches `adapter` with at most `m` mismatches then,
-/// splitting the adapter into `m + 1` disjoint chunks, at least one chunk
-/// matches exactly: `m` mismatches cannot touch `m + 1` disjoint regions. So
-/// if no chunk occurs anywhere in `seq`, no admissible full-length alignment
-/// exists and the position scan can be skipped entirely.
-///
-/// Returns `true` when the scan is still required. It may return `true`
-/// unnecessarily; it never returns `false` for a sequence that contains an
-/// admissible alignment, which is the only direction that affects output.
-#[inline]
-fn full_alignment_plausible(seq: &[u8], adapter: &[u8], max_mm: usize) -> bool {
-    let a = adapter.len();
-    let nchunks = max_mm + 1;
-    if nchunks > a || a / nchunks < FILTER_MIN_CHUNK {
-        // More chunks than bases means every alignment is admissible anyway;
-        // chunks below the selectivity floor would not reject enough to pay.
-        return true;
-    }
-    (0..nchunks).any(|j| {
-        let s = j * a / nchunks;
-        let e = (j + 1) * a / nchunks;
-        s < e && memmem::find(seq, &adapter[s..e]).is_some()
-    })
-}
 
 /// Find the leftmost adapter match in `seq`, or `None`.
 ///
@@ -756,15 +696,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn filter_is_skipped_when_chunks_would_be_too_short() {
-        // epsilon = 0.3 on a 19-base adapter gives 7 chunks of 2 bases, well
-        // below FILTER_MIN_CHUNK, so the filter must not run and must not
-        // reject.
-        let ad = b"CTGTCTCTTATACACATCT";
-        assert!(full_alignment_plausible(b"ACGTACGTACGTACGTACGT", ad, 6));
     }
 
     #[test]

@@ -1692,7 +1692,7 @@ mod tests {
         // NovaSeq first-cycle dropout: 1-base G head, then clean template.
         // The quality-gated scan (min_run 6) leaves it; --head-dropout 5
         // must trim exactly the G run and nothing more.
-        let mut b = b"GACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+        let b = b"GACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
         let q = vec![40u8; b.len()];
         let params = Params {
             min_run: 6,
@@ -1710,7 +1710,7 @@ mod tests {
         // A 3-base G head is trimmed exactly; longer runs (>= min_run)
         // are left to the scan, and a 6-base run must NOT be touched by
         // the dropout rule.
-        let mut b = b"GGGACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+        let b = b"GGGACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
         let q = vec![40u8; b.len()];
         let params = Params {
             min_run: 6,
@@ -1724,7 +1724,7 @@ mod tests {
             r => panic!("unexpected {:?}", r),
         }
 
-        let mut b = b"GGGGGGACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+        let b = b"GGGGGGACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
         let q = vec![40u8; b.len()];
         let params = Params {
             min_run: 6,
@@ -1741,7 +1741,7 @@ mod tests {
         }
 
         // Without the flag, a 1-base G head is left untouched.
-        let mut b = b"GACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
+        let b = b"GACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec();
         let q = vec![40u8; b.len()];
         let params = Params {
             min_run: 6,
