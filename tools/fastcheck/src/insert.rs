@@ -353,11 +353,6 @@ impl InsertHist {
         }
     }
 
-    pub fn resident_bytes(&self) -> usize {
-        (self.bins.len() + self.bins_adapter.len()) * std::mem::size_of::<u64>()
-            + self.adapters.iter().map(|a| a.len()).sum::<usize>()
-    }
-
     /// Public view of the quantile, for the report's metric namespace.
     pub fn quantile_public(&self, q: f64) -> f64 {
         self.quantile(q)

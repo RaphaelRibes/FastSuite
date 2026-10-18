@@ -45,20 +45,6 @@ impl OverrepMode {
             ),
         })
     }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            OverrepMode::None => "none",
-            OverrepMode::Fingerprint => "fingerprint",
-            OverrepMode::SecondPass => "second-pass",
-            OverrepMode::Table => "table",
-        }
-    }
-
-    /// Whether sequence text is recoverable in this mode.
-    pub fn names_available(&self) -> bool {
-        matches!(self, OverrepMode::SecondPass | OverrepMode::Table)
-    }
 }
 
 /// 2-bit packed sequence with its length. `N` and every non-ACGT code are not packable and
@@ -136,10 +122,6 @@ impl SequenceTable {
         self.counts.len() as u64
     }
 
-    pub fn resident_bytes(&self) -> usize {
-        self.counts.iter().map(|(k, _)| k.bytes()).sum()
-    }
-
     /// Sequences occurring at least `min_count` times, most frequent first, as
     /// `(sequence text, count)`.
     pub fn at_least(&self, min_count: u32) -> Vec<(String, u32)> {
@@ -159,14 +141,6 @@ impl SequenceTable {
             *self.counts.entry(k.clone()).or_insert(0) += c;
         }
     }
-}
-
-/// One entry of the over-representation report.
-#[derive(Debug, Clone)]
-pub struct OverrepEntry {
-    pub seq: Option<String>,
-    pub fingerprint: Option<String>,
-    pub count: u32,
 }
 
 /// Build the over-representation report for one mode.

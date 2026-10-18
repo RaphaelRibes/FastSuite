@@ -230,7 +230,6 @@ pub fn all_matches(seq: &[u8], set: &AdapterSet) -> Vec<(usize, usize)> {
         if a == 0 {
             continue;
         }
-        let ms = min_sound_k(a, set.error_rate);
         for p in 0..=max_p {
             let k = a.min(l - p);
             if k < set.min_overlap_se {
