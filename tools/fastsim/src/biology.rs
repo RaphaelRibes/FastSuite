@@ -114,12 +114,10 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
 /// Ring buffer of recently emitted inserts, the template pool for PCR
 /// duplicates.
 ///
-/// A duplicate re-sequences a stored fragment: same template, but fresh
-/// quality, sequencing errors and polyG artefacts are drawn independently,
-/// because dropout is a per-cluster failure. Emitting byte-identical copies
-/// The duplicate pool holds FINISHED PAIRS, not bare inserts, and a sampled
-/// pair is replayed byte-for-byte. That is what makes a duplicate detectable
-/// the way a real one is.
+/// A duplicate replays a STORED pair byte-for-byte: the pool holds finished
+/// pairs, not bare inserts, so a copy carries the original's template,
+/// artefact, substitution errors and quality unchanged — which is what makes
+/// it detectable the way a real duplicate is.
 ///
 /// Measured on real data before this change: fastsim drew the right number of
 /// duplicate pairs (ground truth said 1073) but fastcheck's exact sequence

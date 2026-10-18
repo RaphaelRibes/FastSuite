@@ -31,9 +31,6 @@ pub enum Mate {
 }
 
 impl Mate {
-    pub fn both() -> [Mate; 2] {
-        [Mate::R1, Mate::R2]
-    }
     pub fn as_str(&self) -> &'static str {
         match self {
             Mate::R1 => "R1",
@@ -96,8 +93,6 @@ pub struct Profile {
     /// (e.g. 38.689 -> 39 -> +0.31 on average); only the final per-base
     /// quality is rounded, after the per-read offset.
     pub pos_q: [Vec<f64>; 2],
-    /// per-position mean Phred unconditional (measured), per mate
-    pub pos_q_uncond: [Vec<f64>; 2],
     /// flat mean Phred INSIDE 3' tail runs, per mate (measured run_q_mean.tail)
     pub tail_q_mean: [f64; 2],
     /// flat mean Phred INSIDE 5' head runs EXCLUDING the first base, per mate
@@ -108,7 +103,6 @@ pub struct Profile {
     pub head_q_mean: [f64; 2],
     /// per-read mean-Q histogram per mate (for baseline variance)
     pub read_meanq: [Cdf; 2],
-    pub full_length_rate: f64,
     pub full_length_q: [u8; 2],
     pub adapter: Adapter,
     /// measured ambiguous-base (N) emission; absent -> emit none (see NModel)
@@ -210,10 +204,6 @@ impl Cdf {
             last.1 = 1.0;
         }
         Cdf { bins, total }
-    }
-
-    pub fn from_vec(v: &[u64]) -> Self {
-        Self::from_dense(v)
     }
 }
 
@@ -416,15 +406,6 @@ impl Profile {
         // rounding the curve here would bias every emitted base.
         let pos_q = [raw.pos_q.R1.clone(), r2_posq];
 
-        // Unconditional (measured) per-position curve. Profiles built before
-        // the deconvolution (build_profile.py) lack pos_q_uncond: fall back
-        // to pos_q itself (then out-of-run == unconditional, correct for
-        // reads without tails).
-        let pos_q_uncond = match raw.pos_q_uncond {
-            Some(u) => [u.R1.clone(), if u.R2.is_empty() { u.R1.clone() } else { u.R2.clone() }],
-            None => pos_q.clone(),
-        };
-
         // Flat in-tail mean quality (measured run_q_mean.tail). Fall back to
         // deriving it from the collapse: in_tail = mean(pos_q) - collapse.
         let mean_of = |v: &[f64]| -> f64 { v.iter().sum::<f64>() / v.len().max(1) as f64 };
@@ -554,14 +535,12 @@ impl Profile {
             tail_q_collapse: [raw.tail_q_collapse.R1,
                               raw.tail_q_collapse.R2.unwrap_or(raw.tail_q_collapse.R1)],
             pos_q,
-            pos_q_uncond,
             tail_q_mean,
             head_q_mean,
             read_meanq: [
                 Cdf::from_map(&raw.read_meanq.R1)?,
                 Cdf::from_map(if raw.read_meanq.R2.is_empty() { &raw.read_meanq.R1 } else { &raw.read_meanq.R2 })?,
             ],
-            full_length_rate: raw.full_length_rate,
             full_length_q: [
                 raw.full_length_q.R1.round().clamp(0.0, 41.0) as u8,
                 if raw.full_length_q.R2 > 0.0 { raw.full_length_q.R2 } else { raw.full_length_q.R1 }
@@ -584,10 +563,6 @@ impl Profile {
 
     pub fn pos_q(&self, mate: Mate) -> &[f64] {
         &self.pos_q[Self::mate_idx(mate)]
-    }
-
-    pub fn pos_q_uncond(&self, mate: Mate) -> &[f64] {
-        &self.pos_q_uncond[Self::mate_idx(mate)]
     }
 
     pub fn tail_cdf(&self, mate: Mate) -> &Cdf {

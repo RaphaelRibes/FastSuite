@@ -90,9 +90,9 @@ pub struct Cli {
     #[arg(long)]
     pub no_gzip: bool,
 
-    /// PCR duplicate fraction (default 0.02; mandril measures 1-4%).
-    /// A duplicate re-sequences a previously emitted fragment with fresh
-    /// quality, errors and artefacts (per-cluster dropout).
+    /// PCR duplicate fraction (default 0.02; mandril measures 1-4%). Only the
+    /// fallback: a profile carrying a measured dup_rate overrides it. A
+    /// duplicate replays a previously emitted pair byte-for-byte.
     #[arg(long, default_value_t = 0.02)]
     pub dup_rate: f64,
 

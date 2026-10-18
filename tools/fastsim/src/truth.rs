@@ -18,9 +18,9 @@
 //! - `r1_h` / `r1_t`: 5′/3′ G-run lengths of R1; same for R2.
 //! - `full_flag`: 1 = entirely artefact (full-length spike or biology
 //!   window < 1 bp) — the correct answer is to DROP the pair; 0 = trim.
-//! - `is_dup`: 1 = PCR duplicate of a previously emitted fragment (same
-//!   template, independently re-sequenced: fresh errors, quality and
-//!   polyG artefacts).
+//! - `is_dup`: 1 = PCR duplicate of a previously emitted pair: the whole
+//!   stored read (template, artefact, substitution errors and quality) is
+//!   replayed byte-for-byte.
 //!
 //! The correct trimmed window per mate is `[h, min(I, L−t))`:
 //! - `[0, h)`     — 5′ G-run (artefact)

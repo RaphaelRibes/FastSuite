@@ -386,3 +386,62 @@ fn drop_rate_produces_short_fragments_and_reads_stay_150bp() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn profile_dup_rate_beats_the_cli_flag() {
+    // main.rs does `profile.dup_rate.unwrap_or(cfg.dup_rate)`, and clap cannot
+    // tell an explicit --dup-rate from its 0.02 default, so once the profile
+    // carries a measured dup_rate the CLI flag is NEVER consulted. This pins
+    // that precedence: profile dup_rate 0.25 + `--dup-rate 0.05` must yield a
+    // GT duplicate rate that follows the PROFILE (~0.25), not the flag. A
+    // harness pinning --dup-rate for reproducibility would otherwise silently
+    // get the measured rate.
+    let dir = std::env::temp_dir().join(format!("fastsim_it_duprate_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let q150 = vec!["30"; 150].join(",");
+    let json = format!(
+        r#"{{
+        "read_len": 150, "gc": 0.5, "geometry": "tail3p_both",
+        "dup_rate": 0.25,
+        "head": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+        "tail": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+        "joint_tail": {{"0,0": 100}},
+        "tail_q_collapse": {{"R1": 0.0, "R2": 0.0}},
+        "pos_q": {{"R1": [{q}], "R2": [{q}]}},
+        "read_meanq": {{"R1": {{"30": 100}}, "R2": {{"30": 100}}}},
+        "full_length_rate": 0.0,
+        "adapter": {{"seq": "CTGTCTCTTATACACATCT", "mode": "readthrough"}}
+    }}"#,
+        q = q150
+    );
+    let profile = dir.join("duprate_profile.json");
+    std::fs::write(&profile, json).unwrap();
+    let out = dir.join("sim");
+
+    let status = Command::new(bin())
+        .args([
+            "--pairs", "20000", "--profile", profile.to_str().unwrap(),
+            "--out", out.to_str().unwrap(), "--seed", "7", "--no-gzip",
+            "--dup-rate", "0.05", "--dup-pool", "4096",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // GT is_dup column (index 9) must track the profile's 0.25, not the flag.
+    let gt = std::fs::read_to_string(dir.join("sim.gt.tsv")).unwrap();
+    let mut n = 0u64;
+    let mut nd = 0u64;
+    for line in gt.lines().skip(1) {
+        n += 1;
+        let dup: u8 = line.split('\t').nth(9).unwrap().parse().unwrap();
+        nd += u64::from(dup);
+    }
+    let rate = nd as f64 / n as f64;
+    assert!(
+        (rate - 0.25).abs() < 0.02,
+        "observed dup rate {rate} must follow the profile's 0.25, not --dup-rate 0.05"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -557,36 +557,46 @@ mod tests {
         let run = r1.seq.iter().rev().take_while(|&&b| b == b'G').count();
         assert_eq!(run, 5, "measured run must equal injected tail exactly");
     }
-    /// A pooled pair replays byte-for-byte: the property the closed loop's
-    /// duplicate-rate gate depends on. Before the pool stored finished pairs,
-    /// a duplicate re-drew the artefact and the substitution errors, so a copy
-    /// differed from its original on ~56.5% of reads (per-base error 0.0055
-    /// over 150 bp) and the measured rate came out at ~0.35 of the requested
-    /// rate, independent of pool size.
+    /// A pooled pair replays byte-for-byte through the REAL pool path: push a
+    /// finished pair into a `History`, sample it back, and the sampled element
+    /// must be exactly what was pushed — sequence, quality and artefact. This
+    /// is the property the closed loop's duplicate-rate gate depends on;
+    /// before the pool stored finished pairs, a duplicate re-drew the artefact
+    /// and the substitution errors, so a copy differed from its original on
+    /// ~56.5% of reads (per-base error 0.0055 over 150 bp) and the measured
+    /// rate came out at ~0.35 of the requested rate, independent of pool size.
     #[test]
     fn pooled_pair_replays_identical_bytes() {
-        use crate::quality::{qualify, MateRead};
-        // Reuse the existing 150bp test profile; only the insert length matters
-        // for this test, and a shorter insert than read_len exercises the same
-        // replay path.
+        use crate::biology::History;
+        use crate::quality::qualify;
         let p = tail_profile();
         let mut rng = rng();
         let insert: Vec<u8> = (0..120u32).map(|i| b"ACGT"[(i % 4) as usize]).collect();
         let a = decide(&p, &mut rng);
         let read = build_read(&p, &insert, 120, Mate::R1, &a, &mut rng);
         let m1 = qualify(&p, Mate::R1, &read, &mut rng);
-
-        let pooled = PooledPair {
+        let pushed = PooledPair {
             insert: insert.clone(),
             insert_len: 120,
             artefact: a,
-            r1: m1.clone(),
+            r1: m1,
             r2: None,
         };
-        // Replaying means emitting the stored bytes unchanged.
-        assert_eq!(pooled.r1.seq, m1.seq, "the pooled sequence must not be regenerated");
-        assert_eq!(pooled.r1.qual, m1.qual, "the pooled quality must not be regenerated");
-        assert_eq!(pooled.artefact.h1, a.h1, "the artefact travels with the pair");
-        assert_eq!(pooled.artefact.t1, a.t1, "the artefact travels with the pair");
+
+        // An empty pool samples nothing.
+        assert!(History::new(4).sample(&mut rng).is_none());
+
+        // Drive the real path: store the pair, then read it back out.
+        let mut hist = History::new(4);
+        hist.push(pushed.clone());
+        let sampled = hist.sample(&mut rng).expect("the pool is primed by the push");
+
+        // The sampled pair IS the pushed pair, byte for byte: nothing is
+        // regenerated on replay.
+        assert_eq!(sampled.insert, pushed.insert);
+        assert_eq!(sampled.insert_len, pushed.insert_len);
+        assert_eq!(sampled.r1.seq, pushed.r1.seq, "replayed sequence must be the stored bytes");
+        assert_eq!(sampled.r1.qual, pushed.r1.qual, "replayed quality must be the stored bytes");
+        assert_eq!(sampled.artefact, pushed.artefact, "the artefact travels with the pair");
     }
 }

@@ -64,12 +64,14 @@ fn run(cfg: &cli::Config) -> Result<()> {
             bail!("--read-len {} does not match profile read_len {}", l, profile.read_len);
         }
     }
-    // The profile's measured dup_rate is the authority on the duplicate class
-    // when present: the closed loop compares the sim's QC against the real
+    // Duplicate-class rate: the profile's measured dup_rate is the authority
+    // when present — the closed loop compares the sim's QC against the real
     // library's QC, and a sim pinned to --dup-rate's 0.02 default sits at
-    // 0.015-0.018 whatever the real library's rate is (measured dup_ratio up
-    // to 20x — the other GATE-2 cluster). An explicit CLI value still wins,
-    // so a harness can force a specific rate.
+    // 0.015-0.018 whatever the real library's rate is (measured dup_ratio up to
+    // 20x — the other GATE-2 cluster). --dup-rate is ONLY the fallback for a
+    // profile with no measured rate: clap cannot tell an explicit flag from its
+    // default, so once the profile carries a rate the flag is never consulted
+    // (see `profile_dup_rate_beats_the_cli_flag` in tests/cli_test.rs).
     if profile.dup_rate.is_none() {
         profile.dup_rate = Some(cfg.dup_rate);
     }
@@ -121,8 +123,8 @@ fn run(cfg: &cli::Config) -> Result<()> {
 
     let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
 
-    // Duplicate pool: recently emitted inserts. A duplicate re-sequences a
-    // stored fragment with fresh artefacts/quality (per-cluster dropout).
+    // Duplicate pool: recently emitted pairs. A duplicate replays a stored
+    // pair byte-for-byte — same template, artefact, errors and quality.
     let mut hist = History::new(cfg.dup_pool as usize);
 
     let mut n_full = 0u64;
@@ -198,9 +200,9 @@ fn run(cfg: &cli::Config) -> Result<()> {
             n_drop += 1;
         }
 
-        // 2. Artefact decision (correlated tails, heads, full spike).
-        // Drawn fresh even for duplicates: dropout is a per-cluster failure,
-        // so a copy gets its own polyG runs, exactly like the measured data.
+        // 2. Artefact decision (correlated tails, heads). Drawn fresh for every
+        // non-duplicate pair; a duplicate never reaches here — it replays the
+        // stored artefact verbatim in the is_dup branch above.
         let mut a = decide(&profile, &mut rng);
         if a.full {
             n_full += 1;
