@@ -142,10 +142,9 @@ pub struct Cli {
     /// winner from the 55-config grid beats it on the other 100, so there
     /// is real signal to switch on but no model trained on a corpus large
     /// enough to beat the default on held-out studies (docs/AUTO-PARAMS.md).
-    /// This is the honest surface for `fastprep --auto-params <qc.json>
-    /// --print-args` — the flag parses, validates the QC path, and refuses
-    /// with a message pointing at the doc, exactly as CLI-SPEC §1 rule 4
-    /// requires of a correct refusal.
+    /// `fastprep --auto-params <qc.json> --print-args` — the flag parses,
+    /// validates the QC path, and refuses with a message pointing at the
+    /// doc, exactly as CLI-SPEC §1 rule 4 requires of a correct refusal.
     #[arg(long, value_name = "QC.json", help_heading = "Model Recommendation")]
     pub auto_params: Option<PathBuf>,
 
@@ -198,31 +197,6 @@ pub struct Cli {
     #[arg(long, default_value_t = 12, value_name = "N", help_heading = "PolyX Trimming")]
     pub min_run: usize,
 
-    /// 3′-terminal minimum run, overriding --min-run at the 3′ end only
-    /// (the 5′ end and the interior keep --min-run). Omit to use --min-run
-    /// everywhere — the default, and byte-for-byte the old behaviour.
-    ///
-    /// A single global threshold cannot be right at both ends: measured
-    /// P(artefact | run length) at the 3′ terminus crosses 0.5 by r=6
-    /// (0.54), so a --min-run sized to reject short 5′ biology (12) leaves
-    /// genuine 3′ artefacts of 6–11 behind, while lowering the global value
-    /// would start trimming 5′ biology (P ≈ 0.28).
-    ///
-    /// MEASURED NEGATIVE — DO NOT RAISE WITHOUT RE-MEASURING. The trade
-    /// above is real for **G** runs, but this threshold is generic polyX, so
-    /// it also licenses trimming terminal A/C/T runs, which are artefacts
-    /// once in ~2000 (P = 0.0002–0.0007 at r=6; G is 0.536). On the
-    /// 102-dataset simulator corpus at tolerance 0, `--min-run-3p 6` moved
-    /// 35,196 mates out of undertrim but cost 236,779 overtrim for a net
-    /// **−1.07 pp** of exact rate (and −1.60 pp combined with
-    /// --trim-terminal-n); a second effect compounds it — a lower 3′
-    /// threshold shrinks the 3′ rejection window, so the reverse scan
-    /// engages on reads it previously rejected and overshoots boundaries
-    /// that were already correct. The whole recoverable class was worth at
-    /// most +0.094 pp. See docs/TRIM-ACCURACY.md §"the two opt-in flags".
-    #[arg(long, value_name = "N", help_heading = "PolyX Trimming")]
-    pub min_run_3p: Option<usize>,
-
     /// Trim the NovaSeq first-cycle 5′ G-dropout: a short (1..=N) leading
     /// G-run with normal quality is removed exactly, no quality gate.
     /// Must be < --min-run so the scan stays in charge of long runs.
@@ -241,25 +215,6 @@ pub struct Cli {
     /// bench/results/phase-d/head-dropout-axis.tsv.
     #[arg(long, value_name = "N", default_value = "0", help_heading = "PolyX Trimming")]
     pub head_dropout: Option<usize>,
-
-    /// Trim runs of N at the 5′ and/or 3′ terminus only (off by default).
-    /// An *interior* N-run is never touched — N is a valid ambiguity code
-    /// inside biology.
-    ///
-    /// MEASURED NEGATIVE — DO NOT ENABLE WITHOUT RE-MEASURING. It was added
-    /// on the observation that 2.9% of the undertrim bucket is N-runs, but
-    /// that inference does not hold: this simulator places N *inside* the
-    /// biology window (`quality.rs::inject_ambiguous`, `truth.rs`), so a
-    /// terminal N-run is never labelled an artefact to remove. Census over
-    /// 20.4 M mates: 66,583 mate-ends carry a terminal N-run and the ground
-    /// truth moves that boundary for **0** of them, so trimming the run is
-    /// always an overtrim. On the corpus it costs **−0.53 pp** of exact rate
-    /// at tolerance 0 and converts zero mates to exact. It may still be
-    /// defensible on a real library whose terminal N-runs are mask/failure
-    /// padding, which this benchmark cannot show. See
-    /// docs/TRIM-ACCURACY.md §"the two opt-in flags".
-    #[arg(long, help_heading = "PolyX Trimming")]
-    pub trim_terminal_n: bool,
 
     /// Target letter for anchored mode (repeatable, max 5 distinct).
     /// Omit for generic polyX (match on identical neighbours).
@@ -655,9 +610,6 @@ impl Cli {
             }
         };
         if self.min_run < 2 { bail!("--min-run must be ≥ 2"); }
-        if let Some(n) = self.min_run_3p {
-            if n < 2 { bail!("--min-run-3p must be ≥ 2"); }
-        }
         if let Some(hd) = self.head_dropout {
             // 0 disables the rule (see the field docs): the scan then owns
             // every leading run, which is the only way to avoid trimming a
@@ -797,9 +749,7 @@ impl Cli {
             match_leniency: self.match_leniency,
             mismatch_strength: self.mismatch_strength,
             min_run: self.min_run,
-            min_run_3p: self.min_run_3p,
             head_dropout: self.head_dropout,
-            trim_terminal_n: self.trim_terminal_n,
             rule,
             scan_5: !self.no_5,
             scan_3: !self.no_3,
@@ -1076,19 +1026,6 @@ mod tests {
         assert!(cli.no_dedup);
         assert!(cli.no_auto_phred);
         assert!(cli.interior);
-    }
-
-    #[test]
-    fn per_end_and_terminal_n_flags_default_off() {
-        // Opt-in flags: the shipped default must leave both unset so a bare
-        // invocation behaves exactly as before they existed.
-        use clap::Parser;
-        let cli = Cli::parse_from(["fastprep", "-1", "in.fq", "-o", "out.fq"]);
-        assert_eq!(
-            cli.min_run_3p, None,
-            "--min-run-3p ships unset (global --min-run everywhere)"
-        );
-        assert!(!cli.trim_terminal_n, "--trim-terminal-n ships off");
     }
 }  
 
