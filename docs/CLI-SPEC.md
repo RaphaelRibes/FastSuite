@@ -175,8 +175,14 @@ Ordered by user-visible value:
 * Adding a flag: minor. Removing or renaming one: major, and the old spelling
   must remain as an alias for at least one release.
 * `--json` payload: see `REPORT-SCHEMA.md` for the versioning rule.
-* Exit codes: `0` success, `1` input/usage error, `2` (target) "ran fine but a
-  threshold tripped", `>2` reserved. Today only 0/1 are used.
+* Exit codes: `0` success — a warning (e.g. a residual-adapter trip *without*
+  `--fail-on-adapter-residual`) does not change it; `1` input/run error (a
+  missing or unreadable config, a config `check` rejects, or a step that
+  failed); `2` "ran fine but a threshold tripped" (a `--fail-on` violation in
+  `concatenate`, or a residual-adapter trip under `--fail-on-adapter-residual`
+  in `run`; the report and manifest are still written first), and equally the
+  usage errors clap reports before the run (unknown flag, missing argument — see
+  §4, item 8); `>2` reserved. All of `0`, `1` and `2` are produced today.
 
 ## fastcheck
 

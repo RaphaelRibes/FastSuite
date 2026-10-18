@@ -326,7 +326,6 @@ pub struct GuardOutcome {
     pub verdict: Verdict,
     pub raw: Option<Measurement>,
     pub trimmed: Option<Measurement>,
-    pub cause: Cause,
 }
 
 impl GuardOutcome {
@@ -388,7 +387,6 @@ pub fn guard_step(
             verdict: Verdict::Silent("the trimming step's input could not be measured"),
             raw: None,
             trimmed: None,
-            cause,
         });
     };
     // No adapter entering the step: nothing to guard, no second pass.
@@ -397,7 +395,6 @@ pub fn guard_step(
             verdict: Verdict::Silent("the trimming step's input carries no detectable adapter"),
             raw: Some(raw),
             trimmed: None,
-            cause,
         });
     }
 
@@ -414,7 +411,6 @@ pub fn guard_step(
             verdict: Verdict::Silent("the trimmed output could not be measured"),
             raw: Some(raw),
             trimmed: None,
-            cause,
         });
     };
 
@@ -423,7 +419,6 @@ pub fn guard_step(
         verdict,
         raw: Some(raw),
         trimmed: Some(trimmed),
-        cause,
     })
 }
 

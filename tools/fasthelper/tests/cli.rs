@@ -10,6 +10,33 @@ fn fasthelper() -> &'static str {
     env!("CARGO_BIN_EXE_fasthelper")
 }
 
+/// tools/ — the directory `--tools-dir` expects (holds <tool>/target/<profile>/<tool>).
+fn tools_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// Locate a built suite binary, or fail LOUDLY. These tests exercise the real
+/// runner against the real fastcheck, so a missing binary is a broken
+/// prerequisite, not a reason to pass silently: the test would otherwise go
+/// green without ever proving the step ran.
+fn require_tool(tool: &str) -> PathBuf {
+    let dir = tools_dir().join(tool).join("target");
+    for profile in ["release", "debug"] {
+        let p = dir.join(profile).join(tool);
+        if p.is_file() {
+            return p;
+        }
+    }
+    panic!(
+        "{tool} is not built under {} — build it (cd tools/{tool} && cargo build --release) \
+         before running this test; it is a real gate, not an optional one",
+        tools_dir().display()
+    );
+}
+
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("fasthelper_cli_{}_{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&d);
@@ -293,6 +320,9 @@ fn check_rejects_unknown_step_and_missing_input() {
 fn fastcheck_step_runs_and_writes_a_v1_report() {
     // fastcheck is a terminal QC step: it takes positional FASTQs and writes
     // only a report, never a new FASTQ. The runner must build that argv.
+    // Real gate: requires fastcheck to be built (see require_tool) and asserts
+    // the step actually ran and wrote its report — no silent pass if it didn't.
+    require_tool("fastcheck");
     let d = tmpdir("fastcheck_step");
     let out = d.join("run");
     std::fs::create_dir_all(&out).unwrap();
@@ -311,36 +341,31 @@ fn fastcheck_step_runs_and_writes_a_v1_report() {
     )
     .unwrap();
 
-    // Point the runner at a toolset whose only real binary is fastcheck: the
-    // step must not be rejected as "unsupported".
     let (_, stderr, code) = run(&[
         "run",
         "-c",
         cfg.to_str().unwrap(),
         "--tools-dir",
-        option_env!("FASTSUITE_TOOLS").unwrap_or("tools"),
+        tools_dir().to_str().unwrap(),
     ]);
-    // fastcheck may not be built in this environment; the assertion that
-    // matters is that it was recognised as a step, not called unsupported.
+    assert_eq!(code, 0, "the fastcheck step must run clean: {stderr}");
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+            .unwrap();
+    let cmd = &man["commands"][0];
+    assert_eq!(cmd["tool"], "fastcheck");
+    let argv: Vec<String> = serde_json::from_value(cmd["argv"].clone()).unwrap();
+    assert!(argv.contains(&fq.display().to_string()), "argv: {argv:?}");
+    assert!(argv.contains(&"--json".to_string()), "argv: {argv:?}");
     assert!(
-        !stderr.contains("unsupported step"),
-        "fastcheck must be a known step: {stderr}"
+        out.join("s1/fastcheck.json").is_file(),
+        "fastcheck must have written its report, manifest: {man}"
     );
-    if code == 0 {
-        let man: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
-                .unwrap();
-        let cmd = &man["commands"][0];
-        assert_eq!(cmd["tool"], "fastcheck");
-        let argv: Vec<String> = serde_json::from_value(cmd["argv"].clone()).unwrap();
-        assert!(argv.contains(&fq.display().to_string()), "argv: {argv:?}");
-        assert!(argv.contains(&"--json".to_string()), "argv: {argv:?}");
-        assert!(out.join("s1/fastcheck.json").is_file());
-    }
 }
 
 #[test]
 fn jobs_flag_is_accepted_and_the_run_still_succeeds() {
+    require_tool("fastcheck");
     let d = tmpdir("jobs");
     let out = d.join("run");
     std::fs::create_dir_all(&out).unwrap();
@@ -359,24 +384,27 @@ fn jobs_flag_is_accepted_and_the_run_still_succeeds() {
         ),
     )
     .unwrap();
-    let (_, stderr, code) = run(&["run", "-c", cfg.to_str().unwrap(), "-P", "2"]);
-    // fastcheck may be missing; what must hold: -P is a real flag, and when
-    // the step runs both samples get manifest entries.
-    assert!(
-        !stderr.contains("unexpected argument"),
-        "-P must exist: {stderr}"
-    );
-    if code == 0 {
-        let man: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
-                .unwrap();
-        let cmds = man["commands"].as_array().unwrap();
-        assert_eq!(cmds.len(), 2, "both samples must run: {cmds:?}");
-    }
+    let (_, stderr, code) = run(&[
+        "run",
+        "-c",
+        cfg.to_str().unwrap(),
+        "-P",
+        "2",
+        "--tools-dir",
+        tools_dir().to_str().unwrap(),
+    ]);
+    // -P is a real flag AND the run must succeed: both samples get a manifest entry.
+    assert_eq!(code, 0, "-P must be accepted and the run must succeed: {stderr}");
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap())
+            .unwrap();
+    let cmds = man["commands"].as_array().unwrap();
+    assert_eq!(cmds.len(), 2, "both samples must run: {cmds:?}");
 }
 
 #[test]
 fn from_flag_forces_a_step_rerun_and_resume_skips_matches() {
+    require_tool("fastcheck");
     let d = tmpdir("resume");
     let out = d.join("run");
     std::fs::create_dir_all(&out).unwrap();
@@ -392,18 +420,18 @@ fn from_flag_forces_a_step_rerun_and_resume_skips_matches() {
         ),
     )
     .unwrap();
-    // First run populates the manifest.
-    let (_, _, c1) = run(&["run", "-c", cfg.to_str().unwrap()]);
-    if c1 != 0 {
-        return; // fastcheck not installed here; the flag test below still runs
-    }
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+    // First run populates the manifest; it must actually succeed.
+    let (_, e1, c1) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c1, 0, "first run must succeed: {e1}");
     // Second run: identical config -> the step is resumed (skipped).
-    let (stdout2, _, c2) = run(&["run", "-c", cfg.to_str().unwrap()]);
-    assert_eq!(c2, 0);
+    let (stdout2, e2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c2, 0, "{e2}");
     assert!(stdout2.contains("resumed s1/fastcheck"), "{stdout2}");
     // --from fastcheck forces it to run again.
-    let (stdout3, _, c3) = run(&["run", "-c", cfg.to_str().unwrap(), "--from", "fastcheck"]);
-    assert_eq!(c3, 0);
+    let (stdout3, e3, c3) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td, "--from", "fastcheck"]);
+    assert_eq!(c3, 0, "{e3}");
     assert!(!stdout3.contains("resumed s1/fastcheck"), "{stdout3}");
 }
 

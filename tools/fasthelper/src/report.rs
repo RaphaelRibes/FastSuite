@@ -80,10 +80,6 @@ fn num(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
-fn get<'a>(o: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    o.get(key)
-}
-
 fn get_num(o: &serde_json::Value, key: &str) -> f64 {
     o.get(key).and_then(num).unwrap_or(0.0)
 }
@@ -198,8 +194,8 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
         let size = get_num(&v, "size") as i64;
         let windows: [(&str, &serde_json::Value); 3] = [
             ("all", &v),
-            ("r1", get(&v, "counts_r1").unwrap_or(&serde_json::Value::Null)),
-            ("r2", get(&v, "counts_r2").unwrap_or(&serde_json::Value::Null)),
+            ("r1", v.get("counts_r1").unwrap_or(&serde_json::Value::Null)),
+            ("r2", v.get("counts_r2").unwrap_or(&serde_json::Value::Null)),
         ];
         let mut metrics = BTreeMap::new();
         metrics.insert("total_reads".into(), get_num(&v, "total_reads"));
@@ -292,7 +288,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
             reads_dropped += get_num(mate, "reads_dropped");
             bases_in += get_num(mate, "bases_in");
             bases_trimmed += get_num(mate, "bases_trimmed_5") + get_num(mate, "bases_trimmed_3");
-            if let Some(a) = get(mate, "adapter") {
+            if let Some(a) = mate.get("adapter") {
                 adapter_trimmed += get_num(a, "reads_trimmed");
             }
             for cause in [
@@ -407,14 +403,13 @@ pub fn collect(inputs: &[PathBuf], sample: Option<&str>) -> Result<Vec<ToolRepor
     files.dedup();
 
     let mut reports = Vec::new();
-    for (i, f) in files.iter().enumerate() {
+    for f in files.iter() {
         let hint = if files.len() == 1 { sample } else { None };
         match adapt_file(f, hint) {
             Ok(Some(r)) => reports.push(r),
             Ok(None) => {}
             Err(e) => eprintln!("fasthelper: skipping {}: {e}", f.display()),
         }
-        let _ = i;
     }
     Ok(reports)
 }

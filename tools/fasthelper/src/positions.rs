@@ -28,7 +28,6 @@ const REQUIRED_COLUMN: &str = "pos";
 
 pub struct SamplePositions {
     pub sample: String,
-    pub source: PathBuf,
     pub metrics: Vec<String>,
     /// position (1-based, as written by fastcheck) -> metric values, aligned
     /// with `metrics`
@@ -90,7 +89,6 @@ pub fn read_positions(path: &Path, sample_hint: Option<&str>) -> Result<Option<S
     }
     Ok(Some(SamplePositions {
         sample,
-        source: path.to_path_buf(),
         metrics,
         rows,
     }))

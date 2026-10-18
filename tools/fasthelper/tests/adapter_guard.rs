@@ -2,10 +2,10 @@
 //!
 //! They drive the real `fasthelper run` against fixtures built inline, using the
 //! suite's own `fastcheck`/`fastprep` binaries when they resolve under
-//! `tools/`. When they do not, the test says so and returns: the decision logic
-//! itself is covered exhaustively by the unit tests in
-//! `src/adapter_guard.rs`, so a missing binary must never turn into a red build
-//! (the same discipline as `fastcheck_step_runs_and_writes_a_v1_report`).
+//! `tools/`. These are real gates: if a required binary is absent the test FAILS
+//! loudly (see `require_tools`) rather than passing without exercising anything.
+//! The decision logic itself is also covered exhaustively by the unit tests in
+//! `src/adapter_guard.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,12 +34,23 @@ fn resolve(tool: &str) -> Option<PathBuf> {
     None
 }
 
-fn skip_if_missing() -> bool {
-    if resolve("fastcheck").is_none() || resolve("fastprep").is_none() {
-        eprintln!("adapter_guard test skipped: fastcheck/fastprep not built under tools/");
-        return true;
+/// Fail LOUDLY when a required binary is missing. These are real end-to-end
+/// gates, so an absent prerequisite must be a broken test, not a silent pass
+/// that would go green without ever driving `fasthelper run`.
+fn require_tools(tools: &[&str]) {
+    let missing: Vec<&str> = tools
+        .iter()
+        .copied()
+        .filter(|t| resolve(t).is_none())
+        .collect();
+    if !missing.is_empty() {
+        panic!(
+            "adapter_guard test needs {} built under {} — build them \
+             (cd tools/<tool> && cargo build --release) before running this test",
+            missing.join(", "),
+            tools_dir().display()
+        );
     }
-    false
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -107,9 +118,7 @@ fn read_manifest(outdir: &Path) -> serde_json::Value {
 /// the actionable cause, and can be made fatal on demand.
 #[test]
 fn residual_adapter_after_trimming_warns_with_an_actionable_cause() {
-    if skip_if_missing() {
-        return;
-    }
+    require_tools(&["fastcheck", "fastprep"]);
     let d = tmpdir("residual");
     let raw = d.join("s1_R1.fastq");
     fixture_fastq(&raw);
@@ -170,9 +179,7 @@ fn residual_adapter_after_trimming_warns_with_an_actionable_cause() {
 /// Scenario 2 — a clean trimmed output: the guard stays silent.
 #[test]
 fn clean_trimmed_output_is_silent() {
-    if skip_if_missing() {
-        return;
-    }
+    require_tools(&["fastcheck", "fastprep"]);
     let d = tmpdir("clean");
     let raw = d.join("s1_R1.fastq");
     fixture_fastq(&raw);
@@ -213,10 +220,7 @@ fn clean_trimmed_output_is_silent() {
 /// Scenario 3 — a run with no trimming step: the guard never fires.
 #[test]
 fn a_run_without_a_trimming_step_never_fires_the_guard() {
-    if resolve("fastcheck").is_none() {
-        eprintln!("adapter_guard test skipped: fastcheck not built under tools/");
-        return;
-    }
+    require_tools(&["fastcheck"]);
     let d = tmpdir("notrim");
     let raw = d.join("s1_R1.fastq");
     fixture_fastq(&raw);
@@ -244,9 +248,7 @@ fn a_run_without_a_trimming_step_never_fires_the_guard() {
 /// The guard is opt-out: --no-adapter-guard silences even a bad trim.
 #[test]
 fn the_guard_can_be_disabled() {
-    if skip_if_missing() {
-        return;
-    }
+    require_tools(&["fastcheck", "fastprep"]);
     let d = tmpdir("disabled");
     let raw = d.join("s1_R1.fastq");
     fixture_fastq(&raw);
