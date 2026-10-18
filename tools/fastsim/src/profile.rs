@@ -218,19 +218,16 @@ impl Cdf {
 }
 
 
-/// P(position p is covered by an injected 5' G-run) for one mate.
+/// P(read position p is covered by an injected 5' G-run), for p in 0..read_len.
 ///
-/// `head` is the measured histogram of run LENGTHS {len: count}. Position p is
+/// `m` is the measured histogram of run LENGTHS {len: count}. Position p is
 /// inside the run exactly when the run length h satisfies h > p, so
 /// P(p covered) = (sum of counts for h > p) / (total counts).
-fn head_artefact_mass(head: &RawMateHists, mate: usize) -> std::collections::HashMap<usize, f32> {
-    let mut out = std::collections::HashMap::new();
-    let m: &BTreeMap<String, u64> = if mate == 0 { &head.R1 } else { &head.R2 };
+fn head_cover(m: &BTreeMap<String, u64>, read_len: usize) -> Vec<f32> {
     let total: u64 = m.values().sum();
     if total == 0 {
-        return out;
+        return vec![0.0; read_len];
     }
-    // suffix sums over run length: how many reads have h > p
     let maxlen = m.keys().filter_map(|k| k.parse::<usize>().ok()).max().unwrap_or(0);
     let mut counts = vec![0u64; maxlen + 2];
     for (k, v) in m.iter() {
@@ -241,14 +238,111 @@ fn head_artefact_mass(head: &RawMateHists, mate: usize) -> std::collections::Has
     // greater[p] = number of reads with h > p
     let mut greater = vec![0u64; maxlen + 2];
     let mut acc = 0u64;
-    for p in (0..=maxlen).rev() {
-        greater[p] = acc;
-        acc += counts[p];
+    for p in (0..=maxlen + 1).rev() {
+        if p <= maxlen {
+            greater[p] = acc;
+        }
+        if p <= maxlen {
+            acc += counts[p];
+        }
     }
-    for p in 0..=maxlen {
-        out.insert(p, greater[p] as f32 / total as f32);
+    (0..read_len)
+        .map(|p| if p <= maxlen { greater[p] as f32 / total as f32 } else { 0.0 })
+        .collect()
+}
+
+/// P(read position p is covered by an injected 3' G-run), for p in 0..read_len.
+///
+/// A run of length t fills the LAST t positions of the read (read coordinates
+/// L-t..L-1), so it covers read position p exactly when t >= L - p.
+fn tail_cover(m: &BTreeMap<String, u64>, read_len: usize) -> Vec<f32> {
+    let total: u64 = m.values().sum();
+    if total == 0 {
+        return vec![0.0; read_len];
     }
-    out
+    let maxlen = m.keys().filter_map(|k| k.parse::<usize>().ok()).max().unwrap_or(0);
+    let mut counts = vec![0u64; maxlen + 1];
+    for (k, v) in m.iter() {
+        if let Ok(len) = k.parse::<usize>() {
+            counts[len] += *v;
+        }
+    }
+    // ge[k] = number of reads with t >= k
+    let mut ge = vec![0u64; maxlen + 2];
+    let mut acc = 0u64;
+    for k in (0..=maxlen).rev() {
+        ge[k] = acc + counts[k];
+        acc += counts[k];
+    }
+    (0..read_len)
+        .map(|p| {
+            let need = read_len - p; // >= 1 for every valid read position
+            if need <= maxlen { ge[need] as f32 / total as f32 } else { 0.0 }
+        })
+        .collect()
+}
+
+/// Remove one (plane × artefact) pair's contribution from a single measured
+/// `[a,c,g,t]` row already normalised to sum to 1.
+///
+/// `cover` is P(this position carries the injected G). A covered position is
+/// forced G, so `g_measured = cover * 1 + (1 - cover) * g_bio`; invert for the
+/// biology G fraction and renormalise the remaining three channels over the
+/// non-G mass. A no-op when the pair does not reach this position.
+fn deconvolve_row(a: &mut [f32; 4], cover: f32) {
+    if cover <= 1e-6 || cover >= 1.0 - 1e-6 {
+        return;
+    }
+    let g_bio = ((a[2] - cover) / (1.0 - cover)).clamp(0.0, 1.0);
+    let rest_total: f32 = a[0] + a[1] + a[3];
+    let rest_bio = (1.0 - g_bio).max(0.0);
+    if rest_total > 1e-6 && rest_bio > 1e-6 {
+        let scale = rest_bio / rest_total;
+        a[0] *= scale;
+        a[1] *= scale;
+        a[3] *= scale;
+    }
+    a[2] = g_bio;
+    let t: f32 = a.iter().sum();
+    if t > 1e-6 {
+        for x in a.iter_mut() {
+            *x /= t;
+        }
+    }
+}
+
+/// Build a fragment-frame per-position composition from one measured `base`
+/// plane, deconvolving BOTH injected runs that contaminate it.
+///
+/// The plane is the MEASURED read-position composition, so every position an
+/// injected head or tail run reaches already contains that artefact. The
+/// consumer draws biology from this plane and injects the runs separately, so
+/// each pair must be divided out or the artefact is counted twice
+/// (docs/GFRAC-MECHANISM.md §3).
+fn biased_plane(plane: &[Vec<f32>], head_cov: &[f32], tail_cov: &[f32]) -> Vec<[f32; 4]> {
+    plane
+        .iter()
+        .enumerate()
+        .map(|(p, v)| {
+            let mut a = [0.0f32; 4];
+            for (i, x) in v.iter().take(4).enumerate() {
+                if x.is_finite() && *x >= 0.0 {
+                    a[i] = *x;
+                }
+            }
+            let s: f32 = a.iter().sum();
+            if s > 0.0 {
+                for x in a.iter_mut() {
+                    *x /= s;
+                }
+            } else {
+                a = [0.25; 4];
+            }
+            deconvolve_row(&mut a, head_cov.get(p).copied().unwrap_or(0.0));
+            deconvolve_row(&mut a, tail_cov.get(p).copied().unwrap_or(0.0));
+            a
+        })
+        .collect()
 }
 
 impl Profile {
@@ -394,79 +488,54 @@ impl Profile {
             }
             _ => None,
         };
-        // R1 shows the fragment's 5′ end, so its head composition anchors the fragment head.
-        // Deconvolve the artefact out of the measured per-position composition
-        // before it is used as a BIOLOGY draw.
+        // R1 shows the fragment's 5′ end, so its head composition anchors the fragment head;
+        // R2 shows the fragment's 3′ end reverse-complemented, so its head composition
+        // becomes the fragment tail after A<->T, C<->G.
         //
-        // `base.R1[pos]` is the MEASURED composition at that position, which is a
-        // mixture: reads carrying a 5' G-run of length h contribute an injected G
-        // at every position < h, and reads with h = 0 contribute biology. The
-        // simulator draws biology from head_bias and separately injects the run,
-        // so feeding it the mixed value double-counts the artefact.
+        // `base.R1[pos]` and `base.R2[pos]` are the MEASURED read-position
+        // compositions. Each is a MIXTURE: reads carrying an injected run
+        // contribute a forced G at every position the run covers, and reads with
+        // no run there contribute biology. The simulator draws biology from this
+        // plane and separately injects the runs, so feeding it the mixed value
+        // double-counts the artefact. All FOUR (plane × artefact) pairs must be
+        // deconvolved out before the plane is used as a biology draw:
         //
-        // Measured on DRR014283: 22.0% of reads carry a head artefact, the
-        // measured G fraction at position 0 is 0.4147, and the biology-only value
-        // implied by that mixture is 0.2497 -- an overstatement of 0.1650, which
-        // matches the observed closed-loop g_frac_max_diff of 0.1273 at that
-        // position. Same signature on DRR015266 (0.1517 predicted, 0.1195
-        // observed) and DRR083295 (0.1547 predicted, 0.1241 observed).
+        //   base.R1 × R1 head run   (h > p)      -- handled historically
+        //   base.R1 × R1 tail run   (t >= L - p) -- was NOT handled
+        //   base.R2 × R2 head run   (h > p)      -- was NOT handled
+        //   base.R2 × R2 tail run   (t >= L - p) -- was NOT handled
         //
-        // For each position p, solve  mixed[p] = sum_h P(h>p) * G_injected
-        //                                  + sum_h P(h<=p) * bio[p]
-        // over the measured head-length histogram, then renormalise bio[p].
-        let head_cdf_tail = head_artefact_mass(&raw.head, 0);
+        // Measured (docs/GFRAC-MECHANISM.md §3): with only the first pair
+        // handled, DRR083326's R1 terminal G was 0.5270 against a real 0.4245,
+        // and the 0.5285 model is exactly the double count. Deconvolving the
+        // other three takes it to 0.4140.
+        //
+        // The head run's mass is P(h > p) -- a run of length h fills positions
+        // 0..h-1, including position 0 for an h = 1 run (the boundary rule
+        // rewrites index h, the FIRST BIOLOGY position, not inside the run).
+        let r1_head = head_cover(&raw.head.R1, read_len);
+        let r1_tail = tail_cover(&raw.tail.R1, read_len);
+        let r2_head_hist = if raw.head.R2.is_empty() { &raw.head.R1 } else { &raw.head.R2 };
+        let r2_tail_hist = if raw.tail.R2.is_empty() { &raw.tail.R1 } else { &raw.tail.R2 };
+        let r2_head = head_cover(r2_head_hist, read_len);
+        let r2_tail = tail_cover(r2_tail_hist, read_len);
+
         let head_bias: Vec<[f32; 4]> = match &raw.base {
-            Some(b) => b.get("R1").cloned().unwrap_or_default().into_iter().enumerate().map(|(p, v)| {
-                let mut a = [0.0f32; 4];
-                for (i, x) in v.iter().take(4).enumerate() { if x.is_finite() && *x >= 0.0 { a[i] = *x; } }
-                let s: f32 = a.iter().sum();
-                if s > 0.0 { for x in a.iter_mut() { *x /= s; } } else { a = [0.25; 4]; }
-                // p_mass = probability that position p is covered by an injected run
-                // Position p carries an injected G exactly when the run covers
-                // it, i.e. h > p. (The boundary rule rewrites index h, which is
-                // the FIRST BIOLOGY position, so every position inside the run
-                // keeps its G -- including position 0 for an h = 1 run.)
-                let _p_cover = 0.0f32;
-                let p_mass = head_cdf_tail.get(&p).copied().unwrap_or(0.0);
-                if p_mass > 1e-6 && p_mass < 1.0 - 1e-6 {
-                    // Remove the artefact's contribution. An injected run of
-                    // length h puts G at positions 0..h, but the boundary rule
-                    // rewrites position h to a random non-G. So position p carries
-                    // an injected G exactly when h > p+1, i.e. the run is at least
-                    // p+2 long. Recompute the mass on that stricter condition:
-                    //   g_mass(p) = P(h >= p+2)
-                    // and position p is biology whenever h <= p+1.
-                    let bio_mass = 1.0 - p_mass;
-                    let g_injected = 1.0f32;
-                    let g_measured = a[2];
-                    let g_bio = ((g_measured - p_mass * g_injected) / bio_mass).clamp(0.0, 1.0);
-                    // Renormalise the remaining three channels over what is left
-                    // of the non-G mass, then rebuild a proper distribution.
-                    let rest_total: f32 = a[0] + a[1] + a[3];
-                    let rest_bio = (1.0 - g_bio).max(0.0);
-                    if rest_total > 1e-6 && rest_bio > 1e-6 {
-                        let scale = rest_bio / rest_total;
-                        a[0] *= scale; a[1] *= scale; a[3] *= scale;
-                    }
-                    a[2] = g_bio;
-                    let t: f32 = a.iter().sum();
-                    if t > 1e-6 { for x in a.iter_mut() { *x /= t; } } else { a = [0.25; 4]; }
-                }
-                a
-            }).collect(),
+            Some(b) => match b.get("R1") {
+                Some(plane) => biased_plane(plane, &r1_head, &r1_tail),
+                None => Vec::new(),
+            },
             None => Vec::new(),
         };
-        // R2 shows the fragment's 3′ end reverse-complemented, so its head
-        // composition becomes the fragment tail after A<->T, C<->G.
         let tail_bias: Vec<[f32; 4]> = match &raw.base {
-            Some(b) => b.get("R2").cloned().unwrap_or_default().into_iter().map(|v| {
-                let mut a = [0.0f32; 4];
-                for (i, x) in v.iter().take(4).enumerate() { if x.is_finite() && *x >= 0.0 { a[i] = *x; } }
-                let s: f32 = a.iter().sum();
-                if s > 0.0 { for x in a.iter_mut() { *x /= s; } } else { a = [0.25; 4]; }
-                // revcomp: A<->T (0<->3), C<->G (1<->2)
-                [a[3], a[2], a[1], a[0]]
-            }).collect(),
+            Some(b) => match b.get("R2") {
+                Some(plane) => biased_plane(plane, &r2_head, &r2_tail)
+                    .into_iter()
+                    // revcomp: A<->T (0<->3), C<->G (1<->2)
+                    .map(|a| [a[3], a[2], a[1], a[0]])
+                    .collect(),
+                None => Vec::new(),
+            },
             None => Vec::new(),
         };
 
@@ -770,6 +839,89 @@ mod tests {
     fn cdf_zero_total_is_error() {
         let err = Cdf::from_map(&BTreeMap::new()).unwrap_err();
         assert!(err.to_string().contains("zero total"));
+    }
+
+    // ---- consumer-side plane deconvolution (docs/GFRAC-MECHANISM.md §3) ----
+
+    #[test]
+    fn run_coverage_masses_match_the_geometry() {
+        // {"0":60,"1":30,"2":10}: P(h>p) and P(t >= L-p) for L = 5.
+        let m = BTreeMap::from([("0".into(), 60u64), ("1".into(), 30), ("2".into(), 10)]);
+        let h = head_cover(&m, 5);
+        assert!((h[0] - 0.4).abs() < 1e-6, "P(h>0)=0.4, got {}", h[0]);
+        assert!((h[1] - 0.1).abs() < 1e-6, "P(h>1)=0.1, got {}", h[1]);
+        assert_eq!(h[2], 0.0);
+        let t = tail_cover(&m, 5);
+        // p=4 -> need 1 -> P(t>=1)=0.4; p=3 -> need 2 -> 0.1; p=2 -> 0
+        assert!((t[4] - 0.4).abs() < 1e-6, "P(t>=1)=0.4, got {}", t[4]);
+        assert!((t[3] - 0.1).abs() < 1e-6, "P(t>=2)=0.1, got {}", t[3]);
+        assert_eq!(t[2], 0.0);
+        // an empty histogram covers nothing
+        assert!(head_cover(&BTreeMap::new(), 3).iter().all(|&x| x == 0.0));
+        assert!(tail_cover(&BTreeMap::new(), 3).iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn deconvolve_row_inverts_the_mixture() {
+        // measured = cover*1 + (1-cover)*bio  ->  deconvolve must recover bio
+        for &(cover, bio) in &[(0.2f32, 0.1f32), (0.4, 0.3), (0.25, 0.6)] {
+            let measured = cover + (1.0 - cover) * bio;
+            let mut a = [(1.0 - measured) / 3.0, (1.0 - measured) / 3.0, measured, (1.0 - measured) / 3.0];
+            deconvolve_row(&mut a, cover);
+            assert!((a[2] - bio).abs() < 1e-5, "cover {cover}: got {}, want {bio}", a[2]);
+            let s: f32 = a.iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "row must stay normalised, sum {s}");
+        }
+        // a pair that does not reach the position is a no-op
+        let mut a = [0.2, 0.2, 0.4, 0.2];
+        deconvolve_row(&mut a, 0.0);
+        assert_eq!(a, [0.2, 0.2, 0.4, 0.2]);
+    }
+
+    #[test]
+    fn profile_deconvolves_both_planes_for_both_injected_runs() {
+        // read_len 4; R1 head {"0":50,"2":50} and tail {"0":70,"2":30};
+        // R2 has neither a head nor a tail run.
+        // The measured plane's terminal R1 base is G = 0.5. At p = 3 the head
+        // run does not reach (P(h>3)=0) and the tail run covers with
+        // P(t>=1) = 0.3, so the biology value must be (0.5-0.3)/0.7 = 0.2857.
+        // Before this fix that terminal base was used as 0.5 and the injected
+        // tail was counted on top of it -- the DRR083326 double count.
+        let q = vec!["30"; 4].join(",");
+        let json = format!(
+            r#"{{
+            "read_len": 4, "gc": 0.5, "geometry": "tail3p_both",
+            "head": {{"R1": {{"0": 50, "2": 50}}, "R2": {{"0": 100}}}},
+            "tail": {{"R1": {{"0": 70, "2": 30}}, "R2": {{"0": 100}}}},
+            "joint_tail": {{"0,0": 100}},
+            "tail_q_collapse": {{"R1": 0.0, "R2": 0.0}},
+            "pos_q": {{"R1": [{q}], "R2": [{q}]}},
+            "read_meanq": {{"R1": {{"30": 100}}, "R2": {{"30": 100}}}},
+            "full_length_rate": 0.0,
+            "full_length_q": {{"R1": 20, "R2": 20}},
+            "adapter": {{"seq": "CTGTCTCTTATACACATCT", "mode": "none"}},
+            "base": {{
+                "R1": [[0.25,0.25,0.25,0.25],[0.25,0.25,0.25,0.25],
+                       [0.25,0.25,0.25,0.25],[0.1667,0.1667,0.5,0.1666]],
+                "R2": [[0.1,0.1,0.7,0.1],[0.25,0.25,0.25,0.25],
+                       [0.25,0.25,0.25,0.25],[0.25,0.25,0.25,0.25]]
+            }}
+        }}"#,
+            q = q
+        );
+        let p = Profile::from_raw(serde_json::from_str::<RawProfile>(&json).unwrap()).unwrap();
+        assert_eq!(p.head_bias.len(), 4);
+        assert_eq!(p.tail_bias.len(), 4);
+        // R1 terminal: tail pair removed, not just the head pair
+        assert!((p.head_bias[3][2] - 0.2857).abs() < 1e-3,
+                "R1 terminal biology G should be 0.2857, got {}", p.head_bias[3][2]);
+        // R1 position 0: head covers with P(h>0) = 0.5, tail does not reach
+        assert!((p.head_bias[0][2] - 0.0).abs() < 1e-6,
+                "R1 pos0 is fully covered by the head run, got {}", p.head_bias[0][2]);
+        // R2's plane is revcomp'd into the fragment tail: measured G 0.7 at R2
+        // position 0 becomes C (index 1) at tail_bias[0]; no run reaches R2.
+        assert!((p.tail_bias[0][1] - 0.7).abs() < 1e-6,
+                "revcomp must map G->C, got {:?}", p.tail_bias[0]);
     }
 
     #[test]
