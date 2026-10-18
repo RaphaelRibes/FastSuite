@@ -82,7 +82,7 @@ Evidence, `tools/fastmaps/src/`:
 | 1 | **gzip decode is single-threaded per file** — the actual bottleneck | `encode.rs`: `get_reader()` uses `flate2::read::MultiGzDecoder`. One inflate stream per file, serial, regardless of cores. |
 | 2 | **parallelism is per file, not per core** | `main.rs`: `num_workers = available_parallelism().min(total_files)` with a work queue of *files*. R1+R2 → 2 workers on a 32-core box. |
 | 3 | **writes 8 bytes per read to temp files** | `worker.rs` `SpillChunk.indices: Vec<(u16,u16,u16,u32)>`, consumed by `spiller.rs` → `heatmap_row_*.tmp`. 3×10⁸ reads ⇒ **2.4 GB written and re-read**, for a grid that is 178 KB dense. |
-| 4 | **keeps read payloads in RAM** | `worker.rs` `PreviewRead { header, seq, qual }`, `preview_n = 5` per pixel, and `spiller.rs` holds `preview_rows: HashMap<u16, Vec<PreviewRead>>` until the end. |
+| 4 | **keeps read payloads in RAM** | `worker.rs` `PreviewRead { header, seq, qual }`, `preview_n = 5` per pixel, and `spiller.rs` holds `preview_rows: HashMap<u16, Vec<PreviewRead>>` until the end. **Fixed 2026-10-18**: previews stream to per-row temp files (spiller) instead of being retained; see `docs/BENCHMARKS.md` §2. |
 | 5 | **counters are HashMaps keyed by (x,y)** | `spiller.rs` `counts/counts_r1/counts_r2: HashMap<(u16,u16), …>` — hashing per read, and no dense-array fast path. |
 | 6 | **no per-position accumulator at all** | there is no per-position base or quality array anywhere in the crate; that is the core of a FastQC replacement. |
 | 7 | **short-read assumption baked in** | grid is `(max_seq_len+1)²`; a 10 kb ONT read ⇒ 10⁸ pixels. |

@@ -47,6 +47,13 @@ pub struct WorkerCfg {
     pub threshold_bytes: usize,
 }
 
+/// Byte threshold for the *preview* buffer. Previews carry read payloads
+/// (header+seq+qual), so they are flushed on their own, much sooner than the
+/// index buffer: the spiller streams each one to its row's temp file, which
+/// keeps preview memory flat in library size instead of `preview_n x pixels`
+/// read payloads resident for the whole run.
+const PREVIEW_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+
 /// A corner extraction region. Each instance writes matching reads to its
 /// own output file.
 #[derive(Clone)]
@@ -81,6 +88,8 @@ pub struct WorkerLocal {
     pub max_seq_len: u32,
     pub total_reads: u64,
     pub bytes_estimate: usize,
+    /// Bytes currently held in `previews` (flushed on its own threshold).
+    pub preview_bytes: usize,
 }
 
 impl WorkerLocal {
@@ -96,6 +105,7 @@ impl WorkerLocal {
             max_seq_len: 0,
             total_reads: 0,
             bytes_estimate: 0,
+            preview_bytes: 0,
         }
     }
 }
@@ -112,6 +122,23 @@ pub fn flush_local(state: &mut WorkerLocal, tx: &mpsc::Sender<SpillerMsg>) {
         previews: std::mem::take(&mut state.previews),
     };
     state.bytes_estimate = 0;
+    state.preview_bytes = 0;
+    tx.send(SpillerMsg::Chunk(chunk))
+        .expect("spiller died while workers still running");
+}
+
+/// Flush pending previews alone (indices stay buffered). Keeps the read
+/// payloads from accumulating: the spiller writes them straight to the row's
+/// preview temp file, so they never become `preview_n x pixels` resident.
+pub fn flush_previews(state: &mut WorkerLocal, tx: &mpsc::Sender<SpillerMsg>) {
+    if state.previews.is_empty() {
+        return;
+    }
+    let chunk = SpillChunk {
+        indices: Vec::new(),
+        previews: std::mem::take(&mut state.previews),
+    };
+    state.preview_bytes = 0;
     tx.send(SpillerMsg::Chunk(chunk))
         .expect("spiller died while workers still running");
 }
@@ -184,7 +211,7 @@ pub fn process_fastq(
             let pc = state.preview_count.entry((xy, kind)).or_insert(0);
             if (*pc as usize) < cfg.preview_n {
                 *pc += 1;
-                state.bytes_estimate += header.len() + seq.len() + qual.len() + 64;
+                let cost = header.len() + seq.len() + qual.len() + 64;
                 state.previews.push(PreviewRead {
                     x: xy.0,
                     y: xy.1,
@@ -194,6 +221,10 @@ pub fn process_fastq(
                     seq: seq.clone(),
                     qual: qual.clone(),
                 });
+                state.preview_bytes += cost;
+                if state.preview_bytes >= PREVIEW_FLUSH_BYTES {
+                    flush_previews(state, tx);
+                }
             }
         }
 

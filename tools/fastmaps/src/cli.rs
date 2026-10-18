@@ -28,8 +28,13 @@ pub struct Args {
     #[arg(long, default_value = "5", value_name = "N")]
     pub preview_reads: usize,
 
-    /// Approximate total RAM budget for worker index/preview buffers
-    /// before they are spilled to the spiller thread (megabytes).
+    /// Approximate total RAM budget for the worker index buffer before it is
+    /// spilled to the spiller thread (megabytes). Preview reads are streamed
+    /// to disk independently and do not count against it.
+    /// Measured on a real 5M-read library: ~141 MB peak RSS at the 512 MB
+    /// default, ~36 MB at 8 MB, wall time unchanged. The budget is divided
+    /// across workers, so an input file smaller than a worker's share is held
+    /// whole without spilling.
     #[arg(long, default_value = "512", value_name = "MB")]
     pub buffer_mb: usize,
 

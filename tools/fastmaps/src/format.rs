@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::encode::json_escape;
 use crate::file_kind::FileKind;
-use crate::spiller::{row_temp_path, SpillerState};
+use crate::spiller::{preview_row_temp_path, row_temp_path, SpillerState};
 use crate::varint::varint_write;
 use crate::worker::PreviewRead;
 
@@ -126,14 +126,73 @@ pub fn encode_preview_row(
     buf
 }
 
+// ── Preview temp-file codec ──────────────────────────────────────────────────
+//
+// The spiller streams preview reads to one temp file per grid row so their
+// payloads (header+seq+qual) never stay resident. Entry layout, little-endian:
+//   x:u16 | file_id:u16 | read_num:u32 | hlen:u32 | header | slen:u32 | seq | qual
+// `y` is implicit in the row's file name; `qual` has `slen` bytes.
+
+/// Append one preview read to a row's preview temp file.
+pub fn write_preview_entry(w: &mut impl Write, p: &PreviewRead) -> std::io::Result<()> {
+    w.write_all(&p.x.to_le_bytes())?;
+    w.write_all(&p.file_id.to_le_bytes())?;
+    w.write_all(&p.read_num.to_le_bytes())?;
+    w.write_all(&(p.header.len() as u32).to_le_bytes())?;
+    w.write_all(p.header.as_bytes())?;
+    w.write_all(&(p.seq.len() as u32).to_le_bytes())?;
+    w.write_all(p.seq.as_bytes())?;
+    w.write_all(p.qual.as_bytes())
+}
+
+/// Decode a whole preview temp row (written by `write_preview_entry`).
+pub fn decode_preview_row(raw: &[u8], y: u16) -> Vec<PreviewRead> {
+    fn u16_at(raw: &[u8], pos: &mut usize) -> u16 {
+        let v = u16::from_le_bytes(raw[*pos..*pos + 2].try_into().unwrap());
+        *pos += 2;
+        v
+    }
+    fn u32_at(raw: &[u8], pos: &mut usize) -> u32 {
+        let v = u32::from_le_bytes(raw[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        v
+    }
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < raw.len() {
+        let x = u16_at(raw, &mut pos);
+        let file_id = u16_at(raw, &mut pos);
+        let read_num = u32_at(raw, &mut pos);
+        let hlen = u32_at(raw, &mut pos) as usize;
+        let header = String::from_utf8_lossy(&raw[pos..pos + hlen]).into_owned();
+        pos += hlen;
+        let slen = u32_at(raw, &mut pos) as usize;
+        let seq = String::from_utf8_lossy(&raw[pos..pos + slen]).into_owned();
+        pos += slen;
+        let qual = String::from_utf8_lossy(&raw[pos..pos + slen]).into_owned();
+        pos += slen;
+        out.push(PreviewRead {
+            x,
+            y,
+            file_id,
+            read_num,
+            header,
+            seq,
+            qual,
+        });
+    }
+    out
+}
+
 // ── Output ───────────────────────────────────────────────────────────────────
 
 /// Write `heatmap.data`, `heatmap.preview`, and `heatmap.json` to `output_dir`.
 ///
 /// Index entries are read one row at a time from the per-y temp files written
 /// by the spiller, then deleted, so peak RAM ≈ the largest single row's data.
+/// Preview payloads are read back the same way (one row file at a time).
 pub fn write_format(
-    mut state: SpillerState,
+    state: SpillerState,
     files: &[String],
     file_kinds: &[FileKind],
     preview_n: usize,
@@ -181,7 +240,19 @@ pub fn write_format(
             vec![]
         };
 
-        let previews = state.preview_rows.remove(&y).unwrap_or_default();
+        let previews = {
+            // Preview payloads were streamed to a per-row temp file by the
+            // spiller; read (and delete) this row's file instead of holding
+            // them in RAM for the whole run.
+            let path = preview_row_temp_path(&state.temp_dir, y);
+            if path.exists() {
+                let raw = std::fs::read(&path)?;
+                std::fs::remove_file(&path)?;
+                decode_preview_row(&raw, y)
+            } else {
+                Vec::new()
+            }
+        };
 
         let drow = encode_data_row(indices);
         let prow = encode_preview_row(previews, preview_n, file_kinds);
@@ -389,5 +460,50 @@ mod tests {
         assert_eq!(varint_read(&buf, &mut pos), 1); // n_pixels
         assert_eq!(varint_read(&buf, &mut pos), 0); // x
         assert_eq!(varint_read(&buf, &mut pos), 4); // 2 per kind × 2 kinds
+    }
+
+    #[test]
+    fn preview_temp_entry_roundtrip() {
+        let mut p = make_preview(2, 42);
+        p.x = 7;
+        p.y = 9;
+        p.header = "@NS500:1:FC".into();
+        p.seq = "ACGTACGTAC".into();
+        p.qual = "IIIIIIIIII".into();
+        let mut buf = Vec::new();
+        write_preview_entry(&mut buf, &p).unwrap();
+        let back = decode_preview_row(&buf, 9);
+        assert_eq!(back.len(), 1);
+        let q = &back[0];
+        assert_eq!(
+            (q.x, q.y, q.file_id, q.read_num),
+            (7, 9, 2, 42)
+        );
+        assert_eq!(q.header, p.header);
+        assert_eq!(q.seq, p.seq);
+        assert_eq!(q.qual, p.qual);
+    }
+
+    #[test]
+    fn preview_temp_row_roundtrip_multiple() {
+        let mut reads = Vec::new();
+        for i in 0..5u32 {
+            let mut p = make_preview(i as u16, i);
+            p.x = (i * 3) as u16;
+            p.seq = "ACGT".repeat(1 + i as usize);
+            p.qual = "I".repeat(p.seq.len());
+            reads.push(p);
+        }
+        let mut buf = Vec::new();
+        for p in &reads {
+            write_preview_entry(&mut buf, p).unwrap();
+        }
+        assert!(decode_preview_row(&[], 3).is_empty());
+        let back = decode_preview_row(&buf, 3);
+        assert_eq!(back.len(), reads.len());
+        for (a, b) in back.iter().zip(&reads) {
+            assert_eq!((a.x, a.file_id, a.read_num, &a.seq, &a.qual),
+                       (b.x, b.file_id, b.read_num, &b.seq, &b.qual));
+        }
     }
 }

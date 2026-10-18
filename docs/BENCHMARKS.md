@@ -206,10 +206,43 @@ equivalence on the image axis.
   0.22 s at 100 k; 8.27 s vs 9.17 s at 5 M), and fastmaps is not the fastest
   tool in this table. The claim is the plane and the per-mate view, not raw
   speed.
-* **FastQC's low peak RSS (16.4 MB) is not comparable to fastmaps' 145 MB** —
-  they are computing different things at different resolutions. fastmaps'
-  memory grows with library size because it builds per-mate grids; FastQC
-  streams per-position counters.
+* **fastmaps' 145 MB peak RSS is decomposed and bounded, and it is not the
+  grid.** Measured on a real 5 M-pair library (50 corpus datasets concatenated,
+  10 M reads, 22 064 grid pixels; peak RSS read from `wait4(rusage)` of the
+  child):
+
+  | run | peak RSS before | peak RSS after |
+  |---|---|---|
+  | shipped defaults | 202.6 MB | 141.2 MB |
+  | `--buffer-mb 8` | 100.5 MB | 36.1 MB |
+  | `--preview-reads 0` | 126.3 MB | 126.3 MB |
+  | `--buffer-mb 1 --preview-reads 0` | 16.5 MB | 16.0 MB |
+
+  The terms are ~8 MB of process base, the worker index buffer, and the preview
+  payloads. The index buffer holds one 12-byte `(x, y, file_id, read_num)` entry
+  per read until `--buffer-mb` (default 512 MB, divided across workers) is
+  reached; with two input files each worker's share is 256 MB, so an entire
+  5 M-read file (~60 MB of entries, ~110 MB with `Vec` growth) is retained and
+  nothing spills — the "budget" never binds. The preview store used to keep
+  `preview_n` full read payloads per (pixel, mate) for the whole run (~76 MB,
+  ≈15 MB per `--preview-reads` step). FastQC keeps neither a per-read record
+  nor a read payload, and that is the whole 9×.
+* **The preview payloads are now streamed, not resident** (fixed 2026-10-18).
+  The spiller writes each preview read to its row's temp file as it arrives
+  (the worker flushes previews on their own 4 MB threshold, independent of the
+  index buffer), and the writer reads one row file back at a time. The preview
+  term fell from ~76 MB to ~3 MB per step, flat in library size, with
+  **byte-identical** `heatmap.data` / `.preview` / `.json` / `.png` on the same
+  inputs (only `heatmap_3d.html` varies, and it already varied run-to-run
+  because it serialises a `HashMap`). The remaining term is the index buffer,
+  a `--buffer-mb` policy: at the shipped 512 MB default a 5 M-pair run is
+  ~141 MB; at `--buffer-mb 8` it is ~36 MB with wall time unchanged
+  (5.3–5.9 s both, i.e. within run-to-run noise).
+* **What stays structural.** One 8-byte index record per read is written to a
+  per-row temp file and re-read to build `heatmap.data` — that is the tool's
+  contract (every read is addressable in the grid), so fastmaps cannot reach
+  FastQC's 16 MB without the PLAN-QC rewrite (dense per-pixel counters, no
+  per-read temp stream, no per-read buffer). Costed in `docs/PLAN-QC.md` §1.
 * **Pinned fastmaps is 1.95× slower than shipped-default** at 5 M (17.91 vs
   9.17 s): the win is thread scaling, and it is real, but the comparison is
   only honest with both modes shown.
