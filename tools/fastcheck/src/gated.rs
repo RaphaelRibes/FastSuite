@@ -292,10 +292,15 @@ impl Accum {
             self.seq_counts.observe(seq);
             w.fingerprints = 1;
             if self.track_overrep_table {
-                // A non-ACGT base cannot be packed; skipping the sequence is the
-                // caller-visible outcome (main.rs admission-checks the mode), and the
-                // report's unique_sequences count shows the gap.
-                let _ = self.overrep_table.observe(seq);
+                // See accum::observe: the scan refuses a sequence that table mode cannot
+                // pack (reader::scan_file_gated), so this only ever sees ACGT and observe
+                // always packs it. It is not a silent drop.
+                if !self.overrep_table.observe(seq) {
+                    debug_assert!(
+                        false,
+                        "reader::scan_file_gated must refuse a sequence table mode cannot pack"
+                    );
+                }
             }
         }
 

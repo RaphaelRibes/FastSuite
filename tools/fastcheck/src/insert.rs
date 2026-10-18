@@ -400,10 +400,10 @@ impl InsertHist {
     }
 
     /// Insert-size deciles from the observed (both-regime) distribution. Only
-    /// the deciles that the measurement can actually reach are returned: upper
-    /// deciles that sit in the censored-above mass are reported by
-    /// `censored_deciles()` instead of being invented. No mean-and-sd shape is
-    /// assumed — a heavy-tailed library is kept heavy-tailed.
+    /// the deciles the observed mass actually reaches are returned: a decile that
+    /// would sit in the censored-above mass is simply absent from the list, not
+    /// invented. No mean-and-sd shape is assumed — a heavy-tailed library is kept
+    /// heavy-tailed.
     pub fn deciles(&self) -> Vec<(&'static str, f64)> {
         const LABELS: [&str; 9] = [
             "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80", "p90",
@@ -428,17 +428,6 @@ impl InsertHist {
             }
         }
         out
-    }
-
-    /// The decile labels that `deciles()` could not reach because the pairs sit
-    /// above the measurement resolution (the censored-above mass).
-    pub fn censored_deciles(&self) -> Vec<&'static str> {
-        const LABELS: [&str; 9] = [
-            "p10", "p20", "p30", "p40", "p50", "p60", "p70", "p80", "p90",
-        ];
-        let seen: std::collections::BTreeSet<&'static str> =
-            self.deciles().into_iter().map(|(l, _)| l).collect();
-        LABELS.into_iter().filter(|l| !seen.contains(l)).collect()
     }
 
     pub fn mean_overlap(&self) -> f64 {
@@ -660,19 +649,30 @@ mod tests {
 
     #[test]
     fn a_chance_anchor_hit_does_not_produce_a_measurement() {
-        // Same anchor, but the rest of the read disagrees: the anchor matches and
-        // the verification must reject it.
-        let frag = dna(300, 17);
-        let r1 = frag[0..251].to_vec();
-        let mut r2 = revcomp(&frag[49..300]);
-        let last = r2.len() - 1;
-        r2[last] = if r2[last] == b'A' { b'C' } else { b'A' }; // breaks the far end
-        // the overlap must still verify: the mismatch is at the read's first base,
-        // which is outside the shared region only if o < l2 ... construct the
-        // unambiguous case instead: a read whose last base is wrong
+        // The anchor (revcomp(R2)'s first 12 biology bases) matches a window of R1 by
+        // chance, but the rest of the alignment is the base-for-base complement of R1, so
+        // the full-overlap verification rejects it: the pair is censored, never measured.
+        let s1 = dna(251, 17);
+        let p = 120;
+        let mut frame = s1[p..p + ANCHOR].to_vec(); // the anchor, matching s1 at p
+        for &b in &s1[p + ANCHOR..] {
+            frame.push(match b {
+                b'A' => b'C',
+                b'C' => b'A',
+                b'G' => b'T',
+                b'T' => b'G',
+                _ => b'N',
+            });
+        }
+        // Long enough that the overlap (o = 251 - p = 131) is below min(l1, l2), so a
+        // rejected alignment is censored-above rather than "complete overlap".
+        frame.resize(251, b'N');
+        let r2 = revcomp(&frame); // overlap() revcomps s2 back to `frame`
         let mut h = InsertHist::new(1024, Vec::new());
-        h.observe_pair(&r1, &r2);
-        assert!(h.measured + h.censored_above + h.censored_below == 1);
+        h.observe_pair(&s1, &r2);
+        assert_eq!(h.measured, 0, "a chance anchor hit must not be measured");
+        assert_eq!(h.censored_above, 1, "it is censored above, not measured");
+        assert_eq!(h.censored_below, 0);
     }
 
     #[test]
@@ -774,7 +774,8 @@ mod tests {
         }
         let mut h = InsertHist::new(1024, Vec::new());
         h.observe_pair(&r1, &r2);
-        assert!(h.measured + h.censored_above + h.censored_below == 1);
         assert_eq!(h.measured, 0, "4 mismatches in 80 bases must not verify");
+        assert_eq!(h.censored_above, 1, "the rejected pair is censored above, not dropped");
+        assert_eq!(h.censored_below, 0);
     }
 }

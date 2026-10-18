@@ -21,6 +21,7 @@ use gzp::par::decompress::ParDecompressBuilder;
 use crate::accum::Accum;
 use crate::cli::Modules;
 use crate::gated::Work;
+use crate::overrep;
 
 const INPUT_BUFFER: usize = 1 << 20;
 
@@ -277,6 +278,26 @@ pub fn scan_file_gated(
                 seq.len(),
                 qual.len()
             );
+        }
+
+        // --overrep-mode table packs each sequence 2 bits per base, so a read with an N or
+        // an IUPAC code cannot be represented. Dropping it (what `let _ = observe(..)` used
+        // to do) under-counts the unique-sequence table exactly on the libraries the mode
+        // exists to name, so the mode refuses instead, naming the record and the offending
+        // base's position. The other over-representation modes do not pack and are unaffected.
+        if acc.track_overrep_table {
+            if let Some(pos) = overrep::first_unpackable(&seq) {
+                bail!(
+                    "{}: record {:?} has {:?} at sequence position {}, which --overrep-mode \
+                     table cannot pack (2-bit ACGT only). Refusing rather than silently \
+                     dropping it from the unique-sequence table; remove reads with N or IUPAC \
+                     codes, or use --overrep-mode fingerprint or second-pass.",
+                    path.display(),
+                    String::from_utf8_lossy(&line),
+                    seq[pos] as char,
+                    pos
+                );
+            }
         }
 
         // The record is measured here: gated when a module subset was selected, the

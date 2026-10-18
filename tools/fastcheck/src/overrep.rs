@@ -101,6 +101,15 @@ impl Packed {
     }
 }
 
+/// Index of the first base that cannot be packed 2 bits (N or any IUPAC code), or
+/// `None` when every base is A/C/G/T. `table` mode calls this before scanning so it can
+/// refuse a read it cannot represent instead of silently dropping it from the
+/// unique-sequence table (see [`SequenceTable::observe`]).
+pub fn first_unpackable(seq: &[u8]) -> Option<usize> {
+    seq.iter()
+        .position(|&b| !matches!(b.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T'))
+}
+
 /// The sequence table used by `table` mode: packed sequence -> multiplicity.
 #[derive(Clone, Default)]
 pub struct SequenceTable {

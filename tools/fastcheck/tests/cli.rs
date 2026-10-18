@@ -474,6 +474,27 @@ fn write_overrep(dir: &Path) -> std::path::PathBuf {
     p
 }
 
+/// A sequence repeated three times whose LAST base is an N — exactly the case the 2-bit
+/// packer of `--overrep-mode table` cannot represent. The old code dropped every such read
+/// from the unique-sequence table, silently under-counting the library; the mode must refuse.
+const OVERREP_N_FASTQ: &[u8] = b"@a\n\
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCN\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@b\n\
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCN\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@c\n\
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCN\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+@d\n\
+TTTTAAAACCCCGGGGTTTTAAAACCCCGGGGT\n\
++\n\
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n\
+";
+
 #[test]
 fn overrep_mode_none_is_the_default_and_reports_no_names() {
     let d = tmpdir("overrep_none");
@@ -554,6 +575,36 @@ fn overrep_mode_table_refuses_above_max_mem_like_the_fingerprint_table() {
         "the refusal must name the table: {stderr}"
     );
     assert!(stderr.contains("--overrep-mode fingerprint"), "must offer the cheaper mode: {stderr}");
+}
+
+/// Under `--overrep-mode table` every sequence is packed 2 bits per base, so an N cannot be
+/// represented. The old code dropped every such read from the unique-sequence table, silently
+/// under-counting exactly the libraries the mode exists to name — this must be a refusal that
+/// names the record and the offending base's position, not a silent gap.
+#[test]
+fn overrep_mode_table_refuses_a_read_it_cannot_pack_instead_of_dropping_it() {
+    let d = tmpdir("overrep_table_n");
+    let fq = d.join("n.fastq");
+    std::fs::write(&fq, OVERREP_N_FASTQ).unwrap();
+
+    let (_, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--overrep-mode", "table", "--overrep-min-count", "3", "-q"],
+    );
+    assert_ne!(code, 0, "table mode must refuse a sequence it cannot pack: {stderr}");
+    assert!(stderr.contains("cannot pack"), "the refusal must say why: {stderr}");
+    assert!(stderr.contains("@a"), "and name the offending read: {stderr}");
+    assert!(stderr.contains("position 32"), "and the offending base's position: {stderr}");
+
+    // The modes that do not pack read the same file without complaint.
+    let json = d.join("fp.json");
+    let (_, stderr2, code2) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(),
+          "--overrep-mode", "fingerprint", "--overrep-min-count", "3", "-q"],
+    );
+    assert_eq!(code2, 0, "fingerprint mode must accept N-bearing reads: {stderr2}");
+    assert_eq!(read_json(&json)["overrep"]["mode"], "fingerprint");
 }
 
 #[test]

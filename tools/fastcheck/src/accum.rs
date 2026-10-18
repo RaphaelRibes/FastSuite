@@ -329,10 +329,17 @@ impl Accum {
         // not rehash. Over-representation naming is a separate, opt-in concern (§5.9).
         self.seq_counts.observe(seq);
         if self.track_overrep_table {
-            // A non-ACGT base cannot be packed; refusing is the caller's job (main.rs
-            // checks the first read), and here the sequence is simply skipped rather than
-            // silently mis-counted — the report's unique_sequences count shows the gap.
-            let _ = self.overrep_table.observe(seq);
+            // --overrep-mode table packs sequences 2 bits per base, and a read with an N or
+            // an IUPAC code cannot be packed. The scan refuses such a read outright
+            // (reader::scan_file_gated, naming the record and the base's position), so an
+            // unpackable sequence never reaches here — it is not silently dropped from the
+            // unique-sequence table, which is exactly what the old `let _ =` did.
+            if !self.overrep_table.observe(seq) {
+                debug_assert!(
+                    false,
+                    "reader::scan_file_gated must refuse a sequence table mode cannot pack"
+                );
+            }
         }
         if let Some(ap) = self.adapter_pos.as_mut() {
             ap.observe(seq, &self.adapter_set);
