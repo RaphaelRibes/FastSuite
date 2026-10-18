@@ -56,6 +56,28 @@ Outputs (never overwrite an existing .tsv unless --force)
   <results>/trim-report-<YYYYMMDD>.tsv     the per-tool decomposition
   <results>/trim-retention-<YYYYMMDD>.tsv  per-domain + per-dataset retention
 
+Third output: the PE-overlap slice
+----------------------------------
+Phase 1 of the PE-overlap plan (`docs/plans/…-pe-overlap-with-without.md`)
+needs the SAME counters cut three extra ways, all of them additive: every
+column the published table has keeps its name and its value.
+
+  per mate   exact_R1 / exact_R2, overtrim_R1 / overtrim_R2,
+             undertrim_rec_R1 / _R2, undertrim_irr_R1 / _R2 -- so the hypothesis
+             "the effect lives on a specific mate" can be read off the table
+             instead of re-running anything. The R1+R2 sums MUST equal the
+             pooled column (asserted by `bench/scripts/trim_report_check.py`).
+  by GT      readthrough (r1_adapter>0 or r2_adapter>0) and in_window
+             (L <= insert <= 2L-12) -- the two conditions the mode keys on,
+             from the gt's per-pair columns, per MATE (a pair is readthrough if
+             either mate carried adapter).
+  pe_trims   pairs where the tool's observed (5',3') cuts differ from the
+             `fastprep-hd0` baseline for the same (pair, mate). With no
+             --pe-overlap flag in fastprep yet this is ~0 BY CONSTRUCTION for
+             the published configs; the column exists so that when the flag
+             lands (Task 2.4: FASTPREP_VARIANTS='[["fp-pe",["--pe-overlap"]]]')
+             it has somewhere to show up.
+
 Usage
 -----
   trim_report.py                       # retention + decomposition, full corpus
@@ -101,6 +123,15 @@ except Exception:  # pragma: no cover - fallback keeps the script runnable
 
 TOOLS = ("fastprep-hd0", "fastp-default", "fastp-tuned", "fastprep-hd4")
 
+# The PE-overlap slice is built on a pair's ground-truth insert, so it needs
+# the two gt columns below. read_len is optional (older gt files lack it) and
+# falls back to --read-len; `insert` is not -- a gt without it cannot place a
+# pair in the window, and that slice is then skipped for that file with a
+# message instead of crashing (the decomposition itself never needs it).
+GT_COLS = ("insert", "r1_adapter", "r2_adapter")
+DEFAULT_READ_LEN = 150
+DEFAULT_ANCHOR = 12
+
 
 # --------------------------------------------------------------------------
 # MEASUREMENT-ONLY extra fastprep configs (opt-in flags under test)
@@ -141,6 +172,72 @@ def gt_full(path):
                 int(r["r1_n"]), int(r["r2_n"]),
             )
     return out
+
+
+def gt_meta(path):
+    """-> (read_len, header) for a gt.tsv, or (None, header) if it has no read_len.
+
+    The PE slice needs a per-pair read length; fastsim writes one into some gt
+    files and not others. Absent the column the caller falls back to --read-len
+    (150) rather than failing, since the decomposition never needs it.
+    """
+    with open(path) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+    if "read_len" not in header:
+        return None, header
+    rl = None
+    with open(path) as fh:
+        next(fh)
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            try:
+                rl = int(f[header.index("read_len")])
+                break
+            except (ValueError, IndexError):
+                continue
+    return rl, header
+
+
+def gt_flags(path, read_len):
+    """-> (flags, skipped) for the PE slice of one dataset.
+
+    flags is {pair_id: (readthrough, in_window)} -- a PAIR-level answer to two
+    pair-level questions, applied to BOTH mates when counting (a pair is
+    "readthrough" if either mate carried adapter, so the pair's mates are all
+    readthrough mates for slicing purposes).
+
+    skipped is a short reason string when the gt cannot answer: a missing
+    `insert` column (older gt files) means a pair cannot be placed in the
+    window, and an all-empty insert column means the same. In both cases the
+    caller drops the in_window slice for this file and says so -- it must not
+    crash the run, and it must not silently count the file as "no window
+    pairs" (which would bias the slice towards the datasets that do have the
+    column).
+    """
+    rl, header = gt_meta(path)
+    if "insert" not in header:
+        return {}, "no `insert` column"
+    if rl is None:
+        rl = read_len
+    ceiling = 2 * rl - DEFAULT_ANCHOR
+    flags, seen_insert, n = {}, 0, 0
+    with open(path) as fh:
+        rd = csv.DictReader(fh, delimiter="\t")
+        fields = rd.fieldnames or []
+        if "r1_adapter" not in fields or "r2_adapter" not in fields:
+            return {}, "no adapter columns"
+        for r in rd:
+            n += 1
+            try:
+                ins = int(r["insert"])
+                rt = int(r["r1_adapter"]) > 0 or int(r["r2_adapter"]) > 0
+            except (ValueError, TypeError):
+                continue
+            seen_insert += 1
+            flags[int(r["pair_id"])] = (rt, rl <= ins <= ceiling)
+    if seen_insert == 0:
+        return {}, "empty `insert` column"
+    return flags, ""
 
 
 # --------------------------------------------------------------------------
@@ -206,8 +303,17 @@ def classify(t5, t3, h, t, ad, n, obs5, obs3, p5, p3, tol):
     return "irr"
 
 
-def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
-    """Run every tool on every dataset; return per (tool, tol) counters."""
+def decomp(winners, work, results, p5, p3, limit, run_fastp=True,
+           read_len=DEFAULT_READ_LEN):
+    """Run every tool on every dataset; return per (tool, tol) counters.
+
+    Returns (c, cdom, cmate, cpe). `c`/`cdom` are the published decomposition;
+    `cmate` (task 1.1) adds exact_R1/_R2, overtrim_R1/_R2, undertrim_rec_R1/_R2
+    and undertrim_irr_R1/_R2 alongside them; `cpe` (tasks 1.2 + 1.3) adds
+    pe_trims (cut decisions that differ from the fastprep-hd0 baseline) and the
+    readthrough / in_window slices. None of the three changes what `c` counts:
+    each is written into a fresh Counter keyed by its own prefix.
+    """
     if limit:
         winners = winners[:limit]
     c = collections.defaultdict(collections.Counter)      # (tool,tol) -> Counter
@@ -215,6 +321,15 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
     # read per domain (the kept-set question is concentrated: virome/rna_seq).
     # Written to $FASTPREP_DOMAIN_TSV when set; inert otherwise.
     cdom = collections.defaultdict(collections.Counter)   # (tool,tol,domain)
+    cmate = collections.defaultdict(collections.Counter)  # (tool,tol) -> mate-split
+    cpe = collections.defaultdict(collections.Counter)    # (tool,tol) -> PE slice
+    # (pair, mate) -> (t5, t3) from the no-PE baseline, per dataset: the
+    # reference pe_trims compares every config against. fastp has no baseline
+    # row of its own, so its pe_trims is left at 0 and reported as "n/a" --
+    # see the note in the report header.
+    base_cuts = {}
+    # (domain, acc) -> reason the in_window slice was skipped (task 1.2)
+    pe_skipped = {}
     for i, w in enumerate(winners, 1):
         dom, acc = w["domain"], w["run_accession"]
         v0 = f"{work}/{dom}/{acc}/v0"
@@ -226,6 +341,9 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
         raw = {(pid, m): seq for pid, m, seq in
                (H.read_fastq_keyed(s1) + H.read_fastq_keyed(s2))}
         coremap = H.core_to_pid([s1, s2])
+        gflags, gskip = gt_flags(gtp, read_len)
+        if gskip:
+            pe_skipped[(dom, acc)] = gskip
         d = f"/tmp/trim_report/{dom}_{acc}"
         os.makedirs(d, exist_ok=True)
 
@@ -268,20 +386,43 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
                       flush=True)
                 continue
             p = H.parse_pxmt(px)
+            cuts = {}
             for (rid, mate), (status, t5, t3) in p.items():
                 pid = coremap.get((rid, mate))
                 if pid is None or pid not in gt:
                     continue
+                cuts[(pid, mate)] = (status, t5, t3)
+            if tag == "fastprep-hd0":
+                base_cuts = cuts
+            for (pid, mate), (status, t5, t3) in cuts.items():
                 g = gt[pid]
                 h, t = (g[0], g[1]) if mate == 1 else (g[2], g[3])
                 ad = g[4] if mate == 1 else g[5]
                 n = g[6] if mate == 1 else g[7]
+                obs5 = leading_g(raw.get((pid, mate), ""))
+                obs3 = trailing_g(raw.get((pid, mate), ""))
+                rt, win = gflags.get(pid, (None, None))
                 for tol in (0, 2):
                     k = "dropped" if status != 0 else classify(
-                        t5, t3, h, t, ad, n, leading_g(raw.get((pid, mate), "")),
-                        trailing_g(raw.get((pid, mate), "")), p5, p3, tol)
+                        t5, t3, h, t, ad, n, obs5, obs3, p5, p3, tol)
                     c[(tag, tol)][k] += 1
                     cdom[(tag, tol, dom)][k] += 1
+                    if mate == 1:
+                        cmate[(tag, tol)][k + "_R1"] += 1
+                    else:
+                        cmate[(tag, tol)][k + "_R2"] += 1
+                    # pe_trims: the cut decision this config made vs the
+                    # baseline's, on the same (pair, mate). Both configs are
+                    # in the same dataset, so base_cuts is populated by the time
+                    # any variant is scored (fp_tools runs hd0 first).
+                    if base_cuts:
+                        b = base_cuts.get((pid, mate))
+                        if b is not None and (status, t5, t3) != b:
+                            cpe[(tag, tol)]["pe_trims"] += 1
+                    if rt is not None:
+                        cpe[(tag, tol)][f"{k}_readthrough_{int(rt)}"] += 1
+                    if win is not None:
+                        cpe[(tag, tol)][f"{k}_in_window_{int(win)}"] += 1
 
         # ---- fastp-default and fastp-tuned (cuts recovered by alignment) ----
         for tag, extra in ((("fastp-default", []), ("fastp-tuned", H.FASTP_TUNED))
@@ -302,30 +443,35 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
                 h, t = (g[0], g[1]) if mate == 1 else (g[2], g[3])
                 ad = g[4] if mate == 1 else g[5]
                 n = g[6] if mate == 1 else g[7]
+                rt, win = gflags.get(pid, (None, None))
                 tr = tmap.get((pid, mate))
-                if tr is None:
-                    c[(tag, 0)]["dropped"] += 1
-                    c[(tag, 2)]["dropped"] += 1
-                    cdom[(tag, 0, dom)]["dropped"] += 1
-                    cdom[(tag, 2, dom)]["dropped"] += 1
-                    continue
-                cuts = H.infer_cuts(seq, tr)
                 for tol in (0, 2):
-                    if cuts is None:
-                        c[(tag, tol)]["unaligned"] += 1
-                        cdom[(tag, tol, dom)]["unaligned"] += 1
-                        continue
-                    k = classify(cuts[0], cuts[1], h, t, ad, n,
-                                 leading_g(seq), trailing_g(seq), p5, p3, tol)
+                    if tr is None:
+                        k = "dropped"
+                    else:
+                        cuts = H.infer_cuts(seq, tr)
+                        if cuts is None:
+                            k = "unaligned"
+                        else:
+                            k = classify(cuts[0], cuts[1], h, t, ad, n,
+                                         leading_g(seq), trailing_g(seq), p5, p3, tol)
                     c[(tag, tol)][k] += 1
                     cdom[(tag, tol, dom)][k] += 1
+                    if mate == 1:
+                        cmate[(tag, tol)][k + "_R1"] += 1
+                    else:
+                        cmate[(tag, tol)][k + "_R2"] += 1
+                    if rt is not None:
+                        cpe[(tag, tol)][f"{k}_readthrough_{int(rt)}"] += 1
+                    if win is not None:
+                        cpe[(tag, tol)][f"{k}_in_window_{int(win)}"] += 1
         # measurement-only: every config's PXMT/FASTQ for this dataset has been
         # scored above, so free it — a 102-dataset × 6-config run otherwise
         # fills /tmp (overtrim_vs_fastp.py does the same). Numbers unaffected.
         subprocess.run(["rm", "-rf", d], capture_output=True)
         if i % 10 == 0:
             print(f"  [{i}/{len(winners)}] {acc}", file=sys.stderr, flush=True)
-    return c, cdom
+    return c, cdom, cmate, cpe, pe_skipped
 
 
 # --------------------------------------------------------------------------

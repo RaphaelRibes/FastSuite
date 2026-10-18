@@ -269,7 +269,7 @@ def main():
             continue
         gt = gt_rows(gtp)
         coremap = core_to_pid([s1, s2])
-        d = f"/tmp/ovf/{a.offset}_{dom}_{acc}"
+        d = os.path.join(os.environ.get("FASTSCRATCH_OVF", "/tmp/ovf"), f"{a.offset}_{dom}_{acc}")
         os.makedirs(d, exist_ok=True)
 
         base = ["--force", "-q", "--gz-level", "6"]
