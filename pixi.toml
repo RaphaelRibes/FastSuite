@@ -157,9 +157,18 @@ workdir = "/work"
 # Build every tool in dependency order (fasthelper last).
 build = "bash scripts/build.sh"
 build-offline = "bash scripts/build.sh --offline"
-# All six tool test suites plus the pathology corpus (466 on the GRAND line:
-# 465 cargo tests + 1 pathology aggregate line covering 9 assertions).
+# All six tool test suites plus the pathology corpus. The per-tool counts are
+# asserted against scripts/expected-test-counts.txt by `pixi run ci`; do not
+# restate them here — that is how this comment went stale (it claimed 465/466
+# while the suite was at 476).
 test = "bash scripts/test.sh"
+# CI gate: the same suite, then an assertion that every tool's parsed test count
+# matches scripts/expected-test-counts.txt — a SHORT count means cargo considered
+# a stale test binary fresh and part of the suite silently never ran. It also
+# refuses to run on a rustc/cargo outside the pinned range, so `pixi run ci` (the
+# compiler is the env's 1.99) never gets confused with a bare `bash scripts/ci.sh`
+# on a machine whose ambient cargo is 1.95.
+ci = "bash scripts/ci.sh"
 doctor = "./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools"
 demo = "bash examples/demo.sh"
 report = "./tools/fasthelper/target/release/fasthelper report examples/runs/demo -o examples/runs/demo --format html,tsv"

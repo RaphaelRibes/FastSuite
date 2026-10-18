@@ -1,0 +1,42 @@
+# FastSuite expected test counts — one `tool count` line per tool, plus GRAND.
+#
+# WHAT THIS FILE IS: a STALENESS DETECTOR, not bookkeeping.
+#
+# scripts/test.sh can only print a total, so a suite that did not really run is
+# invisible: cargo reports the stale test binary as FRESH, the affected
+# integration tests never compile, and the run still exits 0 with a total that
+# is merely a little too low. scripts/ci.sh asserts every parsed count below,
+# so that class of failure becomes loud instead of silent. The incident this
+# exists for: the same git tree (identical HEAD and HEAD^{tree}) reported 463
+# tests on one machine and 471 on another; 8 fastcheck integration tests were
+# never compiled, because an mtime-preserving copy left the sources older than
+# the artifacts cargo considered fresh.
+#
+# WHAT A MISMATCH MEANS:
+#   * A SHORT count (actual < expected) = a REAL FAILURE. Cargo skipped a
+#     rebuild and tests did not run. Do NOT "fix" it by lowering the number:
+#     find out why the test binary was not rebuilt (rebuild through `pixi run`
+#     so the compiler matches the pin, or `cargo clean` in the affected tool).
+#   * A LONG count (actual > expected) = tests were ADDED (or removed) without
+#     updating this file. That is a deliberate, reviewable change: update the
+#     number here in the same commit, so a future stale-binary incident cannot
+#     hide behind an already-wrong expectation.
+#
+# FORMAT: `tool count`, one per line; `#` comments and blank lines are ignored.
+# The GRAND line must equal the sum of the tool lines — ci.sh checks that, and
+# refuses to run on an internally inconsistent manifest. `pathology` is the one
+# aggregate line scripts/test.sh prints for bench/tests/pathology_test.sh, which
+# bundles 9 individual assertions; `TOTAL` is deliberately NOT listed (it is the
+# cargo-only subtotal, not part of the gate).
+#
+# REGENERATE after a legitimate change: run `pixi run ci`, read the ACTUAL
+# column of its per-tool table, and copy those numbers here.
+
+fastcheck   108
+fastdedup   104
+fastprep    136
+fastsim      63
+fastmaps     43
+fasthelper   21
+pathology     1
+GRAND       476
