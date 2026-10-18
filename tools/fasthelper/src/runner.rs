@@ -17,9 +17,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use crate::adapter_guard::{self, Policy, Verdict};
 use crate::cli::{DoctorArgs, RunArgs};
 use crate::config::Config;
 use crate::report;
+
+/// Steps that trim adapter off the reads. The residual-adapter guard runs only
+/// around these, so a chain with no trimming step pays nothing.
+const TRIMMING_STEPS: &[&str] = &["fastprep"];
+
+fn is_trimming(tool: &str) -> bool {
+    TRIMMING_STEPS.contains(&tool)
+}
 
 pub struct ToolSet {
     pub check: Option<PathBuf>,
@@ -94,10 +103,12 @@ struct StepOutcome {
 }
 
 /// What one sample contributed to the run: its manifest entries (each tagged
-/// with its step index for deterministic merging) plus any failures.
+/// with its step index for deterministic merging) plus any failures, plus the
+/// names of any samples whose trimming step tripped the residual-adapter guard.
 struct SampleOutcome {
     entries: Vec<(usize, serde_json::Value)>,
     failed: Vec<String>,
+    adapter_trips: Vec<String>,
 }
 
 /// Run one sample through the configured steps, strictly in order.
@@ -115,11 +126,13 @@ fn run_sample(
     config_dir: &Path,
     dry_run: bool,
     threads: usize,
+    guard: &Policy,
     resume: &BTreeMap<String, ResumeEntry>,
     from: Option<&str>,
 ) -> Result<SampleOutcome> {
     let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
+    let mut adapter_trips: Vec<String> = Vec::new();
 
     let work = outdir.join(&sample.name);
     std::fs::create_dir_all(&work)?;
@@ -132,7 +145,11 @@ fn run_sample(
             in1.display()
         );
         failed.push(sample.name.clone());
-        return Ok(SampleOutcome { entries, failed });
+        return Ok(SampleOutcome {
+            entries,
+            failed,
+            adapter_trips,
+        });
     }
 
     println!(
@@ -291,6 +308,40 @@ fn run_sample(
             failed.push(format!("{}/{}", sample.name, tool));
             break;
         }
+        // Post-trim residual-adapter guard: measure adapter on the reads entering
+        // this trimming step (cur1/cur2) and on the reads it wrote (out1/out2),
+        // and warn when it survived (see adapter_guard.rs). Only a trimming step
+        // pays for it, so a chain without one is unaffected.
+        if guard.enabled && is_trimming(tool) && !dry_run {
+            if let Some(check) = ts.check.as_ref() {
+                let inputs: Vec<PathBuf> =
+                    std::iter::once(cur1.clone()).chain(cur2.clone()).collect();
+                let outputs: Vec<PathBuf> =
+                    std::iter::once(out1.clone()).chain(out2.clone()).collect();
+                let g = adapter_guard::guard_step(
+                    check,
+                    &inputs,
+                    &outputs,
+                    logs,
+                    &sample.name,
+                    guard,
+                    &step.args,
+                    1,
+                )?;
+                if let Some(entry) = entries.last_mut() {
+                    entry.1["adapter_guard"] = g.to_json();
+                }
+                match &g.verdict {
+                    Verdict::Warn(m) | Verdict::Fail(m) => {
+                        eprintln!("fasthelper: adapter guard: sample {}: {m}", sample.name);
+                        // Recorded on the manifest either way; only a Fail (under
+                        // --fail-on-adapter-residual) makes the run exit 2.
+                        adapter_trips.push(sample.name.clone());
+                    }
+                    Verdict::Silent(_) => {}
+                }
+            }
+        }
         if tool != "fastmaps" {
             if !cfg.run.keep_intermediate {
                 if cur1 != in1 {
@@ -311,7 +362,11 @@ fn run_sample(
             let _ = std::fs::remove_file(&p);
         }
     }
-    Ok(SampleOutcome { entries, failed })
+    Ok(SampleOutcome {
+        entries,
+        failed,
+        adapter_trips,
+    })
 }
 
 fn run_step(
@@ -536,6 +591,27 @@ pub fn run(args: &RunArgs) -> Result<()> {
         );
     }
 
+    let guard = Policy {
+        enabled: !args.no_adapter_guard,
+        threshold: args.adapter_residual_threshold,
+        min_reduction: args.adapter_min_reduction,
+        fail: args.fail_on_adapter_residual,
+    };
+    // The guard costs two fastcheck passes per trimming step; say so once when
+    // it is enabled but its measurement tool is missing, rather than silently
+    // doing nothing.
+    let has_enabled_trimming = cfg
+        .run
+        .steps
+        .iter()
+        .any(|s| is_trimming(s) && cfg.step(s).enabled);
+    if guard.enabled && has_enabled_trimming && ts.check.is_none() && !args.dry_run {
+        eprintln!(
+            "fasthelper: adapter guard: fastcheck not found — residual-adapter check skipped \
+             (build tools/fastcheck or pass --tools-dir)"
+        );
+    }
+
     let outdir = cfg.run.outdir.clone();
     let logs = outdir.join("logs");
     std::fs::create_dir_all(&logs)?;
@@ -625,6 +701,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
     let entries: std::sync::Mutex<Vec<(usize, usize, serde_json::Value)>> =
         std::sync::Mutex::new(Vec::new());
     let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let guard_trips: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     std::thread::scope(|scope| {
         for _ in 0..args.jobs.max(1) {
@@ -640,6 +717,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                     &config_dir,
                     args.dry_run,
                     per_sample_threads,
+                    &guard,
                     &resume,
                     args.from.as_deref(),
                 ) {
@@ -649,6 +727,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                             .unwrap()
                             .extend(o.entries.into_iter().map(|(step_idx, m)| (sample_idx, step_idx, m)));
                         failures.lock().unwrap().append(&mut o.failed);
+                        guard_trips.lock().unwrap().append(&mut o.adapter_trips);
                     }
                     Err(err) => {
                         eprintln!("fasthelper: {} failed: {err}", sample.name);
@@ -666,6 +745,9 @@ pub fn run(args: &RunArgs) -> Result<()> {
     let mut failed = failures.into_inner().unwrap();
     failed.sort();
     failed.dedup();
+    let mut trips = guard_trips.into_inner().unwrap();
+    trips.sort();
+    trips.dedup();
 
     // Manifest + aggregate report over everything the run produced.
     let manifest_path = outdir.join("manifest.json");
@@ -684,6 +766,14 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 "fastprep": ts.prep.as_ref().map(|p| s(p)),
                 "fastmaps": ts.maps.as_ref().map(|p| s(p)),
                 "fastsim": ts.sim.as_ref().map(|p| s(p)),
+            },
+            // The residual-adapter guard: its policy, and which samples tripped it.
+            "adapter_guard": {
+                "enabled": guard.enabled,
+                "threshold": guard.threshold,
+                "min_reduction": guard.min_reduction,
+                "fail_on_trip": guard.fail,
+                "tripped_samples": trips.clone(),
             },
             "commands": manifest,
             "failed": failed,
@@ -711,6 +801,19 @@ pub fn run(args: &RunArgs) -> Result<()> {
     );
     if !failed.is_empty() {
         bail!("{} step(s) failed: {}", failed.len(), failed.join(", "));
+    }
+    // The residual-adapter guard asked to be fatal (--fail-on-adapter-residual):
+    // the report and manifest are written, then exit 2 — the --fail-on convention
+    // ("ran fine, but a threshold tripped", CLI-SPEC §5).
+    if guard.fail && !trips.is_empty() {
+        for t in &trips {
+            eprintln!("fasthelper: adapter guard: {t} tripped --fail-on-adapter-residual");
+        }
+        eprintln!(
+            "fasthelper: {} sample(s) still carry adapter after trimming — report written, exiting 2",
+            trips.len()
+        );
+        std::process::exit(2);
     }
     // Citation request (MIT stays permissive; this is the community-norm ask).
     eprintln!(

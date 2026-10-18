@@ -77,6 +77,26 @@ pub struct RunArgs {
     /// Directory holding the tool checkouts (default: this crate's parent, then $FASTSUITE_TOOLS_DIR).
     #[arg(long, env = "FASTSUITE_TOOLS_DIR")]
     pub tools_dir: Option<PathBuf>,
+
+    /// Disable the post-trim residual-adapter guard. The guard is on by default;
+    /// it only runs when the chain has a trimming step (fastprep).
+    #[arg(long)]
+    pub no_adapter_guard: bool,
+
+    /// Residual adapter fraction (of trimmed reads) that trips the guard.
+    /// Conservative default: a working trim leaves essentially none.
+    #[arg(long, value_name = "FLOAT", default_value_t = 0.05)]
+    pub adapter_residual_threshold: f64,
+
+    /// Relative fall required from the raw adapter fraction (0.5 = at least
+    /// halved). If the trimmed fraction is above this, the guard trips.
+    #[arg(long, value_name = "FLOAT", default_value_t = 0.5)]
+    pub adapter_min_reduction: f64,
+
+    /// Exit 2 (the --fail-on convention) when the residual-adapter guard trips,
+    /// instead of printing a warning.
+    #[arg(long)]
+    pub fail_on_adapter_residual: bool,
 }
 
 #[derive(Args, Debug)]

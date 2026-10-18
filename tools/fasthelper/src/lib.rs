@@ -12,3 +12,4 @@ pub mod report;
 pub mod runner;
 pub mod check;
 pub mod install;
+pub mod adapter_guard;
