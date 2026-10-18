@@ -21,7 +21,12 @@ Scripts: `bench/scripts/gfrac_attribution.py` (replaces
 `verify_gfrac_deconv.py`), `gfrac_mechanism_summary.py`, `probe_plane_arms.py`,
 `probe_frame_shift.py`, `probe_head_gfrac.py`, `probe_mate_lengths.py`.
 
-**No Rust file was changed.** The reasons are in §5.
+**No Rust file was changed by the diagnosis itself.** The reasons are in §5. Two
+follow-up commits then acted on it: `7631292` implemented the fix order's steps
+1(a) and 1(b) — the harness's length-matched/per-mate gate, and all four
+(plane × artefact) deconvolutions in fastsim — and everything in §1–§4 describes
+the state measured **before** that. Where §3 says a pair is "not deconvolved",
+read it as "not deconvolved at diagnosis time"; the update is inline below.
 
 ## 1. Where the mismatch sits
 
@@ -70,6 +75,17 @@ the **head** run (`profile.rs`: `p_mass = P(h > p)`). Not deconvolved:
 * `base.R2` (consumed revcomp'd as the fragment's 3′ end) against R2's **5′**
   run → same double count at R2's first base (group B). R2's 3′ run is a third,
   smaller case.
+
+**Update (`7631292`): all four pairs are now deconvolved** — `profile.rs` builds
+`head_cover`/`tail_cover` and applies them to both mates, revcomp'ing R2's tail
+plane, which is why the code cites this section. Measured on the corpus, old →
+new: DRR083326's R1 terminal **0.5270 → 0.4166** against a real 0.4245 (and the
+old hand-built `fixed_planes` arm read 0.4140), its length-matched gate
+**0.1026 → 0.0268**; group A 0.1026–0.1092 → 0.0268–0.0306; group B 0.0655–0.0756
+→ 0.0387–0.0409. The **pooled** gate for group A moves *up* (0.0387 → 0.0960)
+because those rows sit on two cancelling errors — which is why step 1(a) had to
+land first, and why the metagenomics pass rate is unchanged at 3/51: what remains
+is mechanism C (the head-run frame, §4) and the per-mate read length (§5).
 
 Measured per mate (`gfrac_attribution.py --per-mate` for the pooled plane,
 `probe_plane_arms.py` for the per-mate positions; "model" is the simulator's own
