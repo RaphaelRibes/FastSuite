@@ -2079,7 +2079,7 @@ src/
 ├── main.rs          # CLI entry point (rpolyx)
 ├── bin/pxmt.rs      # metadata viewer binary
 ├── algorithm.rs     # core polyX + scan primitives
-├── adapter.rs       # adapter matching + PE overlap + auto-detect
+├── adapter.rs       # adapter matching + auto-detect
 ├── pipeline.rs      # single-end / paired-end orchestration
 ├── cli.rs           # clap-based argument parsing + validation
 ├── io.rs            # FASTQ/FASTA output + compression
@@ -2902,6 +2902,15 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
 == PE overlap detection
 
 Direct encoding of @alg:adp-pe:
+
+#block(inset: 0.6em, stroke: 0.5pt + gray, radius: 2pt, [
+  *Specification only --- not present in `src/`.* As @sec:adp-pe states, this mode
+  is not implemented in the current revision: it was removed when the six tools
+  were unified under one CLI. `adapter.rs` carries no `detect_pe_overlap` and no
+  `complement`; sequence matching is the single adapter path. The listing below
+  is the direct encoding of the designed procedure, retained as the reference for
+  the specification.
+])
 
 ```rust
 pub fn detect_pe_overlap(

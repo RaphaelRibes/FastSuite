@@ -159,7 +159,7 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.2, value_name = "FLOAT", help_heading = "Adapter Trimming")]
     pub adapter_error_rate: f64,
 
-    /// Minimum adapter overlap for SE / PE-fallback sequence matching.
+    /// Minimum adapter overlap for sequence matching.
     /// 8 (was 4): a 4-base window at 10% error tolerates 1 mismatch on 4
     /// bases — any read ending in "AGAT" (adapter prefix) was falsely
     /// trimmed (~10% of clean reads measured on the benchmark QC set).

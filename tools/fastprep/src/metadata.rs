@@ -113,13 +113,3 @@ pub fn write_record(
     Ok(())
 }
 
-/// Returns `true` for reads that should be recorded in the metadata file.
-#[inline]
-pub fn is_touched(res: &TrimResult) -> bool {
-    match res {
-        TrimResult::Drop { .. } => true,
-        TrimResult::Emit { t5_adapter, t3_adapter, t5_poly, t3_poly, runs } => {
-            *t5_adapter > 0 || *t3_adapter > 0 || *t5_poly > 0 || *t3_poly > 0 || !runs.is_empty()
-        }
-    }
-}

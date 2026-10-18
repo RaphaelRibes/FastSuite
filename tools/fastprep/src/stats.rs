@@ -1,8 +1,8 @@
 //! Pipeline statistics.
 //!
-//! Accumulated per-chunk in the parallel path (no shared mutex), then
-//! merged once per chunk on the main thread. At program end, rendered to
-//! stderr.
+//! A single [`Stats`] accumulates per read on the ordered (main) thread as
+//! results arrive from the compute thread — there is no per-chunk
+//! accumulation and no merge step. At program end, rendered to stderr.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -36,15 +36,6 @@ impl AdapterStats {
         self.reads_trimmed += 1;
         self.bases_trimmed_5 += t5 as u64;
         self.bases_trimmed_3 += t3 as u64;
-    }
-
-    pub fn merge(&mut self, other: &AdapterStats) {
-        for (name, count) in &other.by_name {
-            *self.by_name.entry(name.clone()).or_insert(0) += count;
-        }
-        self.reads_trimmed += other.reads_trimmed;
-        self.bases_trimmed_5 += other.bases_trimmed_5;
-        self.bases_trimmed_3 += other.bases_trimmed_3;
     }
 }
 
@@ -112,24 +103,6 @@ impl Stats {
                 }
             }
         }
-    }
-
-    pub fn merge(&mut self, other: &Stats) {
-        self.reads_in             += other.reads_in;
-        self.reads_kept           += other.reads_kept;
-        self.reads_dropped        += other.reads_dropped;
-        self.reads_dropped_poly5  += other.reads_dropped_poly5;
-        self.reads_dropped_poly3  += other.reads_dropped_poly3;
-        self.reads_dropped_poly_int += other.reads_dropped_poly_int;
-        self.reads_dropped_hard   += other.reads_dropped_hard;
-        self.reads_dropped_mean_q += other.reads_dropped_mean_q;
-        self.reads_dropped_adapter += other.reads_dropped_adapter;
-        self.reads_dropped_duplicate += other.reads_dropped_duplicate;
-        self.bases_in             += other.bases_in;
-        self.bases_trimmed_5      += other.bases_trimmed_5;
-        self.bases_trimmed_3      += other.bases_trimmed_3;
-        self.bases_interior_mass += other.bases_interior_mass;
-        self.adapter.merge(&other.adapter);
     }
 
     pub fn bases_trimmed_total(&self) -> u64 {
@@ -369,29 +342,5 @@ mod tests {
         assert_eq!(s.adapter.bases_trimmed_5, 5);
         assert_eq!(s.adapter.bases_trimmed_3, 10);
         assert_eq!(*s.adapter.by_name.get("TruSeq/R1").unwrap(), 1);
-    }
-
-    #[test]
-    fn merge_adds_fields() {
-        let mut a = Stats::default();
-        a.record(100, &TrimResult::Emit { t5_adapter: 0, t3_adapter: 0, t5_poly: 5, t3_poly: 5, runs: vec![] }, None);
-        let mut b = Stats::default();
-        b.record(100, &TrimResult::Drop { reason: DropReason::Poly3, t5_adapter: 0, t3_adapter: 0, t5_poly: 0, t3_poly: 0, runs: vec![] }, None);
-        a.merge(&b);
-        assert_eq!(a.reads_in, 2);
-        assert_eq!(a.reads_kept, 1);
-        assert_eq!(a.reads_dropped, 1);
-        assert_eq!(a.reads_dropped_poly3, 1);
-    }
-
-    #[test]
-    fn merge_adapter_stats_accumulates_by_name() {
-        let mut a = Stats::default();
-        a.record(100, &TrimResult::Emit { t5_adapter: 0, t3_adapter: 5, t5_poly: 0, t3_poly: 0, runs: vec![] }, Some("Nextera"));
-        let mut b = Stats::default();
-        b.record(100, &TrimResult::Emit { t5_adapter: 0, t3_adapter: 8, t5_poly: 0, t3_poly: 0, runs: vec![] }, Some("Nextera"));
-        a.merge(&b);
-        assert_eq!(*a.adapter.by_name.get("Nextera").unwrap(), 2);
-        assert_eq!(a.adapter.bases_trimmed_3, 13);
     }
 }

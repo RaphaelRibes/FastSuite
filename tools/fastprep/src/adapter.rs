@@ -46,7 +46,7 @@ pub struct AdapterSet {
     pub adapters: Vec<Adapter>,
     /// Maximum fraction of mismatches allowed in a match.
     pub error_rate: f64,
-    /// Minimum overlap for SE / PE-fallback sequence matching.
+    /// Minimum overlap for sequence matching.
     pub min_overlap_se: usize,
     /// 6-mer seed index, built once at construction. `match_adapters` uses it
     /// to skip the ~118-position full scan on reads that share no 6-mer with
@@ -399,7 +399,7 @@ pub fn load_fasta(path: &Path) -> Result<Vec<Adapter>> {
 }
 
 // ---------------------------------------------------------------------------
-// Sequence matching (SE / PE-fallback).
+// Sequence matching.
 // ---------------------------------------------------------------------------
 
 /// Find the leftmost adapter match in `seq`, or `None`.

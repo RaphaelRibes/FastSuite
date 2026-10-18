@@ -463,25 +463,6 @@ impl TrimResult {
             } => t3_adapter + t3_poly,
         }
     }
-    /// Total bases removed on a kept read (0 on a drop).
-    pub fn total_trim(&self) -> usize {
-        match self {
-            TrimResult::Drop { .. } => 0,
-            TrimResult::Emit {
-                t5_adapter,
-                t3_adapter,
-                t5_poly,
-                t3_poly,
-                runs,
-            } => {
-                t5_adapter
-                    + t3_adapter
-                    + t5_poly
-                    + t3_poly
-                    + runs.iter().map(|(_, l)| l).sum::<usize>()
-            }
-        }
-    }
 }
 
 /// Resolve trim length from a scan result, applying the m_h threshold
@@ -1628,25 +1609,24 @@ mod tests {
             } => {
                 assert_eq!(t5_poly, 0);
                 // T_3 is large enough that the G-run's last position
-                // (≥ 38) falls into [L - T_3, L - 1] = [40 - T_3, 39].
-                // If T_3 ≥ 2 (trivially satisfied) reconciliation triggers.
-                assert!(t3_poly >= 2, "t3_poly = {}", t3_poly);
-                // Either: reconciliation removed the run (H_int == 0), or
-                // the forward scan never recorded it (also H_int == 0).
-                // Both satisfy the no-double-counting invariant.
-                let h_int: usize = runs.iter().map(|(_, l)| l).sum();
+                // (≥ 38) falls into [L - T_3, L - 1] = [40 - T_3, 39],
+                // so reconciliation removes it from H_int.
+                assert_eq!(t3_poly, 11, "t3_poly = {}", t3_poly);
+                // The specific outcome for this input: reconciliation dropped
+                // the overlapping run, so the surviving run list is empty
+                // (H_int == 0). The value is exact, not "either this or that":
+                // breaking the reconciliation block below makes the run
+                // survive here (H_int > 0) and this assertion fails.
                 assert!(
-                    t3_poly + h_int <= 11,
-                    "no double counting: t3_poly={}, h_int={}",
-                    t3_poly,
-                    h_int
+                    runs.is_empty(),
+                    "reconciliation should have removed the overlapping run, runs = {:?}",
+                    runs
                 );
             }
-            TrimResult::Drop { .. } => {
-                // Dropping is also acceptable here — what matters is that
-                // double-counting doesn't inflate the drop rate when the
-                // physical trim is within budget.
-            }
+            other => panic!(
+                "expected Emit with the overlapping run removed, got {:?}",
+                other
+            ),
         }
     }
 
