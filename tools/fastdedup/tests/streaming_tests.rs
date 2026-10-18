@@ -340,3 +340,31 @@ fn threaded_stdin_to_stdout() {
         "the threaded pipeline must read stdin and write stdout identically"
     );
 }
+
+#[test]
+fn the_documented_stream_refusals_report_their_own_reason() {
+    // README §83 lists five refusals. Each must name its OWN cause: until the
+    // validation order was fixed, `-1 - -2 -` reported "an output file is
+    // required" because that generic bail ran first and shadowed the real one.
+    let cases: [(&[&str], &str); 5] = [
+        (&["-1", "-", "-2", "-"], "one stream cannot carry two files"),
+        (&["-1", "IN", "-o", "-", "-p", "-"], "cannot both be stdout"),
+        (&["-1", "IN", "--json", "-", "-o", "-"], "cannot both write to stdout"),
+        (&["-1", "-", "--pre-count"], "impossible on a stream"),
+        (&["-1", "-", "--abundance"], "needs a second pass over the input"),
+    ];
+    let dir = assert_fs::TempDir::new().unwrap();
+    let input = dir.child("in.fq");
+    std::fs::write(input.path(), FASTQ).unwrap();
+
+    for (i, (args, reason)) in cases.iter().enumerate() {
+        let full: Vec<String> = args
+            .iter()
+            .map(|a| if *a == "IN" { input.path().to_string_lossy().into_owned() } else { a.to_string() })
+            .collect();
+        let out = cmd().args(&full).assert().failure();
+        let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+        assert!(stderr.contains(reason), "case {i}: expected the refusal for '{reason}', got: {stderr}");
+        assert!(!stderr.contains("An output file is required"), "case {i}: the generic bail shadowed the specific refusal: {stderr}");
+    }
+}

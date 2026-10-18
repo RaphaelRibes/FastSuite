@@ -191,20 +191,13 @@ fn main() -> Result<()> {
         }
     }
 
-    // Resolve output paths: required unless --dry-run
-    let output = match (&args.output, args.dry_run) {
-        (Some(path), _) => path.clone(),
-        (None, true) => String::new(), // dummy, never written in dry-run
-        (None, false) => bail!(
-            "An output file is required. Use --output (-o) to specify one, or --dry-run to only compute stats."
-        ),
-    };
-
-    if args.dry_run && args.abundance {
-        bail!("--abundance is not compatible with --dry-run");
-    }
-
     // --- D-4: what a single stream cannot carry ---
+    //
+    // These MUST be evaluated before the "an output file is required" bail further
+    // down: the refusals below are about what a stream can carry, and they were
+    // previously shadowed by it, so `-1 - -2 -` reported a missing output instead
+    // of the real problem (two files through one stdin). Ordered refusals beat a
+    // generic one.
     let out1_stream = args.output.as_deref().is_some_and(crate::stream::is_stream);
     let out2_stream = args.output_r2.as_deref().is_some_and(crate::stream::is_stream);
 
@@ -233,6 +226,17 @@ fn main() -> Result<()> {
             "--out1 (-) and --json (-) cannot both write to stdout. Send the report to a file, or drop one of them."
         );
     }
+
+    // Resolve output paths: required unless --dry-run. Deliberately AFTER the
+    // stream refusals above, so a stream-specific error is never reported as a
+    // missing output.
+    let output = match (&args.output, args.dry_run) {
+        (Some(path), _) => path.clone(),
+        (None, true) => String::new(), // dummy, never written in dry-run
+        (None, false) => bail!(
+            "An output file is required. Use --output (-o) to specify one, or --dry-run to only compute stats."
+        ),
+    };
 
     // In dry-run mode, output_r2 is optional even when input_r2 is provided
     if args.input_r2.is_some() && !args.dry_run && args.output_r2.is_none() {
