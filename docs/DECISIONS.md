@@ -87,6 +87,12 @@ Reference implementation: `fastcheck`. fastprep and fastdedup follow.
   samples, computes cross-sample statistics, renders the HTML/TSV/MD report,
   runs the chain from a config.
 
+*Correction (2026-10-12, verified 2026-10-18):* fastcheck **does** render its own
+**per-file** HTML report (`--html`, MultiQC-style, inline SVG, no JS). The
+boundary therefore reads: fastcheck renders the **per-file** report, fasthelper
+renders the **cross-sample** report. fastcheck still never reads a run directory,
+which is the half of the original statement that held.
+
 ---
 
 ## D-6 — Behaviour when a detection returns nothing ✅ decided: B

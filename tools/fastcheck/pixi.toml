@@ -26,3 +26,9 @@ test = "cargo test --offline"
 differential = "python tests/differential.py ../../examples/runs/demo/sim_E/sim_R1.fastq.gz"
 # Smoke test on generated data: no real dataset is ever involved (D-11).
 smoke = "cargo run --release --offline -- --reads 20000 ../../examples/runs/demo/sim_E/sim_R1.fastq.gz --json /tmp/fastcheck.json"
+# Ground-truth recovery (plan Task 13, PLAN-QC §7.3): simulate paired reads with
+# exact ground truth from the committed synthetic profile (tests/gt_profile.json,
+# no real data — D-11), QC them, and assert every recovered number against the
+# simulator's own per-pair record (sim.gt.tsv) within a stated tolerance. The
+# decisive correctness gate. Needs both binaries built: `pixi run build`.
+ground-truth = "python tests/ground_truth.py"
