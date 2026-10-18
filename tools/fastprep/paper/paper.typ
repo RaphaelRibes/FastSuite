@@ -1684,6 +1684,16 @@ procedure MatchAdapters(R, L, 𝒜, ε, o_SE) → (T3_adp, name)
 
 == Paired-end overlap detection <sec:adp-pe>
 
+#block(inset: 0.6em, stroke: 0.5pt + gray, radius: 2pt, [
+  *Not implemented in the current revision.* This section specifies the
+  paired-end overlap mode as designed. The implementation carries a single
+  adapter-detection mode: overlap detection was removed when the six tools were
+  unified under one CLI, and the modelled value of the mate rule is confined to
+  short-insert libraries --- it reaches about 1% of trim events on the fitted
+  insert distributions (`docs/OVERTRIM-PAIRED.md`). The design and its rationale
+  are retained deliberately.
+])
+
 In paired-end sequencing, when the insert length $I$ is shorter
 than the read length $L$, R1 reads bases $0, dots, L-1$ of the
 fragment while R2 reads the same fragment from the opposite strand.
@@ -1836,6 +1846,13 @@ $ "Hint" := cases(
   "Detect" quad &"(SE sequence matching from" cal(A) ")",
   "Override"(T_5, T_3, eta) &"(pre-computed trim from PE overlap)".
 ) $
+
+#block(inset: 0.6em, stroke: 0.5pt + gray, radius: 2pt, [
+  *Current implementation.* The hint has one inhabitant: every call site passes
+  $"Detect"$, and the $"Override"$ branch was never constructed --- it existed
+  only to carry a trim from @sec:adp-pe. The implementation therefore takes no
+  hint parameter at all, which is why @sec:adp-pe is marked not implemented.
+])
 
 #Def (combined trim procedure). The public entry point $"Trim"$
 takes a read $(R, Q)$, a parameter set $Theta$ (§1.2), and a hint,
@@ -2196,19 +2213,15 @@ can attribute every base precisely. `runs` lists interior runs as
 `(start, len)` pairs in absolute 0-based coordinates of the original read,
 after adapter coordinates have been reconstructed.
 
-=== `AdapterHint`: the dispatcher between detection modes
+=== Adapter detection has a single mode
 
-```rust
-#[derive(Debug, Clone)]
-pub enum AdapterHint {
-    /// Run sequence matching from params.adapter.
-    Detect,
-    /// Pre-computed adapter trim (e.g. from PE overlap geometry).
-    Override { t5: usize, t3: usize, name: String },
-}
-```
-
-This is the direct encoding of the $"Hint"$ definition of @sec:adp-integration.
+The current implementation has no dispatcher type: sequence matching against
+`params.adapter` is the only adapter-detection path, and `trim` takes no hint
+parameter. The `AdapterHint` enum described in earlier revisions of this
+document --- whose `Override` variant carried a pre-computed trim from the PE
+overlap geometry of @sec:adp-pe --- was removed together with that mode. It was
+matched at exactly one call site and never constructed, because every caller
+passed `Detect`.
 
 == Concurrency primitives
 
@@ -2774,21 +2787,15 @@ The public `trim` entry point composes adapter detection with the polyX core,
 implementing @alg:trim:
 
 ```rust
-pub fn trim(bases: &[u8], quals: &[u8], params: &Params, hint: AdapterHint) -> TrimOutput {
+pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
     let l = bases.len();
 
-    // Step 1: resolve adapter trim.
-    let (t5_adapter, t3_adapter, adapter_name) = match hint {
-        AdapterHint::Override { t5, t3, name } => (
-            t5, t3,
-            if t5 > 0 || t3 > 0 { Some(name) } else { None },
-        ),
-        AdapterHint::Detect => match params.adapter.as_deref() {
+    // --- Step 1: adapter detection (sequence matching) ---
+    let (t5_adapter, t3_adapter, adapter_name) = match params.adapter.as_deref() {
+        None => (0, 0, None),
+        Some(set) => match crate::adapter::match_adapters(bases, set) {
             None => (0, 0, None),
-            Some(set) => match crate::adapter::match_adapters(bases, set) {
-                None    => (0, 0, None),
-                Some(m) => (m.t5, m.t3, Some(m.name)),
-            },
+            Some(m) => (m.t5, m.t3, Some(m.name)),
         },
     };
 
@@ -2969,7 +2976,7 @@ pub fn run_single(
             // Parallel within the chunk via rayon.
             let results: Vec<_> = chunk.into_par_iter()
                 .map(|input| {
-                    let output = trim(&input.seq, &input.qual, &params_arc, AdapterHint::Detect);
+                    let output = trim(&input.seq, &input.qual, &params_arc);
                     Processed { input, output }
                 })
                 .collect();
