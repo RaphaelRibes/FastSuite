@@ -1,11 +1,12 @@
 # FastSuite status
 
-Verified 2026-10-16 against the current `main` (commit `50e8373`, 107 commits
+Verified 2026-10-18 against the current `main` (commit `0745008`, 137 commits
 ahead of `origin/main`; **nothing pushed**, per standing instruction). Every
 number here was verified this session, either by running it or by re-reading the
-cited artifact: the six cargo test suites, `scripts/test.sh` (pathology corpus
-included), the Phase D closed loop re-read from its TSV, and the trim-accuracy
-and `head_dropout` tables re-aggregated from `bench/results/phase-d/`. **The
+cited artifact: the six cargo test suites under `pixi run ci`, `scripts/test.sh`
+(pathology corpus included), the Phase D closed loop re-read from its TSV, the
+trim-accuracy, `head_dropout` and retention tables re-aggregated from
+`bench/results/phase-d/`, and the `g_frac` mechanism decomposition. **The
 suite is WIP: nothing here is production-ready** (see the README banner).
 
 ## The tools
@@ -16,16 +17,17 @@ suite is WIP: nothing here is production-ready** (see the README banner).
 | fastprep | 0.2.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
 | fastsim | 0.1.0 | 63 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`). This was the simulator's last-named composition gap: it emitted no `N` at all. See `docs/N-EMISSION.md` | — |
 | fastmaps | 0.1.0 | 43 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads` | — |
-| fastcheck | 0.1.0 | 108 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), harness green | `plans/2026-10-12_fastcheck-exactness.md` (tasks 5–9, 11–14) |
-| fasthelper | 0.1.0 | 21 | working — fastcheck step, `check -c`, `--fail-on` | `plans/2026-10-12_fasthelper-hardening.md` — already done on disk: `run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on` (exit 2); the plan's open items are the *hardening* ones (5–8: `-P/--jobs`, resume/`--from`, `install --prefix`) |
+| fastcheck | 0.1.0 | 120 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), harness green | `plans/2026-10-12_fastcheck-exactness.md` — Task 12 (`--only` module gating) landed; Task 11 (per-tile quality modules) and 13–14 are open |
+| fasthelper | 0.1.0 | 36 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — `run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on` are done, as are `-P/--jobs` and `install --prefix`; **resume/`--from` is the one open item** |
 
-**470 cargo tests, 0 failures**, plus the **pathology corpus: 9 assertions
+**502 cargo tests, 0 failures**, plus the **pathology corpus: 9 assertions
 passed, 0 failed**. Note that `scripts/test.sh` counts the pathology suite as one
-aggregate line, so its own `GRAND` reads **471** (470 + the one aggregate line);
-the 9 is the number of individual assertions inside it. (Measured this run;
-the count moved up from the 465/466 recorded earlier because the tree gained
-tests in the same session, not from the detector fix, which removed three
-obsolete estimator tests and added three regression tests.) `pixi run doctor`
+aggregate line, so its own `GRAND` reads **503** (502 + the one aggregate line);
+the 9 is the number of individual assertions inside it. `pixi run ci` asserts
+every per-tool count against `scripts/expected-test-counts.txt` and refuses a
+rustc outside the pinned `>=1.99,<2`; **run it after any change** (the laptop's
+ambient cargo is 1.95 while the desktop's is 1.99, and an unasserted total is
+what let a stale test binary report 463 against 471 unnoticed). `pixi run doctor`
 lists all six binaries; `bash
 examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 `examples/runs/demo/report.html`, mtime 2026-10-15 21:40).
@@ -76,7 +78,7 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 | fastsim insert resolution | 94–95% measured exactly at 200–288 bp (18 982 of 20 000 at insert 200, p50 200); the 288 bp ceiling is geometry, not a defect |
 | trim accuracy vs simulator ground truth, tolerance 0 (102 real libraries, one harness) | **fastprep with `--head-dropout 0` leads**: 89.1% exact / 0.6% overtrim / 10.3% undertrim. fastp-default 88.6 / 0.8 / 10.6; fastp-tuned 80.4 / 9.6 / 10.0; **fastprep's historical default (`--head-dropout 4`) is worst at 75.5 / 22.5 / 2.0**. Tolerance 2: 99.1 / 98.5 / 90.2 / 98.5. Re-measured on the regenerated corpus (see above); the ordering is unchanged but the level dropped ~3pp and undertrim roughly doubled, because the simulator now emits N-runs that no trimmer removes. Aggregate of `bench/results/phase-d/overtrim-vs-fastp.tsv`; see `docs/TRIM-ACCURACY.md` |
 | `head_dropout` axis (1515 runs, 3030 rows = 101 datasets × 3 variants × hd {0,1,2,3,4}) | `0` is the per-dataset winner on **100 of 101** datasets, `1` on the remaining one, `4` on **none**. Corpus total error at tolerance 0: **7.44% at `0` vs 24.64% at `4` (3.3×)**. `docs/OVERTRIM-SWEEP.md`, `bench/results/phase-d/head-dropout-axis.tsv` |
-| drop asymmetry (the caveat under the trim result) | fastprep drops more reads than fastp at tolerance 0, unevenly: virome **18.2% vs 0.3%**, RNA-seq 12.2% vs 2.3%, while on bacterial_isolate fastprep drops *fewer* (5.6% vs 8.7%). So the largest fastprep accuracy win (virome, 87.3% vs 86.0%) sits on a kept-set substantially smaller and is not apples-to-apples; the bacterial_isolate comparison is. Re-derived from the regenerated corpus (the pre-rebuild figures were virome 15.2%/0.0%, RNA-seq 10.8%/2.1%, bacterial 3.8%/5.1%). `docs/TRIM-ACCURACY.md` §Drop asymmetry |
+| drop asymmetry (the caveat under the trim result) | **Re-attributed 2026-10-18: this is the dedup default, not the length floor.** The PXMT status byte shows 100% of the drops on the worst datasets are `Duplicate` — fastprep deduplicates by default, fastp does not: SRR20754397 167,162/167,162 drops, DRR015139 32,138/32,138, and `--min-len 15` leaves those histograms untouched. With `--no-dedup` the aggregate retention is **98.47% against fastp's 97.23%** (virome 99.74% vs 99.7%, rna_seq 98.90% vs 97.8%), i.e. the suite does not retain fewer reads, it deduplicates, and the trim harness charges it for that because a dropped read leaves the scored set. The earlier "virome 18.2% vs 0.3%" framing described the symptom and mis-named the cause; the corrected per-domain retention table is in `docs/TRIM-ACCURACY.md` §Read retention. **Read retention and exact rate together, never the rate alone**: `--min-len 0.9L` shows the highest fastprep exact *rate* (89.470% vs 89.088%) with 441k *fewer* exact mates and 2.8 pp lower retention, while `--no-dedup` raises both — so "dropping flatters the score" depends on the class dropped. |
 
 ## Phase D — the closed loop, re-measured
 
@@ -181,14 +183,24 @@ tuned against and worse at the one the loop scores. See
    points over the same span. All 48 failures are `g_frac`, at a median
    over-tolerance error of 0.0529. Neither the dup model, nor the 3′
    boundary rule, nor the head-G deconvolution touched it: this is a
-   **distinct, still-undiagnosed mechanism**, and it is the main remaining
-   blocker to a publishable simulator accuracy number. (Checked 2026-10-16: the
-   new ambiguous-base emission *does* move the metagenomics `g_frac` — e.g.
-   DRR083326 0.0532 → 0.0396, DRR083353 0.0455 → 0.0293, DRR083390 0.0490 →
-   0.0350 — but it does not close it (all still above the 0.02 bound) and the
-   movement is confounded with the RNG-stream shift the emission causes, so it
-   is not attributed to the N overlay. The metagenomics pass count is unchanged.
-   `docs/N-EMISSION.md` §6.2.)
+   **distinct mechanism — DIAGNOSED 2026-10-18, and it is not in the fitter.**
+   All 16 failing datasets are accounted for by three consumer-side mechanisms:
+   a single scalar `read_len` applied to *both* mates while real libraries are
+   asymmetric (DRR083073: 0.1029 pooled → 0.0358 length-matched), a
+   double-counted injected run (the plane already holds the artefact Gs, and
+   fastsim deconvolves one of four plane × artefact pairs: DRR083326 R1 terminal
+   real 0.4245 vs sim 0.5270), and a frame shift (`build_read` prepends `[G;h]`,
+   so read position p shows fragment p−h while the plane is a read-position
+   measurement). The run-length round trip, the N overlay, the body zone and GC
+   are ruled out with numbers. No single patch closes them: the 3′-plane fix
+   moves a row's length-matched gate 0.1047 → 0.0288 while its *judged* pooled
+   gate goes 0.0383 → 0.0969, because that row sits on two cancelling errors
+   today. Full evidence and method: `docs/GFRAC-MECHANISM.md`. This remains the
+   main blocker to a publishable simulator accuracy number; it is no longer
+   undiagnosed. (Earlier check, 2026-10-16: the ambiguous-base emission *does*
+   move the metagenomics `g_frac` — DRR083326 0.0532 → 0.0396 and others — but it
+   does not close it, and the movement is confounded with the RNG-stream shift
+   the emission causes. `docs/N-EMISSION.md` §6.2.)
 2. ~~**fastcheck's polyG detector** — reports 93.98% tail-free against a true
    66.01%, zero mass at t=3/t=15 (true 7.99%/6.99%).~~ **FIXED.** The profile
    fitter estimated the head/tail distributions from the per-position G
