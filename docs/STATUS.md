@@ -1,7 +1,8 @@
 # FastSuite status
 
-Verified 2026-10-18 against the current `main` (commit `0745008`, 137 commits
-ahead of `origin/main`; **nothing pushed**, per standing instruction). Every
+Verified 2026-10-18 against the current `main` (the code state at `3548ffe`,
+which this file's own refresh follows; the first push since 2026-10-13 landed at
+`bdc42da`, so the commits after it are local until the next push). Every
 number here was verified this session, either by running it or by re-reading the
 cited artifact: the six cargo test suites under `pixi run ci`, `scripts/test.sh`
 (pathology corpus included), the Phase D closed loop re-read from its TSV, the
@@ -15,14 +16,14 @@ suite is WIP: nothing here is production-ready** (see the README banner).
 |---|---|---|---|---|
 | fastdedup | 1.3.0 | 104 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
 | fastprep | 0.2.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
-| fastsim | 0.1.0 | 63 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`). This was the simulator's last-named composition gap: it emitted no `N` at all. See `docs/N-EMISSION.md` | — |
-| fastmaps | 0.1.0 | 43 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads` | — |
-| fastcheck | 0.1.0 | 120 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), harness green | `plans/2026-10-12_fastcheck-exactness.md` — Task 12 (`--only` module gating) landed; Task 11 (per-tile quality modules) and 13–14 are open |
-| fasthelper | 0.1.0 | 36 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — `run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on` are done, as are `-P/--jobs` and `install --prefix`; **resume/`--from` is the one open item** |
+| fastsim | 0.1.0 | 66 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`), and **all four (plane × artefact) pairs deconvolved on the consumer side** (`7631292`, the g_frac fix order's step 1(b)) — DRR083326's R1 terminal moved 0.5292 → 0.4140 against a real 0.4245. The insert ceiling (`2L − 12 = 288 bp`) is now stated in `--help` too | — |
+| fastmaps | 0.1.0 | 45 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads`; **previews streamed instead of held resident** (`90573ea`: defaults 202.6 → 141.2 MB, `--buffer-mb 8` 100.5 → 36.1 MB, outputs verified byte-identical) | — |
+| fastcheck | 0.1.0 | 126 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), **per-tile quality modules** (`--tiles`, opt-in, `93ed54a`), harness green | `plans/2026-10-12_fastcheck-exactness.md` — **tasks 5–14 all landed**; the ground-truth recovery claim is a gate now, not a session: `pixi run ground-truth` |
+| fasthelper | 0.1.0 | 36 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — **every item is landed** (`run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on`, `-P/--jobs`, `install --prefix`, and `--from`/resume, which `runner.rs` implements via the per-step `ResumeEntry` re-run rule) |
 
-**502 cargo tests, 0 failures**, plus the **pathology corpus: 9 assertions
+**508 cargo tests, 0 failures**, plus the **pathology corpus: 9 assertions
 passed, 0 failed**. Note that `scripts/test.sh` counts the pathology suite as one
-aggregate line, so its own `GRAND` reads **503** (502 + the one aggregate line);
+aggregate line, so its own `GRAND` reads **509** (508 + the one aggregate line);
 the 9 is the number of individual assertions inside it. `pixi run ci` asserts
 every per-tool count against `scripts/expected-test-counts.txt` and refuses a
 rustc outside the pinned `>=1.99,<2`; **run it after any change** (the laptop's
@@ -70,7 +71,7 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 | claim | measurement |
 |---|---|
 | fastcheck memory is flat in dataset size | 133–140 MB from 100k to **20M pairs** (2.7 GB of reads) vs FastQC's 310–363 MB |
-| fastmaps vs FastQC (5M pairs) | 9.17 s / 145 MB vs 16.1 s / 16 MB — FastQC is leaner and this is not a memory win; the honest claim is the composition plane plus thread scaling, not raw speed or RSS |
+| fastmaps vs FastQC (5M pairs) | 9.17 s / 145 MB vs 16.1 s / 16 MB. The RSS is now decomposed term by term and the preview term is gone (`90573ea`: defaults **202.6 → 141.2 MB** on this batch's 5M-pair library, **100.5 → 36.1 MB** at `--buffer-mb 8`, outputs byte-identical). FastQC is still leaner, so the honest claim remains the composition plane plus thread scaling, not raw speed or RSS; the remaining lever is the 512 MB `--buffer-mb` default and the structural residue is the 8 bytes/read stream behind `heatmap.data` (PLAN-QC §1) |
 | fastprep vs fastp (5M pairs, 1 core, gzip level 6 both) | 34.37 s vs 28.50 s — fastp LEADS this cell; fastprep leads at 100k/500k/1M and on 2 cores (25.84 vs 39.61 s) |
 | fastprep's drop rate tracks the injected must-drop + polyG | 7.7–7.9% drops vs the 4.7–4.8% injected (a retention check, not a trim-accuracy claim) — carried from the paper campaign, not re-measured this session |
 | fasthelper vs MultiQC | zero orchestration overhead (0.667 s vs 0.647 s) + manifest provenance; MultiQC v1.35 emits **no output** on `fastsuite.report.v1` (no module for it) — 0 report files at every N from 25 to 800 samples |
