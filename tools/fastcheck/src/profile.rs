@@ -706,7 +706,7 @@ mod tests {
     fn acc_with(seqs: &[(&[u8], &[u8])], max_pos: usize) -> Accum {
         let mut a = Accum::new(max_pos);
         for (s, q) in seqs {
-            a.observe(s, q);
+            a.observe(b"@r", s, q);
         }
         a
     }

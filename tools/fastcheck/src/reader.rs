@@ -282,9 +282,9 @@ pub fn scan_file_gated(
         // The record is measured here: gated when a module subset was selected, the
         // ungated (unchanged) path otherwise.
         let w = match &gate {
-            Some(m) => acc.observe_gated(&seq, &qual, m),
+            Some(m) => acc.observe_gated(&line, &seq, &qual, m),
             None => {
-                acc.observe(&seq, &qual);
+                acc.observe(&line, &seq, &qual);
                 Work::default()
             }
         };

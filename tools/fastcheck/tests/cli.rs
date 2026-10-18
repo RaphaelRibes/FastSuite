@@ -1019,3 +1019,72 @@ fn gating_refuses_an_output_whose_modules_are_off() {
     assert_eq!(code, 0, "{stderr}");
     assert!(all.exists());
 }
+
+// ---------------------------------------------------------------------------
+// Task 11: --tiles per-tile quality, off by default.
+//
+// The tile module rides on its own opt-in flag: off (the default) nothing is
+// computed and the report is byte for byte what it was; on, quality is separated
+// by the tile parsed from the 7-field Illumina header, and headers without
+// coordinates are counted, never dropped.
+// ---------------------------------------------------------------------------
+
+/// 7-field Illumina headers: `@instrument:run:flowcell:lane:tile:x:y`.
+/// Tile 1101 gets good quality, tile 1102 gets bad, on the same read content.
+const TILE_FASTQ: &[u8] = b"@LH00916:1:SIMFLOW1:1:1101:1:1 1:N:0:ATCGATCG\nACGTACGTAC\n+\nIIIIIIIIII\n\
+@LH00916:1:SIMFLOW1:1:1101:2:2 1:N:0:ATCGATCG\nACGTACGTAC\n+\nIIIIIIIIII\n\
+@LH00916:1:SIMFLOW1:1:1102:3:3 1:N:0:ATCGATCG\nACGTACGTAC\n+\n#####AAAAA\n\
+@LH00916:1:SIMFLOW1:1:1102:4:4 1:N:0:ATCGATCG\nACGTACGTAC\n+\n#####AAAAA\n\
+@simple_read_with_no_coords\nACGTACGTAC\n+\nIIIIIIIIII\n";
+
+#[test]
+fn tiles_module_separates_quality_by_tile_and_is_off_by_default() {
+    let d = tmpdir("tiles");
+    let p = d.join("t.fastq");
+    std::fs::write(&p, TILE_FASTQ).unwrap();
+
+    // Off by default: no block, and headers without coords are simply not counted.
+    let j0 = d.join("off.json");
+    run(&d, &[p.to_str().unwrap(), "--json", j0.to_str().unwrap(), "-q"]);
+    assert!(read_json(&j0).get("per_tile").is_none(), "must be opt-in");
+
+    let json = d.join("on.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[p.to_str().unwrap(), "--tiles", "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&json);
+    let blk = &v["per_tile"];
+    assert_eq!(blk["tiles"].as_array().unwrap().len(), 2, "1101 and 1102");
+    assert_eq!(blk["reads_with_coordinates"], 4);
+    assert_eq!(blk["reads_without_coordinates"], 1, "the simple header is counted, not dropped");
+    // The projection line names the cost.
+    assert!(stderr.contains("per-tile"), "{stderr}");
+
+    let by_tile: std::collections::HashMap<String, &serde_json::Value> = blk["tiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| (t["tile"].as_str().unwrap().to_string(), t))
+        .collect();
+    // Tile 1101: every base is 'I' = Q40. Tile 1102: five '#' (Q2) then five 'A' (Q32).
+    let good = &by_tile["1101"];
+    assert_eq!(good["mean_q"], 40.0);
+    let bad = &by_tile["1102"];
+    // (5*2 + 5*32) / 10 = 17
+    assert!((bad["mean_q"].as_f64().unwrap() - 17.0).abs() < 1e-9, "{bad}");
+    // Per-position detail exists for both.
+    assert!(good["per_position_mean_q"].as_array().unwrap().len() == 10);
+}
+
+#[test]
+fn tiles_module_reports_the_memory_projection_when_on() {
+    let d = tmpdir("tiles_mem");
+    let p = d.join("t.fastq");
+    std::fs::write(&p, TILE_FASTQ).unwrap();
+    let (_, stderr, code) = run(&d, &[p.to_str().unwrap(), "--tiles", "-q"]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("per-tile quality"), "{stderr}");
+    assert!(stderr.contains("MB"), "{stderr}");
+}

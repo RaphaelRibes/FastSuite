@@ -158,6 +158,18 @@ Ordered by user-visible value:
    (`error: unexpected argument '--bogus' found`, exit 2). See
    `docs/plans/2026-10-12_fastsim-cli-convergence.md`.
 
+### fastcheck-specific gaps (closed by docs/plans/2026-10-12_fastcheck-exactness.md)
+
+* `--max-mem` admission refusal — ported from fastprep's proven model.
+* `--overrep-mode none|fingerprint|second-pass|table` — the four honest
+  trade-offs; default `none` (PLAN-QC §5.9).
+* adapter content per position — reusing fastprep's catalogue/matcher
+  semantics, copied per D-1.
+* per-tile quality modules — default off, ~5 MB per 100 tiles.
+* `--only <module>` gating — the parser materialises only what enabled
+  modules need.
+* ground-truth recovery test (PLAN-QC §7.3) — the decisive correctness gate.
+
 ## 5. Compatibility promises
 
 * Adding a flag: minor. Removing or renaming one: major, and the old spelling
@@ -169,7 +181,7 @@ Ordered by user-visible value:
 ## fastcheck
 
 `fastcheck [FILES...] [--json PATH] [--html PATH] [--positions-tsv PATH]
-[--profile PATH] [--insert-hist] [--processed-1 FQ] [--processed-2 FQ]`
+[--profile PATH] [--insert-hist] [--tiles] [--processed-1 FQ] [--processed-2 FQ]`
 
 * `--json PATH` — the `fastsuite.report.v1` QC report (metrics + rich blocks).
 * `--html PATH` — a self-contained FastQC-style report (inline SVG, no JS):
@@ -182,6 +194,10 @@ Ordered by user-visible value:
 * `--processed-1/--processed-2 FQ` — optional processed files; the report then
   carries a `processed` block and the HTML gains a Before/After section.
 * `--insert-hist` — the paired lockstep pass that measures insert sizes.
+* `--tiles` — per-tile quality (FastQC's per-tile modules), off by default: quality by
+  tile x position x quality bin, parsed from 7-field Illumina headers
+  (`@instrument:run:flowcell:lane:tile:x:y`), emitted as a `per_tile` block. Reads whose
+  header has no tile field are counted in `reads_without_coordinates`, never dropped.
 
 Compare two runs side by side with `fasthelper compare --before <set>
 --after <set> -o out/`.

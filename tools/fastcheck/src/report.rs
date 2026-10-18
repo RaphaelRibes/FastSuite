@@ -173,6 +173,7 @@ pub fn write_report(
     overrep_min_count: u32,
     adapter_content: Option<(&crate::adapter_pos::AdapterPos, f64, usize)>,
     modules: Option<&Modules>,
+    tile: Option<&crate::tile::TileQual>,
 ) -> Result<()> {
     let offset = verdict.offset;
     let (byte_min, byte_max) = byte_range(&total.qual_byte);
@@ -421,6 +422,11 @@ pub fn write_report(
     let mut doc = doc;
     if let Some((ap, error_rate, min_overlap)) = adapter_content {
         doc["adapter_content"] = ap.to_json(error_rate, min_overlap);
+    }
+    // The per-tile block follows the same rule: --tiles off leaves the accumulator None,
+    // so the key is absent rather than a null or a measured zero.
+    if let Some(t) = tile {
+        doc["per_tile"] = t.to_json(offset);
     }
 
     // Gating: a module that did not run leaves no key behind. The values for gated-out

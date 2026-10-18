@@ -131,11 +131,20 @@ pub struct Cli {
     #[arg(long, default_value_t = 14, value_name = "N")]
     pub min_adapter_overlap: usize,
 
+    /// Per-tile quality (PLAN-QC module 7 / FastQC's per-tile modules): quality by
+    /// tile x position x quality bin, parsed from 7-field Illumina headers
+    /// (`@instrument:run:flowcell:lane:tile:x:y`). OFF by default: it costs ~5 MB per 100
+    /// tiles at R=150, and only raw Illumina runs carry the coordinates. Reads whose
+    /// header has no tile field are counted and reported, never silently dropped.
+    #[arg(long)]
+    pub tiles: bool,
+
     /// Run only these modules (comma-separated): bases, quality, length, gc, heatmap,
-    /// dup, polyx, kmer, adapter. The parser then materialises only what the enabled
-    /// modules need, so `--only dup` touches neither the quality bytes nor the heatmap
-    /// grid, and skips the per-read loops entirely. Absent = every module on, which is
-    /// byte for byte the pre--only behaviour; `adapter` stays opt-in either way.
+    /// dup, polyx, kmer, adapter, tile. The parser then materialises only what the
+    /// enabled modules need, so `--only dup` touches neither the quality bytes nor the
+    /// heatmap grid, and skips the per-read loops entirely. Absent = every module on,
+    /// which is byte for byte the pre--only behaviour; `adapter` and `tile` stay opt-in
+    /// behind --adapter-content / --tiles either way.
     #[arg(long, value_name = "MODULE[,MODULE...]")]
     pub only: Option<String>,
 
@@ -217,7 +226,12 @@ impl Cli {
     /// empty report is the one outcome this must never produce silently.
     pub fn modules(&self) -> anyhow::Result<Modules> {
         let mut m = match &self.only {
-            None => Modules::defaults(self.adapter_content),
+            None => {
+                // The tile module rides on its own opt-in flag, like adapter content.
+                let mut m = Modules::defaults(self.adapter_content);
+                m.tile = self.tiles;
+                m
+            }
             Some(list) => {
                 let names: Vec<&str> =
                     list.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
@@ -241,6 +255,8 @@ impl Cli {
                         // `adapter` is the --adapter-content module: naming it here does not
                         // switch that module on, it only says it may run.
                         "adapter" => m.adapter = self.adapter_content,
+                        // `tile` is the --tiles module, opt-in the same way.
+                        "tile" => m.tile = self.tiles,
                         other => anyhow::bail!(
                             "--only: unknown module {other:?} (known: {})",
                             MODULE_NAMES.join(", ")
@@ -262,11 +278,16 @@ impl Cli {
                  or drop --adapter-content"
             );
         }
+        if self.tiles && self.only.is_some() && !m.tile {
+            anyhow::bail!(
+                "--tiles is not selected by --only: add `tile` to the list, or drop --tiles"
+            );
+        }
         if !m.any() {
             anyhow::bail!(
                 "--only: nothing left to run — the selection was empty, or every module in it \
-                 was disabled by --no-quality/--no-heatmap, or `adapter` was named without \
-                 --adapter-content (known: {})",
+                 was disabled by --no-quality/--no-heatmap, or `adapter`/`tile` was named \
+                 without --adapter-content/--tiles (known: {})",
                 MODULE_NAMES.join(", ")
             );
         }
@@ -277,7 +298,7 @@ impl Cli {
 /// Every module name, in the order they are reported. An unknown name in `--only` is
 /// refused against this list rather than ignored.
 pub const MODULE_NAMES: &[&str] = &[
-    "bases", "quality", "length", "gc", "heatmap", "dup", "polyx", "kmer", "adapter",
+    "bases", "quality", "length", "gc", "heatmap", "dup", "polyx", "kmer", "adapter", "tile",
 ];
 
 /// Which modules a run measures.
@@ -285,8 +306,9 @@ pub const MODULE_NAMES: &[&str] = &[
 /// `bases` owns the per-position composition, `quality` the per-position quality and the
 /// byte census, `length` the read-length histogram, `gc` the ACGT/GC histograms, `dup`
 /// the exact fingerprint table, `polyx` the homopolymer runs, `kmer` the 12-mer counter,
-/// `heatmap` the composition grid, `adapter` the per-position adapter content. Modules
-/// left off are not measured *and* not reported: an absent field never reads as a zero.
+/// `heatmap` the composition grid, `adapter` the per-position adapter content, `tile` the
+/// per-tile quality. Modules left off are not measured *and* not reported: an absent field
+/// never reads as a zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Modules {
     pub bases: bool,
@@ -298,6 +320,7 @@ pub struct Modules {
     pub polyx: bool,
     pub kmer: bool,
     pub adapter: bool,
+    pub tile: bool,
 }
 
 impl Modules {
@@ -313,10 +336,12 @@ impl Modules {
             polyx: false,
             kmer: false,
             adapter: false,
+            tile: false,
         }
     }
 
-    /// Today's default: every module except the opt-in adapter content.
+    /// Today's default: every module except the opt-in tile and adapter content, which
+    /// stay behind their own flags (`modules()` adds them back when asked for).
     pub fn defaults(adapter_content: bool) -> Self {
         Self {
             bases: true,
@@ -328,6 +353,7 @@ impl Modules {
             polyx: true,
             kmer: true,
             adapter: adapter_content,
+            tile: false,
         }
     }
 
@@ -351,6 +377,7 @@ impl Modules {
                 "polyx" => self.polyx,
                 "kmer" => self.kmer,
                 "adapter" => self.adapter,
+                "tile" => self.tile,
                 _ => false,
             })
             .collect()

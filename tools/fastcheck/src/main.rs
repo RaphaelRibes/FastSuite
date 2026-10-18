@@ -21,6 +21,7 @@ mod fingerprint;
 mod overrep;
 mod adapter;
 mod adapter_pos;
+mod tile;
 mod reader;
 mod report;
 
@@ -52,6 +53,10 @@ fn main() -> Result<()> {
     let modules = cli.modules()?;
     let gate = if cli.gating_requested() { Some(modules) } else { None };
     let overrep = cli.overrep_mode()?;
+    // The per-tile module is opt-in behind --tiles; `modules()` already folded the flag
+    // (and any --only selection) into `modules.tile`, so this is the one place that decides
+    // whether the tile accumulator exists at all.
+    let track_tile = modules.tile;
     if let Some(m) = &gate {
         check_outputs(&cli, m, overrep)?;
     }
@@ -226,7 +231,7 @@ fn main() -> Result<()> {
     let reports: Vec<FileReport> = if files.len() == 1 || threads <= 1 {
         let mut out = Vec::with_capacity(files.len());
         for path in &files {
-            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, gate)?);
+            out.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, track_tile, gate)?);
         }
         out
     } else {
@@ -240,7 +245,7 @@ fn main() -> Result<()> {
             handles.push(std::thread::spawn(move || -> Result<Vec<FileReport>> {
                 let mut out = Vec::with_capacity(chunk.len());
                 for path in &chunk {
-                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, gate)?);
+                    out.push(scan_one(path, per_worker_threads, limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, track_tile, gate)?);
                 }
                 Ok(out)
             }));
@@ -273,6 +278,16 @@ fn main() -> Result<()> {
         reports.len(),
         cli.max_read_len
     );
+
+    // Only when --tiles: the per-tile module's memory, printed so a run's cost is known
+    // rather than discovered. Off, there is no accumulator and no line.
+    if let Some(t) = total.tile.as_ref() {
+        eprintln!(
+            "fastcheck: per-tile quality for {} tile(s), {:.1} MB",
+            t.tiles.len(),
+            t.resident_bytes() as f64 / (1024.0 * 1024.0),
+        );
+    }
 
     // Only when a gating flag was given: what ran, and the work the run actually
     // performed. A module that is off contributes nothing to these counters because
@@ -315,7 +330,7 @@ fn main() -> Result<()> {
             pfiles.push(p2.clone());
         }
         for path in &pfiles {
-            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, gate)?);
+            processed_reports.push(scan_one(path, threads.max(1), limits, max_pos, track_profile, overrep, &adapter_set, cli.adapter_content, track_tile, gate)?);
         }
         for r in &processed_reports {
             processed_total.merge(&r.acc);
@@ -345,6 +360,7 @@ fn main() -> Result<()> {
                 (ap, cli.adapter_error_rate, cli.min_adapter_overlap)
             }),
             gate.as_ref(),
+            total.tile.as_ref(),
         )?;
     }
     if let Some(p) = &cli.html {
@@ -432,6 +448,7 @@ fn scan_one(
     overrep: overrep::OverrepMode,
     adapter_set: &crate::adapter::AdapterSet,
     adapter_content: bool,
+    tiles: bool,
     gate: Option<Modules>,
 ) -> Result<FileReport> {
     let mut acc = Accum::new(max_pos);
@@ -440,6 +457,11 @@ fn scan_one(
     acc.adapter_set = adapter_set.clone();
     if adapter_content {
         acc.adapter_pos = Some(crate::adapter_pos::AdapterPos::new(adapter_set));
+    }
+    // Only when --tiles: the per-tile accumulator exists iff the module runs, so "off"
+    // costs nothing and leaves the report unchanged.
+    if tiles {
+        acc.tile = Some(crate::tile::TileQual::default());
     }
     let scan = reader::scan_file_gated(path, gz_threads, limits, &mut acc, gate)?;
     Ok(FileReport {

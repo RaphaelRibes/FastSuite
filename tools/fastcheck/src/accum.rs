@@ -114,6 +114,9 @@ pub struct Accum {
     pub adapter_pos: Option<crate::adapter_pos::AdapterPos>,
     /// The adapter set for --adapter-content (only consulted when adapter_pos is Some).
     pub adapter_set: crate::adapter::AdapterSet,
+    /// Per-tile quality, only when --tiles is on. `None` means the flag was off, the work
+    /// was not done, and no tile block is emitted.
+    pub tile: Option<crate::tile::TileQual>,
 }
 
 /// Adapter prefixes the fitter's readthrough scan looks for.
@@ -163,6 +166,7 @@ impl Accum {
             track_overrep_table: false,
             adapter_pos: None,
             adapter_set: crate::adapter::AdapterSet::illumina_default(),
+            tile: None,
         }
     }
 
@@ -189,9 +193,10 @@ impl Accum {
         }
     }
 
-    /// One record. `seq` and `qual` must have equal length (the scanner
-    /// enforces it: a mismatch is an error, not an assumption).
-    pub fn observe(&mut self, seq: &[u8], qual: &[u8]) {
+    /// One record. `header` carries the tile coordinates for `--tiles`; `seq` and `qual`
+    /// must have equal length (the scanner enforces it: a mismatch is an error, not an
+    /// assumption).
+    pub fn observe(&mut self, header: &[u8], seq: &[u8], qual: &[u8]) {
         let len = seq.len();
         self.reads += 1;
         self.bases += len as u64;
@@ -332,6 +337,10 @@ impl Accum {
         if let Some(ap) = self.adapter_pos.as_mut() {
             ap.observe(seq, &self.adapter_set);
         }
+        // Per-tile quality: only when --tiles is on (the accumulator is Some).
+        if let Some(t) = self.tile.as_mut() {
+            t.observe(header, qual);
+        }
         if seq.len() >= 12 {
             for w in seq.windows(12) {
                 if let Some(pk) = repeated::pack_kmer(w) {
@@ -374,6 +383,13 @@ impl Accum {
             // tracked it is ADOPTED whole (a clone of nothing-plus-itself), so its
             // counts are not added twice.
             (None, Some(b)) => self.adapter_pos = Some(b.clone()),
+            _ => {}
+        }
+        // The per-tile accumulator merges the same way: adopted whole by the first file
+        // that tracked it, summed exactly thereafter.
+        match (self.tile.as_mut(), o.tile.as_ref()) {
+            (Some(a), Some(b)) => a.merge(b),
+            (None, Some(b)) => self.tile = Some(b.clone()),
             _ => {}
         }
         if self.track_overrep_table || o.track_overrep_table {
@@ -528,9 +544,9 @@ mod tests {
     /// read 3: GGCC / 55..  -> acgt 4, gc 4, mean byte 53
     fn fixture() -> Accum {
         let mut a = Accum::new(8);
-        a.observe(b"ACGT", b"IIII");
-        a.observe(b"AANN", b"!!!!");
-        a.observe(b"GGCC", b"55..");
+        a.observe(b"@r", b"ACGT", b"IIII");
+        a.observe(b"@r", b"AANN", b"!!!!");
+        a.observe(b"@r", b"GGCC", b"55..");
         a
     }
 
@@ -630,7 +646,7 @@ mod tests {
     #[test]
     fn positions_beyond_max_read_len_are_excluded_not_misattributed() {
         let mut a = Accum::new(4);
-        a.observe(b"ACGTAACC", b"IIIIIIII"); // 8 bp read, max_pos 4
+        a.observe(b"@r", b"ACGTAACC", b"IIIIIIII"); // 8 bp read, max_pos 4
         assert_eq!(a.reads, 1);
         assert_eq!(a.bases, 8);
         assert_eq!(a.reads_over_max_len, 1);
@@ -645,10 +661,10 @@ mod tests {
     #[test]
     fn merge_is_exact() {
         let mut x = Accum::new(8);
-        x.observe(b"ACGT", b"IIII");
+        x.observe(b"@r", b"ACGT", b"IIII");
         let mut y = Accum::new(8);
-        y.observe(b"AANN", b"!!!!");
-        y.observe(b"GGCC", b"55..");
+        y.observe(b"@r", b"AANN", b"!!!!");
+        y.observe(b"@r", b"GGCC", b"55..");
         let mut m = x.clone();
         m.merge(&y);
         let f = fixture();

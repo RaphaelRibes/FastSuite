@@ -8,13 +8,15 @@
 //! default report is unchanged byte for byte; [`observe_gated`] is its gated twin,
 //! used only when a gating flag was given.
 //!
-//! Why this lives outside `accum.rs`: that file is owned by the per-tile module
-//! change. Rust allows an inherent `impl` for a type from another module of the
+//! Why this lives outside `accum.rs`: that file is the dense per-read accumulator
+//! and the gated twin is far easier to hold to it from beside it than from inside
+//! it. Rust allows an inherent `impl` for a type from another module of the
 //! same crate, and every `Accum` field is `pub`, so the gated path can be written
-//! beside the type without editing it. The handful of helpers copied from
+//! beside the type without bloating it. The handful of helpers copied from
 //! `accum.rs` (`grow`, `record_n_run`, the adapter-prefix search) are private
 //! there; `gated_all_modules_is_exactly_observe` below holds this copy to the
-//! original counter for counter, so a divergence cannot pass unnoticed.
+//! original counter for counter — including the `tile` module — so a divergence
+//! cannot pass unnoticed.
 //!
 //! [`observe_gated`]: Accum::observe_gated
 
@@ -131,8 +133,9 @@ impl Accum {
     /// `reads`, `bases` and `reads_over_max_len` are always counted, and so is
     /// `reads_with_n` (a run that reports no reads is not a run); everything else
     /// is conditional. The quality *line* is still delivered here by the scanner
-    /// for framing, but with `quality` off its bytes are never touched.
-    pub fn observe_gated(&mut self, seq: &[u8], qual: &[u8], m: &Modules) -> Work {
+    /// for framing, but with `quality` off its bytes are never touched. `header`
+    /// carries the tile coordinates the `tile` module needs.
+    pub fn observe_gated(&mut self, header: &[u8], seq: &[u8], qual: &[u8], m: &Modules) -> Work {
         let mut w = Work { reads: 1, ..Work::default() };
         let len = seq.len();
         self.reads += 1;
@@ -302,6 +305,14 @@ impl Accum {
             }
         }
 
+        // Per-tile quality: gated on its own module, so it is skipped when --tiles is
+        // off even under an --only that selected other modules.
+        if m.tile {
+            if let Some(t) = self.tile.as_mut() {
+                t.observe(header, qual);
+            }
+        }
+
         if m.kmer && seq.len() >= 12 {
             for win in seq.windows(12) {
                 if let Some(pk) = repeated::pack_kmer(win) {
@@ -325,11 +336,11 @@ mod tests {
     /// moment a flag is added on the command line.
     #[test]
     fn gated_all_modules_is_exactly_observe() {
-        let reads: [(&[u8], &[u8]); 4] = [
-            (b"ACGTACGTAC", b"IIIIIIIIII"),
-            (b"AANNGGCCTT", b"!!!!55555."),
-            (b"GGGGNNNNNN", b"##########"),
-            (b"ACGTACGTAC", b"JJJJJJJJJJ"),
+        let reads: [(&[u8], &[u8], &[u8]); 4] = [
+            (b"@i:1:f:1:1101:1:1 1:N:0:x", b"ACGTACGTAC", b"IIIIIIIIII"),
+            (b"@i:1:f:1:1101:2:2 1:N:0:x", b"AANNGGCCTT", b"!!!!55555."),
+            (b"@i:1:f:1:2202:3:3 1:N:0:x", b"GGGGNNNNNN", b"##########"),
+            (b"@no_coords", b"ACGTACGTAC", b"JJJJJJJJJJ"),
         ];
         let mut plain = Accum::new(64);
         let mut gated = Accum::new(64);
@@ -339,13 +350,16 @@ mod tests {
         plain.adapter_set = gated.adapter_set.clone();
         plain.adapter_pos = Some(crate::adapter_pos::AdapterPos::new(&plain.adapter_set));
         plain.track_profile = true;
+        plain.tile = Some(crate::tile::TileQual::default());
+        gated.tile = Some(crate::tile::TileQual::default());
         let all = Modules {
             adapter: true,
+            tile: true,
             ..Modules::defaults(true)
         };
-        for (seq, qual) in reads {
-            plain.observe(seq, qual);
-            let w = gated.observe_gated(seq, qual, &all);
+        for (header, seq, qual) in reads {
+            plain.observe(header, seq, qual);
+            let w = gated.observe_gated(header, seq, qual, &all);
             assert_eq!(w.reads, 1);
         }
         assert_eq!(plain.reads, gated.reads);
@@ -376,6 +390,11 @@ mod tests {
             plain.adapter_pos.as_ref().unwrap().to_json(0.2, 14),
             gated.adapter_pos.as_ref().unwrap().to_json(0.2, 14)
         );
+        assert_eq!(
+            plain.tile.as_ref().unwrap().to_json(33),
+            gated.tile.as_ref().unwrap().to_json(33),
+            "the tile module must be the same gated and ungated"
+        );
     }
 
     /// The gated path measures what its modules say and nothing else: the counters
@@ -391,7 +410,7 @@ mod tests {
                 m
             };
             let mut a = Accum::new(64);
-            let w = a.observe_gated(seq, qual, &m);
+            let w = a.observe_gated(b"@i:1:f:1:1101:1:1 1:N:0:x", seq, qual, &m);
             (a, w)
         };
 
@@ -426,7 +445,7 @@ mod tests {
         assert_eq!(w.kmer_windows, 0);
         let long = &b"ACGTACGTACGTACGT"[..];
         let mut a = Accum::new(64);
-        let w = a.observe_gated(long, &long[..], &Modules { kmer: true, ..Modules::none() });
+        let w = a.observe_gated(b"@r", long, &long[..], &Modules { kmer: true, ..Modules::none() });
         assert_eq!(w.kmer_windows, 5, "16 bp carries 5 distinct windows");
     }
 }
