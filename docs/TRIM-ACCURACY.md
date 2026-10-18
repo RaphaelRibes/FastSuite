@@ -267,6 +267,25 @@ in the table. The bacterial_isolate domain is the opposite case: fastprep keeps
 *more* (+2.6 pp) and still ties, which is the comparable-kept-set comparison the
 caveat is meant to isolate.
 
+**Re-attributed 2026-10-18: this gap is the dedup default, not `--min-len`.**
+The PXMT status byte shows that on those same datasets **100% of the drops are
+`Duplicate`** (SRR20754397: 167,162 of 167,162; DRR015139: 32,138 of 32,138), and
+`--min-len 15` leaves the histogram untouched to the drop — a ladder of absolute
+floors and fractions moves retention by ±0.15 pp at best and costs 2.7–2.9 pp at
+worst. With dedup off the aggregate is **98.47% against fastp's 97.23%**:
+
+| config (tol 0) | kept | kept % | exact | exact/kept | overtrim |
+|---|---|---|---|---|---|
+| fastprep-hd-off (shipped) | 18,945,051 | 92.87% | 16,877,693 | 89.088% | 116,100 |
+| fastprep-hd-off `--no-dedup` | 20,087,297 | **98.47%** | 17,814,876 | 88.687% | 138,037 |
+| fastp-default (no dedup) | 19,834,186 | 97.23% | 17,575,859 | 88.614% | 150,230 |
+
+So the suite does not keep fewer reads than fastp; it deduplicates, and the
+harness charges it for that because a dropped read leaves the scored set. The
+ship default stays dedup-on (decision D-13 in `docs/DECISIONS.md`, which also
+records the rule that follows: quote both configurations whenever fastp is in the
+table, and never read the exact rate without the retention column beside it).
+
 ## The two opt-in flags: measured, and neither pays
 
 Two flags were added on the hypothesis that the recoverable class above could be

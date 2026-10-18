@@ -174,6 +174,43 @@ synthetic (gc 0.5, no artefacts, `full_length_rate: 0`).
 ## D-12 — What the suite refuses to do ⏳ open
 
 Planned list, one line each in the README with the reason: PE overlap/merge
-(removed from the polyx lineage deliberately), UMI handling, alignment-based QC,
-workflow-engine semantics (arrays, resume — that is Snakemake/Nextflow's job),
-per-tile modules (implemented, off by default), long reads (D-7).
+(removed from the polyx lineage deliberately — the paper's §`adp-pe` now says so),
+UMI handling, alignment-based QC, workflow-engine semantics (arrays, resume — that
+is Snakemake/Nextflow's job), per-tile modules (planned, plan Task 11), long reads
+(D-7).
+
+---
+
+## D-13 — Deduplication ships ON ✅ decided (2026-10-18)
+
+`fastprep --dedup` is on by default. This is a product decision, not a
+measurement outcome: exact-fingerprint dedup is one of the things that separates
+the suite from fastp, which does not dedup at all.
+
+The consequence to keep in view, measured over 102 datasets and 20.4 M mates: the
+trim-accuracy harness scores only the reads a tool **kept**, so a deduplicating
+tool is charged for every duplicate it removes. On the worst-retention datasets
+**100% of the drops are `Duplicate`** (SRR20754397: 167,162 of 167,162;
+DRR015139: 32,138 of 32,138), and `--min-len` does not move that histogram at all
+— the earlier "fastprep drops more reads than fastp" reading blamed the length
+floor for the dedup default. With `--no-dedup` the aggregate retention is
+**98.47% against fastp's 97.23%** (virome 99.74% vs 99.7%, rna_seq 98.90% vs
+97.8%): the suite does not keep fewer reads, it deduplicates.
+
+Rules that follow:
+
+* Quote trim accuracy **with the shipped default** and, whenever fastp is in the
+  table, **also with `--no-dedup`** — that is the only apples-to-apples pair.
+* Read **retention and exact rate together**, never the rate alone. Dropping a
+  read removes it from the scored set, and whether that flatters or depresses the
+  rate depends on the class dropped: `--min-len 0.9L` shows the *highest* fastprep
+  exact rate (89.470% vs 89.088%) with **441k fewer** exact mates, while
+  `--no-dedup` raises both.
+* Evidence: `bench/results/phase-d/minlen-ladder-20261018.tsv` (+
+  `-perdomain` and `-dropreason`), `docs/TRIM-ACCURACY.md` §Read retention.
+
+**Corollary (decision taken with it): `--min-len` keeps its shipped `0.9L`
+default.** The ladder showed no rung buying anything (15/0.5L: +0.15 pp
+retention, +0.07 pp exact, i.e. noise; 30 neutral; 50 and uniform 0.9L cost
+2.7–2.9 pp of both), so the retention question is answered by D-13, not by the
+length floor.
