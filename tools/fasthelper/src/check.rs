@@ -13,8 +13,6 @@ use crate::cli::CheckArgs;
 use crate::config::Config;
 use crate::runner;
 
-const KNOWN_STEPS: &[&str] = &["fastdedup", "fastprep", "fastmaps", "fastcheck"];
-
 /// Run `<bin> --help` and return the combined output text.
 fn help_text(bin: &Path) -> Option<String> {
     let out = Command::new(bin).arg("--help").output().ok()?;
@@ -43,10 +41,10 @@ pub fn cmd_check(args: &CheckArgs) -> Result<()> {
 
     // 1. Step names.
     for step in &cfg.run.steps {
-        if !KNOWN_STEPS.contains(&step.as_str()) {
+        if !runner::KNOWN_STEPS.contains(&step.as_str()) {
             errors.push(format!(
                 "unknown step '{step}' — supported: {}",
-                KNOWN_STEPS.join(", ")
+                runner::KNOWN_STEPS.join(", ")
             ));
         }
         if let Some(extra) = cfg.step(step).args.iter().find(|a| a.starts_with("--")) {
@@ -81,7 +79,7 @@ pub fn cmd_check(args: &CheckArgs) -> Result<()> {
 
     // 3. Tools.
     for step in &cfg.run.steps {
-        if KNOWN_STEPS.contains(&step.as_str()) && cfg.step(step).enabled && ts.get(step).is_none()
+        if runner::KNOWN_STEPS.contains(&step.as_str()) && cfg.step(step).enabled && ts.get(step).is_none()
         {
             errors.push(format!("tool {step} not found in the tools dir or $PATH"));
         }

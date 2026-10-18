@@ -30,6 +30,10 @@ fn is_trimming(tool: &str) -> bool {
     TRIMMING_STEPS.contains(&tool)
 }
 
+/// Every step name the runner can execute. `check` validates configs against
+/// this same list, so a config `run` accepts is never rejected by `check`.
+pub const KNOWN_STEPS: &[&str] = &["fastdedup", "fastprep", "fastmaps", "fastcheck", "fastsim"];
+
 pub struct ToolSet {
     pub check: Option<PathBuf>,
     pub dedup: Option<PathBuf>,
@@ -229,8 +233,20 @@ fn run_sample(
             config_dir,
         );
         let log = logs.join(format!("{}.{}.log", sample.name, tool));
-        // Resume: skip this step when a previous manifest recorded the exact
-        // same (argv, binary, version). --from <step> forces a rerun from
+        // Identity of the inputs this step will consume, and the files it is
+        // expected to produce. Both are recorded so a later run can tell
+        // whether a resume would reuse a stale output.
+        let cur_sig = input_signatures(&cur1, cur2.as_deref());
+        let expect_outputs: Vec<PathBuf> = match tool.as_str() {
+            "fastdedup" | "fastprep" => std::iter::once(out1.clone())
+                .chain(out2.clone())
+                .collect(),
+            // fastmaps/fastcheck/fastsim write only their JSON report.
+            _ => vec![json_path.clone()],
+        };
+        // Resume: skip this step only when a previous manifest recorded the
+        // exact same (argv, binary, version), the SAME inputs, and the outputs
+        // it produced are still on disk. --from <step> forces a rerun from
         // that step onward, so once the named step is reached everything is
         // forced regardless of what the manifest says.
         let forced = from.map(|f| f == tool).unwrap_or(false);
@@ -239,10 +255,14 @@ fn run_sample(
         }
         let key = format!("{}/{}", sample.name, tool);
         if !forced && !from_reached {
-            if let Some((prev_argv, prev_bin, prev_ver)) = resume.get(&key) {
-                if prev_argv == &argv
-                    && prev_bin == &s(&bin)
-                    && *prev_ver == tool_version(&bin)
+            if let Some(prev) = resume.get(&key) {
+                let inputs_match = prev.inputs == cur_sig;
+                let outputs_present = expect_outputs.iter().all(|p| p.is_file());
+                if prev.argv == argv
+                    && prev.binary == s(&bin)
+                    && prev.version == tool_version(&bin)
+                    && inputs_match
+                    && outputs_present
                 {
                     println!("fasthelper: resumed {key}");
                     entries.push((
@@ -250,16 +270,19 @@ fn run_sample(
                         serde_json::json!({
                             "sample": sample.name,
                             "tool": tool,
-                            "binary": prev_bin,
-                            "argv": prev_argv,
+                            "binary": prev.binary.clone(),
+                            "argv": prev.argv.clone(),
                             "exit": 0,
                             "elapsed_s": 0.0,
                             "log": s(&log),
                             "resumed": true,
+                            "tool_version": prev.version.clone(),
+                            "inputs": inputs_json(&prev.inputs),
                         }),
                     ));
                     // The chain continues from this step's output: the file
-                    // the resumed step produced (same argv) is still there.
+                    // the resumed step produced (same argv, same inputs) is
+                    // still there — we only get here when it is.
                     if tool != "fastmaps" {
                         if !cfg.run.keep_intermediate {
                             if cur1 != in1 {
@@ -295,6 +318,8 @@ fn run_sample(
                 "exit": outcome.exit,
                 "elapsed_s": outcome.elapsed,
                 "log": s(&outcome.log),
+                "tool_version": tool_version(&bin),
+                "inputs": inputs_json(&cur_sig),
             }),
         ));
         if outcome.exit != 0 {
@@ -427,9 +452,46 @@ fn tool_version(bin: &Path) -> Option<String> {
 }
 
 /// What a previous run recorded for one `sample/tool` step: the argv it ran,
-/// the binary path, and that binary's `--version` at the time. A step is only
-/// resumed when all three match today.
-type ResumeEntry = (Vec<String>, String, Option<String>);
+/// the binary path, that binary's `--version` AT THE TIME, and the identity
+/// (size + mtime) of each input it consumed. A step is only resumed when all of
+/// these still match today, so a change to an input — an overwrite in place
+/// included — forces a rerun rather than reusing a stale output.
+#[derive(Debug, Clone)]
+struct ResumeEntry {
+    argv: Vec<String>,
+    binary: String,
+    version: Option<String>,
+    /// (path, size, mtime_secs, mtime_nanos) for r1, then r2 when paired.
+    inputs: Vec<(String, u64, i64, u32)>,
+}
+
+/// Identity of one step's inputs: path, size and mtime, in order. Cheap, and an
+/// overwrite in place changes size or mtime, so a stale resume is not possible.
+fn input_signatures(r1: &Path, r2: Option<&Path>) -> Vec<(String, u64, i64, u32)> {
+    std::iter::once(r1)
+        .chain(r2)
+        .filter_map(|p| {
+            let md = std::fs::metadata(p).ok()?;
+            let mtime = md.modified().ok()?;
+            let d = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
+            Some((s(p), md.len(), d.as_secs() as i64, d.subsec_nanos()))
+        })
+        .collect()
+}
+
+/// Serialise an input signature list into the manifest's `inputs` array.
+fn inputs_json(sig: &[(String, u64, i64, u32)]) -> Vec<serde_json::Value> {
+    sig.iter()
+        .map(|(p, size, secs, nanos)| {
+            serde_json::json!({
+                "path": p.clone(),
+                "size": *size,
+                "mtime_secs": *secs,
+                "mtime_nanos": *nanos,
+            })
+        })
+        .collect()
+}
 
 /// Read `<outdir>/manifest.json` and build the `sample/tool -> ResumeEntry`
 /// map. A missing or unreadable manifest yields an empty map (fresh run).
@@ -451,14 +513,34 @@ fn load_resume(outdir: &Path) -> BTreeMap<String, ResumeEntry> {
             }
             let argv: Vec<String> = serde_json::from_value(c["argv"].clone()).unwrap_or_default();
             let binary = c["binary"].as_str().unwrap_or("").to_string();
-            // Version is re-resolved live from the recorded binary; None when
-            // that binary no longer answers --version (then never resume).
-            let ver = if binary.is_empty() {
-                None
-            } else {
-                tool_version(Path::new(&binary))
-            };
-            map.insert(format!("{sample}/{tool}"), (argv, binary, ver));
+            // The version is the one recorded AT RUN TIME, never re-resolved
+            // here: re-resolving live made the later comparison tautological,
+            // so a binary that changed under the same path was still resumed.
+            let version = c["tool_version"].as_str().map(str::to_string);
+            let inputs: Vec<(String, u64, i64, u32)> = c["inputs"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| {
+                            Some((
+                                e["path"].as_str()?.to_string(),
+                                e["size"].as_u64()?,
+                                e["mtime_secs"].as_i64()?,
+                                e["mtime_nanos"].as_u64()? as u32,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            map.insert(
+                format!("{sample}/{tool}"),
+                ResumeEntry {
+                    argv,
+                    binary,
+                    version,
+                    inputs,
+                },
+            );
         }
     }
     map

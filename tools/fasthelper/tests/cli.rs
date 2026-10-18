@@ -433,3 +433,199 @@ fn install_symlinks_binaries_and_legacy_names() {
     let n = std::fs::read_dir(&bin).unwrap().count();
     assert!(n > 0, "nothing installed");
 }
+
+/// One fastsuite.report.v1 file carrying a single named metric.
+fn write_metric_report(dir: &Path, name: &str, metric: &str, value: f64) -> PathBuf {
+    let p = dir.join(name);
+    let mut metrics = serde_json::Map::new();
+    metrics.insert(metric.to_string(), serde_json::json!(value));
+    let doc = serde_json::json!({
+        "schema": "fastsuite.report.v1",
+        "tool": "fastdedup",
+        "tool_version": "1.3.0",
+        "metrics": metrics,
+    });
+    std::fs::write(&p, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    p
+}
+
+#[test]
+fn fail_on_gates_every_sample_not_just_the_last() {
+    // Regression (B1): the gate used to flatten all samples' metrics into one
+    // "last wins" map, so a violating sample was missed whenever another
+    // sample came after it. Every sample must be judged, and named.
+    let d = tmpdir("failon_multi");
+    let a = d.join("A");
+    let b = d.join("B");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    write_metric_report(&a, "fastdedup.json", "duplicate_rate", 0.5); // violates
+    write_metric_report(&b, "fastdedup.json", "duplicate_rate", 0.0); // clean
+
+    let out = d.join("out");
+    // A alone trips (the baseline the old code got right).
+    let (_, stderr_a, code_a) = run(&[
+        "concatenate", a.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--fail-on", "duplicate_rate>0.01",
+    ]);
+    assert_eq!(code_a, 2, "A alone must trip: {stderr_a}");
+
+    // A first, then B: the old "last wins" map kept B=0.0 and missed A.
+    let (_, stderr_ab, code_ab) = run(&[
+        "concatenate", a.to_str().unwrap(), b.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--fail-on", "duplicate_rate>0.01",
+    ]);
+    assert_eq!(code_ab, 2, "A B must still trip on A: {stderr_ab}");
+    assert!(stderr_ab.contains('A'), "must name the tripping sample: {stderr_ab}");
+
+    // B first, then A: same, both orders.
+    let (_, stderr_ba, code_ba) = run(&[
+        "concatenate", b.to_str().unwrap(), a.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--fail-on", "duplicate_rate>0.01",
+    ]);
+    assert_eq!(code_ba, 2, "B A must still trip on A: {stderr_ba}");
+    assert!(stderr_ba.contains('A'), "must name the tripping sample: {stderr_ba}");
+}
+
+#[test]
+fn concatenate_ignores_fasthelpers_own_aggregate_report() {
+    // Regression (B3): a run directory holds each sample's report plus
+    // fasthelper's own aggregate report.json, which shares the
+    // fastsuite.report.v1 schema. Re-concatenating the directory used to
+    // ingest that aggregate as a phantom third sample ("run"/"unknown").
+    let d = tmpdir("own_aggregate");
+    let run_dir = d.join("run");
+    std::fs::create_dir_all(run_dir.join("a")).unwrap();
+    std::fs::create_dir_all(run_dir.join("b")).unwrap();
+    write_metric_report(&run_dir.join("a"), "fastdedup.json", "duplicate_rate", 0.5);
+    write_metric_report(&run_dir.join("b"), "fastdedup.json", "duplicate_rate", 0.0);
+
+    // Let fasthelper write its own aggregate into the run directory.
+    let (_, e, c) = run(&[
+        "concatenate", run_dir.join("a").to_str().unwrap(), run_dir.join("b").to_str().unwrap(),
+        "-o", run_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(c, 0, "{e}");
+    assert!(run_dir.join("report.json").is_file());
+
+    // Re-concatenating the whole directory must see exactly the two samples.
+    let (stdout, stderr, code) = run(&["concatenate", run_dir.to_str().unwrap(), "-o", d.join("out").to_str().unwrap(), "--stdout"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("from 2 sample(s)"),
+        "the aggregate must not add a phantom sample: {stdout}"
+    );
+    assert!(
+        !stdout.contains("run\tunknown"),
+        "fasthelper's own report.json must be skipped: {stdout}"
+    );
+}
+
+#[test]
+fn check_accepts_the_fastsim_step() {
+    // Regression (B4): `check`'s step list omitted fastsim, which `run` can
+    // execute, so check rejected a config run accepted.
+    let d = tmpdir("check_fastsim");
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(&fq, "@r1\nACGT\n+\nIIII\n").unwrap();
+    let cfg = d.join("fastsim.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"s\"\nsteps = [\"fastsim\"]\n\n[[samples]]\nname = \"s1\"\nr1 = \"{}\"\n",
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "check", "-c", cfg.to_str().unwrap(),
+        "--tools-dir", &std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()),
+    ]);
+    assert!(
+        !stderr.contains("unknown step"),
+        "fastsim must be a known step to check: {stderr}"
+    );
+    // Either it validates cleanly or it reports the (possibly absent) binary —
+    // never "unknown step".
+    if code != 0 {
+        assert!(stderr.contains("not found"), "unexpected failure: {stderr}");
+    }
+}
+
+/// A stand-in fastdedup: echoes its `--version`, copies the md5 of its -1
+/// input into its -o output and writes a v1 report. A stale (un-rerun) output
+/// is therefore visible as an unchanged md5.
+const FAKE_DEDUP: &str = r#"#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo "fastdedup 9.9.9"; exit 0; fi
+in=""; out=""; json=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -1) in="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
+    --json) json="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$(dirname "$out")" "$(dirname "$json")"
+md5sum "$in" > "$out"
+printf '{"schema":"fastsuite.report.v1","tool":"fastdedup","tool_version":"9.9.9","metrics":{"duplicate_rate":0.0}}\n' > "$json"
+"#;
+
+#[test]
+fn resume_reruns_when_an_input_changes_in_place() {
+    // Regression (B2): resume keyed only on (argv, binary, live version) and
+    // never looked at the inputs, so overwriting a sample's FASTQ in place let
+    // the next run "resume" and keep a report computed from the old reads.
+    let d = tmpdir("resume_stale");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let bin = tools.join("fastdedup");
+    std::fs::write(&bin, FAKE_DEDUP).unwrap();
+    let mut perm = std::fs::metadata(&bin).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&bin, perm).unwrap();
+
+    let out = d.join("run");
+    let fq = d.join("a.fq");
+    std::fs::write(&fq, "@r0\nACGTACGT\n+\nIIIIIIII\n").unwrap();
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"v\"\noutdir = \"{}\"\nsteps = [\"fastdedup\"]\n\n[[samples]]\nname = \"a\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, e1, c1) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap()]);
+    assert_eq!(c1, 0, "first run must succeed: {e1}");
+    let out_fq = out.join("a/a_dedup_R1.fastq.gz");
+    let after1 = std::fs::read_to_string(&out_fq).unwrap();
+
+    // Overwrite the input at the SAME path with different, longer reads.
+    std::fs::write(&fq, "@r0\nTTTTTTTTTTTTTTTTTTTT\n+\nIIIIIIIIIIIIIIIIIIII\n").unwrap();
+
+    let (stdout2, e2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap()]);
+    assert_eq!(c2, 0, "second run must succeed: {e2}");
+    assert!(
+        !stdout2.contains("resumed a/fastdedup"),
+        "a changed input must invalidate the resume, not reuse stale output: {stdout2}"
+    );
+    let after2 = std::fs::read_to_string(&out_fq).unwrap();
+    assert_ne!(after1, after2, "the output must be regenerated from the new reads");
+
+    // A third run with the input unchanged DOES resume (the fix must not
+    // disable resume, only make it input-sensitive).
+    let (stdout3, e3, c3) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap()]);
+    assert_eq!(c3, 0, "third run must succeed: {e3}");
+    assert!(
+        stdout3.contains("resumed a/fastdedup"),
+        "an unchanged input must still resume: {stdout3}"
+    );
+}

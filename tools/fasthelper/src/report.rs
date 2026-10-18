@@ -141,6 +141,15 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
     if !v.is_object() {
         return Ok(None);
     }
+    // fasthelper's own aggregate (report.json) carries the same schema string
+    // as a per-tool report but is a collection, not a measurement. Skip it by
+    // its generator/reports shape, so re-concatenating a run directory never
+    // turns fasthelper's report.json into a phantom sample.
+    if v.get("generator").and_then(|g| g.as_str()) == Some("fasthelper")
+        || v.get("reports").is_some_and(|r| r.is_array())
+    {
+        return Ok(None);
+    }
     let sample = sample_hint
         .map(str::to_string)
         .unwrap_or_else(|| sample_from_path(path));
@@ -732,26 +741,27 @@ impl Threshold {
     }
 }
 
-/// Evaluate thresholds against the aggregated metrics (last value wins).
-/// Returns the tripped descriptions, e.g. `polyG_frac=0.12 > 0.05`.
+/// Evaluate thresholds against EVERY report, not a flattened map.
+///
+/// Each tripped metric is returned labelled with the sample it came from, so a
+/// violation in one sample of a multi-sample run is never masked by another
+/// sample's value ("last wins" hid exactly that). Returns the tripped
+/// descriptions, e.g. `a: duplicate_rate=0.5 > 0.01`.
 pub fn evaluate_thresholds(reports: &[ToolReport], thresholds: &[Threshold]) -> Vec<String> {
-    let mut values: BTreeMap<String, f64> = BTreeMap::new();
-    for r in reports {
-        for (k, v) in &r.metrics {
-            values.insert(k.clone(), *v);
-        }
-    }
     let mut out = Vec::new();
-    for t in thresholds {
-        if let Some(actual) = values.get(&t.metric) {
-            if t.tripped(*actual) {
-                out.push(format!(
-                    "{}={} {} {}",
-                    t.metric,
-                    actual,
-                    t.op.as_str(),
-                    t.value
-                ));
+    for r in reports {
+        for t in thresholds {
+            if let Some(actual) = r.metrics.get(&t.metric) {
+                if t.tripped(*actual) {
+                    out.push(format!(
+                        "{}: {}={} {} {}",
+                        r.sample,
+                        t.metric,
+                        actual,
+                        t.op.as_str(),
+                        t.value
+                    ));
+                }
             }
         }
     }
