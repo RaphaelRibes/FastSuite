@@ -56,6 +56,9 @@ pub struct Cli {
     pub read_len: Option<u32>,
 
     /// Insert length mean (default 300). Ignored when the profile carries a measured insert CDF.
+    /// Inserts are measurable only up to 2 x read-len - 12 bp (288 bp at the
+    /// default 150 bp read length); above that ceiling the mates share no 12-base
+    /// anchor and the pair is reported as censored.
     #[arg(long, default_value_t = 300.0)]
     pub insert_mean: f64,
 
