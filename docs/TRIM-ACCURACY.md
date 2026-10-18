@@ -118,6 +118,33 @@ mates per tool per tolerance. Re-measured on the regenerated corpus.
 | fastp-tuned      | 19,849,862 | 80.4%     | 9.6%     | 10.0%     | 550,138   |
 | fastprep-shipped | 18,928,152 | 75.5%     | 22.5%    | 2.0%      | 1,471,848 |
 
+Read the `undertrim` column here only next to the decomposition below (full
+argument in §"What the undertrim figure actually contains"): **almost all of it
+is irreducible, not a defect.** Of fastprep-hd-off's 10.3%, **0.094 pp is
+recoverable** and **10.21 pp is not.**
+
+### Tolerance 0 (strict), undertrim decomposed
+
+`bench/scripts/trim_report.py`, output `bench/results/phase-d/trim-report-20261018.tsv`.
+"kept mates" = `scored`; shares are of `scored`. **Recoverable** = a failing
+mate whose ground-truth artefact is a clean G-run (no adapter, no N) whose
+*observed* run length has `P(artefact | r) > 0.5` in the measured posterior;
+**irreducible** = every other failing mate (P ≤ 0.5, or an adapter/N-run the
+posterior does not model). The totals reproduce the table above to the mate.
+
+| tool             | kept mates | exact      | overtrim | und-recoverable  | und-irreducible      | recoverable share |
+|------------------|------------|------------|----------|------------------|----------------------|-------------------|
+| fastprep-hd-off  | 18,945,051 | **89.09%** | 0.61%    | 17,793 (0.094%)  | 1,933,465 (10.21%)   | 0.91% of undertrim |
+| fastp-default    | 19,834,186 | 88.61%     | 0.76%    | 16,124 (0.081%)  | 2,091,973 (10.55%)   | 0.76%             |
+| fastp-tuned      | 19,849,862 | 80.37%     | 9.59%    | 13,538 (0.068%)  | 1,978,415 (9.97%)    | 0.68%             |
+| fastprep-shipped | 18,928,152 | 75.48%     | 22.55%   | 14,570 (0.077%)  | 358,848 (1.90%)      | 3.90%             |
+
+fastprep-shipped's recoverable *share* is the largest (3.90%) only because its
+unconditional leading-G rule already eats most short G-runs, leaving a
+disproportionately long-run residual — it is the worst tool overall, not the one
+with the most to fix. For every tool the recoverable class is under 1% of the
+undertrim bucket except fastprep-shipped's 3.9% residual.
+
 ### Tolerance 2 (forgiving)
 
 | tool             | exact     | overtrim | undertrim |
@@ -214,6 +241,32 @@ fastprep-hd-off win (virome, 87.3% vs 86.0%) is measured on a kept-set roughly
 substantially smaller (18.2% of virome reads dropped against fastp's 0.3%), so it
 is not an apples-to-apples comparison.
 
+### Read retention (kept vs total)
+
+`bench/scripts/trim_report.py --mode retention` reads the same TSV and reports
+`kept = scored`, `total = scored + dropped`, tolerance 0
+(`bench/results/phase-d/trim-retention-20261018.tsv`; the drop-share table above
+uses a different denominator, these are shares of *all* mates):
+
+| domain            | fastprep-hd-off kept/total | fastp-default kept/total | kept-set gap |
+|-------------------|----------------------------|--------------------------|--------------|
+| bacterial_isolate | 94.7% (3,218,614/3,400,000) | 92.0% (3,128,564)        | +2.6 pp      |
+| generalised       | 92.1% (3,131,038)          | 93.8% (3,189,934)        | −1.7 pp      |
+| human_gut         | 97.2% (3,305,267)          | 100.0% (3,399,744)       | −2.8 pp      |
+| metagenomics      | 99.5% (3,384,568)          | 100.0% (3,399,580)       | −0.4 pp      |
+| rna_seq           | 89.1% (3,029,509)          | 97.8% (3,325,108)        | −8.7 pp      |
+| virome            | 84.6% (2,876,055)          | 99.7% (3,391,256)        | −15.2 pp     |
+| **ALL**           | **92.87%** (18,945,051)    | **97.23%** (19,834,186)  | **−4.4 pp**  |
+
+fastprep-hd-off's exact rate is earned on **92.9%** of mates against fastp's
+**97.2%**. The asymmetry is concentrated, not uniform. The widest per-dataset
+gaps are all virome — **SRR20754397 retains 16.4%** against fastp's 100.0%
+(−83.6 pp), **SRR19649201 52.0%** vs 99.1%, **SRR17327626 57.3%** vs 100.0% — so
+the virome per-domain win (87.3% vs 86.0%) is the least apples-to-apples number
+in the table. The bacterial_isolate domain is the opposite case: fastprep keeps
+*more* (+2.6 pp) and still ties, which is the comparable-kept-set comparison the
+caveat is meant to isolate.
+
 ## Caveats
 
 - This measures agreement with the **simulator's artefact model**, not wet-lab
@@ -304,6 +357,16 @@ attached, or it misrepresents the trimmer by ~100×. The defensible claim is
 that the trimmer keeps those bases because they are majority biology, and that
 the ground truth can label them artefact only because a simulator injected them.
 
+`bench/scripts/trim_report.py` now produces this split mechanically
+(`bench/results/phase-d/trim-report-20261018.tsv`) and it reproduces the
+hand-derived figures above. Measured across all four tools, the recoverable
+class is **0.68–0.91%** of each tool's undertrim bucket (3.90% for
+fastprep-shipped's long-run residual). For fastprep-hd-off it is **17,793 mates
+— 0.91% of the 1,951,258 undertrimmed mates — worth +0.094 pp of tolerance-0
+exact rate**; the other 1,933,465 are irreducible. The recoverable set is
+essentially invariant to tolerance (17,793 at tolerance 0, 17,721 at 2), the
+signature of a long missed run rather than boundary jitter.
+
 ## Reproducing
 
 ```bash
@@ -318,6 +381,19 @@ python3 bench/scripts/trim_attribution.py    # bucket each failing mate by cause
 python3 bench/scripts/trim_posterior.py --end 5   # P(artefact | observed run length)
 python3 bench/scripts/trim_posterior.py --end 3
 ```
+
+`bench/scripts/trim_report.py` merges both into the decomposed table and the
+retention table. It re-runs the same four tools, so its `exact`/`overtrim`/
+`dropped` totals reproduce the TSV above to the mate, and it reuses
+`trim_posterior.py`'s `leading_g`/`trailing_g` (replicating its tabulation):
+
+```bash
+python3 bench/scripts/trim_report.py          # corpus + TSV -> both tables
+#   -> <results>/trim-report-<YYYYMMDD>.tsv, <results>/trim-retention-<YYYYMMDD>.tsv
+python3 bench/scripts/trim_report.py --mode retention   # TSV only; no corpus needed
+```
+
+It never overwrites an existing `.tsv` unless `--force` is passed.
 
 Both re-run fastprep and re-parse its PXMT, so their totals reproduce the TSV
 above. `overtrim_vs_fastp.py` **refuses to overwrite** an existing `--out`

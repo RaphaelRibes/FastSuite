@@ -1,0 +1,57 @@
+building posterior (imported trim_posterior.leading_g/trailing_g) ...
+  posterior from 102 datasets; 5' crossing at r=7, 3' crossing at r=6
+running tools ...
+  [10/102] DRR002643
+  [20/102] DRR000429
+  [30/102] DRR002506
+  [40/102] DRR455998
+  [50/102] DRR509062
+  [60/102] DRR083291
+  [70/102] DRR002131
+  [80/102] DRR015266
+  [90/102] SRR17163735
+  [100/102] SRR38668098
+=== RETENTION (mates kept / total), tolerance 0 ===
+total = kept + dropped; a tool's exact rate is earned on its own kept-set
+domain              fastprep-hd0 retained  fastp-default retained kept-set gap (pp)
+bacterial_isolate            94.7% (3218614)               92.0% (3128564)               2.6
+generalised                  92.1% (3131038)               93.8% (3189934)              -1.7
+human_gut                    97.2% (3305267)              100.0% (3399744)              -2.8
+metagenomics                 99.5% (3384568)              100.0% (3399580)              -0.4
+rna_seq                      89.1% (3029509)               97.8% (3325108)              -8.7
+virome                       84.6% (2876055)               99.7% (3391256)             -15.2
+ALL                          92.9% (18945051)               97.2% (19834186)              -4.4
+
+widest per-dataset kept-set asymmetries (fastprep-hd0 retained - fastp-default retained):
+  virome             SRR20754397   16.4% vs 100.0%  gap  -83.6 pp  (n=200000)
+  virome             SRR19649201   52.0% vs  99.1%  gap  -47.1 pp  (n=200000)
+  virome             SRR17327626   57.3% vs 100.0%  gap  -42.7 pp  (n=200000)
+  generalised        DRR013428     74.7% vs 100.0%  gap  -25.3 pp  (n=200000)
+  virome             SRR17327662   78.0% vs 100.0%  gap  -22.0 pp  (n=200000)
+  virome             SRR38668085   79.1% vs  99.9%  gap  -20.8 pp  (n=200000)
+  rna_seq            DRR015139     83.9% vs  99.9%  gap  -16.0 pp  (n=200000)
+  rna_seq            DRR015294     84.7% vs  99.9%  gap  -15.2 pp  (n=200000)
+
+wrote /tmp/trim-retention-20261018.tsv (408 rows)
+
+
+=== UNDERTRIM DECOMPOSITION (per tool) ===
+posterior: P(artefact | observed run length); imported trim_posterior.leading_g/trailing_g
+recoverable = clean G-run (no adapter, no N) whose observed run length has P>0.5;
+irreducible = every other failing mate (P<=0.5, or adapter/N-run)
+
+-- tolerance 0 ------------------------------------------------------------
+tool                     exact     overtrim      und-rec      und-irr      dropped
+fastprep-hd0          16877693       116100        17793      1933465      1454949
+fastp-default         17575859       150230        16124      2091973       565814
+fastp-tuned           15953729      1904180        13538      1978415       550138
+fastprep-hd4          14286730      4268004        14570       358848      1471848
+
+-- tolerance 2 ------------------------------------------------------------
+tool                     exact     overtrim      und-rec      und-irr      dropped
+fastprep-hd0          18766842        10041        17721       150447      1454949
+fastp-default         19531982       129965        16075       156164       565814
+fastp-tuned           17902557      1800789        13511       133005       550138
+fastprep-hd4          18637342       215216        14232        61362      1471848
+
+wrote /tmp/trim-report-20261018.tsv (8 rows)
