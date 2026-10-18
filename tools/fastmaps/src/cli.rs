@@ -30,12 +30,16 @@ pub struct Args {
 
     /// Approximate total RAM budget for the worker index buffer before it is
     /// spilled to the spiller thread (megabytes). Preview reads are streamed
-    /// to disk independently and do not count against it.
-    /// Measured on a real 5M-read library: ~141 MB peak RSS at the 512 MB
-    /// default, ~36 MB at 8 MB, wall time unchanged. The budget is divided
+    /// to disk independently and do not count against it. The budget is divided
     /// across workers, so an input file smaller than a worker's share is held
     /// whole without spilling.
-    #[arg(long, default_value = "512", value_name = "MB")]
+    ///
+    /// Measured: on a real 5M-read library ~141 MB peak RSS at 512 MB against
+    /// ~36 MB at 8 MB, and on 2M real reads 48.6 MB against 22.7 MB, at
+    /// unchanged wall time and byte-identical outputs — the default is 8 MB for
+    /// that reason. Raising it buys nothing unless the input is large enough for
+    /// a worker's share to bind.
+    #[arg(long, default_value = "8", value_name = "MB")]
     pub buffer_mb: usize,
 
     /// Write all output files into this directory (created if absent).
