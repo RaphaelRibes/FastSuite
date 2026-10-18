@@ -11,7 +11,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::adapter::{AdapterHint, AdapterSet};
+use crate::adapter::AdapterSet;
 
 // ---------------------------------------------------------------------------
 // MinLen — either an absolute base count or a fraction of read length L.
@@ -156,6 +156,17 @@ pub struct Params {
     pub match_leniency: f64,    // μ
     pub mismatch_strength: f64, // ν
     pub min_run: usize,         // m_h
+    /// Per-end override for the 3′-terminal run threshold (--min-run-3p).
+    /// `Some(n)` applies `n` to runs at the physical 3′ terminus only; the
+    /// 5′ end and the interior stay on `min_run`. `None` uses `min_run`
+    /// everywhere, which is byte-for-byte the pre-flag behaviour.
+    ///
+    /// A second threshold is warranted because `P(artefact | run length)`
+    /// is far higher at the 3′ end: it crosses 0.5 by r = 6 (0.54) there,
+    /// while the 5′ terminus stays near 0.28 through r = 4. One global
+    /// `min_run` sized to reject 5′ biology (12) therefore leaves genuine
+    /// 3′ artefacts of 6–11 untrimmed. See docs/TRIM-ACCURACY.md.
+    pub min_run_3p: Option<usize>,
     /// NovaSeq two-colour first-cycle G-dropout: a short (1–4 bp) leading
     /// G-run at the 5′ end with *normal* quality, so the quality-gated
     /// scan never sees it (it looks for the quality collapse of a long
@@ -164,6 +175,14 @@ pub struct Params {
     /// no mercy walk — before the scan runs. `n < min_run` keeps the
     /// scan in charge of longer runs. `None` disables the rule.
     pub head_dropout: Option<usize>,
+    /// Trim terminal runs of N (--trim-terminal-n, off by default). A run
+    /// of N at either physical terminus is an emission artefact — the
+    /// simulator emits them and no trimmer removes them, so they drive the
+    /// undertrim rate (docs/TRIM-ACCURACY.md). When set, exactly the
+    /// terminal run is removed as a hard trim, at both ends. N is a valid
+    /// ambiguity code inside biology, so an *interior* N-run is never
+    /// touched. `false` changes nothing.
+    pub trim_terminal_n: bool,
     pub rule: MatchRule,
     pub scan_5: bool,
     pub scan_3: bool,
@@ -218,7 +237,9 @@ impl Default for Params {
             match_leniency: 0.1,
             mismatch_strength: 0.5,
             min_run: 6,
+            min_run_3p: None,
             head_dropout: None,
+            trim_terminal_n: false,
             rule: MatchRule::Homopolymer,
             scan_5: true,
             scan_3: true,
@@ -538,6 +559,7 @@ fn streaming_walk<const FORWARD: bool>(
     bases: &[u8],
     quals: &[u8],
     params: &Params,
+    first_min_run: usize,
     win_start: usize,
     win_end: usize,
     rem_budget: usize,
@@ -640,11 +662,15 @@ fn streaming_walk<const FORWARD: bool>(
         }
 
         if gamma > params.mercy {
+            // The terminal sub-scan uses the end-specific threshold
+            // (--min-run-3p may lower it at the physical 3′ end); interior
+            // sub-scans always use the global min_run.
+            let sub_threshold = if first_subscan { first_min_run } else { params.min_run };
             let sub_trim = resolve_subscan(
                 k_curr,
                 m_curr,
                 StopMode::Mercy,
-                params.min_run,
+                sub_threshold,
                 run_span_curr,
                 params.boundary_anchored,
             );
@@ -681,7 +707,7 @@ fn streaming_walk<const FORWARD: bool>(
             k_curr,
             m_curr,
             StopMode::Boundary,
-            params.min_run,
+            first_min_run,
             run_span_curr,
             params.boundary_anchored,
         );
@@ -882,6 +908,29 @@ fn polyx_trim_inner(
         0
     };
     let t_front = t_front + head_trim;
+
+    // Terminal-N trim (--trim-terminal-n, off by default). Only the
+    // physical terminus is examined; N inside the read is a valid
+    // ambiguity code and is left for the scan, which (like any other
+    // homopolymer base) will only take it if it clears min_run. Folded
+    // into t_front/t_tail so it flows through the budget, the scan
+    // window, and the reported polyX counts exactly like a hard trim.
+    let (n_head, n_tail) = if params.trim_terminal_n {
+        let head = bases[..l].iter().take_while(|&&b| b == b'N').count();
+        // Clamp the tail to what is left after the head so an all-N read
+        // cannot double count against t_front.
+        let tail = bases[..l]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'N')
+            .count()
+            .min(l - head);
+        (head, tail)
+    } else {
+        (0, 0)
+    };
+    let t_front = t_front + n_head;
+    let t_tail = t_tail + n_tail;
     let sub_l = l - t_front - t_tail;
 
     // Hard trim alone consumes the read, or leaves nothing scannable.
@@ -907,6 +956,12 @@ fn polyx_trim_inner(
     }
     let rem_budget = delta_l - (t_front + t_tail);
 
+    // Per-end run threshold (--min-run-3p). min_run_5 is always the global
+    // value; min_run_3 is the 3′ override when set. `None` makes the two
+    // equal, so every expression below is unchanged by default.
+    let min_run_5 = params.min_run;
+    let min_run_3 = params.min_run_3p.unwrap_or(params.min_run);
+
     // ----- Two-tier cascade, tier 1 (paper §11, Prop "rejection test") -----
     //
     // Quality-blind rejection. The 5′ end-scan can be skipped when its
@@ -921,26 +976,28 @@ fn polyx_trim_inner(
     // mercy within w steps; with a budget cap ≤ w the walk could instead
     // fire the Budget short-circuit and DROP the read, so the skip must
     // not change that outcome.
-    let w = params
-        .min_run
-        .saturating_add(params.mercy.floor() as usize)
-        .saturating_sub(1);
+    let w = min_run_5.saturating_add(params.mercy.floor() as usize).saturating_sub(1);
+    // The 3′ end-scan may resolve on a lower threshold, so its rejection
+    // window is sized to *that* threshold: a window/need derived from a
+    // larger min_run could reject a scan the 3′ threshold would have
+    // trimmed, which is an unsound skip. Equal by default.
+    let w_3 = min_run_3.saturating_add(params.mercy.floor() as usize).saturating_sub(1);
     let scan_range_lo = t_front;
     let scan_range_hi = l - t_tail;
     let five_end_rejects = params.scan_5
         && prefilter_enabled()
-        && prefilter_end_rejects(bases, scan_range_lo, scan_range_hi, w, params.min_run);
+        && prefilter_end_rejects(bases, scan_range_lo, scan_range_hi, w, min_run_5);
     let interior_rejects = !params.scan_interior
         || prefilter_enabled()
-            && prefilter_interior_rejects(bases, scan_range_lo, scan_range_hi, w, params.min_run);
+            && prefilter_interior_rejects(bases, scan_range_lo, scan_range_hi, w, min_run_5);
     let three_end_rejects = params.scan_3
         && prefilter_enabled()
         && prefilter_end_rejects(
             bases,
-            scan_range_hi.saturating_sub(w + 1),
+            scan_range_hi.saturating_sub(w_3 + 1),
             scan_range_hi,
-            w,
-            params.min_run,
+            w_3,
+            min_run_3,
         );
 
     // Direction::Forward  — streaming pass = physical 5′,  reverse pass = physical 3′
@@ -954,18 +1011,39 @@ fn polyx_trim_inner(
     // Which end each pass actually scans, resolved against the physical
     // frame: the streaming pass's terminal window is the 5′ end in
     // Forward mode and the 3′ end in Reverse mode; the reverse pass is
-    // the other end.
-    let (stream_rejects, reverse_rejects) = match dir {
-        Direction::Forward => (five_end_rejects, three_end_rejects),
-        Direction::Reverse => (three_end_rejects, five_end_rejects),
-    };
+    // the other end. Everything end-specific — the run threshold, the
+    // rejection window, and which pass owns the physical 3′ end — follows
+    // the same split, so --min-run-3p lands on the 3′ terminus regardless
+    // of scan direction.
+    let (stream_rejects, reverse_rejects, stream_min_run, reverse_min_run, w_stream, w_reverse) =
+        match dir {
+            Direction::Forward => (
+                five_end_rejects,
+                three_end_rejects,
+                min_run_5,
+                min_run_3,
+                w,
+                w_3,
+            ),
+            Direction::Reverse => (
+                three_end_rejects,
+                five_end_rejects,
+                min_run_3,
+                min_run_5,
+                w_3,
+                w,
+            ),
+        };
 
     // The tier-1 pass is pure overhead when nothing will be scanned (e.g.
     // the bench `floor` stage: --no-5 --no-3 --no-interior). Only compute
     // it when at least one scan is enabled. Verified by profile: with all
     // scans off, `composition_prefilter_rejects` was 38% of floor runtime.
-    let prefiltered =
-        stream_enabled && w >= 2 && rem_budget > w && stream_rejects && interior_rejects;
+    let prefiltered = stream_enabled
+        && w_stream >= 2
+        && rem_budget > w_stream
+        && stream_rejects
+        && interior_rejects;
 
     // ----- Streaming forward pass -----
     //
@@ -1001,9 +1079,9 @@ fn polyx_trim_inner(
             dropped_by_budget: false,
         }
     } else if matches!(dir, Direction::Forward) {
-        streaming_walk::<true>(bases, quals, params, t_front, l - t_tail, rem_budget)
+        streaming_walk::<true>(bases, quals, params, stream_min_run, t_front, l - t_tail, rem_budget)
     } else {
-        streaming_walk::<false>(bases, quals, params, t_front, l - t_tail, rem_budget)
+        streaming_walk::<false>(bases, quals, params, stream_min_run, t_front, l - t_tail, rem_budget)
     };
 
     if stream_out.dropped_by_budget {
@@ -1055,7 +1133,7 @@ fn polyx_trim_inner(
     let upper = sub_l - 1;
 
     let reverse_budget = rem_budget.saturating_sub(first_trim);
-    let second_trim = if reverse_enabled && reverse_rejects && reverse_budget > w {
+    let second_trim = if reverse_enabled && reverse_rejects && reverse_budget > w_reverse {
         // Tier-1 rejection covers the reverse end-scan: its terminal window
         // has < m_h - 1 matches, so the pass would resolve to 0. Guard: the
         // pass's own budget cap is (rem_budget - first_trim), and a cap
@@ -1091,7 +1169,7 @@ fn polyx_trim_inner(
                 runs: vec![],
             };
         }
-        resolve_trim(res, params.min_run, params.boundary_anchored)
+        resolve_trim(res, reverse_min_run, params.boundary_anchored)
     } else {
         0
     };
@@ -1181,10 +1259,13 @@ pub struct TrimOutput {
 
 /// Full single-read processing: adapter detection then polyX trimming.
 ///
+/// Adapter detection is always sequence matching against `params.adapter`
+/// (the configured adapter set); `None` disables it. There is no other
+/// adapter source — PE overlap detection was removed, so mates are trimmed
+/// independently (see `pipeline.rs` and the `adapter` module docs).
+///
 /// Steps (single byte-stream pass design):
-/// 1. Adapter detection via `hint` — either [`AdapterHint::Override`]
-///    (from PE overlap, computed by the pipeline before calling here) or
-///    [`AdapterHint::Detect`] (sequence matching from `params.adapter`).
+/// 1. Adapter detection: `match_adapters` against `params.adapter`.
 /// 2. Budget check: if adapter trim alone exceeds Δ_L, return
 ///    `Drop { reason: Adapter }`.
 /// 3. polyX scan on the adapter-trimmed sub-slice with the remaining
@@ -1192,20 +1273,15 @@ pub struct TrimOutput {
 ///    `extra_committed` and `original_len` overrides are passed explicitly).
 /// 4. Reconstruct absolute coordinates (add `t5_adapter` back to all
 ///    interior-run positions).
-pub fn trim(bases: &[u8], quals: &[u8], params: &Params, hint: AdapterHint) -> TrimOutput {
+pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
     let l = bases.len();
 
-    // --- Step 1: adapter detection ---
-    let (t5_adapter, t3_adapter, adapter_name) = match hint {
-        AdapterHint::Override { t5, t3, name } => {
-            (t5, t3, if t5 > 0 || t3 > 0 { Some(name) } else { None })
-        }
-        AdapterHint::Detect => match params.adapter.as_deref() {
+    // --- Step 1: adapter detection (sequence matching) ---
+    let (t5_adapter, t3_adapter, adapter_name) = match params.adapter.as_deref() {
+        None => (0, 0, None),
+        Some(set) => match crate::adapter::match_adapters(bases, set) {
             None => (0, 0, None),
-            Some(set) => match crate::adapter::match_adapters(bases, set) {
-                None => (0, 0, None),
-                Some(m) => (m.t5, m.t3, Some(m.name)),
-            },
+            Some(m) => (m.t5, m.t3, Some(m.name)),
         },
     };
 
@@ -1855,6 +1931,140 @@ mod tests {
         };
         match polyx_trim(&seq, &q, &p) {
             TrimResult::Emit { t3_poly, .. } => assert_eq!(t3_poly, 0),
+            r => panic!("unexpected {:?}", r),
+        }
+    }
+
+    // ------- Per-end threshold (--min-run-3p) -----------------------------
+
+    #[test]
+    fn min_run_3p_lowers_only_the_3prime_threshold() {
+        // A 7-base 3′ G-run. At the shipped global m_h = 12 it is left
+        // alone; --min-run-3p 6 accepts it, because P(artefact|r) at the
+        // 3′ end is already 0.70 by r = 7 (docs/TRIM-ACCURACY.md).
+        let mut b = b"ACGT".repeat(36); // 144 clean bases
+        b.extend(std::iter::repeat(b'G').take(7));
+        let q = vec![40u8; b.len()];
+
+        let base = Params {
+            min_run: 12,
+            ..Default::default()
+        };
+        match polyx_trim(&b, &q, &base) {
+            TrimResult::Emit { t3_poly, .. } => {
+                assert_eq!(t3_poly, 0, "7-base 3′ run is below m_h = 12")
+            }
+            r => panic!("unexpected {:?}", r),
+        }
+
+        let p = Params {
+            min_run: 12,
+            min_run_3p: Some(6),
+            ..Default::default()
+        };
+        match polyx_trim(&b, &q, &p) {
+            TrimResult::Emit { t3_poly, .. } => {
+                assert!(t3_poly >= 7, "3′ run must be trimmed, t3_poly = {}", t3_poly)
+            }
+            r => panic!("unexpected {:?}", r),
+        }
+    }
+
+    #[test]
+    fn min_run_3p_leaves_short_5prime_run_alone() {
+        // A 3-base 5′ run is majority biology (P ≈ 0.28) and the override
+        // is 3′-only, so it is never trimmed — with or without the flag.
+        let mut b = vec![b'A'; 3];
+        b.extend_from_slice(b"CGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGTCGT");
+        let q = vec![40u8; b.len()];
+        for min_run_3p in [None, Some(6)] {
+            let p = Params {
+                min_run: 12,
+                min_run_3p,
+                ..Default::default()
+            };
+            match polyx_trim(&b, &q, &p) {
+                TrimResult::Emit { t5_poly, .. } => assert_eq!(
+                    t5_poly, 0,
+                    "3-base 5′ run trimmed (min_run_3p = {:?})",
+                    min_run_3p
+                ),
+                r => panic!("unexpected {:?}", r),
+            }
+        }
+    }
+
+    // ------- Terminal-N trimming (--trim-terminal-n) ----------------------
+
+    #[test]
+    fn trim_terminal_n_off_by_default_on_demand() {
+        // A 4-base terminal N-run is below every polyX threshold, so only
+        // --trim-terminal-n removes it. Off must change nothing.
+        let clean = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"; // 52
+
+        let mut b5 = vec![b'N'; 4];
+        b5.extend_from_slice(clean);
+        let q5 = vec![40u8; b5.len()];
+
+        let off = Params {
+            min_run: 12,
+            ..Default::default()
+        };
+        match polyx_trim(&b5, &q5, &off) {
+            TrimResult::Emit {
+                t5_poly, t3_poly, ..
+            } => assert_eq!((t5_poly, t3_poly), (0, 0), "off must change nothing"),
+            r => panic!("unexpected {:?}", r),
+        }
+
+        let on = Params {
+            min_run: 12,
+            trim_terminal_n: true,
+            ..Default::default()
+        };
+        match polyx_trim(&b5, &q5, &on) {
+            TrimResult::Emit {
+                t5_poly, t3_poly, ..
+            } => assert_eq!((t5_poly, t3_poly), (4, 0), "the 4-base 5′ N-run is removed exactly"),
+            r => panic!("unexpected {:?}", r),
+        }
+
+        // 3′ terminal N-run, same rule at the other end.
+        let mut b3 = clean.to_vec();
+        b3.extend_from_slice(b"NNNN");
+        let q3 = vec![40u8; b3.len()];
+        match polyx_trim(&b3, &q3, &on) {
+            TrimResult::Emit {
+                t5_poly, t3_poly, ..
+            } => assert_eq!((t5_poly, t3_poly), (0, 4), "the 4-base 3′ N-run is removed exactly"),
+            r => panic!("unexpected {:?}", r),
+        }
+    }
+
+    #[test]
+    fn trim_terminal_n_never_touches_internal_n() {
+        // N inside the read is a valid ambiguity code: --trim-terminal-n
+        // must leave it alone, and it is below m_h so the scan does too.
+        let mut b = b"ACGTACGTACGTACGTACGTAC".to_vec(); // 22, ends C
+        b.extend_from_slice(b"NNNN");
+        b.extend_from_slice(b"CGTACGTACGTACGTACGTACGTACGT"); // 27, ends T
+        let q = vec![40u8; b.len()];
+        let p = Params {
+            min_run: 12,
+            trim_terminal_n: true,
+            ..Default::default()
+        };
+        match polyx_trim(&b, &q, &p) {
+            TrimResult::Emit {
+                t5_poly,
+                t3_poly,
+                runs,
+                ..
+            } => {
+                assert_eq!((t5_poly, t3_poly), (0, 0), "internal N is not a terminal trim");
+                let h_int: usize = runs.iter().map(|(_, l)| l).sum();
+                assert_eq!(h_int, 0, "4-base internal N-run is below m_h: {:?}", runs);
+            }
             r => panic!("unexpected {:?}", r),
         }
     }

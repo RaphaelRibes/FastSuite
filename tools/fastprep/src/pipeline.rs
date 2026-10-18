@@ -27,7 +27,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::adapter::AdapterHint;
 use crate::algorithm::{trim, DropReason, Params, TrimOutput, TrimResult};
 use crate::cli::Runtime;
 use crate::dedup::{AnchorSpec, Fingerprint, Seen, Verifier};
@@ -182,7 +181,7 @@ fn process_chunk(
     let work = |input: ScanInput| -> Processed {
         let seq = &buf.seq[input.seq.clone()];
         let qual = &buf.qual[input.qual.clone()];
-        let output = trim(seq, qual, params, AdapterHint::Detect);
+        let output = trim(seq, qual, params);
         Processed { input, output }
     };
     if parallel {
@@ -986,8 +985,8 @@ fn pair_chunks(
         let q1 = &buf1.qual[i1.qual.clone()];
         let s2 = &buf2.seq[i2.seq.clone()];
         let q2 = &buf2.qual[i2.qual.clone()];
-        let out1 = trim(s1, q1, params_r1, AdapterHint::Detect);
-        let out2 = trim(s2, q2, params_r2, AdapterHint::Detect);
+        let out1 = trim(s1, q1, params_r1);
+        let out2 = trim(s2, q2, params_r2);
         ProcessedPair {
             p1: Processed {
                 input: i1,

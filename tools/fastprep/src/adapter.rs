@@ -1,16 +1,13 @@
 //! Adapter detection and trimming.
 //!
-//! Two modes:
-//!
-//! * **Sequence matching** (SE and PE fallback): slide the adapter over the
-//!   3′ end of the read, accept the largest overlap that passes the
-//!   mismatch-rate threshold.  O(L × A) per read; negligible for Illumina
-//!   read/adapter lengths.
-//!
-//! * **PE overlap** (PE primary): compare the suffix of R1 with the reverse-
-//!   complement prefix of R2.  When the insert is shorter than the read,
-//!   the overlap reveals both the insert size and the adapter boundaries
-//!   without needing to know the adapter sequence.
+//! **Sequence matching** is the only mode: slide each adapter over the read,
+//! accept the largest overlap that passes the mismatch-rate threshold, and
+//! trim from the match position. O(L × A) per read; negligible for Illumina
+//! read/adapter lengths. Mates are trimmed independently — there is no
+//! cross-mate inference — so PE overlap detection (which once compared the
+//! R1 suffix with the reverse-complement R2 prefix to infer the insert) has
+//! been removed; the adapter sequence comes from the configured set and
+//! nowhere else.
 //!
 //! Auto-detection samples the first 10 k reads, counts catalogue 12-mers at
 //! every offset (not just the 3′ end — a read that runs through the adapter into
@@ -178,21 +175,12 @@ static BASE2: [u8; 256] = {
 /// Result of a successful adapter match on one read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterMatch {
-    /// Name of the matched adapter (or "pe-overlap").
+    /// Name of the matched adapter.
     pub name: String,
     /// Bases to trim from the 5′ end of this read.
     pub t5: usize,
     /// Bases to trim from the 3′ end of this read.
     pub t3: usize,
-}
-
-/// How to supply adapter information to [`crate::algorithm::trim`].
-#[derive(Debug, Clone)]
-pub enum AdapterHint {
-    /// Run internal sequence matching from `params.adapter`.
-    Detect,
-    /// Pre-computed adapter trim (from PE overlap); skip internal matching.
-    Override { t5: usize, t3: usize, name: String },
 }
 
 // ---------------------------------------------------------------------------

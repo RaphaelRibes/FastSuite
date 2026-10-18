@@ -136,12 +136,16 @@ pub struct Cli {
     /// Recommend the trimming config from a fastcheck QC report of the input
     /// (`fastcheck --json qc.json R1 R2`). Requires --print-args.
     ///
-    /// REFUSES until a Phase D model file exists: the shipped default is
-    /// already the swept winner on the current corpus, so there is nothing
-    /// to switch on (docs/AUTO-PARAMS.md). This is the honest surface for
-    /// `fastprep --auto-params <qc.json> --print-args` — the flag parses,
-    /// validates the QC path, and refuses with a message pointing at the
-    /// doc, exactly as CLI-SPEC §1 rule 4 requires of a correct refusal.
+    /// REFUSES until a Phase D model file exists. The shipped default is
+    /// NOT the swept winner on the current corpus: over 101 real ENA
+    /// datasets it is the per-dataset winner on 1 of 101, and a per-dataset
+    /// winner from the 55-config grid beats it on the other 100, so there
+    /// is real signal to switch on but no model trained on a corpus large
+    /// enough to beat the default on held-out studies (docs/AUTO-PARAMS.md).
+    /// This is the honest surface for `fastprep --auto-params <qc.json>
+    /// --print-args` — the flag parses, validates the QC path, and refuses
+    /// with a message pointing at the doc, exactly as CLI-SPEC §1 rule 4
+    /// requires of a correct refusal.
     #[arg(long, value_name = "QC.json", help_heading = "Model Recommendation")]
     pub auto_params: Option<PathBuf>,
 
@@ -194,6 +198,19 @@ pub struct Cli {
     #[arg(long, default_value_t = 12, value_name = "N", help_heading = "PolyX Trimming")]
     pub min_run: usize,
 
+    /// 3′-terminal minimum run, overriding --min-run at the 3′ end only
+    /// (the 5′ end and the interior keep --min-run). Omit to use --min-run
+    /// everywhere — the default, and byte-for-byte the old behaviour.
+    ///
+    /// A single global threshold cannot be right at both ends: measured
+    /// P(artefact | run length) at the 3′ terminus crosses 0.5 by r=6
+    /// (0.54), so a --min-run sized to reject short 5′ biology (12) leaves
+    /// genuine 3′ artefacts of 6–11 behind, while lowering the global value
+    /// would start trimming 5′ biology (P ≈ 0.28). Lower this to ~6 to
+    /// recover those 3′ runs. See docs/TRIM-ACCURACY.md.
+    #[arg(long, value_name = "N", help_heading = "PolyX Trimming")]
+    pub min_run_3p: Option<usize>,
+
     /// Trim the NovaSeq first-cycle 5′ G-dropout: a short (1..=N) leading
     /// G-run with normal quality is removed exactly, no quality gate.
     /// Must be < --min-run so the scan stays in charge of long runs.
@@ -212,6 +229,14 @@ pub struct Cli {
     /// bench/results/phase-d/head-dropout-axis.tsv.
     #[arg(long, value_name = "N", default_value = "0", help_heading = "PolyX Trimming")]
     pub head_dropout: Option<usize>,
+
+    /// Trim runs of N at the 5′ and/or 3′ terminus only (off by default).
+    /// A terminal N-run is an emission artefact that no trimmer removes, so
+    /// it drives the undertrim rate; this removes exactly the terminal run
+    /// as a hard trim, at both ends. An *interior* N-run is never touched —
+    /// N is a valid ambiguity code inside biology. See docs/TRIM-ACCURACY.md.
+    #[arg(long, help_heading = "PolyX Trimming")]
+    pub trim_terminal_n: bool,
 
     /// Target letter for anchored mode (repeatable, max 5 distinct).
     /// Omit for generic polyX (match on identical neighbours).
@@ -607,6 +632,9 @@ impl Cli {
             }
         };
         if self.min_run < 2 { bail!("--min-run must be ≥ 2"); }
+        if let Some(n) = self.min_run_3p {
+            if n < 2 { bail!("--min-run-3p must be ≥ 2"); }
+        }
         if let Some(hd) = self.head_dropout {
             // 0 disables the rule (see the field docs): the scan then owns
             // every leading run, which is the only way to avoid trimming a
@@ -746,7 +774,9 @@ impl Cli {
             match_leniency: self.match_leniency,
             mismatch_strength: self.mismatch_strength,
             min_run: self.min_run,
+            min_run_3p: self.min_run_3p,
             head_dropout: self.head_dropout,
+            trim_terminal_n: self.trim_terminal_n,
             rule,
             scan_5: !self.no_5,
             scan_3: !self.no_3,
@@ -1023,6 +1053,19 @@ mod tests {
         assert!(cli.no_dedup);
         assert!(cli.no_auto_phred);
         assert!(cli.interior);
+    }
+
+    #[test]
+    fn per_end_and_terminal_n_flags_default_off() {
+        // Opt-in flags: the shipped default must leave both unset so a bare
+        // invocation behaves exactly as before they existed.
+        use clap::Parser;
+        let cli = Cli::parse_from(["fastprep", "-1", "in.fq", "-o", "out.fq"]);
+        assert_eq!(
+            cli.min_run_3p, None,
+            "--min-run-3p ships unset (global --min-run everywhere)"
+        );
+        assert!(!cli.trim_terminal_n, "--trim-terminal-n ships off");
     }
 }  
 
