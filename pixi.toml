@@ -7,7 +7,17 @@ channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64"]
 
 [dependencies]
-rust = ">=1.85,<1.96"
+# 1.99 measured 1.44x FASTER than 1.95 on identical source (fastcheck, 5M reads,
+# same idle machine, 3 reps interleaved: 74.35 s vs 107.25 s, memory identical).
+# The old ">=1.85,<1.96" pin was therefore costing ~31% of the suite's speed.
+#
+# THE PIN ALONE DOES NOT DETERMINE THE COMPILER. A build that invokes the env's
+# cargo binary *directly* resolves `rustc` from PATH and silently links with
+# whatever is installed system-wide -- that is how the same source produced two
+# binaries 1.44x apart on two machines, with nothing in either log recording it.
+# Always build through `pixi run` (which puts the env's bin first), and verify
+# with `md5sum` that a rebuild actually changed the binary.
+rust = ">=1.99,<2"
 pkg-config = "*"
 c-compiler = "*"
 cmake = "*"       # flate2's zlib-ng builds from source
