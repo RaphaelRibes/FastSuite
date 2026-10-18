@@ -102,6 +102,30 @@ except Exception:  # pragma: no cover - fallback keeps the script runnable
 TOOLS = ("fastprep-hd0", "fastp-default", "fastp-tuned", "fastprep-hd4")
 
 
+# --------------------------------------------------------------------------
+# MEASUREMENT-ONLY extra fastprep configs (opt-in flags under test)
+# --------------------------------------------------------------------------
+# FASTPREP_VARIANTS is a JSON list of [tag, [args…]] entries. Each entry runs
+# fastprep once more per dataset with the winner's own config, `--head-dropout
+# 0` (the published baseline) and these extra args appended. UNSET/empty (the
+# default) registers NOTHING: the decomposition then runs the same four
+# configs, in the same order, with the same argv, as the published table.
+#   FASTPREP_VARIANTS='[["fp-3p6",["--min-run-3p","6"]], \
+#                       ["fp-n",["--trim-terminal-n"]]]' python3 trim_report.py …
+VARIANTS = []
+
+
+def load_variants():
+    raw = os.environ.get("FASTPREP_VARIANTS", "").strip()
+    if not raw:
+        return []
+    import json
+    out = []
+    for tag, args in json.loads(raw):
+        out.append((str(tag), [str(a) for a in args]))
+    return out
+
+
 def gt_full(path):
     """-> {pair_id: (r1_h, r1_t, r2_h, r2_t, r1_ad, r2_ad, r1_n, r2_n)}
 
@@ -182,7 +206,7 @@ def classify(t5, t3, h, t, ad, n, obs5, obs3, p5, p3, tol):
     return "irr"
 
 
-def decomp(winners, work, results, p5, p3, limit):
+def decomp(winners, work, results, p5, p3, limit, run_fastp=True):
     """Run every tool on every dataset; return per (tool, tol) counters."""
     if limit:
         winners = winners[:limit]
@@ -213,11 +237,16 @@ def decomp(winners, work, results, p5, p3, limit):
             base += ["--interior"]
 
         # ---- fastprep-hd0 and fastprep-hd4 (PXMT gives exact cuts) ----
-        for tag, hdv in (("fastprep-hd0", 0), ("fastprep-hd4", H.eff_hd(w))):
+        # The two published configs keep their exact argv; VARIANTS add opt-in
+        # flag sets on top of the newer of them (head-dropout 0).
+        fp_tools = [("fastprep-hd0", ["--head-dropout", "0"]),
+                    ("fastprep-hd4", ["--head-dropout", str(H.eff_hd(w))])]
+        fp_tools += [(tag, ["--head-dropout", "0"] + args) for tag, args in VARIANTS]
+        for tag, hd_args in fp_tools:
             px = f"{d}/{tag}.pxmt"
             r = subprocess.run([H.FP, "-1", s1, "-2", s2, "-o", f"{d}/{tag}_1.fq.gz",
                                 "-p", f"{d}/{tag}_2.fq.gz", "--metadata", px]
-                               + base + ["--head-dropout", str(hdv)],
+                               + base + hd_args,
                                capture_output=True)
             if r.returncode != 0:
                 print(f"  [{i}] {acc} {tag}: rc={r.returncode}", file=sys.stderr,
@@ -239,7 +268,8 @@ def decomp(winners, work, results, p5, p3, limit):
                     c[(tag, tol)][k] += 1
 
         # ---- fastp-default and fastp-tuned (cuts recovered by alignment) ----
-        for tag, extra in (("fastp-default", []), ("fastp-tuned", H.FASTP_TUNED)):
+        for tag, extra in ((("fastp-default", []), ("fastp-tuned", H.FASTP_TUNED))
+                           if run_fastp else ()):
             o1, o2 = f"{d}/{tag}_1.fastq.gz", f"{d}/{tag}_2.fastq.gz"
             r = subprocess.run([H.FASTP, "-i", s1, "-I", s2, "-o", o1, "-O", o2,
                                 "-w", "4", "-z", "6"] + extra, capture_output=True)
@@ -269,6 +299,10 @@ def decomp(winners, work, results, p5, p3, limit):
                     c[(tag, tol)][classify(cuts[0], cuts[1], h, t, ad, n,
                                            leading_g(seq), trailing_g(seq),
                                            p5, p3, tol)] += 1
+        # measurement-only: every config's PXMT/FASTQ for this dataset has been
+        # scored above, so free it — a 102-dataset × 6-config run otherwise
+        # fills /tmp (overtrim_vs_fastp.py does the same). Numbers unaffected.
+        subprocess.run(["rm", "-rf", d], capture_output=True)
         if i % 10 == 0:
             print(f"  [{i}/{len(winners)}] {acc}", file=sys.stderr, flush=True)
     return c
@@ -347,7 +381,7 @@ def cmd_retention(tsv, out):
     print(f"\nwrote {out} ({len(tsv_rows)} rows)")
 
 
-def cmd_decomp(winners, work, results, limit, tol_show, out):
+def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
     print(f"building posterior ({_POSTERIOR_SRC}) ...", file=sys.stderr, flush=True)
     p5, p3, tab5, tab3, used = build_posterior(winners, work, limit)
     print(f"  posterior from {used} datasets; "
@@ -355,7 +389,7 @@ def cmd_decomp(winners, work, results, limit, tol_show, out):
           f"3' crossing at r={next((r for r in sorted(p3) if p3[r] > 0.5), None)}",
           file=sys.stderr, flush=True)
     print("running tools ...", file=sys.stderr, flush=True)
-    c = decomp(winners, work, results, p5, p3, limit)
+    c = decomp(winners, work, results, p5, p3, limit, run_fastp=run_fastp)
 
     lines = []
     lines.append("=== UNDERTRIM DECOMPOSITION (per tool) ===")
@@ -371,7 +405,8 @@ def cmd_decomp(winners, work, results, limit, tol_show, out):
         lines.append(f"-- tolerance {tol} " + "-" * 60)
         lines.append(f"{'tool':17} {'exact':>12} {'overtrim':>12} "
                      f"{'und-rec':>12} {'und-irr':>12} {'dropped':>12}")
-        for tag in TOOLS:
+        for tag in (["fastprep-hd0", "fastprep-hd4"] + [t for t, _ in VARIANTS]
+                    + ["fastp-default", "fastp-tuned"]):
             s = c[(tag, tol)]
             tot = s["exact"] + s["overtrim"] + s["rec"] + s["irr"] + s["unaligned"]
             if tot == 0:
@@ -401,12 +436,21 @@ def main():
     ap.add_argument("--mode", choices=["both", "retention", "decomp"], default="both")
     ap.add_argument("--limit", type=int, default=0,
                     help="scope the decomposition to the first N datasets (timing)")
+    ap.add_argument("--no-fastp", action="store_true",
+                    help="skip the two fastp configs (time); decomposition then "
+                         "covers fastprep configs only")
     ap.add_argument("--tol", type=int, action="append", default=None,
                     help="tolerance to print (repeatable; default 0 and 2)")
     ap.add_argument("--out", default=None, help="decomposition TSV (default dated)")
     ap.add_argument("--out-retention", default=None, help="retention TSV (default dated)")
     ap.add_argument("--force", action="store_true", help="overwrite existing outputs")
     a = ap.parse_args()
+
+    global VARIANTS
+    VARIANTS = load_variants()
+    if VARIANTS:
+        print(f"extra fastprep configs (FASTPREP_VARIANTS): "
+              f"{[t for t, _ in VARIANTS]}", file=sys.stderr)
 
     date = datetime.date.today().strftime("%Y%m%d")
     tsv = a.tsv or f"{a.results}/overtrim-vs-fastp.tsv"
@@ -434,7 +478,8 @@ def main():
                      f"(decomposition needs the ground-truth corpus; "
                      f"use --mode retention without it)")
         print("")
-        cmd_decomp(winners, a.work, a.results, a.limit, tols, out_dec)
+        cmd_decomp(winners, a.work, a.results, a.limit, tols, out_dec,
+                   run_fastp=not a.no_fastp)
 
 
 if __name__ == "__main__":

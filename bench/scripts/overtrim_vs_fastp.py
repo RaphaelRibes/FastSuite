@@ -19,12 +19,20 @@ Read keying is identical for both: the pair id comes from the sim header
 (x + 10000*y), verified against the GT, so neither tool is advantaged by the
 pairing.
 """
-import argparse, collections, csv, gzip, os, struct, subprocess, sys
+import argparse, collections, csv, gzip, os, shlex, struct, subprocess, sys
 
 W = "/mnt/Fast/fastsuite-scratch/work"
 R = "/mnt/Fast/fastsuite-scratch/results"
 FP = "/home/raphael/FastSuite/tools/fastprep/target/release/fastprep"
 FASTP = "/home/raphael/.local/bin/fastp"
+
+# MEASUREMENT-ONLY hook: extra fastprep args, shell-quoted, appended after the
+# winner's own config and after `--head-dropout`. UNSET (the default) is a
+# no-op: every invocation below is then byte-for-byte the published one, so
+# the four baseline configs stay reproducible to the mate. Set it to score an
+# opt-in flag on the same corpus, same ground truth, same read keying:
+#   FASTPREP_EXTRA_ARGS="--min-run-3p 6 --trim-terminal-n" python3 ...
+FP_EXTRA = shlex.split(os.environ.get("FASTPREP_EXTRA_ARGS", ""))
 
 FASTP_TUNED = ["--cut_front", "--cut_front_window_size", "5",
                "--cut_front_mean_quality", "20", "--cut_tail",
@@ -285,7 +293,7 @@ def main():
             px = f"{d}/{tag}.pxmt"
             r = subprocess.run([FP, "-1", s1, "-2", s2, "-o", f"{d}/{tag}_R1.fq.gz",
                                 "-p", f"{d}/{tag}_R2.fq.gz", "--metadata", px]
-                               + argv, capture_output=True)
+                               + argv + FP_EXTRA, capture_output=True)
             if r.returncode != 0:
                 print(f"  [{i}] {acc} {tag}: rc={r.returncode}", flush=True)
                 continue

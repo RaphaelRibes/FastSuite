@@ -267,6 +267,67 @@ in the table. The bacterial_isolate domain is the opposite case: fastprep keeps
 *more* (+2.6 pp) and still ties, which is the comparable-kept-set comparison the
 caveat is meant to isolate.
 
+## The two opt-in flags: measured, and neither pays
+
+Two flags were added on the hypothesis that the recoverable class above could be
+taken (`--min-run-3p`, a separate 3′ threshold; `--trim-terminal-n`). Both were
+then measured over the whole corpus, 102 datasets / 20.4 M mates, against the
+same ground truth (`bench/results/phase-d/trim-report-flags-20261018.tsv`,
+`fastprep-flags-analysis-20261018.tsv`; the baseline rows reproduce the table
+above to the mate). **Neither converts undertrim into exact — both convert it
+into overtrim, and both lose exact mates.**
+
+| config (tolerance 0) | exact | overtrim | und-recoverable | und-irreducible | kept | Δ exact |
+|---|---|---|---|---|---|---|
+| `--head-dropout 0` (baseline) | 16,877,693 | 116,100 | 17,793 | 1,933,465 | 92.868% | — |
+| `+ --min-run-3p 6` | 16,674,168 | 352,879 | 3,352 | 1,912,710 | 92.858% | **−1.074 pp** |
+| `+ --trim-terminal-n` | 16,776,348 | 232,594 | 17,793 | 1,917,211 | 92.863% | **−0.535 pp** |
+| `+ both` | 16,575,521 | 466,384 | 3,352 | 1,896,784 | 92.853% | **−1.595 pp** |
+
+Trade made explicit: `--min-run-3p 6` buys −35,196 undertrim with +236,779
+overtrim — one exact mate lost per ~1.4 "gained". Both flags are off by default
+and should stay off. Their `--help` text carries this verdict.
+
+### Why — a census of the premise, not a trimmer comparison
+
+`bench/scripts/premise_census.py` reads the raw reads and the ground truth only
+(no trimmer involved) and asks, per terminal homopolymer, whether the ground
+truth moves that boundary at all. That is the ceiling for any run-length rule:
+
+| 3′ terminal run | mates | P(GT moves that end) |
+|---|---|---|
+| **G** r=6 | 12,111 | **0.5361** |
+| **G** r=7 | 7,435 | 0.6975 |
+| **G** r=8 | 4,409 | 0.7521 |
+| A / C / T r=6 | 5,418 / 3,582 / 5,319 | **0.0002 / 0.0006 / 0.0002** |
+| N, r=1..>15, either end | 66,583 mate-ends | **0.0000** |
+
+Two conclusions, both fatal to the flags as built:
+
+1. **The posterior is a polyG posterior, but `--min-run` is a generic polyX
+   threshold.** Short 3′ A/C/T runs are artefacts once in ~2,000; lowering the
+   threshold for the run length alone therefore trims biology. G-runs are the
+   only end class where the 6–11 band is majority-artefact, and the whole of it
+   is worth +0.094 pp.
+2. **`--trim-terminal-n` cannot win on this corpus, structurally.** `fastsim`
+   places N *inside* the biology window, so no terminal N-run is ever an
+   artefact to remove: 66,583 mate-ends carry one, the ground truth moves the
+   boundary for none. The earlier "2.9% of undertrim is N-runs" observation is
+   correct, and `trim_report.py` already classed those mates **irreducible** —
+   the inference that trimming them recovers mates was the error.
+
+A second, independent effect compounds (1): a lower 3′ threshold shrinks the 3′
+rejection window, so the reverse scan engages on reads it previously rejected
+and overshoots boundaries that were already correct (on one dataset 1,771 of
+3,046 moved mates had been exact). Any future attempt at the 3′ band must keep
+the window sized to the global `min_run` and lower only the terminal sub-scan
+threshold, and it must be G-specific.
+
+**The undertrim direction is closed**: its recoverable ceiling is +0.094 pp, and
+every instrument tried against it so far costs at least 11× that in overtrim.
+
+
+
 ## Caveats
 
 - This measures agreement with the **simulator's artefact model**, not wet-lab
