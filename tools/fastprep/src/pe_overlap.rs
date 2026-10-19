@@ -222,13 +222,58 @@ pub fn detect_pe_overlap(
 /// `(t5_adapter, t3_adapter)`. The boundary falls at position `I` on both
 /// mates, and each mate's adapter is read 3′, so both receive `(0, L - I)`.
 /// Returns `None` when nothing is detected.
+///
+/// `adapter_set` is the configured adapter set, or `None` when adapter trimming
+/// is disabled. When it is supplied, the boundary is applied **only if the
+/// readthrough past it actually matches an adapter** -- see
+/// [`readthrough_is_adapter`]. This is what keeps the mode from trimming
+/// biology: an overlap proves where the fragment ends, not that anything was
+/// ligated past it.
 pub fn detect_pe_overlap_trim(
     r1: &[u8],
     r2: &[u8],
     anchor: usize,
+    adapter_set: Option<&crate::adapter::AdapterSet>,
 ) -> Option<(usize /* t5 */, usize /* t3 */)> {
     let (_, readthrough) = detect_pe_overlap(r1, r2, anchor)?;
+    if let Some(set) = adapter_set {
+        if !readthrough_is_adapter(r1, readthrough, set) {
+            // The mates overlap, but the sequence past the boundary is not
+            // adapter: there is nothing to trim. Falling through to the
+            // ordinary path (which will also find no adapter) is the safe
+            // action, and it is what keeps the mode inert on adapter-free
+            // libraries -- the Cell A guard.
+            return None;
+        }
+    }
     Some((0, readthrough))
+}
+
+/// Is the `readthrough` bases at the 3′ end of `seq` an adapter that *starts at*
+/// the overlap boundary?
+///
+/// The overlap gives the boundary; this asks whether the adapter begins exactly
+/// there. That distinction is the whole guard: a tail that merely *contains* an
+/// adapter fragment further in is ordinary sequence as far as this mate is
+/// concerned, and applying the PE boundary to it trims biology. (A real tail can
+/// legitimately contain a partial adapter internally -- a 38-base random tail hits
+/// a 14-base adapter prefix by chance -- which is why "contains" is not enough.)
+///
+/// Requires the adapter's own start to coincide with the boundary: the matched
+/// position within the tail must be 0.
+pub fn readthrough_is_adapter(
+    seq: &[u8],
+    readthrough: usize,
+    set: &crate::adapter::AdapterSet,
+) -> bool {
+    if readthrough == 0 || readthrough > seq.len() {
+        return false;
+    }
+    let tail = &seq[seq.len() - readthrough..];
+    match crate::adapter::match_adapters(tail, set) {
+        Some(m) => m.t3 == readthrough,
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +284,7 @@ pub fn detect_pe_overlap_trim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::{Adapter, AdapterSet};
 
     fn dna(len: usize, seed: u64) -> Vec<u8> {
         let mut x = seed | 1;
@@ -270,7 +316,32 @@ mod tests {
         let (r1, r2) = pair(100, 60, 5);
         assert_eq!(detect_pe_overlap(&r1, &r2, ANCHOR), Some((1, 40)));
         assert_eq!(detect_pe_overlap(&r2, &r1, ANCHOR), Some((1, 40)));
-        assert_eq!(detect_pe_overlap_trim(&r1, &r2, ANCHOR), Some((0, 40)));
+        assert_eq!(detect_pe_overlap_trim(&r1, &r2, ANCHOR, None), Some((0, 40)));
+    }
+
+    #[test]
+    fn a_boundary_without_adapter_behind_it_is_not_applied() {
+        // The mates overlap (insert 60 of 100), but the sequence past the
+        // boundary is biology, not adapter. With an adapter set configured the
+        // boundary must NOT be applied -- this is the Cell A guard, and it is
+        // what keeps the mode from trimming clean reads.
+        let (r1, r2) = pair(100, 60, 5);
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "test".into(),
+                seq: b"AGATCGGAAGAGC".to_vec(),
+            }],
+            0.1,
+            4,
+        );
+        assert!(
+            detect_pe_overlap_trim(&r1, &r2, ANCHOR, Some(&set)).is_none(),
+            "an overlap with no adapter behind it must not produce a trim"
+        );
+        // With adapter trimming disabled the boundary is still reported: the
+        // mode is then opt-in and cannot invent an adapter the run never asked
+        // for. The ordinary path is what decides.
+        assert_eq!(detect_pe_overlap_trim(&r1, &r2, ANCHOR, None), Some((0, 40)));
     }
 
     #[test]

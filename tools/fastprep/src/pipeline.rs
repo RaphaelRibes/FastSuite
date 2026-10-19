@@ -1007,10 +1007,13 @@ fn pair_chunks(
     debug_assert_eq!(c1.len(), c2.len());
     // Mates are trimmed independently, except for the one cross-mate inference
     // `--pe-overlap` opts into: when the pair's overlap pins the adapter
-    // boundary, that boundary is handed to each mate's trim as an override and
-    // the configured adapter set is not consulted for it. With the flag off the
-    // detector is never called, so `pe_adapter` stays `None` on every Params and
-    // the trim path below is exactly the pre-flag one (byte-identical output).
+    // boundary AND the readthrough past it is real adapter sequence, that
+    // boundary is handed to each mate's trim as an override. The adapter set is
+    // passed to the detector precisely so a boundary without adapter behind it
+    // is not applied -- an overlap proves where the fragment ends, not that
+    // anything was ligated past it. With the flag off the detector is never
+    // called, so `pe_adapter` stays `None` on every Params and the trim path
+    // below is exactly the pre-flag one (byte-identical output).
     let base1 = Arc::new(params_r1.clone());
     let base2 = Arc::new(params_r2.clone());
     let work = |(i1, i2): (ScanInput, ScanInput)| -> ProcessedPair {
@@ -1024,7 +1027,9 @@ fn pair_chunks(
         // `(0, L - I)` (the paper's geometry, read on each mate's own frame).
         // `Arc::make_mut` clones only when the flag actually fired.
         let (p1, p2) = if pe_overlap {
-            match crate::pe_overlap::detect_pe_overlap_trim(s1, s2, pe_anchor) {
+            match crate::pe_overlap::detect_pe_overlap_trim(
+                s1, s2, pe_anchor, params_r1.adapter.as_deref(),
+            ) {
                 Some(t) => {
                     let mut a = Arc::clone(&base1);
                     let mut b = Arc::clone(&base2);
