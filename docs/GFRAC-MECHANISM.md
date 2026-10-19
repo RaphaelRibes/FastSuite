@@ -252,3 +252,97 @@ Three findings that decide what the fix must be:
   re-simulation: it re-weights the *simulated* per-mate curves, which is exact
   for the pooling effect but does not model what the simulator would emit if it
   could emit a 99 bp R2.
+
+---
+
+## 9. Mechanism C: two fixes attempted, and why the naive one fails (2026-10-19)
+
+Mechanism C was implemented twice, independently, and both attempts failed the
+same way. Recording that here so the next attempt starts from the obstacle rather
+than rediscovering it.
+
+### The model is confirmed
+
+`build_read` composes `[G*h] + insert + adapter + [G*t]` — the head run is
+**prepended**, so a read whose head run is `h` shows the fragment's base `p − h`
+at its own position `p`. The `base` plane is a read-position measurement, so what
+fastsim consumes is the real curve convolved with the head-run distribution:
+
+```text
+sim[p] = Σ_h P(h) · real[p − h]
+```
+
+Verified analytically and against the diagnosis's own numbers: a fixed-`h`
+subtraction leaves the smearing in place (a delta convolved with `P = {0: 0.5,
+1: 0.5}` stays at 0.5 at `p = 1`), while the weighted deconvolution recovers it
+exactly. So the inverse is a **deconvolution of the whole distribution P(h)**,
+not the subtraction of a single `h`.
+
+### Attempt 1 — fixed-`h` subtraction (subagent, 2026-10-19)
+
+Subtracted one `h`'s worth of mass from each position. Measured end to end:
+
+| dataset | arm | pooled | position |
+|---|---|---|---|
+| DRR083082 | asis | 0.0401 | 11 |
+| DRR083082 | fix | **0.1298** | 1 |
+
+**3× worse.** The subagent hit a model repetition loop before it could iterate,
+so no further arms were run. This is the same failure the diagnosis predicted in
+§5 for the fitter-side variant: subtracting where the artefact already was.
+
+### Attempt 2 — distributional deconvolution (parent, 2026-10-19)
+
+Implemented `deconvolve_frame` in `tools/fastsim/src/profile.rs`, mirroring the
+structure of the existing `deconvolve_row`: a sequential (Z-domain) inversion
+`real[p] = (sim[p] − Σ_{h≥1} P(h)·real[p−h]) / P(0)`, applied after the row
+deconvolutions in `biased_plane`.
+
+Correct in isolation — four new unit tests pass, including one that pins the
+fixed-`h` arm as *wrong* (residue left at position 1) and one that checks the
+round trip on a known analytic smearing.
+
+**But it does not compose with the row deconvolution.** The pre-existing test
+`profile_deconvolves_both_planes_for_both_injected_runs` fails:
+
+```
+R1 terminal biology G should be 0.2857, got 1
+```
+
+Position 3's G is *amplified* to 1.0 rather than inverted. The cause is the
+composition, not the arithmetic: `deconvolve_row` has already removed the
+artefact's mass **at** each position, and `deconvolve_frame` then divides by
+`P(0)` **across** positions, so the correction is applied twice. This is the same
+double-subtraction failure class as attempt 1, reached from the other side.
+
+The work was reverted rather than committed: `tools/fastsim` is untouched at 67
+tests and the gate is unchanged at 3/51.
+
+### What the obstacle actually is
+
+The two operations are not independent, and neither order is obviously right:
+
+* **frame-then-row**: the frame step needs an un-smeared plane to work on, but
+  the row step's coverage inputs (`head_cover`, `tail_cover`) are defined on the
+  *read-position* plane — i.e. the smeared one.
+* **row-then-frame** (attempt 2): double-corrects, because the row step has
+  already removed mass the frame step then re-divides.
+
+A correct joint inverse needs a decision about what the row deconvolution's
+coverage should be computed on — the smeared plane (as now) or the un-smeared
+one — and that is a modelling question about what `head_cover` *means*, not a
+bug to be patched. §5's warning that a fitter-side deconvolution is a regression
+is the same shape of problem.
+
+### Recommendation
+
+Do not attempt a third variant without first settling that question. The
+diagnosis already notes that a correct head fix "sits between `head_none` and the
+as-fitted curve" and that three of four group-B rows also need an R2 3′ fix — so
+even a correct frame fix is unlikely to close the gate alone. The gate has been
+stable at 3/51 through mechanisms A and B; a partial fix that moves it while
+risking a double-subtraction regression is not obviously worth it.
+
+What is worth keeping: the model is confirmed and quantified, and both failed
+arms have their numbers recorded. Any future attempt should start by deciding
+what `head_cover` is measured on.
