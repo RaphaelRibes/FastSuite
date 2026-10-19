@@ -274,3 +274,52 @@ The mode ships **default off** and is safe by construction. Whether it earns its
 place is answered by Cell B (a synthetic cohort whose ground truth carries both
 G-runs and readthrough, so the scorer is not confounded) — see
 `docs/plans/2026-10-19_004500-pe-overlap-with-without.md`.
+
+## Cell B — the value test (synthetic cohort, 2026-10-19)
+
+Cell A could not answer the accuracy question, for two reasons: readthrough is
+0.11% of corpus pairs, and the scorer compares trim positions against the
+ground truth's **G-run** lengths — so an adapter trim is labelled `overtrim`
+wherever the GT has no runs. Cell B is a `fastsim` cohort whose ground truth
+carries **both** (489,546 of 800,000 mates with an injected G-run; 112,658 of
+400,000 pairs with readthrough; 74,916 readthrough mates also carrying a run),
+so the G-run boundary is a real reference.
+
+| tool | exact | overtrim | und-rec | und-irr | dropped |
+|---|---|---|---|---|---|
+| `fastprep-hd0` | 347,171 | 18,021 | 228,567 | 74,968 | 131,273 |
+| `fp-pe` | **347,171** | **18,127** | 228,567 | 74,809 | 131,326 |
+
+**Exact is identical; overtrim rises by 106.** On the readthrough slice that is
++0.094 pp, and +0.000 pp overall — against the pre-registered 0.5 pp threshold,
+**do not restore**.
+
+The mechanism is worth recording because it explains the null without hand-waving:
+
+* All 5,328 changed decisions are on readthrough mates, but **4,866 are
+  `dropped → dropped`** — the scorer cannot see a dropped mate at all.
+* Of the 462 that move a class, the effect is **net-negative** (+211 overtrim,
+  −251 dropped): the mode trims 1–2 bp *less* on mates whose adapter the baseline
+  had already found. It corrects an over-trim; it does not discover one.
+* The addressable set is **1,328 of 109,013 readthrough mates (1.2%)**. Readthrough
+  length shrinks as the 3′ run grows, so the same 3′-run mass that makes the
+  G-run boundary scorable starves the adapter.
+
+**A structural result the plan got wrong.** The spec asked for inserts inside the
+overlap window (`L ≤ I ≤ 2L−12`) *and* readthrough on the same pairs. That set is
+empty: readthrough needs `I < L − t`, the window needs `I ≥ L`. Verified on the
+cohort — every `rt=1` row has `win=0`. The mode's real operating region is the
+below-window readthrough mates.
+
+## Verdict
+
+**`--pe-overlap` does not improve trimming and is not restored as a default.** It
+ships opt-in, and it is safe by construction — the boundary applies only when
+adapter starts exactly at it, so it can never trim what the ordinary adapter path
+could not itself confirm. That property is worth keeping even though the feature
+is not: the guard is what turned a silent biology-trimming bug into a measured
+null.
+
+Cohort: `bench/work/cellB/` (profile, deterministic build, README with the full
+spec and its limits). Plan:
+`docs/plans/2026-10-19_004500-pe-overlap-with-without.md`.
