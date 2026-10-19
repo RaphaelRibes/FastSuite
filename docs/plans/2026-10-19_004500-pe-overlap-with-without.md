@@ -159,15 +159,22 @@ produces an `fp-pe` row; confirm.
 - Also record exact rate and retention with vs without; they should be
   indistinguishable. If the mode moves them on clean data, that is the bug.
 
-**Cell B — the value test (synthetic, in-window, with readthrough).**
-- Build a cohort whose inserts are concentrated in `L ≤ I ≤ 2L-12` and whose
-  mates carry adapter readthrough, using fastsim with an adapter-bearing profile
-  (the corpus's `adapter.mode: none` must be overridden — this is the one place
-  the profile is changed, and it must be recorded in the results).
+**Cell B — the value test (synthetic, with readthrough).** — DONE, null result.
+- Build a cohort whose mates carry adapter readthrough, using fastsim with an
+  adapter-bearing profile (the corpus's `adapter.mode: none` must be overridden —
+  this is the one place the profile is changed, and it must be recorded in the
+  results).
 - Run with and without `fp-pe`; score **per mate** and sliced by `readthrough`.
 - **Primary metric:** exact rate at tolerance 0 on readthrough pairs.
 - **Secondary:** retention, undertrim (a win bought with biology must show here),
   and the length-matched `g_frac` gate for the metagenomics domain.
+
+**Correction to the Cell B spec (2026-10-19, after the run).** The spec above asked
+for inserts "concentrated in `L ≤ I ≤ 2L-12`" *and* readthrough. **That set is
+empty**: readthrough needs `I < L − t` (the read runs past the fragment) while the
+overlap window needs `I ≥ L`. Verified on the built cohort — every `rt=1` row has
+`win=0` and every `win=1` row has `rt=0`. The mode's real operating region is the
+*below-window* readthrough mates, and the cohort was built for that instead.
 
 **Task 3.2 — the decision rule, fixed before the numbers are read.**
 
