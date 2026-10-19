@@ -1075,6 +1075,16 @@ procedure MatchAdapters(R, L, 𝒜, ε, o_SE) → (T3_adp, name)
 
 == Paired-end overlap detection <sec:adp-pe>
 
+#block(inset: 0.6em, stroke: 0.5pt + gray, radius: 2pt, [
+  *Specification only --- not implemented in `fastdedup`.* This section
+  describes the paired-end overlap mode as designed. `fastdedup` carries no
+  paired-end overlap detection: the mode belongs to the trimming tool
+  (`fastprep`), where it now exists behind an opt-in `--pe-overlap` flag and is
+  measured with and without in `docs/OVERTRIM-PAIRED.md`. The algorithm is
+  reproduced here because it is part of the suite's shared design vocabulary,
+  not because `fastdedup` performs this inference.
+])
+
 In paired-end sequencing, when the insert length $I$ is shorter
 than the read length $L$, R1 reads bases $0, dots, L-1$ of the
 fragment while R2 reads the same fragment from the opposite strand.

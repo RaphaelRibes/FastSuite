@@ -1685,13 +1685,33 @@ procedure MatchAdapters(R, L, 𝒜, ε, o_SE) → (T3_adp, name)
 == Paired-end overlap detection <sec:adp-pe>
 
 #block(inset: 0.6em, stroke: 0.5pt + gray, radius: 2pt, [
-  *Not implemented in the current revision.* This section specifies the
-  paired-end overlap mode as designed. The implementation carries a single
-  adapter-detection mode: overlap detection was removed when the six tools were
-  unified under one CLI, and the modelled value of the mate rule is confined to
-  short-insert libraries --- it reaches about 1% of trim events on the fitted
-  insert distributions (`docs/OVERTRIM-PAIRED.md`). The design and its rationale
-  are retained deliberately.
+  *Implemented behind `--pe-overlap`, off by default.* This section specifies the
+  paired-end overlap mode, and the current revision carries it as an opt-in flag
+  rather than a default. Two findings shaped that choice and are worth stating
+  with their numbers.
+  #block(inset: 0.6em, [
+    *Detection is anchored, not the scan below.* The algorithm as specified accepts
+    the first insert size whose mismatch fraction is within $epsilon$; at
+    $epsilon = 0.1$ a 150-base window admits 15 mismatches, so it fires on
+    unrelated sequence. The implementation uses a 12-base anchor with
+    full-window verification and refuses ambiguity instead, following the
+    suite's own discipline (`fastcheck`'s insert measurement).
+  ])
+  #block(inset: 0.6em, [
+    *The boundary is applied only when adapter starts exactly at it.* An overlap
+    proves where the fragment ends; it does not prove that anything was ligated
+    past it. The first implementation missed that and trimmed biology on
+    adapter-free data --- the same failure class as the 4-base-overlap false
+    trim that `--min-adapter-overlap 8` exists to prevent. The guard is not
+    thresholded: any firing on adapter-free data is disqualifying.
+  ])
+  Measured on the 102-dataset corpus: adapter readthrough is configured in 53 of
+  102 profiles but materialises in 11,395 of 10.2M pairs (0.112%), because it
+  needs an insert shorter than the read. The corpus therefore cannot answer
+  whether the mode improves accuracy, and a synthetic cohort whose ground truth
+  carries both G-runs and readthrough is used for that instead
+  (`docs/plans/2026-10-19_004500-pe-overlap-with-without.md`). The design and its
+  rationale are retained deliberately.
 ])
 
 In paired-end sequencing, when the insert length $I$ is shorter
