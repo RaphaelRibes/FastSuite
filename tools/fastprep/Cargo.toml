@@ -1,6 +1,6 @@
 [package]
 name = "fastprep"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Asymmetric quality-weighted polyX trimming for FASTQ/FASTA reads"
 

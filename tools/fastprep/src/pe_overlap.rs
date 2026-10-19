@@ -221,14 +221,17 @@ pub fn detect_pe_overlap(
 /// The per-mate adapter trim the detected overlap implies:
 /// `(t5_adapter, t3_adapter)`. The boundary falls at position `I` on both
 /// mates, and each mate's adapter is read 3′, so both receive `(0, L - I)`.
-/// Returns `None` when nothing is detected.
 ///
-/// `adapter_set` is the configured adapter set, or `None` when adapter trimming
-/// is disabled. When it is supplied, the boundary is applied **only if the
-/// readthrough past it actually matches an adapter** -- see
-/// [`readthrough_is_adapter`]. This is what keeps the mode from trimming
-/// biology: an overlap proves where the fragment ends, not that anything was
-/// ligated past it.
+/// `adapter_set` is the adapter set the run actually has, or `None` when
+/// adapter trimming is disabled — **and `None` refuses the boundary outright**.
+/// The safety guard is structural, not a flag default: an overlap proves where
+/// the fragment ends, never that anything was ligated past it, so with nothing
+/// to check the tail against the mode must not apply a boundary. This is what
+/// keeps `--pe-overlap=always` from trimming biology, and it is asserted by
+/// `no_adapter_set_means_no_boundary` in `tests/pe_overlap.rs`.
+///
+/// Returns `None` when nothing is detected, or when the boundary cannot be
+/// checked (no set) or does not hold adapter behind it.
 pub fn detect_pe_overlap_trim(
     r1: &[u8],
     r2: &[u8],
@@ -236,15 +239,14 @@ pub fn detect_pe_overlap_trim(
     adapter_set: Option<&crate::adapter::AdapterSet>,
 ) -> Option<(usize /* t5 */, usize /* t3 */)> {
     let (_, readthrough) = detect_pe_overlap(r1, r2, anchor)?;
-    if let Some(set) = adapter_set {
-        if !readthrough_is_adapter(r1, readthrough, set) {
-            // The mates overlap, but the sequence past the boundary is not
-            // adapter: there is nothing to trim. Falling through to the
-            // ordinary path (which will also find no adapter) is the safe
-            // action, and it is what keeps the mode inert on adapter-free
-            // libraries -- the Cell A guard.
-            return None;
-        }
+    let set = adapter_set?;
+    if !readthrough_is_adapter(r1, readthrough, set) {
+        // The mates overlap, but the sequence past the boundary is not
+        // adapter: there is nothing to trim. Falling through to the
+        // ordinary path (which will also find no adapter) is the safe
+        // action, and it is what keeps the mode inert on adapter-free
+        // libraries -- the Cell A guard.
+        return None;
     }
     Some((0, readthrough))
 }
@@ -316,7 +318,21 @@ mod tests {
         let (r1, r2) = pair(100, 60, 5);
         assert_eq!(detect_pe_overlap(&r1, &r2, ANCHOR), Some((1, 40)));
         assert_eq!(detect_pe_overlap(&r2, &r1, ANCHOR), Some((1, 40)));
-        assert_eq!(detect_pe_overlap_trim(&r1, &r2, ANCHOR, None), Some((0, 40)));
+        // The boundary is applied only with a set to check it against; with
+        // none, the structural guard refuses (no set ⇒ no boundary).
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "test".into(),
+                seq: b"AGATCGGAAGAGC".to_vec(),
+            }],
+            0.1,
+            4,
+        );
+        assert_eq!(
+            detect_pe_overlap_trim(&r1, &r2, ANCHOR, Some(&set)),
+            None,
+            "this pair's tail is not that adapter: refuse"
+        );
     }
 
     #[test]
@@ -338,10 +354,14 @@ mod tests {
             detect_pe_overlap_trim(&r1, &r2, ANCHOR, Some(&set)).is_none(),
             "an overlap with no adapter behind it must not produce a trim"
         );
-        // With adapter trimming disabled the boundary is still reported: the
-        // mode is then opt-in and cannot invent an adapter the run never asked
-        // for. The ordinary path is what decides.
-        assert_eq!(detect_pe_overlap_trim(&r1, &r2, ANCHOR, None), Some((0, 40)));
+        // And with no adapter set at all the boundary is refused too: the
+        // guard is structural, not a flag default, so the mode can never
+        // apply a boundary it has no set to check.
+        assert_eq!(
+            detect_pe_overlap_trim(&r1, &r2, ANCHOR, None),
+            None,
+            "no adapter set must never yield a PE boundary"
+        );
     }
 
     #[test]

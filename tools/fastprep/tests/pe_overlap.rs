@@ -1,4 +1,5 @@
-//! `--pe-overlap` (paper §`sec:adp-pe`, opt-in): paired-end overlap detection.
+//! `--pe-overlap <never|auto|always>` (paper §`sec:adp-pe`, default `auto`):
+//! paired-end overlap detection.
 //!
 //! When the insert is shorter than the read, R1's 3′ suffix and the
 //! reverse-complement of R2's prefix describe the same fragment, so the mate
@@ -9,14 +10,26 @@
 //! `tools/fastcheck/src/insert.rs:651`
 //! (`a_chance_anchor_hit_does_not_produce_a_measurement`).
 //!
-//! **Default off, byte-identical when off**: every detection step is gated
-//! behind `rt.pe_overlap`, and a pair whose detection returns nothing must run
-//! exactly as the flag being absent. The last test of this file is that
+//! # The tri-state, and the guard it exists to serve
+//!
+//! The mode runs on `Auto` (the default): only when the adapter source is
+//! EXPLICIT (`--adapter-preset` / `--adapters`). With auto-detection or
+//! `--no-adapter` the mode stays off, because the safety guard needs a set to
+//! check the boundary against. `Always` is the explicit opt-in to run
+//! regardless, but the guard is structural: **no set ⇒ no boundary**, so even
+//! `always` with no set refuses to trim biology (see
+//! `no_adapter_set_means_no_boundary`).
+//!
+//! **Byte-identical when off**: every detection step is gated behind
+//! `rt.pe_overlap`, and a pair whose detection returns nothing must run
+//! exactly as the flag being absent. The byte-identical test below is that
 //! property, asserted on the full pipeline output (FASTQ and PXMT).
 //!
 //! Test layout: the first block is the detector's unit contract (pure
-//! functions, no I/O); the second is the wiring contract end-to-end.
+//! functions, no I/O); the second is the wiring contract end-to-end; the
+//! third is the mode's semantics (the tri-state) as the CLI resolves it.
 
+use fastprep::cli::{AdapterSource, PeOverlapMode, Runtime};
 use fastprep::pe_overlap::{detect_pe_overlap, revcomp};
 use fastprep::pipeline::{run_paired, run_single};
 
@@ -231,8 +244,8 @@ fn pair_fastq(p1: &[u8], p2: &[u8], name: &str) -> (String, String) {
     (rec(name, p1), rec(name, p2))
 }
 
-fn runtime(pe_overlap: bool) -> fastprep::cli::Runtime {
-    fastprep::cli::Runtime {
+fn runtime(pe_overlap: PeOverlapMode) -> Runtime {
+    Runtime {
         threads: 1,
         chunk: 8,
         compression: fastprep::io::CompressionLevels::default(),
@@ -242,7 +255,7 @@ fn runtime(pe_overlap: bool) -> fastprep::cli::Runtime {
         json: None,
         dry_run: false,
         quiet: false,
-        adapter_source: fastprep::cli::AdapterSource::None,
+        adapter_source: AdapterSource::None,
         adapter_error_rate: 0.2,
         min_adapter_overlap_se: 14,
         pe_overlap,
@@ -251,11 +264,107 @@ fn runtime(pe_overlap: bool) -> fastprep::cli::Runtime {
     }
 }
 
+/// An explicit adapter set that shares no 6-mer with the fixtures: the ordinary
+/// sequence matcher finds nothing, so it isolates the PE decision.
+fn inert_params() -> fastprep::algorithm::Params {
+    let set = fastprep::adapter::AdapterSet::new(
+        vec![fastprep::adapter::Adapter {
+            name: "inert".into(),
+            seq: b"AGTCAGTCAGTCAGTCAGTCAGTCAGTC".to_vec(),
+        }],
+        0.2,
+        14,
+    );
+    fastprep::algorithm::Params {
+        adapter: Some(std::sync::Arc::new(set)),
+        ..params()
+    }
+}
+
+/// The shipped adapter set, as `finalize()` builds it for `--adapter-preset`.
+/// Both mates in a real TruSeq library carry TruSeq readthrough past the
+/// insert, so this is the set the PE boundary is checked against.
+fn explicit_params() -> fastprep::algorithm::Params {
+    let set = fastprep::adapter::AdapterSet::new(
+        fastprep::adapter::preset_illumina(),
+        0.2,
+        14,
+    );
+    fastprep::algorithm::Params {
+        adapter: Some(std::sync::Arc::new(set)),
+        ..params()
+    }
+}
+
+/// A pair whose insert is shorter than the read, with a REAL adapter readthrough
+/// past the fragment on BOTH mates. The overlap pins the boundary at `insert`,
+/// and the sequence past it is adapter — the mode's real target.
+///
+/// A real TruSeq readthrough is longer than the 33-base adapter: the read runs
+/// through the adapter into the downstream primer, so the tail is the adapter
+/// followed by primer sequence, not a repeat of the adapter (which would
+/// self-match the matcher). That is real adapter sequence by construction,
+/// accepted by `--adapters FASTA`, and what `readthrough_is_adapter(r1, …)`
+/// must recognise.
+///
+/// `both_mates` picks the geometry: `true` gives each mate its own adapter
+/// (TruSeq R1 on R1, TruSeq R2 on R2), `false` gives R1 the adapter and R2 only
+/// biology — the case that proves the guard checks the MATE, not a shared
+/// boundary.
+fn adapter_pair(read_len: usize, insert: usize, seed: u64, both_mates: bool) -> (Vec<u8>, Vec<u8>) {
+    let frag = dna(insert, seed);
+    let a1 = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+    let a2 = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
+    // Downstream primer (non-adapter, non-repeating) to lengthen the tail.
+    let p1 = b"GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT";
+    let p2 = b"GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT";
+    let n = read_len - insert;
+    let tail = |a: &[u8], p: &[u8]| -> Vec<u8> {
+        let mut v = a.to_vec();
+        let mut i = 0;
+        while v.len() < n {
+            v.push(p[i % p.len()]);
+            i += 1;
+        }
+        v.truncate(n);
+        v
+    };
+    let mut r1 = frag.clone();
+    r1.extend_from_slice(&tail(a1, p1));
+    let mut r2: Vec<u8> = frag.iter().rev().map(|&b| comp(b)).collect();
+    if both_mates {
+        r2.extend_from_slice(&tail(a2, p2));
+    } else {
+        r2.extend_from_slice(&dna(n, seed ^ 0x85EB_CA6B));
+    }
+    (r1, r2)
+}
+
+/// Write a FASTQ body from `(seq, name)` pairs.
+fn fastq_body(pairs: &[(&[u8], &str)]) -> String {
+    let mut body = String::new();
+    for (s, name) in pairs {
+        body.push_str(&pair_fastq(s, s, name).0);
+    }
+    body
+}
+
+/// Run one paired-end pass and return the R1 output text.
+fn run_r1(in1: &Path, in2: &Path, p: &fastprep::algorithm::Params, rt: &Runtime) -> String {
+    let out1 = tmp_path("run_1.fq");
+    let out2 = tmp_path("run_2.fq");
+    run_paired(in1, in2, &out1, &out2, None, None, p, p, rt).expect("paired run must succeed");
+    let body = read_plain(&out1);
+    std::fs::remove_file(&out1).ok();
+    std::fs::remove_file(&out2).ok();
+    body
+}
+
+/// The shipped winner's own config (CLI-SPEC): adapter matching OFF so the
+/// only possible adapter trim is the PE one, mean-q OFF so the trim cannot
+/// be masked by a drop, and Δ_L = L (min-len 0) so nothing is dropped for
+/// length. What is left is the boundary the detector must find.
 fn params() -> fastprep::algorithm::Params {
-    // The shipped winner's own config (CLI-SPEC): adapter matching OFF so the
-    // only possible adapter trim is the PE one, mean-q OFF so the trim cannot
-    // be masked by a drop, and Δ_L = L (min-len 0) so nothing is dropped for
-    // length. What is left is the boundary the detector must find.
     fastprep::algorithm::Params {
         min_len: fastprep::algorithm::MinLen::Abs(0),
         mean_q: None,
@@ -300,7 +409,7 @@ fn pairs_without_overlap_are_byte_identical_with_and_without_the_flag() {
 
     let p = params();
     let mut runs: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
-    for (tag, on) in [("off", false), ("on", true)] {
+    for (tag, on) in [("off", PeOverlapMode::Never), ("on", PeOverlapMode::Always)] {
         let out1 = tmp_path(&format!("{tag}_1.fq"));
         let out2 = tmp_path(&format!("{tag}_2.fq"));
         let meta = tmp_path(&format!("{tag}.pxmt"));
@@ -348,7 +457,7 @@ fn single_end_output_is_untouched_by_the_flag() {
 
     let p = params();
     let mut outs = Vec::new();
-    for (tag, on) in [("off", false), ("on", true)] {
+    for (tag, on) in [("off", PeOverlapMode::Never), ("on", PeOverlapMode::Always)] {
         let out = tmp_path(&format!("se_{tag}.fq"));
         run_single(&in1, &out, &p, &runtime(on)).expect("single-end run must succeed");
         outs.push((out, tag));
@@ -369,22 +478,23 @@ fn single_end_output_is_untouched_by_the_flag() {
 // THE DETECTOR-REACHES-THE-TRIM TEST.
 // ---------------------------------------------------------------------------
 
-/// With the flag on, a pair whose insert is shorter than the read must be
-/// trimmed at the boundary the overlap reveals — the readthrough length on
-/// both mates — while the same pair with the flag off is left alone (no
-/// adapter set is configured, so there is nothing else to trim).
+/// With the mode on and a real adapter set, a pair whose insert is shorter than
+/// the read is trimmed at the boundary the overlap reveals. R1 carries adapter
+/// (so the ordinary matcher trims it too); R2 carries only biology, so the ONLY
+/// thing that can trim R2 is the PE boundary — which is what makes this a test
+/// of the mode rather than of the matcher.
 #[test]
 fn a_pair_with_overlap_trims_differently_with_the_flag_on() {
-    let (r1, r2) = pair(100, 60, 5);
+    let (r1, r2) = adapter_pair(150, 100, 5, false);
     let (qa, qb) = pair_fastq(&r1, &r2, "short_insert");
     let in1 = tmp_path("ov_r1.fq");
     let in2 = tmp_path("ov_r2.fq");
     write_plain(&in1, &qa);
     write_plain(&in2, &qb);
 
-    let p = params();
+    let p = explicit_params();
     let mut runs: Vec<(String, String)> = Vec::new();
-    for (tag, on) in [("off", false), ("on", true)] {
+    for (tag, on) in [("off", PeOverlapMode::Never), ("on", PeOverlapMode::Auto)] {
         let out1 = tmp_path(&format!("ov_{tag}_1.fq"));
         let out2 = tmp_path(&format!("ov_{tag}_2.fq"));
         let st = run_paired(&in1, &in2, &out1, &out2, None, None, &p, &p, &runtime(on))
@@ -396,20 +506,20 @@ fn a_pair_with_overlap_trims_differently_with_the_flag_on() {
     let (off1, off2) = &runs[0];
     let (on1, on2) = &runs[1];
 
-    // Off: nothing trimmed (60 insert + 40 adapter, all of it written).
-    assert_eq!(off1, &qa, "without the flag the read is untouched");
-    assert_eq!(off2, &qb, "without the flag the mate is untouched");
+    // Off: R1 is trimmed by the ordinary matcher (adapter present); R2 is
+    // biology, so nothing trims it.
+    assert_eq!(off1.lines().nth(1).unwrap().len(), 100, "off: R1 trimmed by the matcher");
+    assert_eq!(off2.lines().nth(1).unwrap().len(), 150, "off: R2 (biology) is untouched");
 
-    // On: exactly the readthrough is removed, on both mates.
+    // On: the PE boundary is applied on BOTH mates. R2 can only be trimmed by
+    // the mode — its tail is not adapter — so 100 proves the boundary fired.
     let kept1 = on1.lines().nth(1).unwrap();
     let kept2 = on2.lines().nth(1).unwrap();
-    assert_eq!(kept1.len(), 60, "R1 must be cut to the 60-base insert, got {}", kept1.len());
-    assert_eq!(kept2.len(), 60, "R2 must be cut to the 60-base insert, got {}", kept2.len());
-    assert_ne!(on1, off1, "the flag must change R1");
-    assert_ne!(on2, off2, "the flag must change R2");
-    // And the kept bases are the fragment, not a truncated tail of it.
-    assert_eq!(kept1, String::from_utf8_lossy(&r1[..60]));
-    assert_eq!(kept2, String::from_utf8_lossy(&r2[..60]));
+    assert_eq!(kept1.len(), 100, "R1 must be cut to the 100-base insert, got {}", kept1.len());
+    assert_eq!(kept2.len(), 100, "R2 must be cut to the 100-base insert, got {}", kept2.len());
+    assert_ne!(on2, off2, "the mode must change R2, whose tail is not adapter");
+    assert_eq!(kept1, String::from_utf8_lossy(&r1[..100]));
+    assert_eq!(kept2, String::from_utf8_lossy(&r2[..100]));
 
     for p in [&in1, &in2] {
         std::fs::remove_file(p).ok();
@@ -418,5 +528,292 @@ fn a_pair_with_overlap_trims_differently_with_the_flag_on() {
         for m in ["1", "2"] {
             std::fs::remove_file(tmp_path(&format!("ov_{tag}_{m}.fq"))).ok();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE TRI-STATE, AND THE GUARD IT EXISTS TO SERVE.
+// ---------------------------------------------------------------------------
+
+/// The CLI-level resolution of `Auto`: the mode runs only when the adapter
+/// source is EXPLICIT. This is what `finalize()` computes, asserted through the
+/// public `Cli` API (not a private field), so it cannot be edited away by a
+/// refactor of the flag alone.
+#[test]
+fn auto_resolves_on_only_for_an_explicit_adapter_source() {
+    use clap::Parser;
+    let dir = std::env::temp_dir().join("fastprep_pe_tristate");
+    std::fs::create_dir_all(&dir).unwrap();
+    let adapters = dir.join("adapters.fa");
+    write_plain(&adapters, ">tru\nAGATCGGAAGAGCACACGTCTGAACTCCAGTCA\n");
+    // Auto-detection peeks at these; they must exist and hold no catalogue
+    // fingerprint, so detection finds nothing.
+    let clean1 = dir.join("clean1.fq");
+    let clean2 = dir.join("clean2.fq");
+    let body = fastq_body(&[(&dna(60, 3), "n1")]);
+    write_plain(&clean1, &body);
+    write_plain(&clean2, &body);
+
+    // Explicit preset ⇒ Auto is ON (the guard has a set to check against).
+    let cli = fastprep::cli::Cli::parse_from([
+        "fastprep", "-1", clean1.to_str().unwrap(), "-2", clean2.to_str().unwrap(),
+        "-o", "o1.fq", "-p", "o2.fq", "--adapter-preset", "illumina",
+    ]);
+    assert_eq!(cli.pe_overlap, PeOverlapMode::Auto, "the default is auto");
+    let (_, rt) = cli.finalize().expect("an explicit adapter source finalizes");
+    assert_eq!(
+        rt.pe_overlap,
+        PeOverlapMode::Auto,
+        "an explicit source keeps auto, and the guard then has a set"
+    );
+    assert!(rt.pe_overlap.runs_with(&rt.adapter_source), "auto + explicit preset must run the mode");
+
+    // Explicit FASTA ⇒ Auto is ON.
+    let cli = fastprep::cli::Cli::parse_from([
+        "fastprep", "-1", clean1.to_str().unwrap(), "-2", clean2.to_str().unwrap(),
+        "-o", "o1.fq", "-p", "o2.fq", "--adapters", adapters.to_str().unwrap(),
+    ]);
+    let (_, rt) = cli.finalize().expect("an explicit FASTA finalizes");
+    assert!(rt.pe_overlap.runs_with(&rt.adapter_source), "auto + explicit FASTA must run the mode");
+
+    // Auto-detection ⇒ the mode stays OFF (the reproduction's exact config).
+    let cli = fastprep::cli::Cli::parse_from([
+        "fastprep", "-1", clean1.to_str().unwrap(), "-2", clean2.to_str().unwrap(),
+        "-o", "o1.fq", "-p", "o2.fq", "--force",
+    ]);
+    let (_, rt) = cli.finalize().expect("auto-detection finalizes");
+    assert_eq!(rt.pe_overlap, PeOverlapMode::Never, "auto + auto-detect resolves to never");
+
+    // --no-adapter ⇒ the mode stays OFF.
+    let cli = fastprep::cli::Cli::parse_from([
+        "fastprep", "-1", clean1.to_str().unwrap(), "-2", clean2.to_str().unwrap(),
+        "-o", "o1.fq", "-p", "o2.fq", "--no-adapter",
+    ]);
+    let (_, rt) = cli.finalize().expect("--no-adapter finalizes");
+    assert_eq!(rt.pe_overlap, PeOverlapMode::Never, "auto + --no-adapter resolves to never");
+
+    std::fs::remove_file(&adapters).ok();
+    std::fs::remove_file(&clean1).ok();
+    std::fs::remove_file(&clean2).ok();
+}
+
+/// The three spellings parse, and `never`/`always` are respected regardless of
+/// the adapter source.
+#[test]
+fn the_tri_state_parses() {
+    use clap::Parser;
+    let parse = |mode: &str| {
+        let cli = fastprep::cli::Cli::parse_from([
+            "fastprep", "-1", "in.fq", "-2", "in2.fq", "-o", "o1.fq", "-p", "o2.fq",
+            "--pe-overlap", mode, "--adapter-preset", "illumina",
+        ]);
+        cli.pe_overlap
+    };
+    assert_eq!(parse("never"), PeOverlapMode::Never);
+    assert_eq!(parse("auto"), PeOverlapMode::Auto);
+    assert_eq!(parse("always"), PeOverlapMode::Always);
+    assert!(!PeOverlapMode::Never.runs(), "never never runs");
+    assert!(PeOverlapMode::Always.runs(), "always runs");
+    // The bare spelling (no value) is the pre-tri-state alias for `always`, so
+    // existing invocations that asked for the mode keep working.
+    let bare = fastprep::cli::Cli::parse_from([
+        "fastprep", "-1", "in.fq", "-2", "in2.fq", "-o", "o1.fq", "-p", "o2.fq",
+        "--pe-overlap",
+    ]);
+    assert_eq!(bare.pe_overlap, PeOverlapMode::Always, "bare --pe-overlap == always");
+    // A bad mode is a clap error, not a silent fallback.
+    let bad = fastprep::cli::Cli::try_parse_from([
+        "fastprep", "-1", "in.fq", "-2", "in2.fq", "-o", "o1.fq", "-p", "o2.fq",
+        "--pe-overlap", "sometimes",
+    ]);
+    assert!(bad.is_err(), "--pe-overlap must reject an unknown mode");
+}
+
+/// The detector's guard, asserted directly: **no set ⇒ no boundary**. This is
+/// the structural invariant that makes `--pe-overlap=always` safe to expose:
+/// even the explicit opt-in cannot apply a boundary it has no set to check.
+#[test]
+fn no_adapter_set_means_no_boundary() {
+    // A pair whose mates genuinely overlap (insert 100 of 150): detection
+    // succeeds and pins the boundary.
+    let (r1, r2) = pair(150, 100, 5);
+    assert_eq!(detect_pe_overlap(&r1, &r2, 12), Some((1, 50)));
+    // Without a set the boundary is refused — the guard cannot be bypassed by
+    // the flag, because the detector has nothing to check the tail against.
+    assert_eq!(
+        fastprep::pe_overlap::detect_pe_overlap_trim(&r1, &r2, 12, None),
+        None,
+        "no adapter set must never yield a PE boundary"
+    );
+}
+
+/// The reproduction, end-to-end: auto-detection finds nothing (a random tail
+/// holds no catalogue fingerprint), so the mode is OFF at its default and the
+/// read is left exactly as it came in.
+#[test]
+fn auto_detect_with_no_adapter_leaves_the_read_untouched_at_the_default() {
+    // Random tails: no TruSeq/Nextera/SmallRNA fingerprint, so auto-detection
+    // finds nothing and `Params.adapter` is None.
+    let (r1, r2) = pair(150, 100, 5);
+    let in1 = tmp_path("repro_r1.fq");
+    let in2 = tmp_path("repro_r2.fq");
+    write_plain(&in1, &fastq_body(&[(&r1, "s1")]));
+    write_plain(&in2, &fastq_body(&[(&r2, "s1")]));
+
+    let p = params();
+    let body = run_r1(&in1, &in2, &p, &runtime(PeOverlapMode::Auto));
+    let kept = body.lines().nth(1).unwrap();
+    assert_eq!(kept.len(), 150, "the default must not trim a random tail, got {}", kept.len());
+    assert_eq!(kept, String::from_utf8_lossy(&r1), "the read must be untouched");
+
+    for p in [&in1, &in2] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+/// The same data, explicit `--adapter-preset`, mode at its default: the guard
+/// refuses the boundary because the tail past it is biology, not adapter.
+#[test]
+fn explicit_preset_with_a_random_tail_is_not_trimmed() {
+    let (r1, r2) = pair(150, 100, 5);
+    let in1 = tmp_path("preset_r1.fq");
+    let in2 = tmp_path("preset_r2.fq");
+    write_plain(&in1, &fastq_body(&[(&r1, "s1")]));
+    write_plain(&in2, &fastq_body(&[(&r2, "s1")]));
+
+    let p = inert_params();
+    let body = run_r1(&in1, &in2, &p, &runtime(PeOverlapMode::Auto));
+    let kept = body.lines().nth(1).unwrap();
+    assert_eq!(kept.len(), 150, "a boundary whose tail is not adapter must not be applied, got {}", kept.len());
+    assert_eq!(kept, String::from_utf8_lossy(&r1));
+
+    for p in [&in1, &in2] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+/// Run the built `fastprep` binary and return its R1 output text.
+///
+/// The binary is what a user runs, and it is the only place the whole chain
+/// (clap → finalize → Runtime → pipeline → trim) is exercised together, so the
+/// end-to-end cases below use it rather than the library entry points.
+fn run_cli(dir: &Path, in1: &Path, in2: &Path, tag: &str, extra: &[&str]) -> String {
+    let out1 = tmp_path(&format!("cli_{tag}_1.fq"));
+    let out2 = tmp_path(&format!("cli_{tag}_2.fq"));
+    let mut args: Vec<&str> = vec![
+        "-1", in1.to_str().unwrap(), "-2", in2.to_str().unwrap(),
+        "-o", out1.to_str().unwrap(), "-p", out2.to_str().unwrap(),
+        "--min-len", "0", "--force",
+    ];
+    args.extend_from_slice(extra);
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fastprep"))
+        .args(&args)
+        .current_dir(dir)
+        .status()
+        .expect("spawn fastprep");
+    assert!(status.success(), "fastprep must exit 0 for {tag}");
+    let body = read_plain(&out1);
+    std::fs::remove_file(&out1).ok();
+    std::fs::remove_file(&out2).ok();
+    body
+}
+
+/// The reproduction, through the CLI binary: auto-detection finds nothing (a
+/// random tail holds no catalogue fingerprint), so the mode is OFF at its
+/// default and the read is left exactly as it came in.
+#[test]
+fn cli_auto_detect_with_no_adapter_leaves_the_read_untouched() {
+    let (r1, r2) = pair(150, 100, 5);
+    let in1 = tmp_path("cli_repro_r1.fq");
+    let in2 = tmp_path("cli_repro_r2.fq");
+    write_plain(&in1, &fastq_body(&[(&r1, "s1")]));
+    write_plain(&in2, &fastq_body(&[(&r2, "s1")]));
+
+    // No --pe-overlap at all: the default is auto, which is off here.
+    let body = run_cli(std::path::Path::new("."), &in1, &in2, "repro", &[]);
+    let kept = body.lines().nth(1).unwrap();
+    assert_eq!(kept.len(), 150, "the default must not trim a random tail, got {}", kept.len());
+
+    // Explicitly `--pe-overlap auto`: same result.
+    let body = run_cli(std::path::Path::new("."), &in1, &in2, "auto", &["--pe-overlap", "auto"]);
+    assert_eq!(body.lines().nth(1).unwrap().len(), 150, "auto + auto-detect must not trim");
+
+    // `--pe-overlap always`: the explicit opt-in, still refused (no set).
+    let body = run_cli(std::path::Path::new("."), &in1, &in2, "always", &["--pe-overlap", "always"]);
+    assert_eq!(body.lines().nth(1).unwrap().len(), 150, "always + no set must still refuse");
+
+    for p in [&in1, &in2] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+/// Explicit `--adapter-preset` on the same adapter-free data: the guard refuses
+/// the boundary because the tail past it is biology, not adapter.
+#[test]
+fn cli_explicit_preset_with_a_random_tail_is_not_trimmed() {
+    let (r1, r2) = pair(150, 100, 5);
+    let in1 = tmp_path("cli_preset_r1.fq");
+    let in2 = tmp_path("cli_preset_r2.fq");
+    write_plain(&in1, &fastq_body(&[(&r1, "s1")]));
+    write_plain(&in2, &fastq_body(&[(&r2, "s1")]));
+
+    let body = run_cli(std::path::Path::new("."), &in1, &in2, "preset", &["--adapter-preset", "illumina"]);
+    let kept = body.lines().nth(1).unwrap();
+    assert_eq!(kept.len(), 150, "a boundary whose tail is not adapter must not be applied, got {}", kept.len());
+
+    for p in [&in1, &in2] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+/// The mode's real target, through the CLI: a real TruSeq readthrough past a
+/// real overlap, with the explicit preset. Both mates are cut to the 100-base
+/// insert — and with the mode off the same pair is untouched by the PE path.
+#[test]
+fn cli_explicit_preset_with_real_adapter_readthrough_trims_at_the_boundary() {
+    let (r1, r2) = adapter_pair(150, 100, 5, true);
+    let in1 = tmp_path("cli_adp_r1.fq");
+    let in2 = tmp_path("cli_adp_r2.fq");
+    write_plain(&in1, &fastq_body(&[(&r1, "s1")]));
+    write_plain(&in2, &fastq_body(&[(&r2, "s1")]));
+
+    // auto (the default) with an explicit preset: the mode runs and fires.
+    let on = run_cli(std::path::Path::new("."), &in1, &in2, "adp_auto", &["--adapter-preset", "illumina"]);
+    let kept1 = on.lines().nth(1).unwrap();
+    assert_eq!(kept1.len(), 100, "R1 must be cut to the 100-base insert, got {}", kept1.len());
+    assert_eq!(kept1, String::from_utf8_lossy(&r1[..100]));
+
+    // never: the mode is off, so the ordinary matcher alone decides.
+    let off = run_cli(std::path::Path::new("."), &in1, &in2, "adp_never",
+        &["--adapter-preset", "illumina", "--pe-overlap", "never"]);
+    assert_eq!(off.lines().nth(1).unwrap().len(), 100,
+        "the matcher alone trims the readthrough to the same boundary");
+
+    for p in [&in1, &in2] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+/// `--pe-overlap=always` with auto-detection and adapter-free data: the mode
+/// is deliberately opted into, but the guard still refuses — **no set, no
+/// boundary**. Detection may run and report; it may not trim biology. This is
+/// the conservative reading of `always`, pinned here so a future change cannot
+/// silently turn it into an opt-in to trims the default forbids.
+#[test]
+fn always_with_no_adapter_set_still_refuses_the_boundary() {
+    let (r1, r2) = pair(150, 100, 5);
+    let in1 = tmp_path("always_r1.fq");
+    let in2 = tmp_path("always_r2.fq");
+    write_plain(&in1, &fastq_body(&[(&r1, "s1")]));
+    write_plain(&in2, &fastq_body(&[(&r2, "s1")]));
+
+    let p = params();
+    let body = run_r1(&in1, &in2, &p, &runtime(PeOverlapMode::Always));
+    let kept = body.lines().nth(1).unwrap();
+    assert_eq!(kept.len(), 150, "always + no set must still refuse the boundary, got {}", kept.len());
+    assert_eq!(kept, String::from_utf8_lossy(&r1));
+
+    for p in [&in1, &in2] {
+        std::fs::remove_file(p).ok();
     }
 }

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::algorithm::{trim, DropReason, Params, TrimOutput, TrimResult};
-use crate::cli::Runtime;
+use crate::cli::{PeOverlapMode, Runtime};
 use crate::dedup::{AnchorSpec, Fingerprint, Seen, Verifier};
 use crate::io::{
     open_input, open_output, open_output_as, write_fasta, write_fastq, OutputWriter, RecordFormat,
@@ -674,7 +674,8 @@ pub fn run_paired(
     let params_r2 = params_r2.clone();
 
     // PE overlap: resolved once per chunk, per pair, inside the work closure.
-    // `rt.pe_overlap` off ⇒ the detector is never called and `pe_adapter` stays
+    // The mode resolved to `Never` (the default with auto-detection or
+    // --no-adapter) ⇒ the detector is never called and `pe_adapter` stays
     // `None`, which is exactly the flag-off code path (byte-identical output).
     let pe_anchor = crate::pe_overlap::ANCHOR;
 
@@ -1001,7 +1002,7 @@ fn pair_chunks(
     params_r1: &Params,
     params_r2: &Params,
     parallel: bool,
-    pe_overlap: bool,
+    pe_overlap: PeOverlapMode,
     pe_anchor: usize,
 ) -> Vec<ProcessedPair> {
     debug_assert_eq!(c1.len(), c2.len());
@@ -1011,7 +1012,7 @@ fn pair_chunks(
     // boundary is handed to each mate's trim as an override. The adapter set is
     // passed to the detector precisely so a boundary without adapter behind it
     // is not applied -- an overlap proves where the fragment ends, not that
-    // anything was ligated past it. With the flag off the detector is never
+    // anything was ligated past it. With the mode off the detector is never
     // called, so `pe_adapter` stays `None` on every Params and the trim path
     // below is exactly the pre-flag one (byte-identical output).
     let base1 = Arc::new(params_r1.clone());
@@ -1025,8 +1026,8 @@ fn pair_chunks(
         // The detection result is shared by both mates: the boundary falls at
         // position I on each, and each mate's adapter is read 3′, so both get
         // `(0, L - I)` (the paper's geometry, read on each mate's own frame).
-        // `Arc::make_mut` clones only when the flag actually fired.
-        let (p1, p2) = if pe_overlap {
+        // `Arc::make_mut` clones only when the mode actually fired.
+        let (p1, p2) = if pe_overlap.runs() {
             match crate::pe_overlap::detect_pe_overlap_trim(
                 s1, s2, pe_anchor, params_r1.adapter.as_deref(),
             ) {
@@ -1037,8 +1038,9 @@ fn pair_chunks(
                     Arc::make_mut(&mut b).pe_adapter = Some(t);
                     (a, b)
                 }
-                // Detection refused (no overlap, ambiguous, chance hit): the
-                // mates fall back to the ordinary per-mate behaviour.
+                // Detection refused (no overlap, ambiguous, chance hit, or no
+                // adapter set to check the boundary against): the mates fall
+                // back to the ordinary per-mate behaviour.
                 None => (Arc::clone(&base1), Arc::clone(&base2)),
             }
         } else {
@@ -1076,6 +1078,7 @@ fn pair_chunks(
 mod tests {
     use super::*;
     use crate::algorithm::MinLen;
+    use crate::cli::PeOverlapMode;
     use crate::io::CompressionLevels;
     use flate2::read::GzDecoder;
     use std::fs::File;
@@ -1123,7 +1126,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
-            pe_overlap: false,
+            pe_overlap: PeOverlapMode::Never,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1382,7 +1385,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
-            pe_overlap: false,
+            pe_overlap: PeOverlapMode::Never,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1407,7 +1410,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
-            pe_overlap: false,
+            pe_overlap: PeOverlapMode::Never,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,

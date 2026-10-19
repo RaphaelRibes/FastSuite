@@ -29,6 +29,52 @@ pub enum AdapterPreset {
 }
 
 // ---------------------------------------------------------------------------
+// PE-overlap mode (tri-state, clap ValueEnum).
+// ---------------------------------------------------------------------------
+
+/// When the paired-end overlap detector may pin the adapter boundary.
+///
+/// `auto` (the default) tracks the adapter source, because the safety guard
+/// needs a set to check the boundary against: `auto` runs only when the
+/// adapter source is EXPLICIT (`--adapter-preset` / `--adapters`), and stays
+/// off with auto-detection or `--no-adapter`. `always` is the explicit opt-in
+/// to run regardless of the source. Either way the detector refuses a
+/// boundary when no set is configured (`detect_pe_overlap_trim(.., None)` is
+/// `None`), so `always` cannot trim biology either — it only opts into running
+/// the detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PeOverlapMode {
+    /// Never run the mode (equivalent to the flag being absent).
+    Never,
+    /// Run only when the adapter source is explicit (the default).
+    Auto,
+    /// Run whenever an overlap is detected, even with no adapter set.
+    Always,
+}
+
+impl PeOverlapMode {
+    /// Whether the mode may run at all, given the resolved adapter source.
+    ///
+    /// `Never` never runs; `Always` always runs (the caller has opted in);
+    /// `Auto` runs only for an explicit source — the guard then has a set to
+    /// check the boundary against. This is the one place the tri-state is
+    /// resolved, so the mode's reach cannot drift from the source that
+    /// justifies it.
+    pub fn runs_with(self, source: &AdapterSource) -> bool {
+        match self {
+            PeOverlapMode::Never => false,
+            PeOverlapMode::Always => true,
+            PeOverlapMode::Auto => matches!(source, AdapterSource::Fixed(_)),
+        }
+    }
+
+    /// Whether the mode runs, for callers that already know the source.
+    pub fn runs(self) -> bool {
+        !matches!(self, PeOverlapMode::Never)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI struct.
 // ---------------------------------------------------------------------------
 
@@ -160,27 +206,46 @@ pub struct Cli {
     pub adapter_error_rate: f64,
 
     /// Paired-end only: infer the adapter boundary from the mate pair's own
-    /// overlap, and trim from there. Off by default, and byte-identical to the
-    /// current behaviour whenever it detects nothing.
+    /// overlap, and trim from there.
+    ///
+    /// Values:
+    /// * `never`  — the mode never runs.
+    /// * `auto`   — **the default.** Runs only when an explicit adapter set is
+    ///   configured (`--adapter-preset` or `--adapters`). Off with
+    ///   auto-detection or `--no-adapter`, because the safety guard needs a set
+    ///   to check the boundary against.
+    /// * `always` — runs whenever an overlap is detected, even with no adapter
+    ///   set (the caller explicitly opts in to the risk).
+    ///
+    /// The bare spelling `--pe-overlap` (no value) is accepted as an alias for
+    /// `always`, so existing invocations that asked for the mode keep working.
     ///
     /// When the insert is shorter than the read, R1's 3′ suffix and the
     /// reverse-complement prefix of R2 describe the same fragment, so the mate
     /// pair pins the insert size and hence where the adapter readthrough begins
-    /// on each mate — without needing to know the adapter sequence. The
-    /// detector anchors on a 12-base match (the same value fastcheck's
-    /// insert-size estimator uses), verifies the whole shared window base for
-    /// base, and refuses anything it cannot pin uniquely: no overlap, no
-    /// anchor, a chance anchor hit, or more than one admissible alignment all
-    /// fall back to the current per-mate behaviour, silently and exactly.
+    /// on each mate. The detector anchors on a 12-base match (the same value
+    /// fastcheck's insert-size estimator uses), verifies the whole shared
+    /// window base for base, and refuses anything it cannot pin uniquely: no
+    /// overlap, no anchor, a chance anchor hit, or more than one admissible
+    /// alignment all fall back to the ordinary per-mate behaviour, silently and
+    /// exactly. A boundary is applied **only if** the readthrough past it is
+    /// adapter sequence from the configured set (`readthrough_is_adapter`), so
+    /// an overlap alone never trims biology; with no set configured the mode
+    /// refuses a boundary outright, structurally.
     ///
-    /// Off by default because the value is unmeasured on real libraries: the
-    /// 102-dataset corpus carries no adapter readthrough at all (its profiles
-    /// have `adapter.mode: none`, so 0.01–0.26% of mates carry adapter), which
-    /// makes it a guard rather than a value test. See
+    /// Measured as a null on a cohort built to be scorable (Cell B,
+    /// docs/OVERTRIM-PAIRED.md): exact matches identical with and without the
+    /// mode, overtrim +106, +0.000 pp against a pre-registered 0.5 pp threshold.
+    /// The 102-dataset corpus cannot answer the question -- adapter readthrough
+    /// is configured in 53 of its 102 profiles but materialises in only 11,395
+    /// of 10.2M pairs (0.112%), because it needs an insert shorter than the read
+    /// -- so the corpus serves as the guard cell, not the value test. See
     /// docs/plans/2026-10-19_004500-pe-overlap-with-without.md and
     /// bench/scripts/trim_report.py's FASTPREP_VARIANTS slot (`fp-pe`).
-    #[arg(long, help_heading = "Adapter Trimming")]
-    pub pe_overlap: bool,
+    #[arg(long, value_name = "MODE", value_enum, default_value_t = PeOverlapMode::Auto,
+          num_args = 0..=1, default_missing_value = "always",
+          help_heading = "Adapter Trimming")]
+    pub pe_overlap: PeOverlapMode,
 
     /// Minimum adapter overlap for sequence matching.
     /// 8 (was 4): a 4-base window at 10% error tolerates 1 mismatch on 4
@@ -459,10 +524,12 @@ pub struct Runtime {
     /// went wrong (CLI-SPEC §1 rule 5).
     pub quiet: bool,
     pub adapter_source: AdapterSource,
-    /// `--pe-overlap`: infer the adapter boundary from the mate pair's own
-    /// overlap. Default off; when off, [`Params::pe_adapter`] is never set and
-    /// the pipeline is byte-identical to the pre-flag behaviour.
-    pub pe_overlap: bool,
+    /// `--pe-overlap`: the tri-state as resolved in `finalize()`. `Auto` is
+    /// resolved against the adapter source here (explicit ⇒ [`PeOverlapMode::Auto`]
+    /// stays; auto-detect/`--no-adapter` ⇒ [`PeOverlapMode::Never`]), so the
+    /// pipeline reads the mode directly and the mode's reach cannot drift from
+    /// the source that justifies it.
+    pub pe_overlap: PeOverlapMode,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
     pub dedup: Option<DedupConfig>,
@@ -614,8 +681,14 @@ impl Cli {
         if !paired && self.out2.is_some() {
             bail!("-p/--out2 requires matching -2/--in2");
         }
+        // The paired-only flags are refused in single-end mode. `--pe-overlap`
+        // counts as asked-for when it is anything other than the default
+        // `auto`: `auto` resolves to off on single-end anyway (there is no
+        // mate), and refusing a bare invocation would be a spurious error. The
+        // bare spelling maps to `always`, so it still refuses as it always did.
         if !paired && (self.singletons1.is_some() || self.singletons2.is_some()
-            || self.r1_scan_reverse || self.r2_scan_reverse || self.pe_overlap)
+            || self.r1_scan_reverse || self.r2_scan_reverse
+            || self.pe_overlap != PeOverlapMode::Auto)
         {
             bail!("--singletons*, --r1-scan-reverse, --r2-scan-reverse and --pe-overlap apply to paired-end mode only");
         }
@@ -881,6 +954,20 @@ impl Cli {
             Mode::Single { in1, out1, params }
         };
 
+        // Resolve the PE-overlap tri-state against the adapter source, in the
+        // same place the source is built: the guard needs a set to check the
+        // boundary against, so `auto` runs only when the source is explicit.
+        // `always` keeps its explicit opt-in, and the detector still refuses a
+        // boundary with no set (`detect_pe_overlap_trim(.., None)` is `None`).
+        let pe_overlap = match self.pe_overlap {
+            PeOverlapMode::Never => PeOverlapMode::Never,
+            PeOverlapMode::Always => PeOverlapMode::Always,
+            PeOverlapMode::Auto => match adapter_source {
+                AdapterSource::Fixed(_) => PeOverlapMode::Auto,
+                AdapterSource::None => PeOverlapMode::Never,
+            },
+        };
+
         let runtime = Runtime {
             threads: self.threads,
             chunk: self.chunk,
@@ -898,7 +985,7 @@ impl Cli {
             dry_run: self.dry_run,
             quiet: self.quiet,
             adapter_source,
-            pe_overlap: self.pe_overlap,
+            pe_overlap,
             dedup,
             adapter_error_rate: self.adapter_error_rate,
             min_adapter_overlap_se: self.min_adapter_overlap,
@@ -1051,5 +1138,29 @@ mod tests {
         assert!(cli.no_auto_phred);
         assert!(cli.interior);
     }
-}  
+
+    #[test]
+    fn pe_overlap_defaults_to_auto() {
+        // The default must be the tri-state's `auto`, not a bare bool: it is
+        // what resolves against the adapter source in finalize().
+        use clap::Parser;
+        let cli = Cli::parse_from(["fastprep", "-1", "in.fq", "-2", "in2.fq",
+                                   "-o", "out.fq", "-p", "out2.fq"]);
+        assert_eq!(cli.pe_overlap, PeOverlapMode::Auto, "--pe-overlap defaults to auto");
+    }
+
+    #[test]
+    fn auto_tracks_the_adapter_source() {
+        // The resolution the pipeline relies on: auto + explicit ⇒ runs;
+        // auto + auto-detect or --no-adapter ⇒ off.
+        assert!(PeOverlapMode::Auto.runs_with(&AdapterSource::Fixed(Arc::new(
+            AdapterSet::new(adapter::preset_illumina(), 0.2, 14)
+        ))));
+        assert!(!PeOverlapMode::Auto.runs_with(&AdapterSource::None));
+        assert!(!PeOverlapMode::Never.runs_with(&AdapterSource::Fixed(Arc::new(
+            AdapterSet::new(adapter::preset_illumina(), 0.2, 14)
+        ))));
+        assert!(PeOverlapMode::Always.runs_with(&AdapterSource::None));
+    }
+}
 
