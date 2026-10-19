@@ -1710,8 +1710,18 @@ procedure MatchAdapters(R, L, 𝒜, ε, o_SE) → (T3_adp, name)
   needs an insert shorter than the read. The corpus therefore cannot answer
   whether the mode improves accuracy, and a synthetic cohort whose ground truth
   carries both G-runs and readthrough is used for that instead
-  (`docs/plans/2026-10-19_004500-pe-overlap-with-without.md`). The design and its
-  rationale are retained deliberately.
+  (`docs/plans/2026-10-19_004500-pe-overlap-with-without.md`).
+  #block(inset: 0.6em, [
+    *Result: the mode is a measured null.* On that cohort (800,000 mates, 14.1%
+    readthrough, 489,546 mates carrying a G-run) exact matches are identical
+    (347,171) with and without the flag, and overtrim rises by 106 --- +0.094 pp
+    on the readthrough slice, +0.000 pp overall, against a pre-registered 0.5 pp
+    threshold. The mode is therefore not restored as a default. The mechanism is
+    that the changed decisions are either invisible to the scorer
+    (dropped-to-dropped) or net-negative: it trims 1--2 bp *less* on mates the
+    ordinary path had already handled, correcting an over-trim rather than
+    discovering one, over an addressable set of 1.2% of readthrough mates.
+  ])
 ])
 
 In paired-end sequencing, when the insert length $I$ is shorter
