@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# C1 — the full chain, one dataset per worker (PLAN-ML-LOCAL C1).
+#
+#   fastcheck --json            the real unit's QC                    (C1)
+#   fastcheck --profile         the fitter IS fastcheck --profile     (A1, Rust)
+#   fastsim --profile           simulate a matching dataset w/ ground truth
+#   fastprep sweep              N configs x 3 variants, scored vs gt.tsv
+#   winner                      the best config per dataset            (C1)
+#
+# A2 is satisfied by construction: the recovery test passed 8/10 on this
+# desktop with the Task-10 insert fix (censored_share 52.75% vs true 55.77%),
+# so the fitter's insert block flows --insert-hist -> --profile -> fastsim.
+#
+# Usage:  chain.sh <unit_dir_prefix> <work_dir> <out_row.tsv>
+#   e.g. chain.sh /mnt/.../units/human_gut/DRR425474 /mnt/.../work/human_gut/DRR425474 row.tsv
+#
+# Env knobs: THREADS (default 4), PAIRS (default 100000), VARIANT (default 0),
+#            CONFIGS (default 60), SIM_PAIRS (default 100000).
+#
+# Idempotent: every artefact is written under work_dir and the row is appended
+# only on success. Re-running recomputes; a partial dir is simply redone.
+
+set -uo pipefail
+
+UNIT="$1"     # e.g. .../units/human_gut/DRR425474  (files: DRR425474.R1.fastq.gz, .R2, .sha256)
+WORK="$2"
+ROW="$3"      # append one TSV row per config evaluated
+
+THREADS="${THREADS:-4}"
+PAIRS="${PAIRS:-100000}"
+VARIANT="${VARIANT:-0}"
+CONFIGS="${CONFIGS:-60}"
+SIM_PAIRS="${SIM_PAIRS:-100000}"
+
+BIN="${BIN:-$HOME/FastSuite/tools}"
+FASTCHECK="$BIN/fastcheck/target/release/fastcheck"
+FASTSIM="$BIN/fastsim/target/release/fastsim"
+FASTPREP="$BIN/fastprep/target/release/fastprep"
+
+[[ -x "$FASTCHECK" && -x "$FASTSIM" && -x "$FASTPREP" ]] || { echo "chain: missing a binary under $BIN" >&2; exit 1; }
+[[ -s "$UNIT.R1.fastq.gz" ]] || { echo "chain: no unit at $UNIT" >&2; exit 1; }
+
+DOMAIN=$(basename "$(dirname "$UNIT")")
+ACC=$(basename "$UNIT")
+mkdir -p "$WORK"
+cd "$WORK" || exit 1
+
+# ---------------------------------------------------------------- 1. real QC
+# The report IS the fitter's input; --insert-hist makes the profile's insert
+# distribution measured rather than invented (20000 pairs sampled).
+if [[ ! -s real.report.json ]]; then
+    if [[ -s "$UNIT.R2.fastq.gz" ]]; then
+        "$FASTCHECK" --json real.report.json --profile real.profile.json \
+            --insert-hist --insert-pairs 20000 \
+            -j "$THREADS" -- "$UNIT.R1.fastq.gz" "$UNIT.R2.fastq.gz" \
+            > real.check.log 2>&1 || { echo "chain: fastcheck failed on $ACC" >&2; tail -5 real.check.log >&2; exit 1; }
+    else
+        echo "chain: unit $ACC is single-end; the C chain is paired-only" >&2
+        exit 1
+    fi
+fi
+
+# The profile must carry a MEASURED insert block or the simulation is invented.
+# --insert-hist makes fastcheck write it as a sparse {length: count} histogram
+# (the same bins the report's insert_hist block carries), so the check is that
+# the dict exists, is non-trivial, and the mode is sane — not that it is a list.
+python3 - "$WORK/real.profile.json" <<'PY' || exit 1
+import json, sys
+p = json.load(open(sys.argv[1]))
+ins = p.get("insert")
+if not isinstance(ins, dict) or not ins:
+    print("chain: profile insert block missing or not a histogram", file=sys.stderr)
+    sys.exit(1)
+bins = {int(k): int(v) for k, v in ins.items()}
+n = sum(bins.values())
+if n < 100:
+    print(f"chain: insert histogram has only {n} sampled pairs", file=sys.stderr)
+    sys.exit(1)
+mode = max(bins, key=bins.get)
+lo, hi = min(bins), max(bins)
+print(f"chain: insert hist {len(bins)} bins, {n} pairs, mode {mode}bp, range {lo}-{hi}bp")
+PY
+
+# ------------------------------------------------------- 2. simulate from it
+# fastsim's CLI defaults assume 150 bp reads (--insert-min 150). The profile's
+# own read_len comes from the real data, so every length knob is derived from
+# it: fastsim REFUSES to run when insert-min > read_len, which is exactly what
+# a 110 bp dataset hits with the default. The insert floor is the profile's
+# measured minimum (an insert shorter than the reads cannot be overlapped), and
+# read_len is passed explicitly rather than left to the default.
+PROFILE_KNOBS=$(python3 - "$WORK/real.profile.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))
+rl = int(p.get("read_len") or 150)
+ins = p.get("insert") or {}
+lens = sorted(int(k) for k in ins) if ins else []
+# the measured insert floor, never below 1 and never above read_len
+imin = max(1, min(lens[0] if lens else 1, rl))
+print(f"{rl} {imin}")
+PY
+) || exit 1
+READ_LEN=$(echo "$PROFILE_KNOBS" | cut -d' ' -f1)
+INSERT_MIN=$(echo "$PROFILE_KNOBS" | cut -d' ' -f2)
+
+# A variant changes ONLY the non-identifiable fields (A4): the seed, so the
+# three variants are three independent draws from the same fitted profile —
+# the sweep then measures a config's mean score across draws, which is the
+# honest estimator of "does this config trim this data well".
+SEED=$(( 42 + VARIANT * 1000 ))
+if [[ ! -s "sim.v$VARIANT.gt.tsv" ]]; then
+    # --drop-rate 0: the closed loop (C2) compares the sim's QC against the
+    # REAL library's QC. fastsim's default --drop-rate 0.05 plants a forced
+    # short-insert class U[1, drop-min-len) — down to insert length 1 — which
+    # the real library does not have (its measured insert floor is 88bp, one
+    # bin under the 90bp read length). With the fitter correctly setting
+    # adapter.mode=none (zero adapter hits in the real data), those planted
+    # reads pad with N, so 4.35% of sim reads end in an N-run: position-90 G
+    # fraction 0.253 real vs 0.0013 sim, g_frac_max_diff 0.25 on every dataset,
+    # 0/69 closed-loop passes. The drop class is a CONTAMINANT model for the
+    # sweep, not part of the library's biology — simulating from the profile's
+    # own insert distribution (drop-rate 0) makes the sim's artefact mix the
+    # profile's artefact mix, which is what the closed loop measures.
+    "$FASTSIM" --pairs "$SIM_PAIRS" --profile real.profile.json \
+        --out "sim.v$VARIANT" --seed "$SEED" \
+        --read-len "$READ_LEN" --insert-min "$INSERT_MIN" --drop-rate 0 \
+        --force > "sim.v$VARIANT.log" 2>&1
+    rc=$?
+    # fastsim prints a citation line on stderr at the end of every run: EXPECTED.
+    if [[ $rc -ne 0 || ! -s "sim.v$VARIANT.gt.tsv" ]]; then
+        echo "chain: fastsim failed on $ACC variant $VARIANT" >&2
+        tail -20 "sim.v$VARIANT.log" >&2; exit 1
+    fi
+fi
+
+# ------------------------------------------------------------- 3. the sweep
+# The grid lives in sweep.py (bench/scripts/sweep.py): 60 configs x 3 variants.
+# Each config is run once per variant; the row carries the variant id.
+SIM_R1="sim.v${VARIANT}_R1.fastq.gz"
+SIM_R2="sim.v${VARIANT}_R2.fastq.gz"
+python3 "$(dirname "$0")/sweep.py" \
+    --acc "$ACC" --domain "$DOMAIN" --variant "$VARIANT" \
+    --fastprep "$FASTPREP" \
+    --r1 "$SIM_R1" --r2 "$SIM_R2" \
+    --gt "sim.v$VARIANT.gt.tsv" \
+    --work "$WORK" --row "$ROW" --threads "$THREADS" --configs "$CONFIGS" \
+    > "sweep.v$VARIANT.log" 2>&1
+rc=$?
+if [[ $rc -ne 0 ]]; then
+    echo "chain: sweep failed on $ACC v$VARIANT" >&2
+    tail -30 "sweep.v$VARIANT.log" >&2; exit 1
+fi
+
+echo "chain: $ACC v$VARIANT done"
