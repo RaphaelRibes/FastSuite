@@ -1,0 +1,275 @@
+"""FastSuite benchmark pipeline.
+
+One Snakemake DAG for the five tools (fastprep, fastcheck, fastsim, fastmaps,
+fasthelper) over the whole corpus, resumable and parallel.
+
+Design notes, because they are not obvious:
+
+* **The fastprep decomposition is deliberately ONE serial job.** It is gated by
+  `p5`/`p3`, global posteriors derived from the whole corpus (trim_report.py
+  `build_posterior`, applied at the "recoverable undertrim" decision). Each
+  dataset therefore cannot be decomposed independently -- sharding the winners
+  list makes every shard derive its own posterior and classify differently
+  (measured: 3 shards summed to 2,095,617 vs a serial run's 2,097,646 on the
+  same datasets). It runs once, over all winners, and is the DAG's long pole.
+  Everything that IS additive is parallel.
+
+* **Everything else is per-dataset and parallel.** fastcheck / fastmaps /
+  fasthelper emit one output set per dataset, so they fan out over the corpus
+  with `threads:` and are independent.
+
+* **Scripts are declared inputs**, never referenced only from `shell:`. A
+  script referenced only inside `shell:` is invisible to Snakemake, so fixing it
+  does not invalidate its outputs and a stale result is silently reused.
+
+* **Intermediates are `temp()`** so 204 datasets of scratch do not accumulate.
+  Only files a declared input points at survive; anything read from a raw path
+  inside a `run:` block is an invisible dependency.
+
+* **`--rerun-triggers=mtime` for incremental runs.** The default includes a
+  per-rule `code` hash, so touching the Snakefile replans the whole DAG even
+  when every output is newer than its inputs.
+"""
+
+import os
+import pathlib
+
+configfile: "config/config.yaml"
+
+
+# ---------------------------------------------------------------------------
+# paths
+# ---------------------------------------------------------------------------
+def _out(*parts):
+    return os.path.join(config["output"]["root"], *parts)
+
+
+CORPUS = config["corpus"]["root"]
+UNITS = os.path.join(CORPUS, "units")
+WORK = os.path.join(CORPUS, "work")
+RESULTS = os.path.join(CORPUS, "results")
+TOOLS = config["tools"]["dir"]
+
+
+def tool(name):
+    return os.path.join(TOOLS, name, "target", "release", name)
+
+
+# ---------------------------------------------------------------------------
+# dataset discovery
+# ---------------------------------------------------------------------------
+def discover():
+    """Every dataset unit: (domain, accession, r1, r2)."""
+    out = []
+    root = pathlib.Path(UNITS)
+    # Flat per domain: units/<domain>/<accession>.R1.fastq.gz
+    for r1 in sorted(root.glob("*/*.R1.fastq.gz")):
+        r2 = r1.with_name(r1.name.replace(".R1.fastq.gz", ".R2.fastq.gz"))
+        if not r2.exists():
+            continue
+        # "DRR000466.R1.fastq.gz" -> accession "DRR000466"; Path.stem only strips
+        # the last suffix, so strip the ".R1.fastq" part explicitly.
+        acc = r1.name[: -len(".R1.fastq.gz")]
+        out.append((r1.parent.name, acc, str(r1), str(r2)))
+    return out
+
+
+DATASETS = discover()
+DOMAINS = sorted({d[0] for d in DATASETS})
+# The same accession can appear in more than one domain, so the dataset key is
+# "domain/acc" -- expanding on {acc} alone would collapse them into one path and
+# Snakemake would reject the duplicate.
+DATASET_IDS = [f"{d[0]}/{d[1]}" for d in DATASETS]
+BY_ID = {f"{d[0]}/{d[1]}": (d[2], d[3]) for d in DATASETS}
+
+
+def unit_r1(w):
+    return BY_ID[w.ds][0]
+
+
+def unit_r2(w):
+    return BY_ID[w.ds][1]
+
+
+# ---------------------------------------------------------------------------
+# targets
+# ---------------------------------------------------------------------------
+rule all:
+    input:
+        # fastprep: one serial decomposition + the per-tool retention
+        _out("fastprep", "decomposition.tsv"),
+        _out("fastprep", "retention.tsv"),
+        # fastcheck / fastmaps / fasthelper: one marker per dataset
+        expand(_out("fastcheck", "{ds}", "qc.json"), ds=DATASET_IDS),
+        expand(_out("fastmaps", "{ds}", "heatmap.data"), ds=DATASET_IDS),
+        expand(_out("fasthelper", "{ds}", "run", "report.json"), ds=DATASET_IDS),
+        _out("fasthelper", "aggregate.tsv"),
+        # fastsim: the sweep grid aggregate
+        _out("fastsim", "sweep", "aggregate.tsv"),
+
+
+# ===========================================================================
+# fastprep -- the decomposition (serial: see module docstring)
+# ===========================================================================
+rule fastprep_decomposition:
+    input:
+        winners = os.path.join(RESULTS, "winners.tsv"),
+        script = "scripts/trim_report.py",
+        fastprep = tool("fastprep"),
+        fastp = config["tools"]["fastp"],
+    output:
+        decomp = _out("fastprep", "decomposition.tsv"),
+        retention = _out("fastprep", "retention.tsv"),
+    params:
+        work = WORK,
+        results = RESULTS,
+        scratch = _out("fastprep", "scratch"),
+        tols = " ".join(f"--tol {t}" for t in config["fastprep"]["tols"]),
+    threads: config["resources"]["fastprep_threads"]
+    resources:
+        mem_mb = config["resources"]["fastprep_mem_mb"],
+    shell:
+        r"""
+        mkdir -p {params.scratch}
+        python3 {input.script} --mode both \
+            --work {params.work} \
+            --results {params.results} \
+            --out {output.decomp} \
+            --out-retention {output.retention} \
+            --scratch {params.scratch} \
+            {params.tols}
+        """
+
+
+# ===========================================================================
+# fastcheck -- profile + QC report per dataset
+# ===========================================================================
+rule fastcheck_run:
+    input:
+        r1 = unit_r1,
+        binary = tool("fastcheck"),
+        profile_script = "scripts/summarise_fastcheck.py",
+    output:
+        qc = _out("fastcheck", "{ds}", "qc.json"),
+        profile = _out("fastcheck", "{ds}", "profile.json"),
+    threads: config["resources"]["per_dataset_threads"]
+    resources:
+        mem_mb = config["resources"]["per_dataset_mem_mb"],
+    shell:
+        r"""
+        mkdir -p $(dirname {output.qc})
+        {input.binary} {input.r1} \
+            --json {output.qc} \
+            --profile {output.profile}
+        """
+
+
+# ===========================================================================
+# fastmaps -- heatmap + peak RSS per dataset
+# ===========================================================================
+rule fastmaps_run:
+    input:
+        r1 = unit_r1,
+        r2 = unit_r2,
+        binary = tool("fastmaps"),
+        rss_wrap = "scripts/rss_wrap.py",
+    output:
+        data = _out("fastmaps", "{ds}", "heatmap.data"),
+        rss = _out("fastmaps", "{ds}", "rss.txt"),
+    threads: config["resources"]["per_dataset_threads"]
+    resources:
+        mem_mb = config["resources"]["per_dataset_mem_mb"],
+    params:
+        outdir = _out("fastmaps", "{ds}"),
+    shell:
+        r"""
+        mkdir -p {params.outdir}
+        python3 {input.rss_wrap} {input.binary} {input.r1} {input.r2} \
+            -o {params.outdir} --force 2> {output.rss}
+        """
+
+
+# ===========================================================================
+# fasthelper -- the chain per dataset
+# ===========================================================================
+rule fasthelper_run:
+    input:
+        r1 = unit_r1,
+        r2 = unit_r2,
+        binary = tool("fasthelper"),
+        steps = tool("fastdedup"),
+    output:
+        # `run` writes a run directory; the per-dataset marker is its report
+        report = _out("fasthelper", "{ds}", "run", "report.json"),
+    threads: config["resources"]["per_dataset_threads"]
+    resources:
+        mem_mb = config["resources"]["per_dataset_mem_mb"],
+    params:
+        rundir = _out("fasthelper", "{ds}", "run"),
+        cfg_toml = _out("fasthelper", "{ds}", "cfg.toml"),
+        toolsdir = TOOLS,
+    run:
+        os.makedirs(params.rundir, exist_ok=True)
+        pathlib.Path(params.cfg_toml).write_text(
+            "[run]\n"
+            'name = "bench"\n'
+            f'outdir = "{params.rundir}"\n'
+            'steps = ["fastdedup", "fastprep", "fastmaps"]\n\n'
+            "[[samples]]\n"
+            f'name = "{wildcards.ds.replace("/", "_")}"\n'
+            f'r1 = "{input.r1}"\n'
+            f'r2 = "{input.r2}"\n'
+        )
+        shell(f"set -o pipefail; {input.binary} run --tools-dir {params.toolsdir} "
+              f"--config {params.cfg_toml}")
+
+
+# ===========================================================================
+# fastsim -- the sweep grid (55 configs x 3 variants), aggregated
+# ===========================================================================
+rule fastsim_sweep:
+    input:
+        units = [d[2] for d in DATASETS],
+        script = "scripts/run_campaign.sh",
+    output:
+        aggregate = _out("fastsim", "sweep", "aggregate.tsv"),
+    params:
+        units = UNITS,
+        results = os.path.join(CORPUS, "work", "fastsim"),
+        variants = config["fastsim"]["variants"],
+    threads: config["resources"]["fastsim_threads"]
+    resources:
+        mem_mb = config["resources"]["fastsim_mem_mb"],
+    shell:
+        r"""
+        mkdir -p $(dirname {output.aggregate})
+        bash {input.script} --units {params.units} \
+            --results {params.results} \
+            --jobs {threads} \
+            --variants {params.variants}
+        cp {params.results}/pilot.tsv {output.aggregate}
+        """
+
+
+# ===========================================================================
+# fasthelper -- one aggregate table over all datasets (the MultiQC slot)
+# ===========================================================================
+rule fasthelper_concatenate:
+    input:
+        reports = expand(_out("fasthelper", "{ds}", "run", "report.json"),
+                         ds=DATASET_IDS),
+        binary = tool("fasthelper"),
+    output:
+        tsv = _out("fasthelper", "aggregate.tsv"),
+    params:
+        outdir = _out("fasthelper", "aggregate"),
+        rundirs = " ".join(_out("fasthelper", ds, "run") for ds in DATASET_IDS),
+    threads: 1
+    resources:
+        mem_mb = 2048
+    shell:
+        r"""
+        mkdir -p {params.outdir}
+        {input.binary} concatenate {params.rundirs}             --outdir {params.outdir} --format tsv
+        cp {params.outdir}/report.tsv {output.tsv}
+        """

@@ -1,0 +1,33 @@
+# FastSuite benchmark pipeline configuration.
+#
+# One config file is the source of truth for every path and tunable; the
+# Snakefile contains no hardcoded absolute paths.
+
+corpus:
+  root: "/mnt/Fast/fastsuite-scratch"
+
+tools:
+  dir: "/home/raphael/FastSuite/tools"
+  fastp: "/home/raphael/.pixi/bin/fastp"
+
+output:
+  root: "/mnt/Fast/fastsuite-scratch/bench-work/snake-sweep"
+
+# The decomposition is gated by corpus-wide posteriors (trim_report.py
+# build_posterior), so it runs ONCE over all winners -- see the Snakefile
+# docstring. Everything else is per-dataset and parallel.
+fastprep:
+  tols: [0, 2]
+
+fastsim:
+  variants: 3
+
+resources:
+  # The decomposition and the fastsim sweep are the long poles: few jobs, many
+  # cores each. The per-dataset rules are numerous: few cores each.
+  fastprep_threads: 8
+  fastprep_mem_mb: 8192
+  fastsim_threads: 12
+  fastsim_mem_mb: 16384
+  per_dataset_threads: 1
+  per_dataset_mem_mb: 2048
