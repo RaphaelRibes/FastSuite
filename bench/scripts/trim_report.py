@@ -66,17 +66,25 @@ column the published table has keeps its name and its value.
              undertrim_rec_R1 / _R2, undertrim_irr_R1 / _R2 -- so the hypothesis
              "the effect lives on a specific mate" can be read off the table
              instead of re-running anything. The R1+R2 sums MUST equal the
-             pooled column (asserted by `bench/scripts/trim_report_check.py`).
+             pooled column (asserted at the end of every run, and fatal on
+             failure).
   by GT      readthrough (r1_adapter>0 or r2_adapter>0) and in_window
              (L <= insert <= 2L-12) -- the two conditions the mode keys on,
              from the gt's per-pair columns, per MATE (a pair is readthrough if
              either mate carried adapter).
-  pe_trims   pairs where the tool's observed (5',3') cuts differ from the
-             `fastprep-hd0` baseline for the same (pair, mate). With no
-             --pe-overlap flag in fastprep yet this is ~0 BY CONSTRUCTION for
-             the published configs; the column exists so that when the flag
-             lands (Task 2.4: FASTPREP_VARIANTS='[["fp-pe",["--pe-overlap"]]]')
-             it has somewhere to show up.
+    pe_trims   (pair, mate) whose observed (5',3') cuts differ from the
+             `fastprep-hd0` baseline's on the same dataset. With no
+             --pe-overlap flag in fastprep yet this is 0 BY CONSTRUCTION for
+             the two published configs and any VARIANT without such a flag; the
+             column exists so that when the flag lands (Task 2.4:
+             FASTPREP_VARIANTS='[["fp-pe",["--pe-overlap"]]]') it has somewhere
+             to show up. It is a diff against the BASELINE, so it is non-zero
+             for fastprep-hd4 (hd4 trims heads differently) and n/a for fastp
+             (fastp reports no trim positions to diff).
+  mates      the mate split and the gt slice are also crossed, so
+             <class>_mate{1,2}_readthrough_{0,1}_in_window_{0,1} is available
+             per (tool, tol) -- "the effect lives on a mate, on readthrough
+             pairs, inside the window" in one cell, no cross-tab by hand.
 
 Usage
 -----
@@ -84,6 +92,19 @@ Usage
   trim_report.py --mode retention      # TSV only, no corpus needed
   trim_report.py --limit 2             # scope / time the run on N datasets
   trim_report.py --work W --results R  # override corpus / results roots
+
+The decomposition also writes three ADDITIVE side tables next to --out:
+  <out>-permate.tsv      task 1.1  exact/overtrim/undertrim_rec/undertrim_irr
+                         per mate (R1, R2), same rows as the main table
+  <out>-pe.tsv           tasks 1.2+1.3  the counters sliced by readthrough and
+                         in_window, plus pe_trims (cuts differing from hd0)
+  <out>-permate-pe.tsv   the two crossed: <class> x mate x readthrough x window
+Both are additive: the main table's columns are never renamed or re-valued.
+
+Environment
+-----------
+  FASTPREP_VARIANTS='[["fp-pe",["--pe-overlap"]]]'   extra fastprep argv (Task 2.4)
+  FASTPREP_DOMAIN_TSV=<path>   also write the per-domain retention table
 """
 import argparse
 import collections
@@ -201,43 +222,49 @@ def gt_meta(path):
 def gt_flags(path, read_len):
     """-> (flags, skipped) for the PE slice of one dataset.
 
-    flags is {pair_id: (readthrough, in_window)} -- a PAIR-level answer to two
-    pair-level questions, applied to BOTH mates when counting (a pair is
-    "readthrough" if either mate carried adapter, so the pair's mates are all
-    readthrough mates for slicing purposes).
+    flags is {pair_id: (readthrough, in_window)}. readthrough and in_window are
+    the PAIR-level answers to the two pair-level questions the PE plan asks,
+    applied to BOTH mates when counting (a pair is "readthrough" if either mate
+    carried adapter, so the pair's mates are all readthrough mates for slicing
+    purposes). Either may be None when this gt cannot answer it:
 
-    skipped is a short reason string when the gt cannot answer: a missing
-    `insert` column (older gt files) means a pair cannot be placed in the
-    window, and an all-empty insert column means the same. In both cases the
-    caller drops the in_window slice for this file and says so -- it must not
-    crash the run, and it must not silently count the file as "no window
-    pairs" (which would bias the slice towards the datasets that do have the
-    column).
+      * no `insert` column (older gt files) -> in_window is None: the window
+        slice is skipped for that dataset, and the report says which datasets
+        were left out. Counting them as "no window pairs" would silently bias
+        the slice towards the datasets that do have the column.
+      * no adapter columns -> readthrough is None.
+
+    skipped is a short reason string when anything had to be dropped, so the
+    report can name it instead of hiding it in a bucket.
     """
     rl, header = gt_meta(path)
-    if "insert" not in header:
-        return {}, "no `insert` column"
     if rl is None:
         rl = read_len
     ceiling = 2 * rl - DEFAULT_ANCHOR
-    flags, seen_insert, n = {}, 0, 0
+    fields = header
+    has_rt = "r1_adapter" in fields and "r2_adapter" in fields
+    has_ins = "insert" in fields
+    flags, seen = {}, 0
     with open(path) as fh:
         rd = csv.DictReader(fh, delimiter="\t")
-        fields = rd.fieldnames or []
-        if "r1_adapter" not in fields or "r2_adapter" not in fields:
-            return {}, "no adapter columns"
         for r in rd:
-            n += 1
             try:
-                ins = int(r["insert"])
-                rt = int(r["r1_adapter"]) > 0 or int(r["r2_adapter"]) > 0
-            except (ValueError, TypeError):
+                pid = int(r["pair_id"])
+                rt = (int(r["r1_adapter"]) > 0 or int(r["r2_adapter"]) > 0) \
+                    if has_rt else None
+                win = (rl <= int(r["insert"]) <= ceiling) if has_ins else None
+            except (ValueError, TypeError, KeyError):
                 continue
-            seen_insert += 1
-            flags[int(r["pair_id"])] = (rt, rl <= ins <= ceiling)
-    if seen_insert == 0:
-        return {}, "empty `insert` column"
-    return flags, ""
+            seen += 1
+            flags[pid] = (rt, win)
+    if seen == 0:
+        return {}, "no usable rows"
+    reasons = []
+    if not has_ins:
+        reasons.append("no `insert` column (in_window slice skipped)")
+    if not has_rt:
+        reasons.append("no adapter columns (readthrough slice skipped)")
+    return flags, "; ".join(reasons)
 
 
 # --------------------------------------------------------------------------
@@ -304,7 +331,7 @@ def classify(t5, t3, h, t, ad, n, obs5, obs3, p5, p3, tol):
 
 
 def decomp(winners, work, results, p5, p3, limit, run_fastp=True,
-           read_len=DEFAULT_READ_LEN):
+           read_len=DEFAULT_READ_LEN, scratch="/tmp/trim_report"):
     """Run every tool on every dataset; return per (tool, tol) counters.
 
     Returns (c, cdom, cmate, cpe). `c`/`cdom` are the published decomposition;
@@ -344,7 +371,7 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True,
         gflags, gskip = gt_flags(gtp, read_len)
         if gskip:
             pe_skipped[(dom, acc)] = gskip
-        d = f"/tmp/trim_report/{dom}_{acc}"
+        d = f"{scratch}/{dom}_{acc}"
         os.makedirs(d, exist_ok=True)
 
         base = ["--force", "-q", "--gz-level", "6"]
@@ -419,10 +446,23 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True,
                         b = base_cuts.get((pid, mate))
                         if b is not None and (status, t5, t3) != b:
                             cpe[(tag, tol)]["pe_trims"] += 1
+                    # The two gt classifiers are pair-level, so both mates of a
+                    # readthrough pair land in the readthrough bucket. The
+                    # mate-specific cell is the one the PE plan reads: "does the
+                    # effect live on a mate, on readthrough pairs?".
                     if rt is not None:
                         cpe[(tag, tol)][f"{k}_readthrough_{int(rt)}"] += 1
+                        cpe[(tag, tol)][f"{k}_mate{mate}_readthrough_{int(rt)}"
+                                      ] += 1
                     if win is not None:
                         cpe[(tag, tol)][f"{k}_in_window_{int(win)}"] += 1
+                        cpe[(tag, tol)][f"{k}_mate{mate}_in_window_{int(win)}"
+                                      ] += 1
+                    if rt is not None and win is not None:
+                        cpe[(tag, tol)][f"{k}_readthrough_{int(rt)}"
+                                      f"_in_window_{int(win)}"] += 1
+                        cpe[(tag, tol)][f"{k}_mate{mate}_readthrough_{int(rt)}"
+                                      f"_in_window_{int(win)}"] += 1
 
         # ---- fastp-default and fastp-tuned (cuts recovered by alignment) ----
         for tag, extra in ((("fastp-default", []), ("fastp-tuned", H.FASTP_TUNED))
@@ -461,10 +501,22 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True,
                         cmate[(tag, tol)][k + "_R1"] += 1
                     else:
                         cmate[(tag, tol)][k + "_R2"] += 1
+                    # fastp is scored by alignment, not PXMT, so there is no
+                    # baseline row of its own to diff against: pe_trims stays 0
+                    # for fastp and is reported as n/a.
                     if rt is not None:
                         cpe[(tag, tol)][f"{k}_readthrough_{int(rt)}"] += 1
+                        cpe[(tag, tol)][f"{k}_mate{mate}_readthrough_{int(rt)}"
+                                      ] += 1
                     if win is not None:
                         cpe[(tag, tol)][f"{k}_in_window_{int(win)}"] += 1
+                        cpe[(tag, tol)][f"{k}_mate{mate}_in_window_{int(win)}"
+                                      ] += 1
+                    if rt is not None and win is not None:
+                        cpe[(tag, tol)][f"{k}_readthrough_{int(rt)}"
+                                      f"_in_window_{int(win)}"] += 1
+                        cpe[(tag, tol)][f"{k}_mate{mate}_readthrough_{int(rt)}"
+                                      f"_in_window_{int(win)}"] += 1
         # measurement-only: every config's PXMT/FASTQ for this dataset has been
         # scored above, so free it — a 102-dataset × 6-config run otherwise
         # fills /tmp (overtrim_vs_fastp.py does the same). Numbers unaffected.
@@ -547,7 +599,8 @@ def cmd_retention(tsv, out):
     print(f"\nwrote {out} ({len(tsv_rows)} rows)")
 
 
-def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
+def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True,
+               read_len=DEFAULT_READ_LEN, scratch="/tmp/trim_report"):
     print(f"building posterior ({_POSTERIOR_SRC}) ...", file=sys.stderr, flush=True)
     p5, p3, tab5, tab3, used = build_posterior(winners, work, limit)
     print(f"  posterior from {used} datasets; "
@@ -555,9 +608,23 @@ def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
           f"3' crossing at r={next((r for r in sorted(p3) if p3[r] > 0.5), None)}",
           file=sys.stderr, flush=True)
     print("running tools ...", file=sys.stderr, flush=True)
-    c, cdom = decomp(winners, work, results, p5, p3, limit,
-                     run_fastp=run_fastp)
+    c, cdom, cmate, cpe, pe_skipped = decomp(
+        winners, work, results, p5, p3, limit, run_fastp=run_fastp,
+        read_len=read_len, scratch=scratch)
+    return report_decomp(p5, p3, c, cdom, cmate, cpe, pe_skipped, tol_show, out)
 
+
+def report_decomp(p5, p3, c, cdom, cmate, cpe, pe_skipped, tol_show, out):
+    """Print + write the decomposition: the published columns, unchanged, and
+    the three additive Phase-1 blocks (per-mate, PE slice, pe_trims).
+
+    Extracted from cmd_decomp so the report can be re-rendered from counters
+    that already exist (the no-regression harness reuses it) without running
+    the tools again. p5/p3 are accepted for signature symmetry with the
+    posterior banner; the counters carry everything the tables need.
+    """
+    tools = (["fastprep-hd0", "fastprep-hd4"] + [t for t, _ in VARIANTS]
+             + ["fastp-default", "fastp-tuned"])
     lines = []
     lines.append("=== UNDERTRIM DECOMPOSITION (per tool) ===")
     lines.append(f"posterior: P(artefact | observed run length); {_POSTERIOR_SRC}")
@@ -572,8 +639,7 @@ def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
         lines.append(f"-- tolerance {tol} " + "-" * 60)
         lines.append(f"{'tool':17} {'exact':>12} {'overtrim':>12} "
                      f"{'und-rec':>12} {'und-irr':>12} {'dropped':>12}")
-        for tag in (["fastprep-hd0", "fastprep-hd4"] + [t for t, _ in VARIANTS]
-                    + ["fastp-default", "fastp-tuned"]):
+        for tag in tools:
             s = c[(tag, tol)]
             tot = s["exact"] + s["overtrim"] + s["rec"] + s["irr"] + s["unaligned"]
             if tot == 0:
@@ -583,6 +649,50 @@ def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
                 f"{s['rec']:12d} {s['irr']:12d} {s['dropped']:12d}")
             tsv_rows.append([tag, tol, s["exact"], s["overtrim"], s["rec"],
                              s["irr"], s["dropped"], s["unaligned"], tot])
+
+    # ---- task 1.1: per-mate columns, and the R1+R2 == pooled assertion ----
+    # cmate's keys are "<class>_R1"/"_R2" where <class> is the POOLED counter's
+    # class name (exact / overtrim / rec / irr / dropped / unaligned); the
+    # report columns are the verbose names. Note rec -> undertrim_recoverable.
+    MATE_COLS = (("exact_R1", "exact_R2", "exact", "exact"),
+                 ("overtrim_R1", "overtrim_R2", "overtrim", "overtrim"),
+                 ("undertrim_rec_R1", "undertrim_rec_R2", "rec",
+                  "undertrim_recoverable"),
+                 ("undertrim_irr_R1", "undertrim_irr_R2", "irr",
+                  "undertrim_irreducible"))
+    mate_rows = []
+    mate_bad = []
+    for tol in tol_show:
+        lines.append("")
+        lines.append(f"-- tolerance {tol}: per mate " + "-" * 46)
+        lines.append(f"{'tool':17} {'exact_R1':>12} {'exact_R2':>12} "
+                     f"{'overt_R1':>12} {'overt_R2':>12} "
+                     f"{'rec_R1':>12} {'rec_R2':>12} "
+                     f"{'irr_R1':>12} {'irr_R2':>12}")
+        for tag in tools:
+            s = cmate[(tag, tol)]
+            tot = (s["exact_R1"] + s["exact_R2"] + s["overtrim_R1"]
+                   + s["overtrim_R2"] + s["rec_R1"] + s["rec_R2"]
+                   + s["irr_R1"] + s["irr_R2"] + s["dropped_R1"] + s["dropped_R2"]
+                   + s["unaligned_R1"] + s["unaligned_R2"])
+            if tot == 0:
+                continue
+            lines.append(
+                f"{tag:17} {s['exact_R1']:12d} {s['exact_R2']:12d} "
+                f"{s['overtrim_R1']:12d} {s['overtrim_R2']:12d} "
+                f"{s['rec_R1']:12d} {s['rec_R2']:12d} "
+                f"{s['irr_R1']:12d} {s['irr_R2']:12d}")
+            mate_rows.append([tag, tol, s["exact_R1"], s["exact_R2"],
+                              s["overtrim_R1"], s["overtrim_R2"],
+                              s["rec_R1"], s["rec_R2"], s["irr_R1"],
+                              s["irr_R2"]])
+            # the instrument check: every mate split must sum back to the
+            # pooled column, for the four required pairs.
+            for k1, k2, cls, pooled in MATE_COLS:
+                got = s[k1] + s[k2]
+                want = c[(tag, tol)][pooled]
+                if got != want:
+                    mate_bad.append((tag, tol, pooled, got, want))
     text = "\n".join(lines)
     print("\n" + text)
     with open(out, "w", newline="") as fh:
@@ -590,6 +700,162 @@ def cmd_decomp(winners, work, results, limit, tol_show, out, run_fastp=True):
         wr.writerow(hdr)
         wr.writerows(tsv_rows)
     print(f"\nwrote {out} ({len(tsv_rows)} rows)")
+
+    mate_out = out.rsplit(".", 1)[0] + "-permate.tsv"
+    with open(mate_out, "w", newline="") as fh:
+        wr = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        wr.writerow(["tool", "tol"] + [k for k1, k2, _, _ in MATE_COLS
+                                       for k in (k1, k2)])
+        wr.writerows(mate_rows)
+    print(f"wrote {mate_out} ({len(mate_rows)} rows)")
+
+    # ---- task 1.2 + 1.3: the PE-overlap slice ----
+    CLASSES = ("exact", "overtrim", "rec", "irr", "dropped", "unaligned")
+    # pooled n for this (tool, tol) from the published counter. Every class is
+    # a plain count per (tool, tol), so the total mates scored is their sum.
+    pe_n = {k: sum(c[k].values()) for k in c}
+    pe_lines = []
+    pe_lines.append("")
+    pe_lines.append("=== PE-OVERLAP SLICE (per tool) ===")
+    pe_lines.append("readthrough = gt r1_adapter>0 or r2_adapter>0; "
+                    "in_window = L <= insert <= 2L-12")
+    pe_lines.append("pe_trims = (pair, mate) whose observed 5'/3' cuts differ "
+                    "from fastprep-hd0's, same dataset; fastp is n/a (no "
+                    "baseline row).")
+    pe_lines.append("")
+    pe_lines.append("per mate: readthrough / in_window, tolerance 0")
+    pe_lines.append(f"{'tool':17} {'n':>12} {'rt%':>7} {'win%':>7} "
+                    f"{'exact_rt':>12} {'exact_win':>12} {'overt_rt':>12} "
+                    f"{'overt_win':>12} {'pe_trims':>12}")
+    pe_rows = []
+    pe_bad = []
+    # which slices exist at all: a slice that no dataset could answer is
+    # reported as absent, and its conservation check is skipped rather than
+    # reported as a violation (a missing slice is not a broken one).
+    slices_ok = {"readthrough": True, "in_window": True}
+    # A slice is "absent" when EVERY dataset in the run could not answer it --
+    # not merely when some did. A partially-available slice is still checked
+    # where it exists: the conservation check below uses the pooled count only
+    # when the slice is complete, and reports the coverage otherwise, so a
+    # degraded gt shows up as a number with a stated denominator rather than
+    # as a failure or as a silent zero.
+    if pe_skipped:
+        # cdom is keyed (tag, tol, domain): the datasets actually scored are
+        # the domains seen in it.
+        n_scored = len({k[2] for k in cdom})
+        if len(pe_skipped) == n_scored:
+            for why in pe_skipped.values():
+                if "in_window" in why:
+                    slices_ok["in_window"] = False
+                if "readthrough" in why:
+                    slices_ok["readthrough"] = False
+    for tol in (0,):
+        for tag in tools:
+            s = cpe[(tag, tol)]
+            n = pe_n.get((tag, tol), 0)
+            if n == 0:
+                continue
+            rt = sum(s[f"{cls}_readthrough_1"] for cls in CLASSES)
+            win = sum(s[f"{cls}_in_window_1"] for cls in CLASSES)
+            pct = lambda x: (100.0 * x / n) if n else 0.0
+            # the baseline row itself: its cuts are the reference, so its own
+            # pe_trims is 0 by construction and shown as n/a rather than 0
+            # (0 is a measurement; n/a is not one).
+            pe_trims = s["pe_trims"] if tag != "fastprep-hd0" else None
+            show = "n/a" if pe_trims is None else str(pe_trims)
+            pe_lines.append(
+                f"{tag:17} {n:12d} {pct(rt):6.2f}% {pct(win):6.2f}% "
+                f"{s['exact_readthrough_1']:12d} {s['exact_in_window_1']:12d} "
+                f"{s['overtrim_readthrough_1']:12d} "
+                f"{s['overtrim_in_window_1']:12d} {show:>12}")
+            pe_rows.append([tag, tol, n, rt, pct(rt), win, pct(win),
+                            s["exact_readthrough_1"], s["exact_in_window_1"],
+                            s["overtrim_readthrough_1"],
+                            s["overtrim_in_window_1"], show])
+            # slice conservation: rt_1 + rt_0 must equal the pooled scored
+            # count, and the same for in_window. A missing slice must be
+            # visible, not silently folded into the "0" bucket.
+            for cls in CLASSES:
+                if slices_ok["readthrough"]:
+                    a = s[f"{cls}_readthrough_1"] + s[f"{cls}_readthrough_0"]
+                    b = c[(tag, tol)][cls]
+                    if a != b:
+                        pe_bad.append((tag, tol, cls, "readthrough", a, b))
+                if slices_ok["in_window"]:
+                    a = s[f"{cls}_in_window_1"] + s[f"{cls}_in_window_0"]
+                    b = c[(tag, tol)][cls]
+                    if a != b:
+                        pe_bad.append((tag, tol, cls, "in_window", a, b))
+    if pe_skipped:
+        pe_lines.append("")
+        pe_lines.append("PE SLICES SKIPPED for these datasets "
+                        "(dropped from the slice, not counted as empty):")
+        for (dom, acc), why in sorted(pe_skipped.items()):
+            pe_lines.append(f"  {dom:18} {acc:12} {why}")
+    print("\n".join(pe_lines))
+    pe_out = out.rsplit(".", 1)[0] + "-pe.tsv"
+    with open(pe_out, "w", newline="") as fh:
+        wr = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        wr.writerow(["tool", "tol", "n", "readthrough", "pct_readthrough",
+                     "in_window", "pct_in_window", "exact_readthrough",
+                     "exact_in_window", "overtrim_readthrough",
+                     "overtrim_in_window", "pe_trims"])
+        wr.writerows(pe_rows)
+    print(f"wrote {pe_out} ({len(pe_rows)} rows)")
+
+    # per-mate table also sliced by readthrough / in_window: the two questions
+    # the PE plan asks (does the effect live on a mate? on readthrough pairs?)
+    # are answered in ONE cell, so no cross-tab has to be rebuilt by hand.
+    matepe_rows = []
+    pe_lines = [""]
+    pe_lines.append("per mate, by readthrough / in_window (tolerance 0)")
+    pe_lines.append(f"{'tool':17} {'mate':>4} {'rt':>3} {'win':>3} "
+                    f"{'n':>12} {'exact':>12} {'overtrim':>12} "
+                    f"{'rec':>12} {'irr':>12} {'dropped':>12}")
+    for tol in (0,):
+        for tag in tools:
+            for mate in (1, 2):
+                for rt in (0, 1):
+                    for win in (0, 1):
+                        s = cpe[(tag, tol)]
+                        n = sum(s[f"{cls}_mate{mate}_readthrough_{rt}"
+                                  f"_in_window_{win}"] for cls in CLASSES)
+                        if n == 0:
+                            continue
+                        row = [tag, mate, rt, win, n]
+                        for cls in ("exact", "overtrim", "rec", "irr",
+                                    "dropped"):
+                            row.append(s[f"{cls}_mate{mate}_readthrough_{rt}"
+                                         f"_in_window_{win}"])
+                        pe_lines.append(
+                            f"{tag:17} {mate:4d} {rt:3d} {win:3d} {n:12d} "
+                            + " ".join(f"{v:12d}" for v in row[5:]))
+                        matepe_rows.append(row)
+    print("\n".join(pe_lines))
+    matepe_out = out.rsplit(".", 1)[0] + "-permate-pe.tsv"
+    with open(matepe_out, "w", newline="") as fh:
+        wr = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        wr.writerow(["tool", "tol", "mate", "readthrough", "in_window", "n",
+                     "exact", "overtrim", "rec", "irr", "dropped"])
+        wr.writerows([[r[0], 0] + r[1:] for r in matepe_rows])
+    print(f"wrote {matepe_out} ({len(matepe_rows)} rows)")
+
+    # ---- the instrument check, printed and asserted ----
+    print("")
+    print("=== INSTRUMENT CHECKS (must all pass) ===")
+    print(f"per-mate sums == pooled: "
+          f"{'PASS' if not mate_bad else 'FAIL'}  ({len(mate_bad)} violations)")
+    for tag, tol, pooled, got, want in mate_bad[:10]:
+        print(f"  FAIL {tag} tol={tol} {pooled}: R1+R2={got} pooled={want}")
+    print(f"slice sums == pooled:     "
+          f"{'PASS' if not pe_bad else 'FAIL'}  ({len(pe_bad)} violations)")
+    for tag, tol, cls, which, got, want in pe_bad[:10]:
+        print(f"  FAIL {tag} tol={tol} {cls} {which}: "
+              f"slice sum={got} pooled={want}")
+    if mate_bad or pe_bad:
+        raise SystemExit(
+            f"trim_report: instrument check failed: {len(mate_bad)} mate "
+            f"violations, {len(pe_bad)} slice violations (see above)")
 
     # MEASUREMENT-ONLY per-domain retention (kept = scored), when requested.
     dtsv = os.environ.get("FASTPREP_DOMAIN_TSV", "").strip()
@@ -628,8 +894,16 @@ def main():
                          "covers fastprep configs only")
     ap.add_argument("--tol", type=int, action="append", default=None,
                     help="tolerance to print (repeatable; default 0 and 2)")
+    ap.add_argument("--scratch",
+                    default=os.environ.get("FASTSCRATCH", "/tmp/trim_report"),
+                    help="scratch root for the tool outputs "
+                         "(default $FASTSCRATCH, else /tmp/trim_report)")
     ap.add_argument("--out", default=None, help="decomposition TSV (default dated)")
     ap.add_argument("--out-retention", default=None, help="retention TSV (default dated)")
+    ap.add_argument("--read-len", type=int, default=DEFAULT_READ_LEN,
+                    help="read length L for the in_window slice "
+                         "(L <= insert <= 2L-12); a gt's own read_len column "
+                         "wins when it has one (default 150)")
     ap.add_argument("--force", action="store_true", help="overwrite existing outputs")
     a = ap.parse_args()
 
@@ -666,7 +940,8 @@ def main():
                      f"use --mode retention without it)")
         print("")
         cmd_decomp(winners, a.work, a.results, a.limit, tols, out_dec,
-                   run_fastp=not a.no_fastp)
+                   run_fastp=not a.no_fastp, read_len=a.read_len,
+                   scratch=a.scratch)
 
 
 if __name__ == "__main__":
