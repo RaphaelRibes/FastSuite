@@ -1,14 +1,13 @@
 # FastSuite status
 
-Verified 2026-10-18 against the current `main` (the code state at `3548ffe`,
-which this file's own refresh follows; the first push since 2026-10-13 landed at
-`bdc42da`, so the commits after it are local until the next push). Every
-number here was verified this session, either by running it or by re-reading the
-cited artifact: the six cargo test suites under `pixi run ci`, `scripts/test.sh`
-(pathology corpus included), the Phase D closed loop re-read from its TSV, the
-trim-accuracy, `head_dropout` and retention tables re-aggregated from
-`bench/results/phase-d/`, and the `g_frac` mechanism decomposition. **The
-suite is WIP: nothing here is production-ready** (see the README banner).
+Verified 2026-10-19 against the current `main` (`3c0aa92`). Every number here was
+verified by running it or by re-reading the cited artifact: the six cargo test
+suites under `pixi run ci`, `scripts/test.sh` (pathology corpus included), the
+Phase D closed loop re-read from its TSV, the trim-accuracy, `head_dropout` and
+retention tables re-aggregated from `bench/results/phase-d/`, the `g_frac`
+mechanism decomposition, and the paired-end overlap with/without experiment
+(Cells A and B, both on the desktop corpus). **The suite is WIP: nothing here is
+production-ready** (see the README banner).
 
 ## The tools
 
@@ -273,15 +272,31 @@ tuned against and worse at the one the loop scores. See
 New and open (not defects of a measured component, but unresolved):
 
 * **The trim-accuracy win is not apples-to-apples on every domain** — see the
-  drop-asymmetry row above: fastprep drops more reads than fastp on RNA-seq and
-  virome, and those are the domains where its accuracy lead is measured on the
-  smaller kept-set. This bounds how the result may be stated, not whether it is
-  real.
+  drop-asymmetry row above. **Re-attributed 2026-10-18: the cause is the dedup
+  default, not the length floor.** fastprep deduplicates and fastp does not, and
+  the harness charges a dropped read to the kept-set; with `--no-dedup` the
+  aggregate retention is 98.47% against fastp's 97.23%. So the win is not
+  apples-to-apples *because the two tools are configured differently*, and the
+  honest comparison quotes both configurations (decision D-13). The
+  `--min-len 0.9L` default was measured and kept.
 * **The `head_dropout` default is now 0** (committed `3d76a31`), which is the
   measured right default on this corpus (100/101 datasets; `1` on the remaining
   one; `4` on none). No version bump, so this is committed-but-unreleased: a
   binary built from `main` trims at 0, a released 0.1.0 tarball still trims
   at 4.
+* **`--pe-overlap` is a measured null and ships opt-in** (2026-10-19). Exact
+  matches identical (347,171) with and without it on a synthetic cohort built to
+  be scorable, overtrim +106, +0.000 pp against a pre-registered 0.5 pp threshold.
+  It is kept as an instrument because its guard is real — the boundary applies
+  only when adapter starts exactly at it, so the mode can never trim what the
+  ordinary adapter path could not itself confirm — and because it is the only way
+  to re-run the question on a different corpus. Throughput cost measured: +3.7%
+  single-threaded, +7.8% at 4 threads (best-of, 400k pairs).
+* **The metagenomics `g_frac` blocker stands at 3/51.** Mechanisms A (harness
+  pooling) and B (plane deconvolution) are fixed and measured; the residual is
+  mechanism C (head-run frame geometry, `build_read` prepends its head run so
+  read position *p* shows fragment *p−h*) and D (per-mate read length, one
+  scalar applied to both mates). Both need corpus re-runs.
 
 ## Where each paper stands (local-only repos, never pushed)
 

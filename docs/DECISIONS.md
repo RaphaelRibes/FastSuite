@@ -220,3 +220,45 @@ default.** The ladder showed no rung buying anything (15/0.5L: +0.15 pp
 retention, +0.07 pp exact, i.e. noise; 30 neutral; 50 and uniform 0.9L cost
 2.7–2.9 pp of both), so the retention question is answered by D-13, not by the
 length floor.
+
+---
+
+## D-14 — `--pe-overlap` needs an adapter set to be sound ✅ decided (2026-10-19)
+
+The paired-end overlap mode pins the adapter boundary from the mate pair. Its
+safety guard — the boundary applies only when adapter *starts exactly at* it —
+needs an adapter set to check against. **With no set, the guard is inert and the
+mode trims biology.**
+
+Measured failure: with adapter auto-detection returning nothing (the default
+configuration, and a common one), `Params.adapter` is `None`, the guard is
+skipped, and the mode trims a short-insert mate to its insert even though nothing
+was ligated past the boundary. 20,000 pairs, insert 100 of 150, random tails →
+reads trimmed to 100 bp with `--pe-overlap` and auto-detection.
+
+The rule, and why it is about the *source* rather than the flag:
+
+| adapter source | mode runs? | why |
+|---|---|---|
+| `--adapter-preset` / `--adapters` (explicit) | **yes** (default) | the set is known, so the guard can actually run — the mode is then *safer* than the ordinary path, since it refuses a boundary the matcher would not confirm |
+| auto-detected (the default) | **no** | auto-detect may return an empty set, and with no set the guard is inert |
+| `--no-adapter` | **no** | nothing to find; the mode would be inventing a boundary |
+
+So the flag is a **tri-state** — `--pe-overlap=never|auto|always`, `auto` being
+the default and resolving to "on iff the adapter source is explicit". `always` is
+the explicit opt-in for someone who knows the guard is inert and wants the
+boundary anyway.
+
+**Why the default tracks the source rather than being a constant:** the mode's
+soundness is a property of whether a set exists to check against, not of the
+user's intent. A constant default either exposes the bug (always on) or hides a
+useful instrument (always off).
+
+**The measurement behind keeping it at all:** on a synthetic cohort built to be
+scorable (800,000 mates, 14.1% readthrough, 489,546 carrying a G-run), exact
+matches are **identical** (347,171) with and without the mode, and overtrim rises
+by 106 — **+0.000 pp overall** against a pre-registered 0.5 pp threshold
+(`docs/OVERTRIM-PAIRED.md`, Cell B). The mode is kept as an opt-in instrument
+because its guard is real and because it is the only way to re-run the question
+on a different corpus. Throughput cost measured: **+3.7% single-threaded, +7.8%
+at 4 threads** (best-of, 400k pairs).

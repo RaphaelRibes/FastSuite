@@ -1440,8 +1440,9 @@ git commit -m "test: streaming suite complete" # only if Step 1-6 left edits
 
 ## Definition of done
 
-* [ ] `cargo test --offline` from `tools/fastdedup/`: 105 tests, 0 failed.
-* [ ] `printf '@r\nACGT\n+\nIIII\n' | ./tools/fastdedup/target/release/fastdedup -1 - -o - | wc -l` prints `4`.
-* [ ] The refusals all exit 1 with a reason on stderr: both inputs `-`, both outputs `-`, `--json -` + `-o -`, `--pre-count` + stdin, `--abundance` + stdin without `--temp-dir`.
-* [ ] `docs/DECISIONS.md` D-4 records the settled output-compression decision; `docs/CLI-SPEC.md` marks fastdedup's gap 7 done.
-* [ ] README documents the flags, the magic-byte rule, the fresh-write rule, and the summary-to-stderr rule.
+* [x] `cargo test --offline` from `tools/fastdedup/`: 110 tests, 0 failed
+      (was 105 when this was written; +5 from the D-4 streaming work).
+* [x] `printf '@r\nACGT\n+\nIIII\n' | ./tools/fastdedup/target/release/fastdedup -1 - -o - | wc -l` prints `4`.
+* [x] The refusals all exit 1 with a reason on stderr: both inputs `-`, both outputs `-`, `--json -` + `-o -`, `--pre-count` + stdin, `--abundance` + stdin without `--temp-dir`.
+* [x] `docs/DECISIONS.md` D-4 records the settled output-compression decision; `docs/CLI-SPEC.md` marks fastdedup's gap 7 done.
+* [x] README documents the flags, the magic-byte rule, the fresh-write rule, and the summary-to-stderr rule.
