@@ -403,6 +403,23 @@ def decomp(winners, work, results, p5, p3, limit, run_fastp=True,
             if has_minlen and "--min-len" in hd_args:
                 k = argv.index("--min-len")
                 del argv[k:k + 2]
+            # A VARIANT is appended to the winner's argv, which already carries
+            # every flag that config sets (e.g. --head-dropout). Appending
+            # --head-dropout again makes clap reject the whole command with
+            # rc=2, which surfaces as the variant silently disappearing from the
+            # report rather than as an error. Drop any flag the base already
+            # carries, so a variant can ADD flags but never duplicate one.
+            # (The published configs are built once and never hit this.)
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for tok in argv:
+                if tok.startswith("--"):
+                    name = tok.split("=", 1)[0]
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                deduped.append(tok)
+            argv = deduped
             px = f"{d}/{tag}.pxmt"
             r = subprocess.run([H.FP, "-1", s1, "-2", s2, "-o", f"{d}/{tag}_1.fq.gz",
                                 "-p", f"{d}/{tag}_2.fq.gz", "--metadata", px]
