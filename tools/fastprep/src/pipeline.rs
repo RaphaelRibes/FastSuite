@@ -673,6 +673,11 @@ pub fn run_paired(
     let params_r1 = params_r1.clone();
     let params_r2 = params_r2.clone();
 
+    // PE overlap: resolved once per chunk, per pair, inside the work closure.
+    // `rt.pe_overlap` off ⇒ the detector is never called and `pe_adapter` stays
+    // `None`, which is exactly the flag-off code path (byte-identical output).
+    let pe_anchor = crate::pe_overlap::ANCHOR;
+
     let mut dedup = rt.dedup.as_ref().map(|cfg| {
         let spec = AnchorSpec::new(&params_r1, cfg.read_len, params_r1.adapter.is_some());
         Dedup::new(cfg, spec)
@@ -685,13 +690,34 @@ pub fn run_paired(
     let params_r1_arc = Arc::new(params_r1);
     let params_r2_arc = Arc::new(params_r2);
     let thread_pool = rt.thread_pool.clone();
+    let pe_overlap = rt.pe_overlap;
     let compute = std::thread::spawn(move || {
         while let Ok(((b1, c1), (b2, c2))) = raw_rx.recv() {
             let results = match thread_pool.as_ref() {
                 Some(pool) => pool.install(|| {
-                    pair_chunks(&b1, &b2, c1, c2, &params_r1_arc, &params_r2_arc, parallel)
+                    pair_chunks(
+                        &b1,
+                        &b2,
+                        c1,
+                        c2,
+                        &params_r1_arc,
+                        &params_r2_arc,
+                        parallel,
+                        pe_overlap,
+                        pe_anchor,
+                    )
                 }),
-                None => pair_chunks(&b1, &b2, c1, c2, &params_r1_arc, &params_r2_arc, parallel),
+                None => pair_chunks(
+                    &b1,
+                    &b2,
+                    c1,
+                    c2,
+                    &params_r1_arc,
+                    &params_r2_arc,
+                    parallel,
+                    pe_overlap,
+                    pe_anchor,
+                ),
             };
             if res_tx.send(((b1, b2), results)).is_err() {
                 break;
@@ -975,18 +1001,47 @@ fn pair_chunks(
     params_r1: &Params,
     params_r2: &Params,
     parallel: bool,
+    pe_overlap: bool,
+    pe_anchor: usize,
 ) -> Vec<ProcessedPair> {
     debug_assert_eq!(c1.len(), c2.len());
-    // Mates are trimmed independently. There is no cross-mate inference:
-    // PE overlap detection was removed, so the adapter comes from the
-    // configured set and nowhere else, and `trim` resolves it itself.
+    // Mates are trimmed independently, except for the one cross-mate inference
+    // `--pe-overlap` opts into: when the pair's overlap pins the adapter
+    // boundary, that boundary is handed to each mate's trim as an override and
+    // the configured adapter set is not consulted for it. With the flag off the
+    // detector is never called, so `pe_adapter` stays `None` on every Params and
+    // the trim path below is exactly the pre-flag one (byte-identical output).
+    let base1 = Arc::new(params_r1.clone());
+    let base2 = Arc::new(params_r2.clone());
     let work = |(i1, i2): (ScanInput, ScanInput)| -> ProcessedPair {
         let s1 = &buf1.seq[i1.seq.clone()];
         let q1 = &buf1.qual[i1.qual.clone()];
         let s2 = &buf2.seq[i2.seq.clone()];
         let q2 = &buf2.qual[i2.qual.clone()];
-        let out1 = trim(s1, q1, params_r1);
-        let out2 = trim(s2, q2, params_r2);
+
+        // The detection result is shared by both mates: the boundary falls at
+        // position I on each, and each mate's adapter is read 3′, so both get
+        // `(0, L - I)` (the paper's geometry, read on each mate's own frame).
+        // `Arc::make_mut` clones only when the flag actually fired.
+        let (p1, p2) = if pe_overlap {
+            match crate::pe_overlap::detect_pe_overlap_trim(s1, s2, pe_anchor) {
+                Some(t) => {
+                    let mut a = Arc::clone(&base1);
+                    let mut b = Arc::clone(&base2);
+                    Arc::make_mut(&mut a).pe_adapter = Some(t);
+                    Arc::make_mut(&mut b).pe_adapter = Some(t);
+                    (a, b)
+                }
+                // Detection refused (no overlap, ambiguous, chance hit): the
+                // mates fall back to the ordinary per-mate behaviour.
+                None => (Arc::clone(&base1), Arc::clone(&base2)),
+            }
+        } else {
+            (Arc::clone(&base1), Arc::clone(&base2))
+        };
+
+        let out1 = trim(s1, q1, &p1);
+        let out2 = trim(s2, q2, &p2);
         ProcessedPair {
             p1: Processed {
                 input: i1,
@@ -1063,6 +1118,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
+            pe_overlap: false,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1321,6 +1377,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
+            pe_overlap: false,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1345,6 +1402,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             adapter_source: crate::cli::AdapterSource::None,
+            pe_overlap: false,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,

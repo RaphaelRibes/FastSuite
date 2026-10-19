@@ -188,6 +188,14 @@ pub struct Params {
     /// Wrapped in `Arc` so per-mate `Params` clones share the allocation.
     pub adapter: Option<Arc<AdapterSet>>,
 
+    /// Paired-end overlap override: the adapter trim the mate pair pinned
+    /// geometrically, as `(t5_adapter, t3_adapter)` on this mate. `None` means
+    /// "no PE detection was done" (the flag is off, or this mate's detection
+    /// returned nothing), and the ordinary sequence-matching path then runs
+    /// unchanged. Set only when `--pe-overlap` is on AND
+    /// [`crate::pe_overlap::detect_pe_overlap`] verified a unique overlap.
+    pub pe_adapter: Option<(usize, usize)>,
+
     /// Trim budget already consumed by a prior step (e.g. adapter trim).
     /// Subtracted from the computed Δ_L inside [`polyx_trim`] so the
     /// combined trim stays within the min-len contract.
@@ -229,6 +237,7 @@ impl Default for Params {
             trim_5: None,
             trim_3: None,
             adapter: None,
+            pe_adapter: None,
             extra_committed: 0,
             original_len: None,
             gate_lut: [0.0; 256],
@@ -1163,9 +1172,10 @@ pub struct TrimOutput {
 /// Full single-read processing: adapter detection then polyX trimming.
 ///
 /// Steps (single byte-stream pass design):
-/// 1. Adapter detection by sequence matching from `params.adapter` — the only
-///    mode. The PE-overlap override path and the `AdapterHint` dispatcher that
-///    carried its result were removed with the feature (adapter.rs).
+/// 1. Adapter detection. The PE-overlap override (`params.pe_adapter`) wins when
+///    present — it is a trim the mate pair pinned geometrically, so it needs no
+///    adapter sequence; otherwise sequence matching from `params.adapter` is the
+///    only mode.
 /// 2. Budget check: if adapter trim alone exceeds Δ_L, return
 ///    `Drop { reason: Adapter }`.
 /// 3. polyX scan on the adapter-trimmed sub-slice with the remaining
@@ -1176,12 +1186,17 @@ pub struct TrimOutput {
 pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
     let l = bases.len();
 
-    // --- Step 1: adapter detection (sequence matching) ---
-    let (t5_adapter, t3_adapter, adapter_name) = match params.adapter.as_deref() {
-        None => (0, 0, None),
-        Some(set) => match crate::adapter::match_adapters(bases, set) {
+    // --- Step 1: adapter detection ---
+    let (t5_adapter, t3_adapter, adapter_name) = match params.pe_adapter {
+        // PE overlap pinned the boundary on this mate: the trim is exact, and
+        // the name records where it came from so the report can say so.
+        Some((t5, t3)) => (t5, t3, Some("pe-overlap".to_string())),
+        None => match params.adapter.as_deref() {
             None => (0, 0, None),
-            Some(m) => (m.t5, m.t3, Some(m.name)),
+            Some(set) => match crate::adapter::match_adapters(bases, set) {
+                None => (0, 0, None),
+                Some(m) => (m.t5, m.t3, Some(m.name)),
+            },
         },
     };
 

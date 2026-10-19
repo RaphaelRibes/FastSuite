@@ -159,6 +159,29 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.2, value_name = "FLOAT", help_heading = "Adapter Trimming")]
     pub adapter_error_rate: f64,
 
+    /// Paired-end only: infer the adapter boundary from the mate pair's own
+    /// overlap, and trim from there. Off by default, and byte-identical to the
+    /// current behaviour whenever it detects nothing.
+    ///
+    /// When the insert is shorter than the read, R1's 3′ suffix and the
+    /// reverse-complement prefix of R2 describe the same fragment, so the mate
+    /// pair pins the insert size and hence where the adapter readthrough begins
+    /// on each mate — without needing to know the adapter sequence. The
+    /// detector anchors on a 12-base match (the same value fastcheck's
+    /// insert-size estimator uses), verifies the whole shared window base for
+    /// base, and refuses anything it cannot pin uniquely: no overlap, no
+    /// anchor, a chance anchor hit, or more than one admissible alignment all
+    /// fall back to the current per-mate behaviour, silently and exactly.
+    ///
+    /// Off by default because the value is unmeasured on real libraries: the
+    /// 102-dataset corpus carries no adapter readthrough at all (its profiles
+    /// have `adapter.mode: none`, so 0.01–0.26% of mates carry adapter), which
+    /// makes it a guard rather than a value test. See
+    /// docs/plans/2026-10-19_004500-pe-overlap-with-without.md and
+    /// bench/scripts/trim_report.py's FASTPREP_VARIANTS slot (`fp-pe`).
+    #[arg(long, help_heading = "Adapter Trimming")]
+    pub pe_overlap: bool,
+
     /// Minimum adapter overlap for sequence matching.
     /// 8 (was 4): a 4-base window at 10% error tolerates 1 mismatch on 4
     /// bases — any read ending in "AGAT" (adapter prefix) was falsely
@@ -436,6 +459,10 @@ pub struct Runtime {
     /// went wrong (CLI-SPEC §1 rule 5).
     pub quiet: bool,
     pub adapter_source: AdapterSource,
+    /// `--pe-overlap`: infer the adapter boundary from the mate pair's own
+    /// overlap. Default off; when off, [`Params::pe_adapter`] is never set and
+    /// the pipeline is byte-identical to the pre-flag behaviour.
+    pub pe_overlap: bool,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
     pub dedup: Option<DedupConfig>,
@@ -588,9 +615,9 @@ impl Cli {
             bail!("-p/--out2 requires matching -2/--in2");
         }
         if !paired && (self.singletons1.is_some() || self.singletons2.is_some()
-            || self.r1_scan_reverse || self.r2_scan_reverse)
+            || self.r1_scan_reverse || self.r2_scan_reverse || self.pe_overlap)
         {
-            bail!("--singletons*, --r1-scan-reverse and --r2-scan-reverse apply to paired-end mode only");
+            bail!("--singletons*, --r1-scan-reverse, --r2-scan-reverse and --pe-overlap apply to paired-end mode only");
         }
 
         // Numeric ranges.
@@ -763,12 +790,14 @@ impl Cli {
                 AdapterSource::Fixed(arc) => Some(Arc::clone(arc)),
                 _ => None,
             },
+            // Set per pair in `pair_chunks` when `--pe-overlap` fires; `None`
+            // here keeps the single-end path and every fallback byte-identical.
+            pe_adapter: None,
             extra_committed: 0,
             original_len: None,
             gate_lut: [0.0; 256],
         };
         base.prepare();
-
         // Deduplication. Resolved here so the run refuses before allocating
         // rather than after filling the table.
         let dedup = if !(self.dedup && !self.no_dedup) {
@@ -869,6 +898,7 @@ impl Cli {
             dry_run: self.dry_run,
             quiet: self.quiet,
             adapter_source,
+            pe_overlap: self.pe_overlap,
             dedup,
             adapter_error_rate: self.adapter_error_rate,
             min_adapter_overlap_se: self.min_adapter_overlap,
