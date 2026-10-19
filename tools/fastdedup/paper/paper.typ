@@ -1205,6 +1205,15 @@ $ "Hint" := cases(
   "Override"(T_5, T_3, eta) &"(pre-computed trim from PE overlap)".
 ) $
 
+#block(inset: 0.6em, stroke: 0.5pt + gray, radius: 2pt, [
+  *Not part of `fastdedup`.* The $Override$ constructor and the dispatcher below
+  belong to the trimming tool's lineage: `fastdedup` carries no paired-end overlap
+  detection (`grep` for `detect_pe_overlap`/`AdapterHint` in `tools/fastdedup/src`
+  returns nothing), and its adapter path is single-mode. They are reproduced here
+  because the algorithm is part of the suite's shared design vocabulary and the
+  trimming tool implements it behind an opt-in flag --- see @sec:adp-pe.
+])
+
 #Def (combined trim procedure). The public entry point $"Trim"$
 takes a read $(R, Q)$, a parameter set $Theta$ (§1.2), and a hint,
 and returns a $"TrimOutput"$ consisting of a $"TrimResult"$ and an

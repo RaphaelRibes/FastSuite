@@ -1881,7 +1881,9 @@ $ "Hint" := cases(
   *Current implementation.* The hint has one inhabitant: every call site passes
   $"Detect"$, and the $"Override"$ branch was never constructed --- it existed
   only to carry a trim from @sec:adp-pe. The implementation therefore takes no
-  hint parameter at all, which is why @sec:adp-pe is marked not implemented.
+  hint parameter at all. @sec:adp-pe is implemented behind `--pe-overlap` (opt-in;
+  @sec:adp-pe), so the branch it existed to serve is now reached by the pipeline's
+  own call rather than by a hint.
 ])
 
 #Def (combined trim procedure). The public entry point $"Trim"$
@@ -2934,12 +2936,14 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
 Direct encoding of @alg:adp-pe:
 
 #block(inset: 0.6em, stroke: 0.5pt + gray, radius: 2pt, [
-  *Specification only --- not present in `src/`.* As @sec:adp-pe states, this mode
-  is not implemented in the current revision: it was removed when the six tools
-  were unified under one CLI. `adapter.rs` carries no `detect_pe_overlap` and no
-  `complement`; sequence matching is the single adapter path. The listing below
-  is the direct encoding of the designed procedure, retained as the reference for
-  the specification.
+  *Implemented behind `--pe-overlap`, opt-in.* The listing below is the direct
+  encoding of the designed procedure as it now exists in `src/pe_overlap.rs`, with
+  one deliberate divergence noted in @sec:adp-pe: the implementation is anchored
+  and refuses ambiguity rather than scanning for the first admissible overlap,
+  because at $epsilon = 0.1$ a 150-base window admits 15 mismatches and the scan
+  fires on unrelated sequence. A boundary is applied only when adapter starts
+  exactly at it, so the mode can never trim what the ordinary adapter path could
+  not itself confirm.
 ])
 
 ```rust
