@@ -196,3 +196,81 @@ dominant class — a 1-2 bp biology-begins-with-G overtrim on I ≥ L pairs —
 remains information-theoretically ambiguous with the data these reads
 carry, which is the diagnosis doc's conclusion, now with the paired
 dimension measured too.
+
+---
+
+# Addendum (2026-10-19): the mode was rebuilt and measured with/without
+
+The sections above answer the **disambiguation** question: can the mate resolve
+the artefact/biology G-run ambiguity? This addendum answers the different
+**accuracy** question — does a paired-end overlap mode improve trimming? — by
+building the mode behind a flag and measuring it, rather than reasoning about it.
+
+## What was built
+
+`fastprep --pe-overlap` (default off). Detection is anchored and verified
+(`tools/fastprep/src/pe_overlap.rs`, 12-base anchor, full-window verification,
+ambiguity refused) and the boundary is applied only when the adapter **starts
+exactly at** it. That last condition is the whole safety property:
+
+> **The PE mode can never trim something the ordinary adapter path could not
+> itself confirm.**
+
+An overlap proves where the fragment ends; it does not prove that anything was
+ligated past it. The first implementation got this wrong and trimmed biology —
+see "The defect" below.
+
+## Cell A — the spurious-fire guard (real corpus, 102 datasets, 10.2M pairs)
+
+The guard: on data with no adapter readthrough, the mode must not change any
+trim decision.
+
+| | pre-fix | post-fix |
+|---|---|---|
+| `pe_trims` (pairs whose trim decision changed) | 50 | 18,436 |
+| new overtrims vs `fastprep-hd0` on a 200k slice | 46 | — |
+| lost exact mates on that slice | 48 | — |
+
+The pre-fix detector applied the overlap boundary as an adapter trim
+unconditionally, so any mate whose fragment was shorter than its read was
+trimmed to the insert **even with nothing ligated past it**. That is the same
+class of failure as the 4-base-overlap false trim that `--min-adapter-overlap 8`
+exists to prevent (~10% of clean reads, per its own help text), which is why the
+guard is not thresholded: any firing on adapter-free data is disqualifying.
+
+**The corpus cannot answer the value question**, for two independent reasons:
+
+1. Adapter readthrough is configured in **53 of 102 profiles** but materialises
+   in only **11,395 of 10.2M pairs (0.112%)** — it needs an insert shorter than
+   the read, which these libraries rarely have. A 0.5 pp threshold on 0.11% of
+   pairs measures noise.
+2. The scorer compares the tool's trim positions against the ground truth's
+   **G-run** lengths. An adapter trim is not a G-run, so on a cohort whose GT
+   carries no runs, every adapter trim is labelled `overtrim`. Cell A's
+   readthrough slice shows 8,533 of 11,299 pairs "overtrimmed" — a scorer
+   artefact, not a detector verdict.
+
+`pe_trims = 18,436` against an 11,395-pair readthrough population is therefore a
+*ceiling* on legitimate firings, not a count of errors: the column measures a
+difference from the `fastprep-hd0` baseline, which already trims readthrough
+pairs its own way.
+
+## The defect, in case it matters later
+
+Two bugs, both found by measuring rather than reasoning:
+
+1. **The boundary was applied unconditionally.** Fixed by requiring adapter to
+   start exactly at the boundary. Verified on synthetic cohorts, flag off vs on,
+   both mates: adapter present → trims to the insert; adapter absent → refuses;
+   unrelated mates → does not fire; adapter tail shorter than the ordinary
+   14-base minimum → refuses (the matcher will not confirm it).
+2. **"Contains adapter" was too weak.** A 38-base random tail hits a 14-base
+   adapter prefix by chance, so the first guard version fired on ordinary
+   sequence. The check now requires the match to begin at the boundary.
+
+## Status
+
+The mode ships **default off** and is safe by construction. Whether it earns its
+place is answered by Cell B (a synthetic cohort whose ground truth carries both
+G-runs and readthrough, so the scorer is not confounded) — see
+`docs/plans/2026-10-19_004500-pe-overlap-with-without.md`.
