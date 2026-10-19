@@ -8,8 +8,9 @@ detection earns its place — and if it does not, record that decision where the
 paper and the code agree.
 
 **Architecture: two cells.** **Cell A** (the existing corpus) is the
-*spurious-fire guard*: the corpus has no adapter readthrough, so any trimming
-the mode does there is wrong by construction. **Cell B** (a synthetic cohort
+*spurious-fire guard*: adapter readthrough is configured in only 53 of the 102
+corpus profiles and materialises in just 11,395 of 10.2M pairs (0.11%), so any
+trimming the mode does outside those pairs is wrong by construction. **Cell B** (a synthetic cohort
 with readthrough, inserts inside `2L-12`) is the *value test*: that is where a
 benefit could exist. A mode that passes Cell A and wins Cell B is worth
 restoring; a mode that fires on clean reads is a bug regardless of Cell B.
@@ -37,9 +38,13 @@ Two conclusions, in order:
 
 1. **The overlap window is large** (73-76% in four domains). The mode *can* fire
    on most pairs — window size is not the constraint.
-2. **Adapter readthrough is 0.01%-0.26%**, and the cause is structural: the real
-   profiles carry `adapter.mode: none`, so the corpus was simulated with no
-   adapter at all. There is nothing for an adapter mode to find.
+2. **Adapter readthrough is 0.01%-0.26% of pairs**, and the cause is structural
+   but narrower than first written: **53 of the 102 profiles are configured with
+   `adapter.mode: readthrough`** and 49 with `none`, so the corpus is *not*
+   adapter-free — but readthrough only materialises in 11,395 of 10.2M pairs
+   (0.112%), because it needs an insert shorter than the read and these libraries
+   rarely have one. (The earlier revision of this plan said "adapter.mode: none in
+   every profile" after sampling one file; that was wrong and is corrected here.)
 
 **Therefore the corpus arm cannot be the value test.** Running with/without on
 this corpus would measure a mode firing on ~0.1% of reads and produce noise. It
