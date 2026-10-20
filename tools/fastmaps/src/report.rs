@@ -11,15 +11,21 @@ use std::collections::BTreeMap;
 ///   low_x/high_y → polyG,      high_x/low_y  → polyC,
 /// and off-diagonal mass where `|x - y| > size/10`.
 ///
-/// `grids` is `[("all", &counts), ("r1", &counts_r1), ("r2", &counts_r2)]`
-/// with flat row-major index `y*size + x`. Keys use the "" / "r1_" / "r2_"
-/// prefixes, exactly as fasthelper's adapter did, so consumers see no
-/// difference in metric names.
-pub fn corner_metrics(size: u32, grids: &[(&str, &[u64])]) -> BTreeMap<String, f64> {
+/// `grids` is `[("all", &counts, no_call), ("r1", &counts_r1, no_call_r1),
+/// ("r2", &counts_r2, no_call_r2)]` with flat row-major index `y*size + x`.
+/// Keys use the "" / "r1_" / "r2_" prefixes, exactly as fasthelper's adapter
+/// did, so consumers see no difference in metric names.
+///
+/// `no_call` is the number of reads in that window with zero ACGT bases. Such
+/// a read encodes to `(0,0)` — the polyA corner — but it has no measurable
+/// composition (an all-N read is not polyA-rich), so it is excluded from every
+/// fraction's denominator and reported as `<pre>no_call_reads` instead. The
+/// grid itself is untouched: the pixel keeps the read.
+pub fn corner_metrics(size: u32, grids: &[(&str, &[u64], u64)]) -> BTreeMap<String, f64> {
     let c = (size / 50).max(2) as usize;
     let diag_lim = size / 10;
     let mut out = BTreeMap::new();
-    for &(label, counts) in grids {
+    for &(label, counts, no_call) in grids {
         let (mut poly_a, mut poly_t, mut poly_g, mut poly_c, mut off_diag) =
             (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
         let mut total = 0.0f64;
@@ -42,13 +48,20 @@ pub fn corner_metrics(size: u32, grids: &[(&str, &[u64])]) -> BTreeMap<String, f
         if total == 0.0 {
             continue;
         }
-        let p = |n: f64| n / total;
+        // No-call reads share the (0,0) pixel with real polyA reads: take them
+        // out of that corner and out of the denominator, so an all-N read can
+        // neither raise polyA_frac nor dilute the other corners. `total` keeps
+        // every read, so total_reads stays the window's true read count.
+        let denom = total - no_call as f64;
+        let poly_a = (poly_a - no_call as f64).max(0.0);
+        let p = |n: f64| if denom > 0.0 { n / denom } else { 0.0 };
         let pre = if label.is_empty() { String::new() } else { format!("{label}_") };
         out.insert(format!("{pre}polyA_frac"), p(poly_a));
         out.insert(format!("{pre}polyT_frac"), p(poly_t));
         out.insert(format!("{pre}polyG_frac"), p(poly_g));
         out.insert(format!("{pre}polyC_frac"), p(poly_c));
         out.insert(format!("{pre}off_diagonal_frac"), p(off_diag));
+        out.insert(format!("{pre}no_call_reads"), no_call as f64);
         if label.is_empty() {
             out.insert("total_reads".into(), total);
         }
@@ -148,7 +161,7 @@ mod tests {
     #[test]
     fn corner_metrics_matches_fasthelper_fixture() {
         let (all, r1, r2) = grids();
-        let m = corner_metrics(11, &[("", &all), ("r1", &r1), ("r2", &r2)]);
+        let m = corner_metrics(11, &[("", &all, 0), ("r1", &r1, 0), ("r2", &r2, 0)]);
         let near = |k: &str, want: f64| {
             assert!((m[k] - want).abs() < 1e-9, "{k}: got {}, want {want}", m[k]);
         };
@@ -188,7 +201,7 @@ mod tests {
         let all = vec![0u64; size * size];
         let r1 = vec![0u64; size * size];
         let r2 = banded();
-        let m = corner_metrics(size as u32, &[("", &all), ("r1", &r1), ("r2", &r2)]);
+        let m = corner_metrics(size as u32, &[("", &all, 0), ("r1", &r1, 0), ("r2", &r2, 0)]);
         assert!(!m.contains_key("polyT_frac"), "empty window must be skipped");
         assert!(!m.contains_key("r1_polyT_frac"));
         assert!(!m.contains_key("total_reads"), "total_reads lives in the all window");

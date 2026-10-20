@@ -3,11 +3,16 @@ use std::io::{BufRead, BufReader};
 
 use flate2::read::MultiGzDecoder;
 
-/// Encode a read sequence as `(x = T+C count, y = T+G count)`.
-/// Non-ACGT characters (e.g. N) are ignored.
-pub fn encode_read(seq: &str) -> (u32, u32) {
+/// Encode a read sequence as `(x = T+C count, y = T+G count, n = ACGT bases)`.
+///
+/// Non-ACGT characters (e.g. N) are skipped from the coordinates, so a read
+/// with no ACGT base at all encodes to `(0, 0)` — the same pixel as an all-A
+/// read. `n` is what lets the caller tell those apart: an `n == 0` read has no
+/// measurable composition and must not be counted as polyA-rich.
+pub fn encode_read(seq: &str) -> (u32, u32, u32) {
     let mut x = 0u32;
     let mut y = 0u32;
+    let mut n = 0u32;
     for b in seq.bytes() {
         let (bx, by) = match b {
             b'A' => (0, 0),
@@ -18,8 +23,9 @@ pub fn encode_read(seq: &str) -> (u32, u32) {
         };
         x += bx;
         y += by;
+        n += 1;
     }
-    (x, y)
+    (x, y, n)
 }
 
 /// Mean Phred quality score for a quality string (ASCII-33 encoded).
@@ -67,22 +73,27 @@ mod tests {
 
     #[test]
     fn all_a() {
-        assert_eq!(encode_read("AAAA"), (0, 0));
+        assert_eq!(encode_read("AAAA"), (0, 0, 4));
     }
 
     #[test]
     fn all_t() {
-        assert_eq!(encode_read("TTTT"), (4, 4));
+        assert_eq!(encode_read("TTTT"), (4, 4, 4));
     }
 
     #[test]
     fn mixed() {
-        assert_eq!(encode_read("ATGC"), (2, 2));
+        assert_eq!(encode_read("ATGC"), (2, 2, 4));
     }
 
     #[test]
     fn skips_n() {
-        assert_eq!(encode_read("ANNN"), (0, 0));
+        assert_eq!(encode_read("ANNN"), (0, 0, 1));
+    }
+
+    #[test]
+    fn all_n_has_no_acgt() {
+        assert_eq!(encode_read("NNNN"), (0, 0, 0));
     }
 
     #[test]

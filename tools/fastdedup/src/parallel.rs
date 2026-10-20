@@ -3,13 +3,15 @@ use std::io::Read;
 
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
-use needletail::parse_fastx_reader;
+use needletail::{parse_fastx_file, parse_fastx_reader};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::hasher::SequenceHasher;
 use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
-use crate::writer::{OutputFormat, prepare_writer, write_fasta_record, StreamCompression};
-use std::fs::File;
+use crate::writer::{
+    ByteCounter, OutputFormat, StreamCompression, prepare_writer, write_fasta_record,
+};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -181,6 +183,7 @@ fn create_output_writer(
     num_threads: usize,
     out_format: OutputFormat,
     out_compression: StreamCompression,
+    force: bool,
 ) -> Result<(
     Box<dyn Write>,
     OutputFormat,
@@ -196,7 +199,10 @@ fn create_output_writer(
     let output_format = OutputFormat::from_extension(output_path);
     let is_gz = OutputFormat::is_gz(output_path);
 
-    if is_gz && num_threads > 1 && compression_level >= 6 {
+    // An existing `.gz` output cannot be resumed (multi-member gzip), and the
+    // gzippy path truncates unconditionally: fall through to `prepare_writer`
+    // so it refuses with the serial path's message instead of overwriting.
+    if is_gz && num_threads > 1 && compression_level >= 6 && (force || !output_path.exists()) {
         // Gzippy parallel compression path — channel-based streaming pipe
         // Levels 6+ with threads>1 use PipelinedGzEncoder → standard gzip
         let (tx, rx) = bounded::<Vec<u8>>(16);
@@ -220,9 +226,135 @@ fn create_output_writer(
         Ok((writer, output_format, Some(handle)))
     } else {
         // Standard path: flate2 GzEncoder (standard gzip at any level/threads)
-        let (writer, format) = prepare_writer(output_path, true, compression_level)?;
+        let (writer, format) = prepare_writer(output_path, force, compression_level)?;
         Ok((writer, format, None))
     }
+}
+
+// ==========================================
+// RESUME (append / truncate-to-last-valid)
+// ==========================================
+
+/// Cut `path` back to the last complete record, as the serial path does after
+/// a crash left a torn tail behind.
+fn truncate_to_valid_len(path: &Path, valid_bytes: u64, label: &str, verbose: bool) -> Result<()> {
+    let current_size = fs::metadata(path)?.len();
+    if valid_bytes < current_size {
+        if verbose {
+            println!("Truncating {label} from {current_size} to {valid_bytes} bytes.");
+        }
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(valid_bytes)?;
+    }
+    Ok(())
+}
+
+/// Resume an existing uncompressed output when `--force` is absent: preload its
+/// hashes into the verifier (so records already on disk are never appended
+/// twice) and truncate a torn trailing record back to the last valid byte.
+///
+/// Mirrors the serial path's preload/truncate sequence, which the threaded
+/// writer used to skip by forcing truncation. Nothing to do for a stream
+/// (always written fresh) or a `.gz` output (`prepare_writer` refuses those).
+fn resume_existing_output<T: SequenceHasher>(
+    path: &str,
+    cfg: &DedupConfig,
+    verifier: &mut ShardedHashVerifier<T>,
+) -> Result<()> {
+    let bound = Path::new(path);
+    if cfg.force || crate::stream::is_stream(path) || !bound.exists() || OutputFormat::is_gz(bound)
+    {
+        return Ok(());
+    }
+
+    if cfg.verbose {
+        println!("Preloading sequences from existing output...");
+    }
+
+    let mut reader = parse_fastx_file(path).context("Error opening preload file")?;
+    let mut valid_bytes = ByteCounter(0);
+    let mut preloads = 0;
+
+    while let Some(record_result) = reader.next() {
+        let record = match record_result {
+            Ok(record) => record,
+            Err(e) => {
+                if cfg.verbose {
+                    eprintln!("Incomplete sequence detected at end of file ({e}).");
+                    eprintln!("Calculating fail-safe truncation point...");
+                }
+                break;
+            }
+        };
+        verifier.verify(T::hash_sequence(&record.seq()));
+        preloads += 1;
+        let _ = record.write(&mut valid_bytes, None);
+    }
+
+    if preloads > 0 && cfg.verbose {
+        println!("{preloads} sequences preloaded.");
+    }
+
+    truncate_to_valid_len(bound, valid_bytes.0, "file", cfg.verbose)
+}
+
+/// Paired-end twin of [`resume_existing_output`]: preloads the pair hashes and
+/// truncates both outputs so R1 and R2 stay synchronized.
+fn resume_existing_paired_outputs<T: SequenceHasher>(
+    path_r1: &str,
+    path_r2: &str,
+    cfg: &DedupConfig,
+    verifier: &mut ShardedHashVerifier<T>,
+) -> Result<()> {
+    let bound_r1 = Path::new(path_r1);
+    let bound_r2 = Path::new(path_r2);
+    if cfg.force
+        || crate::stream::is_stream(path_r1)
+        || crate::stream::is_stream(path_r2)
+        || !bound_r1.exists()
+        || !bound_r2.exists()
+        || OutputFormat::is_gz(bound_r1)
+        || OutputFormat::is_gz(bound_r2)
+    {
+        return Ok(());
+    }
+
+    if cfg.verbose {
+        println!("Preloading and synchronizing pairs from existing outputs...");
+    }
+
+    let mut reader_r1 = parse_fastx_file(path_r1).context("Error opening R1 preload file")?;
+    let mut reader_r2 = parse_fastx_file(path_r2).context("Error opening R2 preload file")?;
+
+    let mut valid_bytes_r1 = ByteCounter(0);
+    let mut valid_bytes_r2 = ByteCounter(0);
+    let mut preloads = 0;
+
+    while let (Some(r1_result), Some(r2_result)) = (reader_r1.next(), reader_r2.next()) {
+        let (record_r1, record_r2) = match (r1_result, r2_result) {
+            (Ok(r1), Ok(r2)) => (r1, r2),
+            _ => {
+                if cfg.verbose {
+                    eprintln!("Incomplete sequence or desynchronization detected at end of file.");
+                    eprintln!("Calculating fail-safe truncation points for R1 and R2...");
+                }
+                break;
+            }
+        };
+        verifier.verify(T::hash_pair(&record_r1.seq(), &record_r2.seq()));
+        preloads += 1;
+        let _ = record_r1.write(&mut valid_bytes_r1, None);
+        let _ = record_r2.write(&mut valid_bytes_r2, None);
+    }
+
+    if preloads > 0 && cfg.verbose {
+        println!("{preloads} pairs preloaded and synchronized.");
+    }
+
+    truncate_to_valid_len(bound_r1, valid_bytes_r1.0, "R1", cfg.verbose)?;
+    truncate_to_valid_len(bound_r2, valid_bytes_r2.0, "R2", cfg.verbose)?;
+
+    Ok(())
 }
 
 // ==========================================
@@ -240,7 +372,18 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     output_path: &str,
     cfg: &DedupConfig,
 ) -> Result<(usize, usize)> {
+    // --dry-run writes nothing: the serial counting pass reaches the identical
+    // verdict (same refusals, same duplicate count) without creating a file.
+    if cfg.dry_run {
+        return crate::processor::execute_deduplication::<T>(input_path, output_path, cfg);
+    }
+
     let num_workers = resolve_thread_count(cfg.threads);
+
+    // Resume an existing output before any thread starts, so the preload pass
+    // cannot race the unbounded worker channel.
+    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
+    resume_existing_output(output_path, cfg, &mut verifier)?;
 
     let (chunk_tx, chunk_rx): (Sender<Vec<RawRecord>>, Receiver<Vec<RawRecord>>) =
         bounded(num_workers * 2);
@@ -326,6 +469,7 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
         gzip_threads,
         cfg.out_format,
         cfg.out_compression,
+        cfg.force,
     )?;
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buffered_writer = BufWriter::with_capacity(buf_size, writer);
@@ -338,7 +482,6 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
         validate_format_compatibility(has_quality, output_format)?;
     }
 
-    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
     let mut duplicates = 0;
     let mut processed = 0;
 
@@ -419,7 +562,24 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     output_r2_path: &str,
     cfg: &DedupConfig,
 ) -> Result<(usize, usize)> {
+    // --dry-run writes nothing: the serial counting pass reaches the identical
+    // verdict (same refusals, same duplicate count) without creating a file.
+    if cfg.dry_run {
+        return crate::processor::execute_paired_deduplication::<T>(
+            input_r1_path,
+            input_r2_path,
+            output_r1_path,
+            output_r2_path,
+            cfg,
+        );
+    }
+
     let num_workers = resolve_thread_count(cfg.threads);
+
+    // Resume existing outputs before any thread starts, so the preload pass
+    // cannot race the unbounded worker channel.
+    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
+    resume_existing_paired_outputs(output_r1_path, output_r2_path, cfg, &mut verifier)?;
 
     let (chunk_tx, chunk_rx): (Sender<Vec<RawPair>>, Receiver<Vec<RawPair>>) =
         bounded(num_workers * 2);
@@ -546,6 +706,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         gzip_threads,
         cfg.out_format,
         cfg.out_compression,
+        cfg.force,
     )?;
     let (writer_r2, _output_format_r2, gzip_handle2) = create_output_writer(
         output_r2_path,
@@ -553,6 +714,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         gzip_threads,
         cfg.out_format,
         cfg.out_compression,
+        cfg.force,
     )?;
 
     let buf_size = compute_write_buffer_size(cfg.read_length);
@@ -565,7 +727,6 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         validate_format_compatibility(has_quality, output_format)?;
     }
 
-    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
     let mut duplicates = 0;
     let mut processed = 0;
 

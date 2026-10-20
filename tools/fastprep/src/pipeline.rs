@@ -172,16 +172,40 @@ fn fill_chunk(
     Ok(chunk.len())
 }
 
+/// `params` with the mean-quality filter removed when the record is FASTA.
+///
+/// FASTA carries no qualities, and ingestion fills them with 0 (`ScanInput::
+/// push_needletail`), so a mean-quality filter computed over a FASTA record
+/// always fails: with the shipped `--mean-q 25`, *every* record of a FASTA
+/// input was dropped. The filter is undefined without quality evidence, so it
+/// is skipped for FASTA records rather than fed an invented quality; the polyX
+/// gates are unaffected (matches are quality-independent by construction, and
+/// a mismatch on a Q0 base was already free).
+fn fasta_params(params: &Params) -> Option<Params> {
+    params.mean_q.map(|_| Params {
+        mean_q: None,
+        ..params.clone()
+    })
+}
+
+fn params_for<'a>(params: &'a Params, fasta: &'a Option<Params>, fmt: RecordFormat) -> &'a Params {
+    match (fmt, fasta) {
+        (RecordFormat::Fasta, Some(p)) => p,
+        _ => params,
+    }
+}
+
 fn process_chunk(
     buf: &ChunkBuf,
     chunk: Vec<ScanInput>,
     params: &Params,
     parallel: bool,
 ) -> Vec<Processed> {
+    let fasta = fasta_params(params);
     let work = |input: ScanInput| -> Processed {
         let seq = &buf.seq[input.seq.clone()];
         let qual = &buf.qual[input.qual.clone()];
-        let output = trim(seq, qual, params);
+        let output = trim(seq, qual, params_for(params, &fasta, input.format));
         Processed { input, output }
     };
     if parallel {
@@ -319,7 +343,8 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
     let mut reader = needletail::parse_fastx_file(path)
         .with_context(|| format!("auto-detecting Phred offset from {}", path.display()))?;
     let mut min_q = u8::MAX;
-    let mut max_q = 0u8;
+    let mut n_bases = 0usize;
+    let mut n_high = 0usize;
     let mut n = 0usize;
     while n < 1000 {
         match reader.next() {
@@ -331,9 +356,10 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
                         if b < min_q {
                             min_q = b;
                         }
-                        if b > max_q {
-                            max_q = b;
+                        if b > 74 {
+                            n_high += 1;
                         }
+                        n_bases += 1;
                     }
                 }
                 n += 1;
@@ -349,13 +375,17 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
     // silence as evidence for 64 — which subtracts 31 from every quality and,
     // combined with a --mean-q filter, silently drops the entire file (seen on
     // a high-quality library where no base fell below Q31). Ask for positive
-    // evidence of +64 instead: a byte above 74 is Q>41 under +33, which is not
-    // produced in practice. Otherwise default to 33, the modern standard —
-    // the same call fastcheck::accum::offset_verdict makes (it reports the
-    // ambiguous case rather than guessing).
+    // evidence of +64 instead, and make it a *preponderance*, not a single
+    // byte: a byte above 74 is Q>41 under +33, which current chemistry does
+    // produce occasionally (Q43 = 'L' = 76), so one such base must not
+    // reinterpret the whole run. Under +64 the same byte is Q<11, i.e. the run
+    // would be saturated with implausibly low scores; require ≥20% of the
+    // sampled bases to be above 74 before believing +64. Otherwise default to
+    // 33, the modern standard — the same call fastcheck::accum::offset_verdict
+    // makes (it reports the ambiguous case rather than guessing).
     Ok(if min_q < 64 {
         33
-    } else if max_q > 74 {
+    } else if n_bases > 0 && n_high * 5 >= n_bases {
         64
     } else {
         33
@@ -1023,19 +1053,19 @@ fn pair_chunks(
         let s2 = &buf2.seq[i2.seq.clone()];
         let q2 = &buf2.qual[i2.qual.clone()];
 
-        // The detection result is shared by both mates: the boundary falls at
-        // position I on each, and each mate's adapter is read 3′, so both get
-        // `(0, L - I)` (the paper's geometry, read on each mate's own frame).
-        // `Arc::make_mut` clones only when the mode actually fired.
+        // The detection result is per-mate: the boundary falls at position I
+        // on each, and each mate's adapter is read 3′, so mate i gets
+        // `(0, l_i - I)` — the same number only when the mates are the same
+        // length. `Arc::make_mut` clones only when the mode actually fired.
         let (p1, p2) = if pe_overlap.runs() {
             match crate::pe_overlap::detect_pe_overlap_trim(
                 s1, s2, pe_anchor, params_r1.adapter.as_deref(),
             ) {
-                Some(t) => {
+                Some((t1, t2)) => {
                     let mut a = Arc::clone(&base1);
                     let mut b = Arc::clone(&base2);
-                    Arc::make_mut(&mut a).pe_adapter = Some(t);
-                    Arc::make_mut(&mut b).pe_adapter = Some(t);
+                    Arc::make_mut(&mut a).pe_adapter = Some(t1);
+                    Arc::make_mut(&mut b).pe_adapter = Some(t2);
                     (a, b)
                 }
                 // Detection refused (no overlap, ambiguous, chance hit, or no

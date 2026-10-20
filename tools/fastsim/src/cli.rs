@@ -5,7 +5,7 @@
 //! fastsim --pairs N --profile profiles/mandril_E.json -o prefix \
 //!   [--seed S] [--read-len 150] [--insert-mean 300 --insert-sd 50] \
 //!   [--gc 0.49] [--reference ref.fa] [--adapter-seq SEQ] [--no-adapter] \
-//!   [--no-gzip] [--insert-min 150] [--dup-rate 0.02] \
+//!   [--no-gzip] [--insert-min M] [--dup-rate 0.02] \
 //!   [--drop-rate 0.05 --drop-min-len 100] [--json report.json]
 //! ```
 //!
@@ -66,9 +66,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 50.0)]
     pub insert_sd: f64,
 
-    /// Insert length floor (default 150). Ignored when the profile carries a measured insert CDF.
-    #[arg(long, default_value_t = 150)]
-    pub insert_min: u32,
+    /// Insert length floor (default: min(150, the profile's read_len), so a
+    /// short-read profile works unmodified). Ignored when the profile carries
+    /// a measured insert CDF.
+    #[arg(long)]
+    pub insert_min: Option<u32>,
 
     /// GC fraction for random DNA (default 0.49).
     #[arg(long, default_value_t = 0.49)]
@@ -144,7 +146,7 @@ pub struct Config {
     pub read_len: Option<u32>,
     pub insert_mean: f64,
     pub insert_sd: f64,
-    pub insert_min: u32,
+    pub insert_min: Option<u32>,
     pub gc: f64,
     pub reference: Option<String>,
     pub adapter_seq: Option<String>,
@@ -201,6 +203,9 @@ impl Config {
         if self.pairs == 0 {
             bail!("--pairs must be >= 1");
         }
+        if self.dup_pool == 0 {
+            bail!("--dup-pool must be >= 1");
+        }
         if self.insert_sd <= 0.0 {
             bail!("--insert-sd must be > 0");
         }
@@ -216,13 +221,9 @@ impl Config {
         if self.drop_min_len == 0 {
             bail!("--drop-min-len must be >= 1");
         }
-        if let Some(l) = self.read_len {
-            if self.insert_min > l {
-                bail!(
-                    "--insert-min ({}) should be <= read-len ({})",
-                    self.insert_min,
-                    l
-                );
+        if let (Some(m), Some(l)) = (self.insert_min, self.read_len) {
+            if m > l {
+                bail!("--insert-min ({}) should be <= read-len ({})", m, l);
             }
         }
         Ok(())

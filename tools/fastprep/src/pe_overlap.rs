@@ -218,17 +218,23 @@ pub fn detect_pe_overlap(
     Some((1, l1 - o))
 }
 
-/// The per-mate adapter trim the detected overlap implies:
-/// `(t5_adapter, t3_adapter)`. The boundary falls at position `I` on both
-/// mates, and each mate's adapter is read 3′, so both receive `(0, L - I)`.
+/// The per-mate adapter trim the detected overlap implies, as
+/// `((t5, t3), (t5, t3))` for R1 and R2.
+///
+/// The boundary falls at the insert length `I` on both mates, and each mate's
+/// adapter is read 3′, so mate *i* receives `(0, l_i - I)`. Equal-length mates
+/// give the same number twice — the published case, and the only one the
+/// original single-value return could express. Unequal mates do not: the
+/// single value (derived from R1) over-trimmed R2 by `l1 - l2` bases of real
+/// insert, and if that pushed R2 past its budget the mate was dropped as
+/// adapter instead of being emitted.
 ///
 /// `adapter_set` is the adapter set the run actually has, or `None` when
 /// adapter trimming is disabled — **and `None` refuses the boundary outright**.
 /// The safety guard is structural, not a flag default: an overlap proves where
 /// the fragment ends, never that anything was ligated past it, so with nothing
-/// to check the tail against the mode must not apply a boundary. This is what
-/// keeps `--pe-overlap=always` from trimming biology, and it is asserted by
-/// `no_adapter_set_means_no_boundary` in `tests/pe_overlap.rs`.
+/// to check the tail against the mode must not apply a boundary. The check runs
+/// on R1, the mate whose boundary the detector pinned.
 ///
 /// Returns `None` when nothing is detected, or when the boundary cannot be
 /// checked (no set) or does not hold adapter behind it.
@@ -237,10 +243,13 @@ pub fn detect_pe_overlap_trim(
     r2: &[u8],
     anchor: usize,
     adapter_set: Option<&crate::adapter::AdapterSet>,
-) -> Option<(usize /* t5 */, usize /* t3 */)> {
-    let (_, readthrough) = detect_pe_overlap(r1, r2, anchor)?;
+) -> Option<((usize, usize), (usize, usize))> {
+    let (_, t3_1) = detect_pe_overlap(r1, r2, anchor)?;
     let set = adapter_set?;
-    if !readthrough_is_adapter(r1, readthrough, set) {
+    // R1's readthrough is `l1 - I`, so the insert is `l1 - t3_1`.
+    let insert = r1.len().checked_sub(t3_1)?;
+    let t3_2 = r2.len().saturating_sub(insert);
+    if !readthrough_is_adapter(r1, t3_1, set) {
         // The mates overlap, but the sequence past the boundary is not
         // adapter: there is nothing to trim. Falling through to the
         // ordinary path (which will also find no adapter) is the safe
@@ -248,7 +257,7 @@ pub fn detect_pe_overlap_trim(
         // libraries -- the Cell A guard.
         return None;
     }
-    Some((0, readthrough))
+    Some(((0, t3_1), (0, t3_2)))
 }
 
 /// Is the `readthrough` bases at the 3′ end of `seq` an adapter that *starts at*
@@ -332,6 +341,36 @@ mod tests {
             detect_pe_overlap_trim(&r1, &r2, ANCHOR, Some(&set)),
             None,
             "this pair's tail is not that adapter: refuse"
+        );
+    }
+
+    #[test]
+    fn unequal_mates_get_their_own_readthrough() {
+        // Insert 60, R1 150, R2 100: R1 carries 90 adapter bases past the
+        // insert, R2 carries 40. The boundary is the same fragment position on
+        // both mates, but the tail length is per-mate. Handing R1's 90 to R2
+        // over-trimmed 50 bases of R2's biology (and dropped the mate outright
+        // when that exceeded its budget).
+        let frag = dna(60, 17);
+        let adapter = dna(120, 99);
+        let mut r1 = frag.clone();
+        r1.extend_from_slice(&adapter[..90]);
+        let mut r2: Vec<u8> = frag.iter().rev().map(|&b| comp(b)).collect();
+        r2.extend_from_slice(&adapter[..40]);
+        assert_eq!((r1.len(), r2.len()), (150, 100));
+
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "long".into(),
+                seq: adapter.clone(),
+            }],
+            0.2,
+            4,
+        );
+        assert_eq!(
+            detect_pe_overlap_trim(&r1, &r2, ANCHOR, Some(&set)),
+            Some(((0, 90), (0, 40))),
+            "each mate's tail is l_i - I: 150-60 and 100-60"
         );
     }
 

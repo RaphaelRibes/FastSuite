@@ -181,38 +181,43 @@ fn read(p: impl AsRef<Path>) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Projection. This is an identity, not an estimate.
+// Projection. An identity in the allocation, over the real entry width.
 // ---------------------------------------------------------------------------
 
-/// Projected resident size of a pre-sized hash table.
+/// Projected resident size of a hash table holding `capacity` distinct keys.
 ///
 /// `hashbrown` is open-addressed with a maximum load factor of 7/8 and one control byte
-/// per bucket, and pre-sizing means no rehashing occurs, so
-/// `buckets = next_power_of_two(ceil(8 * capacity / 7))` and
-/// `bytes = buckets * (size_of::<T>() + 1)`.
+/// per bucket, so `buckets = next_power_of_two(ceil(8 * capacity / 7))` and
+/// `bytes = buckets * (entry_bytes + 1)`. `entry_bytes` is the size of the `(K, V)` record
+/// the table stores — `size_of::<(u64, u32)>()` = 16 for the fingerprint table, not the 8 B
+/// of the key alone.
+///
+/// The figure is the table's size when it holds `capacity` entries, not an up-front
+/// allocation: `FingerprintTable` starts small and rehashes as reads arrive, so the
+/// projection is the bound the admission check enforces, not a preallocated block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Projection {
     pub buckets: u64,
     pub bytes: u64,
 }
 
-pub fn project(capacity: usize, fingerprint_bytes: usize) -> Projection {
+pub fn project(capacity: usize, entry_bytes: usize) -> Projection {
     if capacity == 0 {
         return Projection { buckets: 0, bytes: 0 };
     }
     let need = (capacity as u64 * 8).div_ceil(7);
     let buckets = need.next_power_of_two();
-    Projection { buckets, bytes: buckets * (fingerprint_bytes as u64 + 1) }
+    Projection { buckets, bytes: buckets * (entry_bytes as u64 + 1) }
 }
 
 /// Largest capacity that still fits in `2^k` buckets, i.e. `7 * 2^k / 8`.
 ///
 /// Bucket counts double at these points, **not** at powers of two: 5e8 sits 6% above the
-/// 2^29 boundary and so projects 9216 MB where 4608 MB would do.
+/// 2^29 boundary and so projects 17408 MB where 8704 MB would do.
 pub const fn capacity_ceiling(pow2_buckets: u32) -> usize { (7usize << pow2_buckets) / 8 }
 
 /// Replacement for a round-number preallocation clamp: the largest capacity that fits in
-/// 2^29 buckets, i.e. 4608 MB at 64-bit fingerprints.
+/// 2^29 buckets, i.e. 8704 MB at 17 B per bucket (`(u64, u32)` entry + control byte).
 pub const MAX_PREALLOC_ENTRIES: usize = capacity_ceiling(29); // 469_762_048
 
 // ---------------------------------------------------------------------------
@@ -379,6 +384,35 @@ mod tests {
     #[test]
     fn project_zero_capacity() {
         assert_eq!(project(0, 8), Projection { buckets: 0, bytes: 0 });
+    }
+
+    /// The fingerprint table is `FxHashMap<u64, u32>`: 16 B for the `(key, count)` record
+    /// plus hashbrown's 1 control byte per bucket. Charging 8 (the fingerprint's width)
+    /// understated the table by 1.89x.
+    #[test]
+    fn project_charges_the_real_entry_size() {
+        let entry = std::mem::size_of::<(u64, u32)>();
+        assert_eq!(entry, 16);
+        let p = project(1_000_000, entry);
+        assert_eq!(p.buckets, 2_097_152, "ceil(8e6/7) = 1_142_858 -> 2^21 buckets");
+        assert_eq!(p.bytes, p.buckets * 17);
+        // The old 8-byte charge, for the record: 1.89x low.
+        assert_eq!(p.bytes * 100 / project(1_000_000, 8).bytes, 188);
+    }
+
+    /// ... and against the real allocation rather than only its own arithmetic: the table
+    /// asks hashbrown for `capacity` elements, hashbrown reports what it actually holds,
+    /// and `project` must predict the bucket count from that (7/8 load, power-of-two
+    /// buckets). The entry width is pinned by `size_of::<(u64, u32)>()`, so bytes follow.
+    #[test]
+    fn projection_matches_the_allocated_table() {
+        let cap = 2_000_000usize;
+        let t = crate::fingerprint::FingerprintTable::with_capacity(cap);
+        let p = project(cap, std::mem::size_of::<(u64, u32)>());
+        let held = t.capacity() as u64;
+        assert!(held >= cap as u64, "the table must hold its capacity without rehashing: {held}");
+        assert_eq!(p.buckets, (held * 8).div_ceil(7).next_power_of_two());
+        assert_eq!(p.bytes, p.buckets * 17);
     }
 
     #[test]

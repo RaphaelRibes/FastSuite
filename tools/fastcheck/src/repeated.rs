@@ -63,6 +63,20 @@ impl<K: Hash + Eq + Clone + Ord> RepeatedCounter<K> {
         }
     }
 
+    /// Exact sum of two counters, under the same bound: every key's count is added in one
+    /// batch, then singletons are evicted if the map is over `evict_at` — the rule `insert`
+    /// applies, applied once per merge rather than once per insert.
+    pub fn merge(&mut self, o: &RepeatedCounter<K>) {
+        self.total += o.total;
+        for (k, &c) in &o.map {
+            *self.map.entry(k.clone()).or_insert(0) += c;
+        }
+        if self.map.len() > self.evict_at {
+            self.map.retain(|_, c| *c > 1);
+            self.evict_at = self.map.len().max(self.cap) + self.cap / 4;
+        }
+    }
+
     /// Keys with `count >= min_count`, most frequent first.
     pub fn report(&self, min_count: u32) -> Vec<(K, u32)> {
         let mut v: Vec<(K, u32)> =

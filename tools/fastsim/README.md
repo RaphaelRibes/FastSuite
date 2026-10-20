@@ -87,7 +87,7 @@ fastsim --pairs 20_000_000 --profile profiles/mandril_E.json \
 | `--read-len L` | 150 | read length (must match profile) |
 | `--insert-mean M` | 300 | insert length mean (bp) |
 | `--insert-sd S` | 50 | insert length sd |
-| `--insert-min M` | 150 | insert length floor |
+| `--insert-min M` | min(150, read_len) | insert length floor |
 | `--gc G` | 0.49 | GC fraction for random DNA |
 | `--reference FILE` | — | sample inserts from a FASTA instead of random DNA |
 | `--adapter-seq SEQ` | profile | override adapter sequence |

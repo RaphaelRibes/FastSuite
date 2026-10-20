@@ -325,8 +325,9 @@ impl Accum {
         self.heatmap[heatmap::index(hx, hy)] += 1;
 
         // Duplication: every read is fingerprinted, exactly, with no sample and no cap.
-        // The table is pre-sized from the projected record count in main.rs, so this does
-        // not rehash. Over-representation naming is a separate, opt-in concern (§5.9).
+        // The table starts at 1024 entries and grows (main.rs admission-checks the size it
+        // reaches at the projected record count). Over-representation naming is a separate,
+        // opt-in concern (§5.9).
         self.seq_counts.observe(seq);
         if self.track_overrep_table {
             // --overrep-mode table packs sequences 2 bits per base, and a read with an N or
@@ -384,6 +385,10 @@ impl Accum {
         }
         // The fingerprint table merges exactly, like every other accumulator here.
         self.seq_counts.merge(&o.seq_counts);
+        // The 12-mer counter merges under the same cap/singleton-eviction rule as the
+        // per-file one. Without this the merged accumulator carries an empty spectrum and
+        // every report says kmer_top_count 0 however over-represented the k-mers are.
+        self.kmer_counts.merge(&o.kmer_counts);
         match (self.adapter_pos.as_mut(), o.adapter_pos.as_ref()) {
             (Some(a), Some(b)) => a.merge(b),
             // The run total starts without the optional counter: the first file that
@@ -542,6 +547,7 @@ pub fn offset_verdict(census: &[u64; QBINS], requested: Option<u8>) -> OffsetVer
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// Hand-computed fixture. Three reads, all 4 bp, so every counter below can
     /// be checked by eye.
@@ -685,5 +691,53 @@ mod tests {
             }
             assert_eq!(m.qual_at(p), f.qual_at(p), "qual at {p}");
         }
+    }
+
+    /// Regression: `Accum::merge` summed every counter except the 12-mer one, so the merged
+    /// accumulator — the only one any report renders — always had an empty spectrum:
+    /// `kmer_top_count` 0 and `kmer_spectrum.top` [] even when every read carried the same
+    /// 12-mer. 2000 reads of 40 bp, split over two accumulators and merged.
+    #[test]
+    fn kmer_spectrum_survives_merge() {
+        let read = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"; // 40 bp, 29 12-mer windows
+        let qual = [b'I'; 40];
+        let mut a = Accum::new(40);
+        let mut b = Accum::new(40);
+        for _ in 0..1000 {
+            a.observe(b"@r", read, &qual);
+            b.observe(b"@r", read, &qual);
+        }
+        let mut total = Accum::new(40);
+        total.merge(&a);
+        total.merge(&b);
+        assert_eq!(total.reads, 2000);
+
+        // Through the report path, not the raw counter: this is what the JSON emits.
+        // 29 windows per read over a period-4 sequence give four distinct 12-mers, the
+        // phase-0 one (ACGTACGTACGT) at 8 windows per read: 8 * 2000 = 16000.
+        let (m, block) = crate::rich::kmer_metrics(&total);
+        assert_eq!(m["kmer_top_count"], json!(16_000));
+        assert_eq!(block["top"].as_array().unwrap().len(), 4);
+        assert_eq!(block["top"][0]["kmer"], json!("ACGTACGTACGT"));
+        assert_eq!(block["top"][0]["count"], json!(16_000));
+    }
+
+    /// Merge keeps the bound: an over-cap merge drops singletons and leaves the frequent
+    /// k-mers counted exactly.
+    #[test]
+    fn kmer_merge_respects_the_cap_and_evicts_only_singletons() {
+        let mut a = RepeatedCounter::new(100);
+        let mut b = RepeatedCounter::new(100);
+        let common = repeated::pack_kmer(b"ACGTACGTACGT").unwrap();
+        for _ in 0..50 {
+            a.insert(common);
+        }
+        for i in 0..200u64 {
+            b.insert(1 << 40 | i); // 200 distinct singletons, over the cap
+        }
+        a.merge(&b);
+        assert!(a.len() <= 100, "the merged map must stay under the cap, got {}", a.len());
+        assert_eq!(a.report(10), vec![(common, 50)], "the frequent k-mer keeps its exact count");
+        assert_eq!(a.total, 250, "total is the number of inserts seen");
     }
 }

@@ -110,13 +110,20 @@ fn main() -> Result<()> {
             })
             .sum::<anyhow::Result<usize>>()?;
         let fp_capacity = est_records.clamp(1, memory::MAX_PREALLOC_ENTRIES);
-        let fp_proj = memory::project(fp_capacity, 8); // 64-bit fingerprints
+        // The table is `FxHashMap<u64, u32>`: 16 B for the (fingerprint, count) record plus
+        // hashbrown's 1 control byte per bucket. The projection is the size the table
+        // reaches when it holds `fp_capacity` distinct reads; it is not preallocated to it.
+        let entry_bytes = std::mem::size_of::<(u64, u32)>();
+        let fp_proj = memory::project(fp_capacity, entry_bytes);
         eprintln!(
-            "fastcheck: duplication fingerprint table projected at {:.1} MB for ~{} reads \
-             ({} buckets, 64-bit fingerprints)",
+            "fastcheck: duplication fingerprint table projected at {:.1} MB if ~{} distinct \
+             reads are seen ({} buckets x {} B entry + 1 B control = {} B/bucket); the table \
+             grows into that, it is not preallocated",
             memory::mib(fp_proj.bytes),
             fp_capacity,
             fp_proj.buckets,
+            entry_bytes,
+            entry_bytes + 1,
         );
         Some((fp_capacity, fp_proj))
     } else {
@@ -190,7 +197,8 @@ fn main() -> Result<()> {
                 // In table mode the sequence table is the larger allocation, so name it.
                 if let Some(tp) = table_proj {
                     anyhow::bail!(
-                        "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
+                        "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 17 B: \
+                         (u64, u32) entry + control byte)\n\
                          and --overrep-mode table needs ~{:.1} MB of packed unique sequences on top\n\
                          but this process is limited to {:.1} MB ({})\n\
 \n\
@@ -205,7 +213,8 @@ fn main() -> Result<()> {
                     )
                 }
                 anyhow::bail!(
-                    "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 9 B, 64-bit fingerprints)\n\
+                    "the duplication fingerprint table needs ~{:.1} MB ({} buckets x 17 B: \
+                     (u64, u32) entry + control byte)\n\
                      but this process is limited to {:.1} MB ({})\n\
 \n\
                      --max-mem <MB>           raise the ceiling (it cannot exceed the cgroup limit)\n\

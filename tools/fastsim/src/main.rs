@@ -75,10 +75,16 @@ fn run(cfg: &cli::Config) -> Result<()> {
     if profile.dup_rate.is_none() {
         profile.dup_rate = Some(cfg.dup_rate);
     }
-    if cfg.insert_min > profile.read_len {
+    // Insert floor: the profile's read length is the hard ceiling (a floor
+    // above it is unrepresentable), so the default is min(150, read_len) —
+    // the documented `fastcheck --profile p.json` -> `fastsim --profile p.json`
+    // loop must work unmodified for a 100 bp or 75 bp library. An explicit
+    // --insert-min still wins, and is still validated against the read length.
+    let insert_min = cfg.insert_min.unwrap_or(profile.read_len.min(150));
+    if insert_min > profile.read_len {
         bail!(
             "--insert-min ({}) should be <= the profile read_len ({})",
-            cfg.insert_min,
+            insert_min,
             profile.read_len
         );
     }
@@ -184,7 +190,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             let l = profile.sample_insert(
                 cfg.insert_mean,
                 cfg.insert_sd,
-                cfg.insert_min,
+                insert_min,
                 &mut rng,
             );
             let i = match &contigs {

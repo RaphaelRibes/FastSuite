@@ -32,6 +32,31 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_fastsim")
 }
 
+/// Profile with a configurable read length (no insert CDF, adapter off), for
+/// the short-read closed-loop test.
+fn write_short_profile(dir: &Path, read_len: u32) -> std::path::PathBuf {
+    let q = vec!["30"; read_len as usize].join(",");
+    let json = format!(
+        r#"{{
+        "read_len": {l}, "gc": 0.5, "geometry": "tail3p_both",
+        "head": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+        "tail": {{"R1": {{"0": 70, "2": 30}}, "R2": {{"0": 70, "2": 30}}}},
+        "joint_tail": {{"0,0": 49, "2,2": 9}},
+        "tail_q_collapse": {{"R1": 2.0, "R2": 1.0}},
+        "pos_q": {{"R1": [{q}], "R2": [{q}]}},
+        "read_meanq": {{"R1": {{"30": 100}}, "R2": {{"30": 100}}}},
+        "full_length_rate": 0.0,
+        "full_length_q": {{"R1": 20, "R2": 20}},
+        "adapter": {{"seq": "CTGTCTCTTATACACATCT", "mode": "none"}}
+    }}"#,
+        l = read_len,
+        q = q
+    );
+    let p = dir.join(format!("profile_{read_len}.json"));
+    std::fs::write(&p, json).unwrap();
+    p
+}
+
 #[test]
 fn smoke_run_produces_three_files() {
     let dir = std::env::temp_dir().join(format!("fastsim_it_{}", std::process::id()));
@@ -444,4 +469,91 @@ fn profile_dup_rate_beats_the_cli_flag() {
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn short_read_profile_runs_without_insert_min() {
+    // The documented closed loop is `fastcheck --profile p.json` then
+    // `fastsim --profile p.json` and nothing else. A fixed 150 bp insert floor
+    // refused every library with read_len <= 150 (fastsim requires
+    // insert-min <= read_len); the floor now defaults to min(150, read_len),
+    // so 100 bp and 75 bp profiles go straight in.
+    for l in [100u32, 75] {
+        let dir = std::env::temp_dir()
+            .join(format!("fastsim_it_short{l}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = write_short_profile(&dir, l);
+        let out = dir.join("sim");
+        let o = Command::new(bin())
+            .args([
+                "--pairs", "500", "--profile", profile.to_str().unwrap(),
+                "--out", out.to_str().unwrap(), "--no-gzip", "--drop-rate", "0",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "read_len {l} must simulate with the default insert floor; stderr: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+
+        // Every read is exactly read_len bases...
+        let r1 = std::fs::read_to_string(dir.join("sim_R1.fastq")).unwrap();
+        for s in r1.lines().skip(1).step_by(4) {
+            assert_eq!(s.len(), l as usize, "read_len {l}: read is not full length");
+        }
+        // ...and the floor actually applied is the profile's read_len
+        // (min(150, l) == l), neither 0 nor 150.
+        let gt = std::fs::read_to_string(dir.join("sim.gt.tsv")).unwrap();
+        let min_insert = gt
+            .lines()
+            .skip(1)
+            .map(|line| line.split('\t').nth(1).unwrap().parse::<u32>().unwrap())
+            .min()
+            .unwrap();
+        assert!(min_insert >= l, "read_len {l}: shortest insert {min_insert}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[test]
+fn explicit_insert_min_still_wins() {
+    // The profile-derived default must not swallow an explicit flag: a value
+    // above the profile's read_len is still refused, and the message names the
+    // value the user passed (proving the flag, not the default, was used).
+    let dir = std::env::temp_dir().join(format!("fastsim_it_imin_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_short_profile(&dir, 100);
+    let out = dir.join("sim");
+    let o = Command::new(bin())
+        .args([
+            "--pairs", "10", "--profile", profile.to_str().unwrap(),
+            "--out", out.to_str().unwrap(), "--insert-min", "200",
+        ])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--insert-min (200)"), "stderr: {err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn zero_dup_pool_is_a_clean_cli_error() {
+    // --dup-pool 0 used to reach History::push and panic (index out of bounds
+    // on the empty buffer, then a modulo by zero); it must be a parse-time
+    // error instead.
+    let o = Command::new(bin())
+        .args([
+            "--pairs", "10", "--profile", "p.json", "--out", "x",
+            "--dup-pool", "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    assert_ne!(o.status.code(), Some(101), "must not be a panic");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--dup-pool must be >= 1"), "stderr: {err}");
+    assert!(!err.contains("panicked"), "stderr: {err}");
 }

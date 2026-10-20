@@ -734,12 +734,14 @@ impl Cli {
         let rule = build_match_rule(&self.target)?;
 
         // --force: refuse to clobber any existing output. A dry run writes
-        // nothing, so it never has to refuse (CLI-SPEC §1).
+        // nothing, so it never has to refuse (CLI-SPEC §1). The first existing
+        // path is named — `if let` rather than a `for` because the body always
+        // diverges (clippy::never_loop, deny-by-default).
         if !self.force && !self.dry_run {
-            for p in self
+            if let Some(p) = self
                 .out_paths()
                 .iter()
-                .filter(|p| p.as_path().exists())
+                .find(|p| p.as_path().exists())
             {
                 bail!(
                     "{} already exists; pass --force (-f) to overwrite it",

@@ -619,7 +619,21 @@ fn streaming_walk<const FORWARD: bool>(
         k_curr += 1;
 
         // Streaming 5′ budget short-circuit.
-        if first_subscan && rem_budget > 0 && k_curr >= rem_budget {
+        //
+        // Gated on MATCHES, not steps: a run that has merely consumed
+        // `rem_budget` STEPS may still resolve to T = 0 (a read with no
+        // homopolymer at all gets there on mismatches alone — `gamma` only
+        // exceeds `mercy` after a few of them, and the budget can run out
+        // first on a short read). Only a run carrying at least `rem_budget`
+        // matches is guaranteed to resolve above the budget, which is the
+        // condition the drop needs. Counting steps here dropped every clean
+        // read of <= 30 bp (and some above it) as `polyX 5′` at the shipped
+        // `--min-len 0.9L`.
+        if first_subscan
+            && rem_budget > 0
+            && m_curr >= rem_budget
+            && m_curr + 1 >= params.min_run
+        {
             return StreamOut {
                 quality_sum, // partial; caller still drops, doesn't use
                 first_trim: 0,
@@ -1063,7 +1077,10 @@ fn polyx_trim_inner(
         let res = scan(
             sub_bases, sub_quals, 0, upper, second_dir, params, budget_opt,
         );
-        if res.mode == StopMode::Budget {
+        if res.mode == StopMode::Budget
+            && res.matches >= budget
+            && res.matches + 1 >= params.min_run
+        {
             let reason = match dir {
                 Direction::Forward => DropReason::Poly3,
                 Direction::Reverse => DropReason::Poly5,
@@ -1081,7 +1098,17 @@ fn polyx_trim_inner(
                 runs: vec![],
             };
         }
-        resolve_trim(res, params.min_run, params.boundary_anchored)
+        // A budget stop means "the walk consumed Δ_L steps", not "a run
+        // extends past it": on a short read a walk of mismatches reaches the
+        // cap before the mercy clause can resolve it to 0, and dropping there
+        // deleted clean reads as polyX 3′ (the 5′ twin of this bug lives in
+        // `streaming_walk`). Below `min_run` matches the run is not a run, so
+        // it resolves to no trim and the read is kept on its merits.
+        if res.mode == StopMode::Budget {
+            0
+        } else {
+            resolve_trim(res, params.min_run, params.boundary_anchored)
+        }
     } else {
         0
     };

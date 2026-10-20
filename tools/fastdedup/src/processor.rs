@@ -423,6 +423,12 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
     output_path: &str,
     cfg: &DedupConfig,
 ) -> Result<(usize, usize)> {
+    // --dry-run writes nothing — not even the temp file: the plain counting
+    // pass reaches the identical verdict without creating anything.
+    if cfg.dry_run {
+        return execute_deduplication::<T>(input_path, output_path, cfg);
+    }
+
     let mut tracker = AbundanceTracker::<T>::new(cfg.estimated_capacity)?;
     let mut total_reads = 0;
 
@@ -640,6 +646,18 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
     output_r2_path: &str,
     cfg: &DedupConfig,
 ) -> Result<(usize, usize)> {
+    // --dry-run writes nothing — not even the temp file: the plain paired
+    // counting pass reaches the identical verdict without creating anything.
+    if cfg.dry_run {
+        return execute_paired_deduplication::<T>(
+            input_r1_path,
+            input_r2_path,
+            output_r1_path,
+            output_r2_path,
+            cfg,
+        );
+    }
+
     let mut tracker = AbundanceTracker::<T>::new(cfg.estimated_capacity)?;
     let mut total_reads = 0;
 

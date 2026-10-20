@@ -20,6 +20,11 @@ pub struct SpillerState {
     pub counts_r2: HashMap<(u16, u16), u64>,
     /// Per-file total read count.
     pub per_file_counts: HashMap<u16, u64>,
+    /// Reads with zero ACGT bases (no-call): unplaceable on the composition
+    /// plane, so the corner metrics exclude them instead of calling them polyA.
+    pub no_call: u64,
+    pub no_call_r1: u64,
+    pub no_call_r2: u64,
     pub max_seq_len: u32,
     pub total_reads: u64,
     pub temp_dir: PathBuf,
@@ -57,6 +62,9 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
     let mut counts_r1: HashMap<(u16, u16), u64> = HashMap::new();
     let mut counts_r2: HashMap<(u16, u16), u64> = HashMap::new();
     let mut per_file_counts: HashMap<u16, u64> = HashMap::new();
+    let mut no_call = 0u64;
+    let mut no_call_r1 = 0u64;
+    let mut no_call_r2 = 0u64;
     let mut max_seq_len = 0u32;
     let mut total_reads = 0u64;
 
@@ -99,6 +107,9 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
                 counts_r1: cr1,
                 counts_r2: cr2,
                 per_file_counts: pfc,
+                no_call: nc,
+                no_call_r1: nc1,
+                no_call_r2: nc2,
                 max_seq_len: m,
                 n_reads: n,
             } => {
@@ -106,6 +117,9 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
                     max_seq_len = m;
                 }
                 total_reads += n;
+                no_call += nc;
+                no_call_r1 += nc1;
+                no_call_r2 += nc2;
                 for (k, (cnt, q)) in c {
                     let e = counts.entry(k).or_insert((0, 0.0));
                     e.0 += cnt;
@@ -145,6 +159,9 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
         counts_r1,
         counts_r2,
         per_file_counts,
+        no_call,
+        no_call_r1,
+        no_call_r2,
         max_seq_len,
         total_reads,
         temp_dir,

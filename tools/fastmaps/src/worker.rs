@@ -32,6 +32,9 @@ pub enum SpillerMsg {
         counts_r1: HashMap<(u16, u16), u64>,
         counts_r2: HashMap<(u16, u16), u64>,
         per_file_counts: HashMap<u16, u64>,
+        no_call: u64,
+        no_call_r1: u64,
+        no_call_r2: u64,
         max_seq_len: u32,
         n_reads: u64,
     },
@@ -83,6 +86,12 @@ pub struct WorkerLocal {
     pub counts_r1: HashMap<(u16, u16), u64>,
     /// Per-pixel R2-only count.
     pub counts_r2: HashMap<(u16, u16), u64>,
+    /// Reads with zero ACGT bases (all-N / no-call). They land on (0,0) like an
+    /// all-A read but have no measurable composition, so the corner metrics
+    /// keep them out of their denominators and report them separately.
+    pub no_call: u64,
+    pub no_call_r1: u64,
+    pub no_call_r2: u64,
     /// Per-file total read count.
     pub per_file_counts: HashMap<u16, u64>,
     pub max_seq_len: u32,
@@ -101,6 +110,9 @@ impl WorkerLocal {
             counts: HashMap::new(),
             counts_r1: HashMap::new(),
             counts_r2: HashMap::new(),
+            no_call: 0,
+            no_call_r1: 0,
+            no_call_r2: 0,
             per_file_counts: HashMap::new(),
             max_seq_len: 0,
             total_reads: 0,
@@ -166,7 +178,7 @@ pub fn process_fastq(
     while let (Some(Ok(header)), Some(Ok(seq)), Some(Ok(plus)), Some(Ok(qual))) =
         (lines.next(), lines.next(), lines.next(), lines.next())
     {
-        let (cx, cy) = encode_read(&seq);
+        let (cx, cy, n_acgt) = encode_read(&seq);
         let mq = mean_quality(&qual);
 
         let slen = seq.len() as u32;
@@ -196,6 +208,17 @@ pub fn process_fastq(
                 *state.counts_r2.entry(xy).or_insert(0) += 1;
             }
             FileKind::Unknown => {}
+        }
+        // A read with no ACGT base has no measurable composition: it keeps its
+        // (0,0) pixel (the plane is unchanged) but is counted here so the
+        // corner metrics can leave it out of the polyA denominators.
+        if n_acgt == 0 {
+            state.no_call += 1;
+            match kind {
+                FileKind::R1 => state.no_call_r1 += 1,
+                FileKind::R2 => state.no_call_r2 += 1,
+                FileKind::Unknown => {}
+            }
         }
         state.total_reads += 1;
         *state.per_file_counts.entry(file_id).or_insert(0) += 1;

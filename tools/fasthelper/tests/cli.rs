@@ -657,3 +657,213 @@ fn resume_reruns_when_an_input_changes_in_place() {
         "an unchanged input must still resume: {stdout3}"
     );
 }
+
+/// A two-step config re-run into the same outdir: cleanup deletes each
+/// intermediate FASTQ but used to leave the step's own --json behind, and
+/// nothing passed --force, so fastprep's clobber guard aborted the second run
+/// with exit 1. `--from` takes the same path.
+#[test]
+fn two_step_chain_runs_twice_into_the_same_outdir() {
+    require_tool("fastdedup");
+    require_tool("fastprep");
+    let d = tmpdir("chain_twice");
+    let out = d.join("out");
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(
+        &fq,
+        "@r1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n@r2\nTTTTAAAACCCCGGGG\n+\nIIIIIIIIIIIIIIII\n",
+    )
+    .unwrap();
+    let cfg = d.join("chain.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"chain\"\noutdir = \"{}\"\nsteps = [\"fastdedup\", \"fastprep\"]\nthreads = 2\ngz_level = 1\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+
+    let (_, e1, c1) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c1, 0, "first run must succeed: {e1}");
+    let (_, e2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(
+        c2, 0,
+        "a second run into the same outdir must succeed — the step's stale --json \
+         and outputs must not trip its clobber guard: {e2}"
+    );
+    assert!(
+        out.join("S1/S1_clean_R1.fastq.gz").is_file(),
+        "the chain's final output must be there after the rerun"
+    );
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let cmds = man["commands"].as_array().unwrap();
+    assert_eq!(cmds.len(), 2, "one entry per step: {man}");
+    for c in cmds {
+        assert_eq!(c["exit"], 0, "both steps must have run clean on the rerun: {c}");
+    }
+
+    // Forcing the rerun from the second step must not re-trip the guard either.
+    let (_, e3, c3) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--tools-dir", td, "--from", "fastprep",
+    ]);
+    assert_eq!(c3, 0, "--from must rerun the step cleanly: {e3}");
+}
+
+/// A step that writes no FASTQ, sitting mid-chain: it used to hand an empty
+/// path to the next step (and let the cleanup delete the FASTQ that step still
+/// needed). The chain must keep carrying the last FASTQ output forward.
+#[test]
+fn mid_chain_non_fastq_step_keeps_the_last_fastq_as_input() {
+    require_tool("fastdedup");
+    require_tool("fastcheck");
+    require_tool("fastprep");
+    let d = tmpdir("mid_nonfastq");
+    let out = d.join("out");
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(
+        &fq,
+        "@r1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n@r2\nTTTTAAAACCCCGGGG\n+\nIIIIIIIIIIIIIIII\n",
+    )
+    .unwrap();
+    let cfg = d.join("mid.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"mid\"\noutdir = \"{}\"\nsteps = [\"fastdedup\", \"fastcheck\", \"fastprep\"]\nthreads = 2\ngz_level = 1\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools_dir().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "the chain must survive a mid-chain report-only step: {stderr}");
+    assert!(out.join("S1/fastcheck.json").is_file(), "fastcheck must have run: {stderr}");
+
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let prep = man["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["tool"] == "fastprep")
+        .expect("fastprep must have run");
+    let argv: Vec<String> = serde_json::from_value(prep["argv"].clone()).unwrap();
+    let expected = out.join("S1/S1_dedup_R1.fastq.gz").display().to_string();
+    assert!(
+        argv.iter().all(|a| !a.is_empty()),
+        "no step may be handed an empty path: {argv:?}"
+    );
+    assert!(
+        argv.contains(&expected),
+        "fastprep must read the last FASTQ-producing step's output ({expected}): {argv:?}"
+    );
+}
+
+/// A step whose binary does not resolve must fail the run, not be skipped:
+/// the run used to continue on the previous input and exit 0 while `check`
+/// rejected the identical config.
+#[test]
+fn missing_step_binary_fails_the_run_like_check() {
+    let d = tmpdir("missing_bin");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    // Only fastprep resolves here, so the run gets past its "no binaries at
+    // all" guard and reaches the per-step resolution this test is about.
+    let fake = tools.join("fastprep");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&fake, perm).unwrap();
+
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(&fq, "@r1\nACGT\n+\nIIII\n").unwrap();
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"m\"\noutdir = \"{}\"\nsteps = [\"fastcheck\", \"fastprep\"]\n\n[[samples]]\nname = \"s1\"\nr1 = \"{}\"\n",
+            d.join("out").display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, run_err, run_code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap(),
+    ]);
+    let (_, check_err, check_code) = run(&[
+        "check", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        run_code == 0,
+        check_code == 0,
+        "run must agree with check about an unresolvable step binary: \
+         run {run_code} ({run_err}) / check {check_code} ({check_err})"
+    );
+    // (Only reachable when fastcheck is absent from tools/ and $PATH.)
+    if run_code != 0 {
+        assert!(
+            run_err.contains("fastcheck"),
+            "the failure must name the step: {run_err}"
+        );
+    }
+}
+
+/// A rerun must merge the manifest with what is on disk, not overwrite it:
+/// a step this run did not reach still has artifacts in the outdir, and its
+/// provenance used to be destroyed by the next run.
+#[test]
+fn manifest_keeps_entries_from_a_previous_run() {
+    require_tool("fastdedup");
+    require_tool("fastprep");
+    let d = tmpdir("manifest_merge");
+    let out = d.join("out");
+    let fq = d.join("s1_R1.fastq");
+    std::fs::write(
+        &fq,
+        "@r1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n@r2\nTTTTAAAACCCCGGGG\n+\nIIIIIIIIIIIIIIII\n",
+    )
+    .unwrap();
+    let body = |steps: &str| {
+        format!(
+            "[run]\nname = \"merge\"\noutdir = \"{}\"\nsteps = [{}]\nthreads = 2\ngz_level = 1\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            steps,
+            fq.display()
+        )
+    };
+    let both = d.join("both.toml");
+    std::fs::write(&both, body("\"fastdedup\", \"fastprep\"")).unwrap();
+    let one = d.join("one.toml");
+    std::fs::write(&one, body("\"fastdedup\"")).unwrap();
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+
+    let (_, e1, c1) = run(&["run", "-c", both.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c1, 0, "{e1}");
+    let (_, e2, c2) = run(&["run", "-c", one.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c2, 0, "{e2}");
+
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let tools: Vec<&str> = man["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["tool"].as_str())
+        .collect();
+    assert!(
+        tools.contains(&"fastprep"),
+        "the previous run's fastprep entry must survive a rerun that does not \
+         reach it: {man}"
+    );
+    assert_eq!(tools.iter().filter(|t| **t == "fastdedup").count(), 1, "{man}");
+}

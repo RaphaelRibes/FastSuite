@@ -214,6 +214,9 @@ fn main() {
                 counts_r1:       state.counts_r1,
                 counts_r2:       state.counts_r2,
                 per_file_counts: state.per_file_counts,
+                no_call:         state.no_call,
+                no_call_r1:      state.no_call_r1,
+                no_call_r2:      state.no_call_r2,
                 max_seq_len:     state.max_seq_len,
                 n_reads:         state.total_reads,
             })

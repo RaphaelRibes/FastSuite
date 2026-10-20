@@ -20,8 +20,9 @@ pub fn fingerprint(seq: &[u8]) -> u64 {
 
 /// Exact multiplicity counter: fingerprint -> occurrences.
 ///
-/// Pre-sized from the projected capacity so no rehashing occurs, which is what makes the
-/// projection in `crate::memory::project` an identity rather than an estimate.
+/// Sized from a caller-supplied capacity (clamped to 2^26 entries). The scan starts it at
+/// 1024 entries and it grows by rehashing; `crate::memory::project` gives the size it
+/// reaches when it holds the estimated number of distinct reads.
 #[derive(Clone)]
 pub struct FingerprintTable {
     counts: FxHashMap<u64, u32>,
@@ -46,6 +47,13 @@ impl FingerprintTable {
     /// Distinct fingerprints seen.
     pub fn distinct(&self) -> u64 {
         self.counts.len() as u64
+    }
+
+    /// Test-only: the element capacity hashbrown actually allocated. `memory::tests` uses
+    /// it to check the projection's bucket count against a real table.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.counts.capacity()
     }
 
     /// Total observations recorded (sum of multiplicities).

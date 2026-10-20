@@ -2015,5 +2015,270 @@ fn test_validation_sortie_gz_vs_non_gz_multi_thread() {
 }
 
 // ================================================================
+// TESTS — RÉGRESSION : --dry-run PARALLÈLE ET REPRISE SANS --force
+// ================================================================
+
+/// `--dry-run` doit être honoré par le chemin parallèle : aucun fichier créé,
+/// aucun temporaire. Avant correctif, `-j 4` écrivait une sortie complète et
+/// sortait avec le code 0, alors que le chemin sérial n'écrivait rien.
+#[test]
+fn test_dry_run_parallele_ne_cree_aucun_fichier() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 20, 5);
+    let sortie = temp_dir.child("sortie.fastq");
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("-j")
+        .arg("4")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        // Les statistiques sont bien calculées (20 uniques + 5 duplicats).
+        .stdout(predicate::str::contains("fastdedup: 25 reads in"))
+        .stdout(predicate::str::contains("5 duplicates"));
+
+    assert!(
+        !sortie.path().exists(),
+        "--dry-run -j 4 ne doit créer aucun fichier de sortie"
+    );
+    let restants: Vec<String> = fs::read_dir(temp_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        restants,
+        vec!["entree.fastq".to_string()],
+        "fichiers inattendus après --dry-run: {restants:?}"
+    );
+}
+
+/// Même exigence sur le chemin paired-end parallèle (-j 4) : ni R1 ni R2.
+#[test]
+fn test_dry_run_paire_parallele_ne_cree_aucun_fichier() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1, r2) = generer_fastq_paire(&temp_dir, "R1.fastq", "R2.fastq", 20, 5);
+    let sortie_r1 = temp_dir.child("sortie_R1.fastq");
+    let sortie_r2 = temp_dir.child("sortie_R2.fastq");
+
+    cmd()
+        .arg("-1")
+        .arg(r1.path())
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg(sortie_r1.path())
+        .arg("-p")
+        .arg(sortie_r2.path())
+        .arg("-j")
+        .arg("4")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fastdedup: 25 reads in"));
+
+    assert!(
+        !sortie_r1.path().exists(),
+        "--dry-run -j 4 ne doit créer ni R1 ni R2"
+    );
+    assert!(
+        !sortie_r2.path().exists(),
+        "--dry-run -j 4 ne doit créer ni R1 ni R2"
+    );
+}
+
+/// `--abundance` ignorait aussi `--dry-run` : la sortie annotée était écrite et
+/// le fichier temporaire créé puis supprimé. Rien ne doit être touché.
+#[test]
+fn test_dry_run_abundance_ne_cree_aucun_fichier() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 20, 5);
+    let sortie = temp_dir.child("abondance.fastq");
+    let dossier_temp = temp_dir.child("tmp");
+    dossier_temp.create_dir_all().unwrap();
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("--abundance")
+        .arg("--temp-dir")
+        .arg(dossier_temp.path())
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fastdedup: 25 reads in"));
+
+    assert!(
+        !sortie.path().exists(),
+        "--dry-run --abundance ne doit créer aucun fichier de sortie"
+    );
+    assert_eq!(
+        fs::read_dir(dossier_temp.path()).unwrap().count(),
+        0,
+        "aucun fichier temporaire d'abondance ne doit être laissé derrière"
+    );
+}
+
+/// Sans --force, un second passage `-j 4` doit reprendre la sortie existante
+/// (préchargement puis ajout) comme le chemin sérial. Avant correctif, le
+/// writer parallèle forçait `force = true` et tronquait le fichier : les
+/// lectures du premier passage disparaissaient silencieusement.
+#[test]
+fn test_reprise_parallele_sans_force_conserve_les_lectures() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree_cinq = generer_fastq(&temp_dir, "cinq.fastq", 5, 0);
+    // Sous-ensemble de la première entrée : ces lectures sont déjà en sortie.
+    let entree_deux = generer_fastq(&temp_dir, "deux.fastq", 2, 0);
+    let sortie_ser = temp_dir.child("ser.fastq");
+    let sortie_par = temp_dir.child("par.fastq");
+
+    for (threads, sortie) in [("1", &sortie_ser), ("4", &sortie_par)] {
+        // Premier passage : 5 séquences uniques.
+        cmd()
+            .arg("-1")
+            .arg(entree_cinq.path())
+            .arg("-o")
+            .arg(sortie.path())
+            .arg("-j")
+            .arg(threads)
+            .assert()
+            .success();
+        assert_eq!(
+            compter_sequences_fastq(&fs::read_to_string(sortie.path()).unwrap()),
+            5
+        );
+
+        // Second passage sans --force : les 5 lectures doivent survivre.
+        cmd()
+            .arg("-1")
+            .arg(entree_deux.path())
+            .arg("-o")
+            .arg(sortie.path())
+            .arg("-j")
+            .arg(threads)
+            .assert()
+            .success();
+        assert_eq!(
+            compter_sequences_fastq(&fs::read_to_string(sortie.path()).unwrap()),
+            5,
+            "-j {threads} : sans --force, la reprise ne doit pas perdre les lectures du premier passage"
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(sortie_ser.path()).unwrap(),
+        fs::read_to_string(sortie_par.path()).unwrap(),
+        "sérial != parallèle après reprise"
+    );
+}
+
+/// Version paired-end du même défaut : R1 et R2 doivent conserver les paires du
+/// premier passage, et rester synchronisés.
+#[test]
+fn test_reprise_paire_parallele_sans_force_conserve_les_paires() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1_cinq, r2_cinq) = generer_fastq_paire(&temp_dir, "R1_cinq.fastq", "R2_cinq.fastq", 5, 0);
+    let (r1_deux, r2_deux) = generer_fastq_paire(&temp_dir, "R1_deux.fastq", "R2_deux.fastq", 2, 0);
+    let sortie_r1 = temp_dir.child("sortie_R1.fastq");
+    let sortie_r2 = temp_dir.child("sortie_R2.fastq");
+
+    cmd()
+        .arg("-1")
+        .arg(r1_cinq.path())
+        .arg("-2")
+        .arg(r2_cinq.path())
+        .arg("-o")
+        .arg(sortie_r1.path())
+        .arg("-p")
+        .arg(sortie_r2.path())
+        .arg("-j")
+        .arg("4")
+        .assert()
+        .success();
+
+    cmd()
+        .arg("-1")
+        .arg(r1_deux.path())
+        .arg("-2")
+        .arg(r2_deux.path())
+        .arg("-o")
+        .arg(sortie_r1.path())
+        .arg("-p")
+        .arg(sortie_r2.path())
+        .arg("-j")
+        .arg("4")
+        .assert()
+        .success();
+
+    let final_r1 = fs::read_to_string(sortie_r1.path()).unwrap();
+    let final_r2 = fs::read_to_string(sortie_r2.path()).unwrap();
+    assert_eq!(
+        compter_sequences_fastq(&final_r1),
+        5,
+        "R1 doit conserver les 5 paires du premier passage"
+    );
+    assert_eq!(
+        compter_sequences_fastq(&final_r2),
+        5,
+        "R2 doit conserver les 5 paires du premier passage"
+    );
+    assert_eq!(
+        extraire_ids_fastq(&final_r1),
+        extraire_ids_fastq(&final_r2),
+        "R1 et R2 doivent rester synchronisés après la reprise"
+    );
+}
+
+/// Une queue incomplète laissée par un crash doit être tronquée au dernier
+/// enregistrement valide, comme sur le chemin sérial.
+#[test]
+fn test_reprise_parallele_tronque_queue_incomplete() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 5, 0);
+    let sortie = temp_dir.child("sortie.fastq");
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("-j")
+        .arg("4")
+        .assert()
+        .success();
+    let taille_valide = fs::metadata(sortie.path()).unwrap().len();
+
+    // Simule un crash : un demi-enregistrement à la fin du fichier.
+    let mut contenu = fs::read(sortie.path()).unwrap();
+    contenu.extend_from_slice(b"@read_incomplet\nACGT\n+\n");
+    fs::write(sortie.path(), &contenu).unwrap();
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("-j")
+        .arg("4")
+        .assert()
+        .success();
+
+    assert_eq!(
+        compter_sequences_fastq(&fs::read_to_string(sortie.path()).unwrap()),
+        5
+    );
+    assert_eq!(
+        fs::metadata(sortie.path()).unwrap().len(),
+        taille_valide,
+        "la queue incomplète doit être tronquée au dernier enregistrement valide"
+    );
+}
+
+// ================================================================
 // TESTS PAIRED-END — REPRISE / RÉSILIANCE
 // ================================================================

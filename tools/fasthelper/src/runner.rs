@@ -172,8 +172,14 @@ fn run_sample(
             continue;
         }
         let Some(bin) = ts.get(tool).cloned() else {
-            eprintln!("fasthelper: {tool} not found, step skipped");
-            continue;
+            // A step whose binary does not resolve must not vanish silently:
+            // the run used to continue on the previous step's input and exit 0
+            // while `check` rejected the very same config.
+            eprintln!(
+                "fasthelper: {tool} not found — step cannot run (build tools/{tool} or pass --tools-dir)"
+            );
+            failed.push(format!("{}/{}", sample.name, tool));
+            break;
         };
         let (out1, out2, json_path, maps_dir) = match tool.as_str() {
             "fastdedup" => (
@@ -244,6 +250,20 @@ fn run_sample(
             // fastmaps/fastcheck/fastsim write only their JSON report.
             _ => vec![json_path.clone()],
         };
+        // Re-running into the same outdir: every tool refuses to clobber an
+        // output it is about to rewrite (fastprep and fastmaps guard their own
+        // --json too, fastcheck has no --force at all) while cleanup keeps none
+        // of them. Clearing the step's own stale artifacts first is the one
+        // mechanism that works for every tool, chain position and --from.
+        let mut stale: Vec<PathBuf> = expect_outputs.clone();
+        if !stale.contains(&json_path) {
+            stale.push(json_path.clone());
+        }
+        if tool == "fastmaps" {
+            for f in ["heatmap.json", "heatmap.png", "heatmap.data", "heatmap_3d.html"] {
+                stale.push(maps_dir.join(f));
+            }
+        }
         // Resume: skip this step only when a previous manifest recorded the
         // exact same (argv, binary, version), the SAME inputs, and the outputs
         // it produced are still on disk. --from <step> forces a rerun from
@@ -283,7 +303,7 @@ fn run_sample(
                     // The chain continues from this step's output: the file
                     // the resumed step produced (same argv, same inputs) is
                     // still there — we only get here when it is.
-                    if tool != "fastmaps" {
+                    if !out1.as_os_str().is_empty() {
                         if !cfg.run.keep_intermediate {
                             if cur1 != in1 {
                                 to_delete.push(cur1.clone());
@@ -298,6 +318,13 @@ fn run_sample(
                         cur2 = out2;
                     }
                     continue;
+                }
+            }
+        }
+        if !dry_run {
+            for p in &stale {
+                if p.is_file() {
+                    let _ = std::fs::remove_file(p);
                 }
             }
         }
@@ -367,7 +394,11 @@ fn run_sample(
                 }
             }
         }
-        if tool != "fastmaps" {
+        // Only a step that actually wrote FASTQ becomes the next step's input.
+        // fastcheck/fastsim/fastmaps write reports, and taking their empty
+        // output path forward blanked the chain's input (and dropped the FASTQ
+        // the next step still needed).
+        if !out1.as_os_str().is_empty() {
             if !cfg.run.keep_intermediate {
                 if cur1 != in1 {
                     to_delete.push(cur1.clone());
@@ -833,6 +864,28 @@ pub fn run(args: &RunArgs) -> Result<()> {
 
     // Manifest + aggregate report over everything the run produced.
     let manifest_path = outdir.join("manifest.json");
+    // Merge with what is already on disk instead of overwriting it: an entry
+    // this run did not produce (a step it never reached, or a rerun that failed
+    // before getting there) still describes artifacts sitting in this outdir,
+    // and destroying it lost the previous run's provenance. Entries this run
+    // produced replace their previous counterpart by (sample, tool); the rest
+    // are carried over in their original order. `failed` stays this run's.
+    let mut commands = manifest;
+    if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+        if let Ok(prev) = serde_json::from_str::<serde_json::Value>(&text) {
+            let key = |m: &serde_json::Value| {
+                (
+                    m["sample"].as_str().unwrap_or_default().to_string(),
+                    m["tool"].as_str().unwrap_or_default().to_string(),
+                )
+            };
+            let fresh: std::collections::BTreeSet<(String, String)> =
+                commands.iter().map(key).collect();
+            if let Some(old) = prev["commands"].as_array() {
+                commands.extend(old.iter().filter(|m| !fresh.contains(&key(m))).cloned());
+            }
+        }
+    }
     std::fs::write(
         &manifest_path,
         serde_json::to_string_pretty(&serde_json::json!({
@@ -857,7 +910,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 "fail_on_trip": guard.fail,
                 "tripped_samples": trips.clone(),
             },
-            "commands": manifest,
+            "commands": commands,
             "failed": failed,
         }))? + "\n",
     )

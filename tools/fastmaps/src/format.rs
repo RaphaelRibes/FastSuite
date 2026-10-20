@@ -284,9 +284,16 @@ pub fn write_format(
     }
 
     // Corner metrics (formerly derived by fasthelper from this very file).
+    // No-call reads (zero ACGT bases) sit on (0,0) in the grid like an all-A
+    // read; each window passes its own count so the fractions can leave them
+    // out instead of reporting them as polyA.
     let metrics = crate::report::corner_metrics(
         size as u32,
-        &[("", &counts_arr), ("r1", &counts_r1_arr), ("r2", &counts_r2_arr)],
+        &[
+            ("", &counts_arr, state.no_call),
+            ("r1", &counts_r1_arr, state.no_call_r1),
+            ("r2", &counts_r2_arr, state.no_call_r2),
+        ],
     );
     let per_file_json = (0..files.len())
         .map(|i| {
