@@ -108,3 +108,11 @@ Two rules follow.
   `pgrep -c` reports 0.
 * Snakemake also refuses to rebuild after a killed run until `--unlock`, and
   marks the interrupted cells incomplete; `--rerun-incomplete` is required.
+
+## Force the cells, not the corpus
+
+`-F` forces every job in the DAG, including the three `reads` rules, and
+regenerating the 5 M-pair corpus costs ~10 min for files that are already there
+and byte-identical (fastsim is deterministic at a fixed seed). Target the cells
+instead: `--forcerun cell` plus the aggregate, or list the targets explicitly.
+`-F all` is only right on a cold workspace.
