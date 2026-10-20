@@ -305,8 +305,12 @@ fn fit_mate(acc: &Accum, _g_mean: f64, read_len: usize, offset: u8) -> Mate {
     let tail = dist_to_weights(&deconvolve_boundary_g(&obs_tail, q_bg));
 
     let mut q = per_position_mean_q(acc, offset);
+    // `pos_q` is exactly read_len long. When the measured curve is shorter than
+    // that (some positions never observed), the missing tail is padded with the
+    // LAST measured value — a flat continuation, stated rather than invented: no
+    // measurement here says what those positions look like.
     while q.len() < read_len {
-        q.push(*q.last().unwrap_or(&30.0)); // pad if the run is shorter
+        q.push(*q.last().unwrap_or(&30.0));
     }
     q.truncate(read_len);
     let body_q = median(&q[..((read_len as f64 * 0.8) as usize).max(1)]);
@@ -427,17 +431,24 @@ pub fn write_profile(
     insert: Option<&InsertHist>,
 ) -> Result<()> {
     let qc1 = accs[0];
-    let read_len = (qc1.len_hist.len().saturating_sub(1)) as usize;
-    if read_len == 0 {
-        anyhow::bail!("--profile: no reads were scanned, so there is nothing to fit");
-    }
+    // The library's length is its MODE, not the longest read it ever contained.
+    // `len_hist.len() - 1` is the maximum observed length: one 300 bp outlier in
+    // a 151 bp library set read_len = 300, and the simulator then built a 300 bp
+    // library out of data whose own fit report recorded mode_len 151 at
+    // mode_share 0.999. The insert CDF's censored-below bin sits at read_len and
+    // the saturated bin at 2*read_len+1, so both moved with it.
+    let max_len = qc1.len_hist.len().saturating_sub(1);
     let mode_len = qc1
         .len_hist
         .iter()
         .enumerate()
         .max_by_key(|(_, &c)| c)
         .map(|(i, _)| i)
-        .unwrap_or(read_len);
+        .unwrap_or(max_len);
+    let read_len = mode_len;
+    if read_len == 0 {
+        anyhow::bail!("--profile: no reads were scanned, so there is nothing to fit");
+    }
     let mode_tot: u64 = qc1.len_hist.iter().sum::<u64>().max(1);
     let mode_share = qc1.len_hist[mode_len] as f64 / mode_tot as f64;
     let g_mean = qc1.base_pos.first().map(|_| {
@@ -665,6 +676,14 @@ pub fn write_profile(
     // The fit report, so the assumptions travel with the profile the way the
     // Python fitter's fit_report.json does.
     let mut warnings: Vec<String> = Vec::new();
+    if max_len != mode_len {
+        warnings.push(format!(
+            "read_len is the modal length {mode_len} bp, but the longest read is {max_len} bp — \
+             the {max_len} bp reads (and anything measured at their scale: the insert CDF's \
+             censored bin, pos_q beyond position {mode_len}) are off the simulated read length; \
+             trim or filter them if the simulation must match them"
+        ));
+    }
     if mode_share < 0.9 {
         warnings.push(format!(
             "only {:.1}% of reads are at the modal length {mode_len} — the dataset looks pre-trimmed; \
@@ -956,5 +975,55 @@ mod tests {
                 "merged: 8 reads, 7 distinct -> 0.125, got {merged_level}");
         assert!((merged_level - first_mate_level).abs() > 0.1,
                 "the merged rate must differ from the first mate's, or this test is vacuous");
+    }
+
+    /// `read_len` is the length the library is AT, not the longest read in it.
+    ///
+    /// One 300 bp outlier in a 151 bp library used to set read_len = 300 while
+    /// the same run's fit report recorded mode_len 151 at mode_share 0.999:
+    /// fastsim then simulated 300 bp reads from a 151 bp library, and the insert
+    /// CDF's censored bin (which sits at read_len) moved with it.
+    #[test]
+    fn read_len_is_the_modal_length_not_the_longest_read() {
+        const BODY: &[u8] = b"ACATACATACATACATAC";
+        let mut seqs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for _ in 0..1000 {
+            seqs.push(fixture_read(BODY, b'T', 151 - BODY.len(), b'I'));
+        }
+        seqs.push(fixture_read(BODY, b'T', 300 - BODY.len(), b'I'));
+        let refs: Vec<(&[u8], &[u8])> =
+            seqs.iter().map(|(s, q)| (s.as_slice(), q.as_slice())).collect();
+        let a = acc_with(&refs, 320);
+
+        let dir = std::env::temp_dir().join(format!("fc_prof_readlen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("p.json");
+        write_profile(&p, "fixture", &[&a], 33, None).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let fr: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("p.fit_report.json")).unwrap())
+                .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(fr["measured"]["mode_len"], 151, "the fixture's mode is 151 bp");
+        assert_eq!(
+            v["read_len"], 151,
+            "read_len must be the modal length: the fit report itself records mode_len 151 \
+             at mode_share 0.999"
+        );
+        assert_eq!(
+            v["pos_q"]["R1"].as_array().unwrap().len(),
+            151,
+            "pos_q must be exactly read_len long"
+        );
+        let warnings = fr["fit_warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| {
+                let s = w.as_str().unwrap_or("");
+                s.contains("151") && s.contains("300")
+            }),
+            "the outlier must be named: max 300 vs mode 151, got {warnings:?}"
+        );
     }
 }

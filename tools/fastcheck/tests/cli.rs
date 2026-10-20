@@ -1200,3 +1200,206 @@ fn tiles_module_reports_the_memory_projection_when_on() {
     assert!(stderr.contains("per-tile quality"), "{stderr}");
     assert!(stderr.contains("MB"), "{stderr}");
 }
+
+/// Deterministic pseudo-random DNA (the generator insert.rs's tests use), so a
+/// fragment cannot accidentally be low-complexity.
+fn dna(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            b"ACGT"[((x >> 33) & 3) as usize]
+        })
+        .collect()
+}
+
+fn revcomp(s: &[u8]) -> Vec<u8> {
+    s.iter()
+        .rev()
+        .map(|&c| match c {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            other => other,
+        })
+        .collect()
+}
+
+/// Paired FASTQ: `n` pairs of 50 bp reads off a 70 bp fragment, so every pair's
+/// insert is 70 and recoverable from the mates' 30-base overlap.
+fn write_pairs(dir: &Path, n: usize) -> (PathBuf, PathBuf) {
+    let (mut a, mut b) = (String::new(), String::new());
+    for i in 0..n {
+        let frag = dna(70, 1000 + i as u64);
+        let r1 = frag[..50].to_vec();
+        let r2 = revcomp(&frag[20..]);
+        a.push_str(&format!(
+            "@p{i}/1\n{}\n+\n{}\n",
+            String::from_utf8(r1).unwrap(),
+            "I".repeat(50)
+        ));
+        b.push_str(&format!(
+            "@p{i}/2\n{}\n+\n{}\n",
+            String::from_utf8(r2).unwrap(),
+            "I".repeat(50)
+        ));
+    }
+    let p1 = dir.join("r1.fastq");
+    let p2 = dir.join("r2.fastq");
+    std::fs::write(&p1, a).unwrap();
+    std::fs::write(&p2, b).unwrap();
+    (p1, p2)
+}
+
+/// The `<td>` cell of a key/value row (`<tr><th>label</th><td>…</td></tr>`).
+fn kv_row<'a>(html: &'a str, label: &str) -> &'a str {
+    let marker = format!("<tr><th>{label}</th><td>");
+    let start = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no {label:?} row in the page"))
+        + marker.len();
+    let rest = &html[start..];
+    &rest[..rest.find("</td>").unwrap()]
+}
+
+#[test]
+fn the_html_insert_table_divides_by_the_pairs_it_actually_sampled() {
+    let d = tmpdir("insert_html");
+    let (r1, r2) = write_pairs(&d, 200);
+    let html = d.join("i.html");
+    let json = d.join("i.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--insert-hist",
+            "--json",
+            json.to_str().unwrap(),
+            "--html",
+            html.to_str().unwrap(),
+            "-q",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let j = read_json(&json);
+    let sampled = j["insert_hist"]["pairs_sampled"].as_u64().unwrap();
+    assert_eq!(sampled, 200, "all 200 pairs were read");
+    assert!(
+        j["insert_hist"]["measured"].as_u64().unwrap() >= 190,
+        "the fixture must actually measure inserts: {}",
+        j["insert_hist"]["measured"]
+    );
+
+    let h = std::fs::read_to_string(&html).unwrap();
+    // The denominator is the sample, not the --insert-pairs cap (20000 by
+    // default). Dividing by the cap printed "pairs sampled 20000" for a 200-pair
+    // run and made the four outcome buckets sum to ~1% instead of ~100%.
+    assert_eq!(
+        kv_row(&h, "pairs sampled"),
+        "200",
+        "the page must state the real sample, not the cap"
+    );
+    let mut sum = 0.0;
+    for label in [
+        "measured from overlap",
+        "measured from the adapter",
+        "no overlap (insert above the resolution)",
+        "complete overlap, no adapter found",
+    ] {
+        let cell = kv_row(&h, label);
+        let pct: f64 = cell
+            .rsplit('(')
+            .next()
+            .unwrap()
+            .trim_end_matches("%)")
+            .parse()
+            .unwrap();
+        sum += pct;
+    }
+    assert!(
+        (sum - 100.0).abs() < 0.5,
+        "the outcome buckets partition the sample, so they must sum to ~100%, got {sum}%"
+    );
+}
+
+#[test]
+fn a_partial_run_is_never_called_exact_in_the_html() {
+    let d = tmpdir("partial_html");
+    let fq = write_fixture(&d);
+    let html = d.join("p.html");
+    let json = d.join("p.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[
+            fq.to_str().unwrap(),
+            "--reads",
+            "2",
+            "--html",
+            html.to_str().unwrap(),
+            "--json",
+            json.to_str().unwrap(),
+            "-q",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    // The JSON already says so; the page next to it used to say the opposite.
+    assert_eq!(read_json(&json)["partial"]["is_partial"], true);
+
+    let h = std::fs::read_to_string(&html).unwrap();
+    assert!(
+        h.contains("reads budget"),
+        "a truncated run must name the budget it stopped at"
+    );
+    assert!(
+        !h.contains("no read was skipped"),
+        "a run stopped by --reads may not claim every count is exact"
+    );
+}
+
+#[test]
+fn insert_hist_refuses_two_files_that_are_not_in_the_same_pair_order() {
+    let d = tmpdir("insert_order");
+    let (r1, r2) = write_pairs(&d, 3);
+    // Reversed R2: every "pair" is two unrelated reads, which is exactly the
+    // case that used to yield a smooth, entirely fictional insert distribution.
+    let text = std::fs::read_to_string(&r2).unwrap();
+    let mut swapped = String::new();
+    for rec in text.trim_end().split('@').filter(|s| !s.is_empty()).rev() {
+        swapped.push('@');
+        swapped.push_str(rec);
+        if !rec.ends_with('\n') {
+            swapped.push('\n');
+        }
+    }
+    std::fs::write(&r2, swapped).unwrap();
+
+    let html = d.join("x.html");
+    let json = d.join("x.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[
+            r1.to_str().unwrap(),
+            r2.to_str().unwrap(),
+            "--insert-hist",
+            "--json",
+            json.to_str().unwrap(),
+            "--html",
+            html.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(code, 0, "mis-paired files must be refused, not measured: {stderr}");
+    assert!(
+        stderr.contains("p0"),
+        "the first mismatched pair must be named: {stderr}"
+    );
+    assert!(
+        stderr.contains("p2"),
+        "both records of the first mismatch must be named: {stderr}"
+    );
+    assert!(
+        !json.exists() && !html.exists(),
+        "no report may be written from mis-paired reads"
+    );
+}

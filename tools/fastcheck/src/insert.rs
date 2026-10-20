@@ -553,6 +553,28 @@ impl InsertHist {
     }
 }
 
+/// The pair key a FASTQ header carries: the name up to the first whitespace,
+/// without a trailing `/1` or `/2`.
+///
+/// The conventions disagree about where the mate lives. CASAVA 1.8 appends the
+/// read number to the SECOND field (`@name 1:N:0:ACGT`) and SRA to the first
+/// (`@name.1 1 length=100`), so both mates carry the same name; the older
+/// convention encodes it in the name itself (`@name/1`). Comparing the names
+/// with that suffix removed accepts a correctly paired file under all three and
+/// still catches a shifted, sorted or truncated one.
+fn pair_key(header: &[u8]) -> &[u8] {
+    let end = header
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .unwrap_or(header.len());
+    let name = &header[..end];
+    if name.len() > 2 && name[name.len() - 2] == b'/' && matches!(name[name.len() - 1], b'1' | b'2')
+    {
+        return &name[..name.len() - 2];
+    }
+    name
+}
+
 /// Read up to `max_pairs` pairs from two files in lockstep and fill the histogram.
 pub fn scan_pair(
     r1: &Path,
@@ -582,6 +604,36 @@ pub fn scan_pair(
         }
         if !ok || s1.is_empty() || s2.is_empty() {
             break;
+        }
+        // This pass pairs by ORDINAL, so a file that is sorted differently (or
+        // truncated) pairs unrelated reads and yields a smooth, entirely
+        // fictional insert distribution. The names are the only evidence that
+        // line N of one file belongs with line N of the other, so a mismatch is
+        // a refusal: a QC tool must never report that without saying so.
+        if pair_key(&h1) != pair_key(&h2) {
+            anyhow::bail!(
+                "{} and {} are not in the same pair order: record {:?} of the first file is \
+                 paired with record {:?} of the second. --insert-hist pairs by position, so a \
+                 sorted, reordered or truncated mate would produce an insert distribution out of \
+                 unrelated sequences — fix the pair order (or the truncation) first",
+                r1.display(),
+                r2.display(),
+                String::from_utf8_lossy(&h1),
+                String::from_utf8_lossy(&h2)
+            );
+        }
+        // Same framing check the main reader makes: a short quality line means
+        // the record is malformed, not a pair to measure.
+        for (header, seq, qual) in [(&h1, &s1, &q1), (&h2, &s2, &q2)] {
+            if qual.len() != seq.len() {
+                anyhow::bail!(
+                    "record {:?} has seq length {} but quality length {} — multi-line/wrapped \
+                     FASTQ is not supported, and guessing would produce wrong statistics",
+                    String::from_utf8_lossy(header),
+                    seq.len(),
+                    qual.len()
+                );
+            }
         }
         hist.observe_pair(&s1, &s2);
     }

@@ -347,16 +347,20 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline:2px solid
 table.files caption { text-align:left; font-weight:600; color:var(--muted); font-size:13px; margin-bottom:4px; }
 table.files thead th { border-bottom:2px solid var(--rule); }
 table.files tbody tr:hover { background:#fff8e1; }
+.banner { border:1px solid #e0b400; background:#fff8e1; border-radius:6px; padding:10px 12px; margin:0 0 18px; font-size:14px; }
 "#;
 
-/// Write the report. `insert` is present when `--insert-hist` ran.
+/// Write the report. `insert` is present when `--insert-hist` ran, and `partial`
+/// carries the reason a budget stopped the scan (`None` on a complete run), the
+/// same value the JSON report publishes as `partial.reason`.
 pub fn write_html(
     path: &Path,
     files: &[FileReport],
     total: &Accum,
     offset: u8,
     elapsed_s: f64,
-    insert: Option<(&InsertHist, u64)>,
+    insert: Option<&InsertHist>,
+    partial: Option<&str>,
     processed: Option<(&[FileReport], &Accum)>,
 ) -> Result<()> {
     let n_pos = total.covered_positions();
@@ -516,7 +520,7 @@ pub fn write_html(
 
     // ---- insert sizes, when they were measured ------------------------------
     let (insert_chart, insert_table) = match insert {
-        Some((ih, sampled)) => {
+        Some(ih) => {
             let mut merged: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
             for (k, &v) in ih.bins.iter().enumerate() {
                 if v > 0 {
@@ -530,7 +534,11 @@ pub fn write_html(
             }
             let bars: Vec<(f64, f64)> = merged.into_iter().map(|(k, v)| (k as f64, v as f64)).collect();
             let chart = bar_chart(&bars, "inferred insert length (bp)", "pairs", None);
-            let sampled = ih.pairs_sampled.max(sampled);
+            // The denominator is the sample the pass actually read, never the
+            // --insert-pairs cap: dividing by the cap printed "pairs sampled
+            // 20000" for a 2000-pair run, with every bucket percentage 10x too
+            // small (2000 (10.0%)), so the outcomes did not partition the sample.
+            let sampled = ih.pairs_sampled;
             let pct = |n: u64| format!("{n} ({:.1}%)", 100.0 * n as f64 / sampled.max(1) as f64);
             let t = table(&[
                 ("pairs sampled", format!("{sampled}")),
@@ -706,7 +714,12 @@ pub fn write_html(
         obs.push(format!(
             "{} reads exceed --max-read-len and are counted in the summary but excluded from the              per-position charts", total.reads_over_max_len));
     }
-    obs.push("every count in this report is exact: no sampling, no read was skipped".to_string());
+    // Only a run that read every record may claim exactness: a budget-stopped
+    // scan covers a prefix of each file, and saying otherwise next to a JSON
+    // report that says partial.is_partial = true is a contradiction.
+    if partial.is_none() {
+        obs.push("every count in this report is exact: no sampling, no read was skipped".to_string());
+    }
 
     // ---- per-file table (raw files, then processed files when present) -------
     let mut file_rows = String::new();
@@ -734,9 +747,24 @@ pub fn write_html(
     h.push_str("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">");
     let _ = write!(h, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>fastcheck report — {} file(s)</title><style>{STYLE}</style></head><body>", files.len());
     h.push_str(r##"<a class="skip-link" href="#main">Skip to report content</a>"##);
+    // A partial run says so before any number: the same fact the JSON publishes
+    // as partial.is_partial. Silence here made a --reads 2 page look like a
+    // complete run of a two-read file.
+    if let Some(reason) = partial {
+        let _ = write!(
+            h,
+            "<div class=\"banner\" role=\"status\"><strong>Partial run — the scan stopped at the {reason}.</strong> \
+             Every count below covers only the reads that were read, not the whole file. \
+             The JSON report carries the same state (<code>partial.is_partial = true</code>, reason {reason:?}).</div>"
+        );
+    }
     let _ = write!(h, "<h1>fastcheck report</h1><div class=\"sub\">{} file(s) · {} reads · {} bases · \
-                       {:.2} s · Phred+{offset} · exact counts, no sampling</div>",
-                   files.len(), total.reads, total.bases, elapsed_s);
+                       {:.2} s · Phred+{offset} · {}</div>",
+                   files.len(), total.reads, total.bases, elapsed_s,
+                   match partial {
+                       Some(reason) => format!("partial run, stopped at the {reason}"),
+                       None => "exact counts, no sampling".to_string(),
+                   });
 
     // nav: sticky section links, scrollspy-highlighted
     h.push_str(r##"<nav class="nav" aria-label="Report sections"><a href="#stats">General stats</a><a href="#summary">Summary</a><a href="#seq">Per-base content</a><a href="#n">N content</a><a href="#q">Quality</a><a href="#dist">Distributions</a><a href="#polyx">polyX</a><a href="#repeats">Repeats</a><a href="#heatmap">Heatmap</a>"##);

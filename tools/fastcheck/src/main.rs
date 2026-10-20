@@ -375,7 +375,7 @@ fn main() -> Result<()> {
     }
     if let Some(p) = &cli.html {
         html::write_html(p, &reports, &total, verdict.offset, elapsed,
-                         insert.as_ref().map(|h| (h, cli.insert_pairs)),
+                         insert.as_ref(), stopped,
                          if processed_reports.is_empty() { None }
                          else { Some((&processed_reports, &processed_total)) })?;
     }
