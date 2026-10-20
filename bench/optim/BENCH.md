@@ -116,3 +116,21 @@ regenerating the 5 M-pair corpus costs ~10 min for files that are already there
 and byte-identical (fastsim is deterministic at a fixed seed). Target the cells
 instead: `--forcerun cell` plus the aggregate, or list the targets explicitly.
 `-F all` is only right on a cold workspace.
+
+## Three traps that make a row unreadable rather than wrong
+
+* *The two arms can report the same version.* `baseline-bin/fastdedup` and
+  `new-bin/fastdedup` both print `fastdedup 1.3.0` — the version was never bumped
+  between the frozen commit and the tree under test. A cell is therefore
+  identified by its path, never by `--version`, and a report should quote the
+  commit, not the version string.
+* *A reboot in the middle of a campaign is silent.* One run was interrupted by a
+  host reboot; Snakemake left `IncompleteFilesException` markers on three cells
+  and the aggregate never ran. Check `uptime` against the campaign's start time
+  before blaming the harness, and re-run only the incomplete cells.
+* *The synthetic helper tree is not a sample-count axis if the reports have no
+  sample name.* `helper_tree.py` rewrites the `sample` field to name each
+  directory, but the fastcheck report on this desktop carries no `sample` key, so
+  the rewrite is a no-op and every row is labelled `qc`. That makes
+  `helper__2000` and `helper__5000` the same tree, not two sizes. Fix the tree
+  builder before reading that column as a scaling axis.
