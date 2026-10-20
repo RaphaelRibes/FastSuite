@@ -23,6 +23,7 @@ c-compiler = "*"
 cmake = "*"       # flate2's zlib-ng builds from source
 zlib = "*"
 zstd = "*"
+snakemake = ">=9.27.0,<10"
 
 # The conda `rust` package's activation script hard-codes
 #   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=<conda>/x86_64-conda-linux-gnu-cc
