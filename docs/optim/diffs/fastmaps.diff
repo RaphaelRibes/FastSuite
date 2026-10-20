@@ -1,0 +1,2125 @@
+diff --git a/tools/fastmaps/src/cli.rs b/tools/fastmaps/src/cli.rs
+index e713785..bd40e64 100644
+--- a/tools/fastmaps/src/cli.rs
++++ b/tools/fastmaps/src/cli.rs
+@@ -1,7 +1,90 @@
++use std::fmt;
+ use std::path::PathBuf;
+ 
+ use clap::Parser;
+ 
++/// What to record in the per-read index stream that `heatmap.data` is built
++/// from (FM-1).
++///
++/// The stream is the only structural cost in the tool: 12 B per read in RAM,
++/// 8 B per read of temp disk, and a full render pass — all of it to serve one
++/// output file. The counting grid, the PNG, the corner metrics and the report
++/// come from `state.counts`, which needs no per-read record, so every mode
++/// below is exact for them.
++///
++/// * `Exact`  — every read, as before. The default.
++/// * `Capped(n)` — at most `n` reads per `(pixel, file)`: `heatmap.data` becomes
++///   a labelled sample (pixel *membership* is sampled; pixel *counts* are not).
++/// * `Off` — no index buffer, no spill, no render pass: `heatmap.data` is
++///   written as empty rows, so the file and its offsets stay valid.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
++pub enum DataMode {
++    #[default]
++    Exact,
++    Capped(u8),
++    Off,
++}
++
++impl DataMode {
++    pub fn is_exact(self) -> bool {
++        matches!(self, DataMode::Exact)
++    }
++
++    /// Reads stored per `(pixel, file)`; `None` in exact mode (unbounded).
++    pub fn cap(self) -> Option<u8> {
++        match self {
++            DataMode::Exact => None,
++            DataMode::Capped(n) => Some(n),
++            DataMode::Off => Some(0),
++        }
++    }
++
++    /// Value for the `data_reads_per_pixel` JSON/report field in a non-exact
++    /// mode (0 in exact mode, where the field is omitted).
++    pub fn reads_per_pixel(self) -> u8 {
++        self.cap().unwrap_or(0)
++    }
++}
++
++impl fmt::Display for DataMode {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            DataMode::Exact => f.write_str("exact"),
++            DataMode::Capped(n) => write!(f, "capped:{n}"),
++            DataMode::Off => f.write_str("off"),
++        }
++    }
++}
++
++/// Parse `--data-mode`: `exact`, `off`, or `capped:N` (`capped=N` is accepted
++/// too, as is a space-free `capped` with the count attached by the caller).
++pub fn parse_data_mode(s: &str) -> Result<DataMode, String> {
++    let t = s.trim();
++    if t.eq_ignore_ascii_case("exact") {
++        return Ok(DataMode::Exact);
++    }
++    if t.eq_ignore_ascii_case("off") {
++        return Ok(DataMode::Off);
++    }
++    let lower = t.to_ascii_lowercase();
++    if let Some(rest) = lower.strip_prefix("capped") {
++        let rest = rest.trim_start_matches([':', '=']);
++        let n: u16 = rest
++            .parse()
++            .map_err(|_| format!("--data-mode: {s:?} is not exact|off|capped:N"))?;
++        if n == 0 {
++            return Err("--data-mode capped:0 is meaningless; use --data-mode off".into());
++        }
++        if n > u8::MAX as u16 {
++            return Err(format!("--data-mode capped max is {}", u8::MAX));
++        }
++        return Ok(DataMode::Capped(n as u8));
++    }
++    Err(format!(
++        "--data-mode: {s:?} is not exact|off|capped:N (e.g. capped:4)"
++    ))
++}
++
+ /// 2-D heatmap of FASTQ reads by base composition.
+ ///
+ /// Each read is encoded as (x = T+C count, y = T+G count) and counted
+@@ -29,10 +112,14 @@ pub struct Args {
+     pub preview_reads: usize,
+ 
+     /// Approximate total RAM budget for the worker index buffer before it is
+-    /// spilled to the spiller thread (megabytes). Preview reads are streamed
+-    /// to disk independently and do not count against it. The budget is divided
+-    /// across workers, so an input file smaller than a worker's share is held
+-    /// whole without spilling.
++    /// spilled to the spiller thread (megabytes). The budget is divided across
++    /// workers, so an input file smaller than a worker's share is held whole
++    /// without spilling.
++    ///
++    /// Preview reads are streamed to disk on their own threshold too, but that
++    /// threshold is derived from this one (bounded by 256 KiB) instead of being
++    /// a fixed 4 MiB per worker — before that, previews imposed a memory floor
++    /// `--buffer-mb 1` could not move.
+     ///
+     /// Measured: on a real 5M-read library ~141 MB peak RSS at 512 MB against
+     /// ~36 MB at 8 MB, and on 2M real reads 48.6 MB against 22.7 MB, at
+@@ -42,6 +129,21 @@ pub struct Args {
+     #[arg(long, default_value = "8", value_name = "MB")]
+     pub buffer_mb: usize,
+ 
++    /// Per-read index stream mode for heatmap.data: `exact` (default) stores
++    /// every read, `capped:N` stores at most N reads per (pixel, file) and
++    /// `off` stores none (no buffer, no spill, no render pass).
++    ///
++    /// Only heatmap.data is affected: heatmap.json carries
++    /// `"data_reads_per_pixel"` and `"data_complete": false` when the mode is
++    /// not exact, and the counts, PNG, corner metrics and report stay exact.
++    #[arg(
++        long,
++        default_value = "exact",
++        value_name = "exact|capped:N|off",
++        value_parser = parse_data_mode
++    )]
++    pub data_mode: DataMode,
++
+     /// Write all output files into this directory (created if absent).
+     #[arg(short = 'o', long, default_value = ".", value_name = "PATH")]
+     pub output_dir: PathBuf,
+@@ -218,4 +320,44 @@ mod tests {
+         let n = a.resolved_threads(1);
+         assert!(n >= 1 && n <= 16, "got {n}");
+     }
++
++    // ── FM-1: --data-mode ───────────────────────────────────────────────────
++
++    #[test]
++    fn test_data_mode_default_is_exact() {
++        let a = Args::parse_from(["fastmaps", "a.fq"]);
++        assert_eq!(a.data_mode, DataMode::Exact);
++        assert!(a.data_mode.is_exact());
++        assert_eq!(a.data_mode.cap(), None);
++    }
++
++    #[test]
++    fn test_data_mode_parses_all_forms() {
++        let p = |s: &str| parse_data_mode(s).unwrap();
++        assert_eq!(p("exact"), DataMode::Exact);
++        assert_eq!(p("EXACT"), DataMode::Exact);
++        assert_eq!(p("off"), DataMode::Off);
++        assert_eq!(p("capped:1"), DataMode::Capped(1));
++        assert_eq!(p("capped:255"), DataMode::Capped(255));
++        assert_eq!(p("capped=7"), DataMode::Capped(7));
++        assert_eq!(p("capped:4").to_string(), "capped:4");
++        assert_eq!(p("off").to_string(), "off");
++        assert_eq!(DataMode::Off.reads_per_pixel(), 0);
++        assert_eq!(DataMode::Capped(6).reads_per_pixel(), 6);
++
++        let a = Args::parse_from(["fastmaps", "a.fq", "--data-mode", "off"]);
++        assert_eq!(a.data_mode, DataMode::Off);
++        let a = Args::parse_from(["fastmaps", "a.fq", "--data-mode", "capped:3"]);
++        assert_eq!(a.data_mode, DataMode::Capped(3));
++    }
++
++    #[test]
++    fn test_data_mode_rejects_garbage() {
++        assert!(parse_data_mode("capped:0").is_err(), "cap 0 is `off`, not 0 reads");
++        assert!(parse_data_mode("capped:256").is_err(), "u8 cap");
++        assert!(parse_data_mode("capped:").is_err());
++        assert!(parse_data_mode("mostly").is_err());
++        assert!(parse_data_mode("").is_err());
++        assert!(Args::try_parse_from(["fastmaps", "a.fq", "--data-mode", "nope"]).is_err());
++    }
+ }
+diff --git a/tools/fastmaps/src/encode.rs b/tools/fastmaps/src/encode.rs
+index 16a819f..9361f1b 100644
+--- a/tools/fastmaps/src/encode.rs
++++ b/tools/fastmaps/src/encode.rs
+@@ -5,15 +5,20 @@ use flate2::read::MultiGzDecoder;
+ 
+ /// Encode a read sequence as `(x = T+C count, y = T+G count, n = ACGT bases)`.
+ ///
++/// Takes bytes, not `&str`: the FASTQ loop reads with `read_until` into reused
++/// buffers, so a read never has to be UTF-8-validated (or allocated) just to be
++/// counted. Every non-ACGT byte — `N`, a stray `\r`, an arbitrary binary byte —
++/// is skipped identically.
++///
+ /// Non-ACGT characters (e.g. N) are skipped from the coordinates, so a read
+ /// with no ACGT base at all encodes to `(0, 0)` — the same pixel as an all-A
+ /// read. `n` is what lets the caller tell those apart: an `n == 0` read has no
+ /// measurable composition and must not be counted as polyA-rich.
+-pub fn encode_read(seq: &str) -> (u32, u32, u32) {
++pub fn encode_read(seq: &[u8]) -> (u32, u32, u32) {
+     let mut x = 0u32;
+     let mut y = 0u32;
+     let mut n = 0u32;
+-    for b in seq.bytes() {
++    for &b in seq {
+         let (bx, by) = match b {
+             b'A' => (0, 0),
+             b'T' => (1, 1),
+@@ -28,13 +33,18 @@ pub fn encode_read(seq: &str) -> (u32, u32, u32) {
+     (x, y, n)
+ }
+ 
+-/// Mean Phred quality score for a quality string (ASCII-33 encoded).
+-pub fn mean_quality(qual: &str) -> f64 {
++/// `(sum of Phred scores, number of quality bytes)` — the integer pair whose
++/// ratio is the mean quality.
++///
++/// Integer accumulation is what makes the per-pixel merge order-independent
++/// (FM-12): summing `f64` partial means in whatever order worker threads
++/// happen to finish is not associative, summing `u64` is exactly so.
++pub fn quality_sums(qual: &[u8]) -> (u64, u64) {
+     if qual.is_empty() {
+-        return 0.0;
++        return (0, 0);
+     }
+-    let sum: f64 = qual.bytes().map(|b| b.saturating_sub(33) as f64).sum();
+-    sum / qual.len() as f64
++    let sum: u64 = qual.iter().map(|&b| b.saturating_sub(33) as u64).sum();
++    (sum, qual.len() as u64)
+ }
+ 
+ /// Open a FASTQ file for reading, transparently decompressing `.gz` files.
+@@ -73,33 +83,58 @@ mod tests {
+ 
+     #[test]
+     fn all_a() {
+-        assert_eq!(encode_read("AAAA"), (0, 0, 4));
++        assert_eq!(encode_read(b"AAAA"), (0, 0, 4));
+     }
+ 
+     #[test]
+     fn all_t() {
+-        assert_eq!(encode_read("TTTT"), (4, 4, 4));
++        assert_eq!(encode_read(b"TTTT"), (4, 4, 4));
+     }
+ 
+     #[test]
+     fn mixed() {
+-        assert_eq!(encode_read("ATGC"), (2, 2, 4));
++        assert_eq!(encode_read(b"ATGC"), (2, 2, 4));
+     }
+ 
+     #[test]
+     fn skips_n() {
+-        assert_eq!(encode_read("ANNN"), (0, 0, 1));
++        assert_eq!(encode_read(b"ANNN"), (0, 0, 1));
+     }
+ 
+     #[test]
+     fn all_n_has_no_acgt() {
+-        assert_eq!(encode_read("NNNN"), (0, 0, 0));
++        assert_eq!(encode_read(b"NNNN"), (0, 0, 0));
++    }
++
++    /// FM-10: a byte that is not valid UTF-8 is skipped like any other
++    /// non-ACGT byte instead of aborting the file. `lines()` would have failed
++    /// on this input and silently ended the run at that read.
++    #[test]
++    fn non_utf8_bytes_are_skipped_not_fatal() {
++        assert_eq!(encode_read(&[0xff, 0xfe, b'A', b'C']), (1, 0, 2));
++        assert_eq!(encode_read(&[0x80, 0x81]), (0, 0, 0));
++    }
++
++    fn mq(qual: &[u8]) -> f64 {
++        let (sum, n) = quality_sums(qual);
++        if n == 0 { 0.0 } else { sum as f64 / n as f64 }
+     }
+ 
+     #[test]
+     fn quality() {
+-        assert_eq!(mean_quality("!"), 0.0);      // ASCII 33 → Q0
+-        assert_eq!(mean_quality("I"), 40.0);     // ASCII 73 → Q40
+-        assert!((mean_quality("!I") - 20.0).abs() < 1e-9);
++        assert_eq!(quality_sums(b"!"), (0, 1)); // ASCII 33 → Q0
++        assert_eq!(quality_sums(b"I"), (40, 1)); // ASCII 73 → Q40
++        assert!((mq(b"!I") - 20.0).abs() < 1e-9);
++        assert_eq!(quality_sums(b""), (0, 0));
++    }
++
++    /// The integer path must reproduce the old `f64` sum exactly for anything a
++    /// FASTQ file can hold: scores are ≤ 61 and a read is ≪ 2^53 bytes.
++    #[test]
++    fn quality_sums_match_the_float_mean() {
++        let q = b"!5I?J+;";
++        let by_float: f64 = q.iter().map(|&b| b.saturating_sub(33) as f64).sum::<f64>() / q.len() as f64;
++        assert_eq!(mq(q), by_float);
++        assert_eq!(quality_sums(q).0, q.iter().map(|&b| b.saturating_sub(33) as u64).sum::<u64>());
+     }
+ }
+diff --git a/tools/fastmaps/src/format.rs b/tools/fastmaps/src/format.rs
+index 957f807..9cf06bd 100644
+--- a/tools/fastmaps/src/format.rs
++++ b/tools/fastmaps/src/format.rs
+@@ -3,12 +3,28 @@ use std::fs::File;
+ use std::io::{BufWriter, Write};
+ use std::path::Path;
+ 
++use crate::cli::DataMode;
+ use crate::encode::json_escape;
+ use crate::file_kind::FileKind;
+ use crate::spiller::{preview_row_temp_path, row_temp_path, SpillerState};
+ use crate::varint::varint_write;
+ use crate::worker::PreviewRead;
+ 
++/// Everything `write_format` needs besides the spiller's state. A struct
++/// rather than ten positional arguments: the data-mode knob (FM-1) was the
++/// eleventh.
++pub struct FormatOpts<'a> {
++    pub files: &'a [String],
++    pub file_kinds: &'a [FileKind],
++    pub preview_n: usize,
++    pub data_mode: DataMode,
++    pub output_dir: &'a Path,
++    pub json_path: &'a Path,
++    pub with_wrapper: bool,
++    pub elapsed_s: f64,
++    pub quiet: bool,
++}
++
+ // ── Row encoding ─────────────────────────────────────────────────────────────
+ 
+ /// Encode one row of index entries into the `.data` wire format.
+@@ -191,17 +207,24 @@ pub fn decode_preview_row(raw: &[u8], y: u16) -> Vec<PreviewRead> {
+ /// Index entries are read one row at a time from the per-y temp files written
+ /// by the spiller, then deleted, so peak RAM ≈ the largest single row's data.
+ /// Preview payloads are read back the same way (one row file at a time).
+-pub fn write_format(
+-    state: SpillerState,
+-    files: &[String],
+-    file_kinds: &[FileKind],
+-    preview_n: usize,
+-    output_dir: &Path,
+-    json_path: &Path,
+-    with_wrapper: bool,
+-    elapsed_s: f64,
+-    quiet: bool,
+-) -> std::io::Result<()> {
++///
++/// With `--data-mode off` there is no render pass at all: no row file is read,
++/// no decoder runs, and each row is written as the empty pixel list so the file
++/// and its offsets stay structurally valid. `capped:N` renders whatever the
++/// worker kept (at most N reads per (pixel, file)).
++pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Result<()> {
++    let FormatOpts {
++        files,
++        file_kinds,
++        preview_n,
++        data_mode,
++        output_dir,
++        json_path,
++        with_wrapper,
++        elapsed_s,
++        quiet,
++    } = *opts;
++
+     let size = (state.max_seq_len + 1) as usize;
+     if size > u16::MAX as usize {
+         eprintln!("Error: max read length {} exceeds u16::MAX", state.max_seq_len);
+@@ -218,26 +241,34 @@ pub fn write_format(
+     let mut data_file    = BufWriter::new(File::create(output_dir.join("heatmap.data"))?);
+     let mut preview_file = BufWriter::new(File::create(output_dir.join("heatmap.preview"))?);
+ 
++    // `varint(0)`: a row with no pixels. Off mode emits this for every row.
++    const EMPTY_ROW: [u8; 1] = [0];
++
+     for y in 0..size as u16 {
+-        // Read temp file for this row, then delete it immediately.
+-        let temp = row_temp_path(&state.temp_dir, y);
+-        let indices: Vec<(u16, u16, u32)> = if temp.exists() {
+-            let raw = std::fs::read(&temp)?;
+-            if raw.len() % 8 != 0 {
+-                eprintln!("Corrupt temp file {} (len {})", temp.display(), raw.len());
+-                std::process::exit(1);
+-            }
+-            let mut v = Vec::with_capacity(raw.len() / 8);
+-            for chunk in raw.chunks_exact(8) {
+-                let x   = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
+-                let fid = u16::from_le_bytes(chunk[2..4].try_into().unwrap());
+-                let rn  = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+-                v.push((x, fid, rn));
+-            }
+-            std::fs::remove_file(&temp)?;
+-            v
++        let drow: Vec<u8> = if data_mode == DataMode::Off {
++            EMPTY_ROW.to_vec()
+         } else {
+-            vec![]
++            // Read temp file for this row, then delete it immediately.
++            let temp = row_temp_path(&state.temp_dir, y);
++            let indices: Vec<(u16, u16, u32)> = if temp.exists() {
++                let raw = std::fs::read(&temp)?;
++                if raw.len() % 8 != 0 {
++                    eprintln!("Corrupt temp file {} (len {})", temp.display(), raw.len());
++                    std::process::exit(1);
++                }
++                let mut v = Vec::with_capacity(raw.len() / 8);
++                for chunk in raw.chunks_exact(8) {
++                    let x   = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
++                    let fid = u16::from_le_bytes(chunk[2..4].try_into().unwrap());
++                    let rn  = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
++                    v.push((x, fid, rn));
++                }
++                std::fs::remove_file(&temp)?;
++                v
++            } else {
++                vec![]
++            };
++            encode_data_row(indices)
+         };
+ 
+         let previews = {
+@@ -254,7 +285,6 @@ pub fn write_format(
+             }
+         };
+ 
+-        let drow = encode_data_row(indices);
+         let prow = encode_preview_row(previews, preview_n, file_kinds);
+ 
+         data_file.write_all(&drow)?;
+@@ -271,8 +301,8 @@ pub fn write_format(
+ 
+     // Flat row-major counts grid: index = y*size + x.
+     let mut counts_arr = vec![0u64; size * size];
+-    for (&(x, y), &(c, _)) in &state.counts {
+-        counts_arr[y as usize * size + x as usize] = c;
++    for (&(x, y), acc) in &state.counts {
++        counts_arr[y as usize * size + x as usize] = acc.count;
+     }
+     let mut counts_r1_arr = vec![0u64; size * size];
+     for (&(x, y), &c) in &state.counts_r1 {
+@@ -287,7 +317,7 @@ pub fn write_format(
+     // No-call reads (zero ACGT bases) sit on (0,0) in the grid like an all-A
+     // read; each window passes its own count so the fractions can leave them
+     // out instead of reporting them as polyA.
+-    let metrics = crate::report::corner_metrics(
++    let mut metrics = crate::report::corner_metrics(
+         size as u32,
+         &[
+             ("", &counts_arr, state.no_call),
+@@ -295,6 +325,24 @@ pub fn write_format(
+             ("r2", &counts_r2_arr, state.no_call_r2),
+         ],
+     );
++    // FM-1: a non-exact data mode is a labelled approximation of
++    // `heatmap.data` alone. Both the grid JSON and the v1 wrapper carry the
++    // label, so no consumer can mistake a capped/absent stream for the exact
++    // one. `data_complete` is a boolean in the grid JSON and 0.0 in the metric
++    // map (which is `f64`-valued by schema).
++    let data_labels = if data_mode.is_exact() {
++        String::new()
++    } else {
++        metrics.insert("data_complete".into(), 0.0);
++        metrics.insert(
++            "data_reads_per_pixel".into(),
++            data_mode.reads_per_pixel() as f64,
++        );
++        format!(
++            "  \"data_reads_per_pixel\": {},\n  \"data_complete\": false,\n",
++            data_mode.reads_per_pixel()
++        )
++    };
+     let per_file_json = (0..files.len())
+         .map(|i| {
+             state
+@@ -327,6 +375,7 @@ pub fn write_format(
+             "  \"total_reads\": {total},\n",
+             "  \"per_file_counts\": [{pfc}],\n",
+             "  \"preview_reads_per_pixel\": {pn},\n",
++            "{labels}",
+             "  \"counts\": [{counts}],\n",
+             "  \"counts_r1\": [{counts_r1}],\n",
+             "  \"counts_r2\": [{counts_r2}],\n",
+@@ -340,6 +389,7 @@ pub fn write_format(
+         total     = state.total_reads,
+         pfc       = per_file_json,
+         pn        = preview_n,
++        labels    = data_labels,
+         counts    = counts_join(&counts_arr),
+         counts_r1 = counts_join(&counts_r1_arr),
+         counts_r2 = counts_join(&counts_r2_arr),
+diff --git a/tools/fastmaps/src/main.rs b/tools/fastmaps/src/main.rs
+index 1310922..c603909 100644
+--- a/tools/fastmaps/src/main.rs
++++ b/tools/fastmaps/src/main.rs
+@@ -21,10 +21,12 @@ use clap::Parser;
+ 
+ use cli::{corners_filename, parse_corners, Args};
+ use file_kind::{classify_all, default_r1_patterns, default_r2_patterns};
+-use format::write_format;
++use format::{write_format, FormatOpts};
+ use output::{write_html, write_png, write_svg};
+ use spiller::spiller_thread;
+-use worker::{flush_local, CornerExtractor, SpillerMsg, WorkerCfg, WorkerLocal};
++use worker::{
++    flush_local, preview_flush_bytes, CornerExtractor, PixelAcc, SpillerMsg, WorkerCfg, WorkerLocal,
++};
+ 
+ fn main() {
+     let started = Instant::now();
+@@ -164,8 +166,25 @@ fn main() {
+     let cfg = WorkerCfg {
+         preview_n: args.preview_reads,
+         threshold_bytes,
++        preview_flush_bytes: preview_flush_bytes(threshold_bytes),
++        data_mode: args.data_mode,
+     };
+ 
++    // FM-1: a non-exact data mode must be visible in the run summary, not only
++    // in the JSON — the user has to know heatmap.data is a sample even when
++    // they never open it. Printed unconditionally (like the citation note):
++    // `--quiet` silences the progress lines, not a caveat about the outputs.
++    if !args.data_mode.is_exact() {
++        eprintln!(
++            "fastmaps: --data-mode {} → heatmap.data holds {} reads per (pixel, file) \
++             (data_reads_per_pixel={}, data_complete=false); counts, PNG and corner \
++             metrics stay exact",
++            args.data_mode,
++            args.data_mode.reads_per_pixel(),
++            args.data_mode.reads_per_pixel(),
++        );
++    }
++
+     // ── Work queue ────────────────────────────────────────────────────────
+     let work_queue: Vec<(u16, String)> = files
+         .iter()
+@@ -252,18 +271,25 @@ fn main() {
+     );
+ 
+     // Build u32-keyed map for PNG/HTML before write_format consumes state.
+-    let counts_u32: HashMap<(u32, u32), (u64, f64)> = state
++    let counts_u32: HashMap<(u32, u32), PixelAcc> = state
+         .counts
+         .iter()
+         .map(|(&(x, y), &v)| ((x as u32, y as u32), v))
+         .collect();
+ 
+-    if let Err(e) = write_format(
+-        state, &files, &file_kinds, args.preview_reads, &output_dir, &json_path,
++    let fmt_opts = FormatOpts {
++        files: &files,
++        file_kinds: &file_kinds,
++        preview_n: args.preview_reads,
++        data_mode: args.data_mode,
++        output_dir: &output_dir,
++        json_path: &json_path,
+         with_wrapper,
+-        started.elapsed().as_secs_f64(),
+-        args.quiet,
+-    ) {
++        elapsed_s: started.elapsed().as_secs_f64(),
++        quiet: args.quiet,
++    };
++
++    if let Err(e) = write_format(state, &fmt_opts) {
+         eprintln!("Error writing heatmap files: {e}");
+         std::process::exit(1);
+     }
+@@ -280,7 +306,7 @@ fn main() {
+         let n: u64 = counts_u32
+             .iter()
+             .filter(|(&(x, y), _)| x >= ce.x1 && x <= ce.x2 && y >= ce.y1 && y <= ce.y2)
+-            .map(|(_, (c, _))| c)
++            .map(|(_, acc)| acc.count)
+             .sum();
+         let fname = corners_filename(((ce.x1, ce.y1), (ce.x2, ce.y2)));
+         if !args.quiet {
+diff --git a/tools/fastmaps/src/output.rs b/tools/fastmaps/src/output.rs
+index e24f290..7b72315 100644
+--- a/tools/fastmaps/src/output.rs
++++ b/tools/fastmaps/src/output.rs
+@@ -3,6 +3,8 @@ use std::fs::File;
+ use std::io::{BufWriter, Write};
+ use std::path::Path;
+ 
++use crate::worker::PixelAcc;
++
+ /// Normalised log-count `t` in `[0, 1]` for the heat scale: `ln(c) / ln(max)`.
+ ///
+ /// The degenerate case `max_count <= 1` (every occupied pixel holds exactly
+@@ -41,7 +43,7 @@ fn heat_color(t: f64) -> [u8; 3] {
+     ]
+ }
+ 
+-pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
++pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
+     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
+     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
+     let w = max_x + 1;
+@@ -52,7 +54,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
+     let view_w = margin + w as u32 * cell + 10 + 50;
+     let view_h = y_axis;
+ 
+-    let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
++    let max_count = counts.values().map(|a| a.count).max().unwrap();
+ 
+     let f = BufWriter::new(File::create(output_dir.join("heatmap.svg")).unwrap());
+     let mut f = f;
+@@ -73,8 +75,8 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
+             let px = margin + x * cell;
+             let py = view_h - (margin + (y + 1) * cell);
+             let (r, g, b) = match counts.get(&(x, y)) {
+-                Some((c, _)) => {
+-                    let t = log_norm(*c, max_count);
++                Some(acc) => {
++                    let t = log_norm(acc.count, max_count);
+                     let [r, g, b] = heat_color(t);
+                     (r, g, b)
+                 }
+@@ -163,16 +165,16 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
+         println!("Saved heatmap.svg  ({}x{} cells, {} unique)", w, h, counts.len());
+     }
+ }
+-pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
++pub fn write_png(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
+     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
+     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
+-    let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
++    let max_count = counts.values().map(|a| a.count).max().unwrap();
+ 
+     let w = max_x + 1;
+     let h = max_y + 1;
+     let mut pixels = vec![[0u8; 3]; w * h];
+-    for (&(x, y), &(c, _)) in counts {
+-        let t = log_norm(c, max_count);
++    for (&(x, y), acc) in counts {
++        let t = log_norm(acc.count, max_count);
+         pixels[y as usize * w + x as usize] = heat_color(t);
+     }
+ 
+@@ -195,20 +197,29 @@ pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
+ 
+ /// Write an interactive Plotly 3-D scatter HTML to `output_dir/heatmap_3d.html`.
+ /// z = mean Phred quality, colour = log(count).
+-pub fn write_html(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
+-    let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
+-    let total: u64 = counts.values().map(|(c, _)| c).sum();
++///
++/// The series is sorted by `(x, y)` (FM-12). It used to be emitted in `HashMap`
++/// iteration order, which std seeds per process — so two runs of the identical
++/// command produced different files even at `-j 1`. Together with the integer
++/// quality accumulators this makes the page reproducible.
++pub fn write_html(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
++    let max_count = counts.values().map(|a| a.count).max().unwrap();
++    let total: u64 = counts.values().map(|a| a.count).sum();
++
++    let mut series: Vec<((u32, u32), PixelAcc)> =
++        counts.iter().map(|(&xy, &acc)| (xy, acc)).collect();
++    series.sort_unstable_by_key(|&(xy, _)| xy);
+ 
+-    let mut xs = Vec::new();
+-    let mut ys = Vec::new();
+-    let mut zs = Vec::new();
+-    let mut cs = Vec::new();
++    let mut xs = Vec::with_capacity(series.len());
++    let mut ys = Vec::with_capacity(series.len());
++    let mut zs = Vec::with_capacity(series.len());
++    let mut cs = Vec::with_capacity(series.len());
+ 
+-    for (&(x, y), &(c, cq)) in counts {
++    for ((x, y), acc) in series {
+         xs.push(x);
+         ys.push(y);
+-        zs.push(cq / c as f64);
+-        cs.push(log_norm(c, max_count));
++        zs.push(acc.mean_quality());
++        cs.push(log_norm(acc.count, max_count));
+     }
+ 
+     let fmt_vec = |v: &[f64]| v.iter().map(|n| format!("{n:.4}")).collect::<Vec<_>>().join(",");
+@@ -300,4 +311,44 @@ mod tests {
+         let mid = log_norm(5, 100);
+         assert!((mid - (5f64.ln() / 100f64.ln())).abs() < 1e-12);
+     }
++
++    /// FM-12: the Plotly series is sorted by `(x, y)`, not emitted in `HashMap`
++    /// iteration order (which is randomised per process, so the file used to
++    /// change between two runs of the same command).
++    #[test]
++    fn html_series_is_sorted_by_xy() {
++        let dir = std::env::temp_dir().join(format!("maps_html_{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++
++        let mut counts: HashMap<(u32, u32), PixelAcc> = HashMap::new();
++        // Inserted out of order on purpose.
++        for (x, y, c) in [(9u32, 1u32, 4u64), (2, 7, 2), (2, 3, 7), (5, 5, 1)] {
++            counts.insert(
++                (x, y),
++                PixelAcc { count: c, sum_q: 30 * c, sum_len: c },
++            );
++        }
++        write_html(&counts, &dir, true);
++        let text = std::fs::read_to_string(dir.join("heatmap_3d.html")).unwrap();
++
++        let grab = |open: &str, close: &str| -> Vec<u32> {
++            let start = text.find(open).unwrap_or_else(|| panic!("no {open}")) + open.len();
++            let end = start + text[start..].find(close).unwrap();
++            text[start..end]
++                .split(',')
++                .map(|s| s.trim().parse::<u32>().unwrap())
++                .collect()
++        };
++        let xs = grab("x: [", "], y: [");
++        let ys = grab("y: [", "], z: [");
++        assert_eq!(xs, vec![2, 2, 5, 9]);
++        assert_eq!(ys, vec![3, 7, 5, 1]);
++        assert!(
++            (1..xs.len()).all(|i| (xs[i - 1], ys[i - 1]) < (xs[i], ys[i])),
++            "series must be strictly ordered by (x, y): {xs:?} {ys:?}"
++        );
++
++        let _ = std::fs::remove_dir_all(&dir);
++    }
+ }
+diff --git a/tools/fastmaps/src/spiller.rs b/tools/fastmaps/src/spiller.rs
+index 37f7602..037113f 100644
+--- a/tools/fastmaps/src/spiller.rs
++++ b/tools/fastmaps/src/spiller.rs
+@@ -5,15 +5,15 @@ use std::path::{Path, PathBuf};
+ use std::sync::mpsc;
+ 
+ use crate::format::write_preview_entry;
+-use crate::worker::SpillerMsg;
++use crate::worker::{PixelAcc, SpillerMsg};
+ 
+ // ── Types ────────────────────────────────────────────────────────────────────
+ 
+ /// All data collected by the spiller thread, handed back to main after
+ /// all workers have finished.
+ pub struct SpillerState {
+-    /// Combined per-pixel (count, cumulative_mean_quality).
+-    pub counts: HashMap<(u16, u16), (u64, f64)>,
++    /// Combined per-pixel (count, quality sums).
++    pub counts: HashMap<(u16, u16), PixelAcc>,
+     /// Per-pixel R1 counts.
+     pub counts_r1: HashMap<(u16, u16), u64>,
+     /// Per-pixel R2 counts.
+@@ -30,6 +30,20 @@ pub struct SpillerState {
+     pub temp_dir: PathBuf,
+ }
+ 
++/// One spilled index record: `x:u16 LE | file_id:u16 LE | read_num:u32 LE`.
++/// `y` is implicit in the row's file name.
++pub type IndexRecord = [u8; 8];
++
++/// Size of one spilled index record on disk.
++pub const INDEX_RECORD_BYTES: usize = 8;
++
++/// Per-row `BufWriter` capacity.
++///
++/// FM-3: this was `BufWriter::new` (8 KiB) on 152 row files *plus* 152 preview
++/// row files — 2.5 MB of buffers, most of it idle. 4 KiB still holds 512
++/// records, which is far more than the per-flush row run a worker produces.
++pub const ROW_WRITER_BUF: usize = 4 * 1024;
++
+ // ── Helpers ──────────────────────────────────────────────────────────────────
+ 
+ pub fn row_temp_path(temp_dir: &Path, y: u16) -> PathBuf {
+@@ -43,6 +57,19 @@ pub fn preview_row_temp_path(temp_dir: &Path, y: u16) -> PathBuf {
+     temp_dir.join(format!("preview_row_{y:05}.tmp"))
+ }
+ 
++fn create_row_writer(temp_dir: &Path, y: u16, tag: &str) -> BufWriter<File> {
++    let path = if tag.is_empty() {
++        row_temp_path(temp_dir, y)
++    } else {
++        preview_row_temp_path(temp_dir, y)
++    };
++    let f = File::create(&path).unwrap_or_else(|e| {
++        eprintln!("Cannot create temp file {}: {e}", path.display());
++        std::process::exit(1);
++    });
++    BufWriter::with_capacity(ROW_WRITER_BUF, f)
++}
++
+ // ── Spiller thread ───────────────────────────────────────────────────────────
+ 
+ /// Receive chunks from workers, write index entries directly to per-y temp
+@@ -52,13 +79,17 @@ pub fn preview_row_temp_path(temp_dir: &Path, y: u16) -> PathBuf {
+ /// Peak RAM ≈ the largest single row's index/preview buffer per open temp
+ /// writer + the mpsc queue; neither the index stream nor the preview payloads
+ /// are retained for the whole run.
++///
++/// FM-3: the writer tables are `HashMap`s keyed by row, not a
++/// `Vec<Option<_>>` sized to `u16::MAX` (2.1 MB of `None`s allocated before a
++/// single row is seen). A short-read run has `max_seq_len + 1` ≈ 152 rows, so
++/// the map holds ~152 entries whatever the read length.
+ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> SpillerState {
+-    // Lazily-opened writers, one per y value (at most max_seq_len+1 open).
+-    let mut row_writers: Vec<Option<BufWriter<File>>> =
+-        (0..=u16::MAX as usize).map(|_| None).collect();
+-
++    // Lazily-opened writers, one per y value actually seen.
++    let mut row_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
+     let mut preview_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
+-    let mut counts: HashMap<(u16, u16), (u64, f64)> = HashMap::new();
++
++    let mut counts: HashMap<(u16, u16), PixelAcc> = HashMap::new();
+     let mut counts_r1: HashMap<(u16, u16), u64> = HashMap::new();
+     let mut counts_r2: HashMap<(u16, u16), u64> = HashMap::new();
+     let mut per_file_counts: HashMap<u16, u64> = HashMap::new();
+@@ -72,30 +103,22 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
+         match msg {
+             SpillerMsg::Chunk(chunk) => {
+                 for (x, y, fid, rn) in chunk.indices {
+-                    let slot = &mut row_writers[y as usize];
+-                    if slot.is_none() {
+-                        let path = row_temp_path(&temp_dir, y);
+-                        let f = File::create(&path).unwrap_or_else(|e| {
+-                            eprintln!("Cannot create temp file {}: {e}", path.display());
+-                            std::process::exit(1);
+-                        });
+-                        *slot = Some(BufWriter::new(f));
+-                    }
+-                    let w = slot.as_mut().unwrap();
+-                    w.write_all(&x.to_le_bytes()).unwrap();
+-                    w.write_all(&fid.to_le_bytes()).unwrap();
+-                    w.write_all(&rn.to_le_bytes()).unwrap();
++                    let w = row_writers
++                        .entry(y)
++                        .or_insert_with(|| create_row_writer(&temp_dir, y, ""));
++                    // FM-9: one packed 8-byte store instead of three
++                    // `write_all` calls per record (30 M → 10 M per 10 M reads).
++                    let mut rec: IndexRecord = [0u8; INDEX_RECORD_BYTES];
++                    rec[0..2].copy_from_slice(&x.to_le_bytes());
++                    rec[2..4].copy_from_slice(&fid.to_le_bytes());
++                    rec[4..8].copy_from_slice(&rn.to_le_bytes());
++                    w.write_all(&rec).unwrap();
+                 }
+                 for p in chunk.previews {
+                     let y = p.y;
+-                    let w = preview_writers.entry(y).or_insert_with(|| {
+-                        let path = preview_row_temp_path(&temp_dir, y);
+-                        let f = File::create(&path).unwrap_or_else(|e| {
+-                            eprintln!("Cannot create temp file {}: {e}", path.display());
+-                            std::process::exit(1);
+-                        });
+-                        BufWriter::new(f)
+-                    });
++                    let w = preview_writers
++                        .entry(y)
++                        .or_insert_with(|| create_row_writer(&temp_dir, y, "preview"));
+                     write_preview_entry(w, &p).unwrap_or_else(|e| {
+                         eprintln!("Error writing preview temp row: {e}");
+                         std::process::exit(1);
+@@ -120,10 +143,13 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
+                 no_call += nc;
+                 no_call_r1 += nc1;
+                 no_call_r2 += nc2;
+-                for (k, (cnt, q)) in c {
+-                    let e = counts.entry(k).or_insert((0, 0.0));
+-                    e.0 += cnt;
+-                    e.1 += q;
++                // Integer accumulation: exact in any `Done` arrival order
++                // (FM-12). The old `f64` partial means were not.
++                for (k, p) in c {
++                    let e = counts.entry(k).or_default();
++                    e.count += p.count;
++                    e.sum_q += p.sum_q;
++                    e.sum_len += p.sum_len;
+                 }
+                 for (k, cnt) in cr1 {
+                     *counts_r1.entry(k).or_insert(0) += cnt;
+@@ -139,8 +165,8 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
+     }
+ 
+     // Flush all open writers before write_format reads them.
+-    for slot in row_writers.iter_mut().flatten() {
+-        slot.flush().unwrap_or_else(|e| {
++    for w in row_writers.values_mut() {
++        w.flush().unwrap_or_else(|e| {
+             eprintln!("Error flushing spill file: {e}");
+             std::process::exit(1);
+         });
+@@ -167,3 +193,120 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
+         temp_dir,
+     }
+ }
++
++// ── Tests ────────────────────────────────────────────────────────────────────
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::worker::{PixelAcc, SpillChunk};
++
++    fn tmpdir(tag: &str) -> PathBuf {
++        let d = std::env::temp_dir().join(format!("maps_spill_{tag}_{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&d);
++        std::fs::create_dir_all(&d).unwrap();
++        d
++    }
++
++    fn done(
++        counts: &[((u16, u16), PixelAcc)],
++        n_reads: u64,
++        max_seq_len: u32,
++    ) -> SpillerMsg {
++        SpillerMsg::Done {
++            counts: counts.iter().copied().collect(),
++            counts_r1: HashMap::new(),
++            counts_r2: HashMap::new(),
++            per_file_counts: HashMap::new(),
++            no_call: 0,
++            no_call_r1: 0,
++            no_call_r2: 0,
++            max_seq_len,
++            n_reads,
++        }
++    }
++
++    /// FM-3 + FM-9: one temp file per *seen* row (not per possible row), each
++    /// holding packed 8-byte records in arrival order.
++    #[test]
++    fn one_file_per_seen_row_with_packed_records() {
++        let dir = tmpdir("rows");
++        let (tx, rx) = mpsc::channel();
++        tx.send(SpillerMsg::Chunk(SpillChunk {
++            indices: vec![(7, 3, 0, 11), (9, 3, 1, 2)],
++            previews: vec![],
++        }))
++        .unwrap();
++        // A second chunk for an already-open row appends; a new row opens.
++        tx.send(SpillerMsg::Chunk(SpillChunk {
++            indices: vec![(2, 3, 0, 12), (1, 7, 0, 0)],
++            previews: vec![],
++        }))
++        .unwrap();
++        tx.send(done(&[], 4, 9)).unwrap();
++        drop(tx);
++
++        let state = spiller_thread(rx, dir.clone());
++        assert_eq!(state.total_reads, 4);
++        assert_eq!(state.max_seq_len, 9);
++
++        // Exactly two row files exist: rows 3 and 7.
++        let mut names: Vec<String> = std::fs::read_dir(&dir)
++            .unwrap()
++            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
++            .collect();
++        names.sort();
++        assert_eq!(names.len(), 2, "writer map must only open seen rows: {names:?}");
++        assert_eq!(names, vec!["heatmap_row_00003.tmp", "heatmap_row_00007.tmp"]);
++
++        let row3 = std::fs::read(row_temp_path(&dir, 3)).unwrap();
++        assert_eq!(row3.len(), 3 * INDEX_RECORD_BYTES);
++        // Byte layout: x LE | fid LE | rn LE, in arrival order across chunks.
++        let rec = |i: usize| -> (u16, u16, u32) {
++            let r = &row3[i * 8..i * 8 + 8];
++            (
++                u16::from_le_bytes(r[0..2].try_into().unwrap()),
++                u16::from_le_bytes(r[2..4].try_into().unwrap()),
++                u32::from_le_bytes(r[4..8].try_into().unwrap()),
++            )
++        };
++        assert_eq!(rec(0), (7, 0, 11));
++        assert_eq!(rec(1), (9, 1, 2));
++        assert_eq!(rec(2), (2, 0, 12));
++
++        let row7 = std::fs::read(row_temp_path(&dir, 7)).unwrap();
++        assert_eq!(row7, vec![1, 0, 0, 0, 0, 0, 0, 0]);
++
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    /// FM-12: two workers' quality partials merge to the same value in either
++    /// `Done` order — that is the whole point of the integer accumulator.
++    #[test]
++    fn done_merge_is_order_independent() {
++        let a = ((4u16, 5u16), PixelAcc { count: 3, sum_q: 100, sum_len: 3 });
++        let b = ((4u16, 5u16), PixelAcc { count: 2, sum_q: 71, sum_len: 2 });
++
++        let merge = |first: &SpillerMsg, second: &SpillerMsg| {
++            let dir = tmpdir("order");
++            let (tx, rx) = mpsc::channel();
++            tx.send(first.clone()).unwrap();
++            tx.send(second.clone()).unwrap();
++            drop(tx);
++            let s = spiller_thread(rx, dir.clone());
++            let _ = std::fs::remove_dir_all(&dir);
++            s.counts[&(4, 5)]
++        };
++
++        // Two workers, one Done message each for the same pixel: the merge
++        // order is the message arrival order, which races.
++        let ab = merge(&done(&[a], 3, 6), &done(&[b], 2, 0));
++        let ba = merge(&done(&[b], 2, 0), &done(&[a], 3, 6));
++        assert_eq!(ab, ba);
++        assert_eq!(ab.mean_quality().to_bits(), ba.mean_quality().to_bits());
++        assert_eq!(ab.count, 5);
++        assert_eq!(ab.sum_q, 171);
++        assert_eq!(ab.sum_len, 5);
++        assert_eq!(ab.mean_quality(), 171.0 / 5.0);
++    }
++}
+diff --git a/tools/fastmaps/src/worker.rs b/tools/fastmaps/src/worker.rs
+index 36bff25..0360b81 100644
+--- a/tools/fastmaps/src/worker.rs
++++ b/tools/fastmaps/src/worker.rs
+@@ -3,7 +3,8 @@ use std::fs::File;
+ use std::io::{BufRead, BufWriter, Write};
+ use std::sync::{mpsc, Arc, Mutex};
+ 
+-use crate::encode::{encode_read, get_reader, mean_quality};
++use crate::cli::DataMode;
++use crate::encode::{encode_read, get_reader, quality_sums};
+ use crate::file_kind::FileKind;
+ 
+ // ── Types shared with the spiller ──────────────────────────────────────────
+@@ -20,15 +21,44 @@ pub struct PreviewRead {
+     pub qual: String,
+ }
+ 
++#[derive(Clone)]
+ pub struct SpillChunk {
+     pub indices: Vec<(u16, u16, u16, u32)>, // (x, y, file_id, read_num)
+     pub previews: Vec<PreviewRead>,
+ }
+ 
++/// Per-pixel accumulation: read count plus the *integer* quality sums.
++///
++/// Storing `(sum_q, sum_len)` instead of an accumulated `f64` mean is what
++/// makes the merge order-independent (FM-12): worker threads finish in whatever
++/// order the OS schedules them, and `f64` addition is not associative, so
++/// summing floating-point partial means in `Done` arrival order made
++/// `heatmap_3d.html` differ run to run. `u64` addition is exactly associative,
++/// and `sum_q as f64 / sum_len as f64` is a single rounded division — the same
++/// value in every order and every process.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct PixelAcc {
++    pub count: u64,
++    pub sum_q: u64,
++    pub sum_len: u64,
++}
++
++impl PixelAcc {
++    /// Mean Phred quality over the reads that carried a quality string.
++    pub fn mean_quality(&self) -> f64 {
++        if self.sum_len == 0 {
++            0.0
++        } else {
++            self.sum_q as f64 / self.sum_len as f64
++        }
++    }
++}
++
++#[derive(Clone)]
+ pub enum SpillerMsg {
+     Chunk(SpillChunk),
+     Done {
+-        counts: HashMap<(u16, u16), (u64, f64)>,
++        counts: HashMap<(u16, u16), PixelAcc>,
+         counts_r1: HashMap<(u16, u16), u64>,
+         counts_r2: HashMap<(u16, u16), u64>,
+         per_file_counts: HashMap<u16, u64>,
+@@ -48,14 +78,36 @@ pub struct WorkerCfg {
+     pub preview_n: usize,
+     /// Byte threshold after which the worker flushes to the spiller.
+     pub threshold_bytes: usize,
++    /// Byte threshold for the *preview* buffer (see `preview_flush_bytes`).
++    pub preview_flush_bytes: usize,
++    /// Whether to keep the per-read index stream at all (FM-1).
++    pub data_mode: DataMode,
+ }
+ 
+-/// Byte threshold for the *preview* buffer. Previews carry read payloads
+-/// (header+seq+qual), so they are flushed on their own, much sooner than the
+-/// index buffer: the spiller streams each one to its row's temp file, which
+-/// keeps preview memory flat in library size instead of `preview_n x pixels`
+-/// read payloads resident for the whole run.
+-const PREVIEW_FLUSH_BYTES: usize = 4 * 1024 * 1024;
++/// Upper bound on the preview flush threshold.
++///
++/// Previews carry read payloads (header+seq+qual), so they are flushed on their
++/// own, much sooner than the index buffer: the spiller streams each one to its
++/// row's temp file, which keeps preview memory flat in library size instead of
++/// `preview_n x pixels` payloads resident for the whole run.
++const PREVIEW_FLUSH_MAX: usize = 256 * 1024;
++
++/// Floor for the preview flush threshold: below this a flush would be a message
++/// per few reads, which costs more than the payload it saves.
++const PREVIEW_FLUSH_MIN: usize = 32 * 1024;
++
++/// Preview flush threshold for a worker whose index share is `threshold_bytes`.
++///
++/// FM-2: this used to be a hard-coded 4 MiB *per worker* that `--buffer-mb`
++/// could not see, so the preview buffer was a memory floor the budget could not
++/// move (`--buffer-mb 1` still held up to 4 MiB per worker). Deriving it from
++/// the worker's share puts it inside the budget; the 256 KiB cap keeps it well
++/// under the old value while still batching a few thousand reads per message.
++/// Output-neutral because previews are capped per `(pixel, kind)` and re-sorted
++/// at encode time, so flush boundaries cannot change a byte of `heatmap.preview`.
++pub fn preview_flush_bytes(threshold_bytes: usize) -> usize {
++    threshold_bytes.clamp(PREVIEW_FLUSH_MIN, PREVIEW_FLUSH_MAX)
++}
+ 
+ /// A corner extraction region. Each instance writes matching reads to its
+ /// own output file.
+@@ -80,8 +132,12 @@ pub struct WorkerLocal {
+     /// Per-pixel-per-kind preview cap — persists across spills.
+     /// Keyed by ((x, y), kind) so each kind gets its own preview_n quota.
+     pub preview_count: HashMap<((u16, u16), FileKind), u8>,
+-    /// Per-pixel (count, cumulative_mean_quality) — for PNG/HTML.
+-    pub counts: HashMap<(u16, u16), (u64, f64)>,
++    /// Per-`((x, y), file_id)` count of index records kept, for
++    /// `DataMode::Capped` (FM-1). Persists across spills so the cap is a cap on
++    /// the whole run, not per chunk. Empty in `Exact`/`Off` mode.
++    pub data_count: HashMap<((u16, u16), u16), u8>,
++    /// Per-pixel (count, quality sums) — for PNG/HTML.
++    pub counts: HashMap<(u16, u16), PixelAcc>,
+     /// Per-pixel R1-only count.
+     pub counts_r1: HashMap<(u16, u16), u64>,
+     /// Per-pixel R2-only count.
+@@ -107,6 +163,7 @@ impl WorkerLocal {
+             indices: Vec::new(),
+             previews: Vec::new(),
+             preview_count: HashMap::new(),
++            data_count: HashMap::new(),
+             counts: HashMap::new(),
+             counts_r1: HashMap::new(),
+             counts_r2: HashMap::new(),
+@@ -120,6 +177,45 @@ impl WorkerLocal {
+             preview_bytes: 0,
+         }
+     }
++
++    /// Record one read in the per-read index stream, honouring `--data-mode`.
++    ///
++    /// * `Exact` — always, as before.
++    /// * `Capped(n)` — only while this `(pixel, file)` has fewer than `n`.
++    /// * `Off` — never: no push, so nothing can spill and the render pass has
++    ///   nothing to read.
++    ///
++    /// Returns whether the record was kept. Pixel *counts* are updated by the
++    /// caller regardless, so this only ever affects `heatmap.data`.
++    #[inline]
++    pub fn push_index(
++        &mut self,
++        xy: (u16, u16),
++        file_id: u16,
++        read_num: u32,
++        mode: DataMode,
++    ) -> bool {
++        let keep = match mode {
++            DataMode::Exact => true,
++            DataMode::Off => false,
++            DataMode::Capped(n) => {
++                let c = self.data_count.entry((xy, file_id)).or_insert(0);
++                if *c < n {
++                    *c += 1;
++                    true
++                } else {
++                    false
++                }
++            }
++        };
++        if keep {
++            self.indices.push((xy.0, xy.1, file_id, read_num));
++            // 16 B charged per record against a 12 B in-memory record; the
++            // budget is intentionally conservative here (FM-5, not taken).
++            self.bytes_estimate += 16;
++        }
++        keep
++    }
+ }
+ 
+ // ── Helpers ─────────────────────────────────────────────────────────────────
+@@ -155,6 +251,30 @@ pub fn flush_previews(state: &mut WorkerLocal, tx: &mpsc::Sender<SpillerMsg>) {
+         .expect("spiller died while workers still running");
+ }
+ 
++/// Read one FASTQ line into `buf` (cleared first), returning the byte count
++/// `read_until` reported (0 = EOF).
++///
++/// FM-10: `BufRead::lines()` allocated a `String` per line and validated UTF-8
++/// on every base — four allocations and two full UTF-8 scans per read, for data
++/// that is only ever counted byte by byte. This reuses one `Vec<u8>` per line
++/// slot instead.
++///
++/// It must reproduce `lines()`'s line ending handling exactly: strip `\n`, then
++/// strip a `\r` left by CRLF input. A `\r` left in `seq` would add a byte to
++/// the read length and move every downstream number (`size`, the (x, y) plane,
++/// `data_row_offsets`).
++fn read_line(reader: &mut dyn BufRead, buf: &mut Vec<u8>) -> std::io::Result<usize> {
++    buf.clear();
++    let n = reader.read_until(b'\n', buf)?;
++    if buf.last() == Some(&b'\n') {
++        buf.pop();
++        if buf.last() == Some(&b'\r') {
++            buf.pop();
++        }
++    }
++    Ok(n)
++}
++
+ // ── FASTQ processing ─────────────────────────────────────────────────────────
+ 
+ /// Process one FASTQ file, updating `state` and writing corner extractions.
+@@ -167,19 +287,38 @@ pub fn process_fastq(
+     corners: &[CornerExtractor],
+     file_kinds: &[FileKind],
+ ) -> std::io::Result<()> {
+-    let reader = get_reader(path)?;
+-    let mut lines = reader.lines();
++    let mut reader = get_reader(path)?;
++    // Four reused line buffers for the whole file (FM-10).
++    let mut header: Vec<u8> = Vec::with_capacity(256);
++    let mut seq: Vec<u8> = Vec::with_capacity(256);
++    let mut plus: Vec<u8> = Vec::with_capacity(16);
++    let mut qual: Vec<u8> = Vec::with_capacity(256);
+     let mut read_num: u32 = 0;
+     let kind = file_kinds
+         .get(file_id as usize)
+         .copied()
+         .unwrap_or(FileKind::Unknown);
+ 
+-    while let (Some(Ok(header)), Some(Ok(seq)), Some(Ok(plus)), Some(Ok(qual))) =
+-        (lines.next(), lines.next(), lines.next(), lines.next())
+-    {
++    loop {
++        // A truncated record ends the file exactly as `lines()` running dry did.
++        // A genuine I/O error, in contrast, used to end the loop silently
++        // (`lines()` yielded `Some(Err(_))`, the pattern did not match) and
++        // leave a plausible-looking partial heatmap; `?` now aborts loudly.
++        if read_line(&mut *reader, &mut header)? == 0 {
++            break;
++        }
++        if read_line(&mut *reader, &mut seq)? == 0 {
++            break;
++        }
++        if read_line(&mut *reader, &mut plus)? == 0 {
++            break;
++        }
++        if read_line(&mut *reader, &mut qual)? == 0 {
++            break;
++        }
++
+         let (cx, cy, n_acgt) = encode_read(&seq);
+-        let mq = mean_quality(&qual);
++        let (sum_q, sum_len) = quality_sums(&qual);
+ 
+         let slen = seq.len() as u32;
+         if slen > u16::MAX as u32 {
+@@ -196,9 +335,10 @@ pub fn process_fastq(
+         let xy = (cx as u16, cy as u16);
+ 
+         // Per-pixel counts (combined — for PNG / HTML).
+-        let e = state.counts.entry(xy).or_insert((0, 0.0));
+-        e.0 += 1;
+-        e.1 += mq;
++        let e = state.counts.entry(xy).or_default();
++        e.count += 1;
++        e.sum_q += sum_q;
++        e.sum_len += sum_len;
+         // Per-pixel split counts.
+         match kind {
+             FileKind::R1 => {
+@@ -223,9 +363,8 @@ pub fn process_fastq(
+         state.total_reads += 1;
+         *state.per_file_counts.entry(file_id).or_insert(0) += 1;
+ 
+-        // Index entry for heatmap.data.
+-        state.indices.push((xy.0, xy.1, file_id, read_num));
+-        state.bytes_estimate += 16;
++        // Index entry for heatmap.data (unless --data-mode says otherwise).
++        state.push_index(xy, file_id, read_num, cfg.data_mode);
+ 
+         // Preview accumulation (cap per (pixel, kind), so R1/R2 each get
+         // their own preview_n quota — otherwise alphabetical file_id order
+@@ -235,17 +374,18 @@ pub fn process_fastq(
+             if (*pc as usize) < cfg.preview_n {
+                 *pc += 1;
+                 let cost = header.len() + seq.len() + qual.len() + 64;
++                // Only a kept preview pays for its Strings (FM-10).
+                 state.previews.push(PreviewRead {
+                     x: xy.0,
+                     y: xy.1,
+                     file_id,
+                     read_num,
+-                    header: header.clone(),
+-                    seq: seq.clone(),
+-                    qual: qual.clone(),
++                    header: String::from_utf8_lossy(&header).into_owned(),
++                    seq: String::from_utf8_lossy(&seq).into_owned(),
++                    qual: String::from_utf8_lossy(&qual).into_owned(),
+                 });
+                 state.preview_bytes += cost;
+-                if state.preview_bytes >= PREVIEW_FLUSH_BYTES {
++                if state.preview_bytes >= cfg.preview_flush_bytes {
+                     flush_previews(state, tx);
+                 }
+             }
+@@ -255,7 +395,14 @@ pub fn process_fastq(
+         for c in corners {
+             if cx >= c.x1 && cx <= c.x2 && cy >= c.y1 && cy <= c.y2 {
+                 let mut w = c.writer.lock().unwrap();
+-                writeln!(w, "{}\n{}\n{}\n{}", header, seq, plus, qual)?;
++                w.write_all(&header)?;
++                w.write_all(b"\n")?;
++                w.write_all(&seq)?;
++                w.write_all(b"\n")?;
++                w.write_all(&plus)?;
++                w.write_all(b"\n")?;
++                w.write_all(&qual)?;
++                w.write_all(b"\n")?;
+             }
+         }
+ 
+@@ -269,3 +416,158 @@ pub fn process_fastq(
+     }
+     Ok(())
+ }
++
++// ── Tests ───────────────────────────────────────────────────────────────────
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Cursor;
++
++    fn st() -> WorkerLocal {
++        WorkerLocal::new()
++    }
++
++    // ── FM-1: the index stream is optional ──────────────────────────────────
++
++    #[test]
++    fn index_push_exact_keeps_every_read() {
++        let mut s = st();
++        for rn in 0..5 {
++            assert!(s.push_index((3, 4), 0, rn, DataMode::Exact));
++        }
++        assert_eq!(s.indices.len(), 5);
++        assert_eq!(s.bytes_estimate, 5 * 16);
++        assert!(s.data_count.is_empty(), "exact mode must not track a cap");
++    }
++
++    #[test]
++    fn index_push_capped_limits_per_pixel_and_file() {
++        let mut s = st();
++        // 3 reads at one pixel from file 0: only the first 2 are kept.
++        assert!(s.push_index((1, 1), 0, 0, DataMode::Capped(2)));
++        assert!(s.push_index((1, 1), 0, 1, DataMode::Capped(2)));
++        assert!(!s.push_index((1, 1), 0, 2, DataMode::Capped(2)));
++        // Same pixel, different file: its own quota.
++        assert!(s.push_index((1, 1), 1, 0, DataMode::Capped(2)));
++        // Different pixel: its own quota.
++        assert!(s.push_index((2, 1), 0, 0, DataMode::Capped(2)));
++        assert_eq!(s.indices.len(), 4);
++        assert_eq!(
++            s.indices,
++            vec![(1, 1, 0, 0), (1, 1, 0, 1), (1, 1, 1, 0), (2, 1, 0, 0)]
++        );
++        // The budget only ever sees what is really stored.
++        assert_eq!(s.bytes_estimate, 4 * 16);
++    }
++
++    #[test]
++    fn index_push_off_stores_nothing() {
++        let mut s = st();
++        for rn in 0..10 {
++            assert!(!s.push_index((0, 0), 0, rn, DataMode::Off));
++        }
++        assert!(s.indices.is_empty());
++        assert_eq!(s.bytes_estimate, 0, "off: nothing buffered ⇒ nothing spills");
++        assert!(s.data_count.is_empty());
++    }
++
++    /// The cap must survive a spill: `data_count` is not part of the chunk.
++    #[test]
++    fn capped_counter_survives_a_flush() {
++        let mut s = st();
++        let (tx, _rx) = mpsc::channel();
++        for rn in 0..3 {
++            s.push_index((5, 5), 0, rn, DataMode::Capped(2));
++        }
++        flush_local(&mut s, &tx);
++        assert!(s.indices.is_empty());
++        assert!(!s.push_index((5, 5), 0, 3, DataMode::Capped(2)));
++        assert!(s.data_count.contains_key(&((5, 5), 0)));
++    }
++
++    // ── FM-2: the preview flush lives inside the budget ─────────────────────
++
++    #[test]
++    fn preview_flush_is_budget_aware() {
++        // The old constant was 4 MiB *per worker*, invisible to --buffer-mb.
++        assert_eq!(preview_flush_bytes(4 * 1024 * 1024), 256 * 1024);
++        assert_eq!(preview_flush_bytes(64 * 1024 * 1024), 256 * 1024);
++        // A worker share below the cap is honoured: never exceed the budget.
++        assert_eq!(preview_flush_bytes(512 * 1024), 256 * 1024);
++        assert_eq!(preview_flush_bytes(64 * 1024), 64 * 1024);
++        // Degenerate tiny shares keep a usable batch size.
++        assert_eq!(preview_flush_bytes(0), PREVIEW_FLUSH_MIN);
++        assert_eq!(preview_flush_bytes(1), PREVIEW_FLUSH_MIN);
++        assert!(preview_flush_bytes(8 * 1024 * 1024) <= 8 * 1024 * 1024);
++    }
++
++    // ── FM-10: byte-level line reading ──────────────────────────────────────
++
++    #[test]
++    fn read_line_strips_lf_and_crlf() {
++        let data = b"@h\r\nACGT\r\n+\r\nIIII\r\n@z\nAC\n+\nII\n";
++        let mut r = Cursor::new(&data[..]);
++        let mut buf = Vec::new();
++        let mut got = Vec::new();
++        while read_line(&mut r, &mut buf).unwrap() > 0 {
++            got.push(String::from_utf8(buf.clone()).unwrap());
++        }
++        assert_eq!(got, vec!["@h", "ACGT", "+", "IIII", "@z", "AC", "+", "II"]);
++    }
++
++    #[test]
++    fn read_line_reports_eof_and_keeps_an_unterminated_last_line() {
++        let mut r = Cursor::new(&b"abc"[..]);
++        let mut buf = Vec::new();
++        assert_eq!(read_line(&mut r, &mut buf).unwrap(), 3);
++        assert_eq!(buf, b"abc");
++        assert_eq!(read_line(&mut r, &mut buf).unwrap(), 0);
++        assert!(buf.is_empty(), "buffer is cleared on every call");
++
++        // A blank line is a line, not EOF.
++        let mut r = Cursor::new(&b"\n\n"[..]);
++        assert_eq!(read_line(&mut r, &mut buf).unwrap(), 1);
++        assert!(buf.is_empty());
++        assert_eq!(read_line(&mut r, &mut buf).unwrap(), 1);
++        assert_eq!(read_line(&mut r, &mut buf).unwrap(), 0);
++    }
++
++    // ── FM-12: integer quality accumulation is order-independent ────────────
++
++    #[test]
++    fn pixel_acc_mean_is_order_independent() {
++        let parts: Vec<(u64, u64)> = vec![(40, 1), (20, 1), (61, 1), (0, 1)];
++        let mut fwd = PixelAcc::default();
++        for &(q, n) in &parts {
++            fwd.sum_q += q;
++            fwd.sum_len += n;
++            fwd.count += 1;
++        }
++        let mut rev = PixelAcc::default();
++        for &(q, n) in parts.iter().rev() {
++            rev.sum_q += q;
++            rev.sum_len += n;
++            rev.count += 1;
++        }
++        assert_eq!(fwd, rev);
++        assert_eq!(fwd.mean_quality(), rev.mean_quality());
++        assert_eq!(fwd.mean_quality(), 121.0 / 4.0);
++
++        // Two workers' partials merged in either order agree bit for bit.
++        let a = PixelAcc { count: 3, sum_q: 100, sum_len: 3 };
++        let b = PixelAcc { count: 2, sum_q: 90, sum_len: 2 };
++        let mut ab = a;
++        ab.count += b.count;
++        ab.sum_q += b.sum_q;
++        ab.sum_len += b.sum_len;
++        let mut ba = b;
++        ba.count += a.count;
++        ba.sum_q += a.sum_q;
++        ba.sum_len += a.sum_len;
++        assert_eq!(ab, ba);
++        assert_eq!(ab.mean_quality().to_bits(), ba.mean_quality().to_bits());
++
++        assert_eq!(PixelAcc::default().mean_quality(), 0.0);
++    }
++}
+diff --git a/tools/fastmaps/tests/data_mode_test.rs b/tools/fastmaps/tests/data_mode_test.rs
+new file mode 100644
+index 0000000..7e5dec7
+--- /dev/null
++++ b/tools/fastmaps/tests/data_mode_test.rs
+@@ -0,0 +1,300 @@
++//! FM-1 — `--data-mode exact|capped:N|off`.
++//!
++//! The per-read index stream exists for exactly one output: `heatmap.data`.
++//! Making it optional must not move a single number anywhere else, and a
++//! non-exact mode must say so in both the grid JSON and the v1 wrapper.
++//!
++//! Fixture: 14 reads of length 20, so pixel membership is deep enough for a
++//! cap of 2 to bite (4 reads land on (0,0), 4 on (20,20), 4 on (0,20),
++//! 2 on (20,0); `size` = 21).
++
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++use serde_json::Value;
++
++const SIZE: usize = 21;
++
++fn bin() -> &'static str {
++    env!("CARGO_BIN_EXE_fastmaps")
++}
++
++fn fixture(dir: &Path) -> String {
++    let fq = dir.join("mix_R1.fastq");
++    let mut body = String::new();
++    for (seq, n) in [("A", 4), ("T", 4), ("G", 4), ("C", 2)] {
++        for i in 0..n {
++            let s = seq.repeat(20);
++            body.push_str(&format!("@p{seq}{i}\n{s}\n+\n{}\n", "I".repeat(s.len())));
++        }
++    }
++    std::fs::write(&fq, body).unwrap();
++    fq.to_string_lossy().to_string()
++}
++
++struct Run {
++    out: PathBuf,
++    report: Option<PathBuf>,
++    stdout: String,
++    stderr: String,
++}
++
++/// One binary run. `extra` is appended verbatim; `--json` is added by the
++/// caller when it wants the v1 wrapper.
++fn run(tag: &str, fq: &str, extra: &[&str]) -> Run {
++    let dir = std::env::temp_dir().join(format!("maps_dm_{tag}_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    let out = dir.join("out");
++    let mut c = Command::new(bin());
++    c.arg("-o").arg(&out).arg("--force").arg(fq).args(extra);
++    let o = c.output().unwrap();
++    assert!(
++        o.status.success(),
++        "--data-mode run {tag} failed\nstdout: {}\nstderr: {}",
++        String::from_utf8_lossy(&o.stdout),
++        String::from_utf8_lossy(&o.stderr)
++    );
++    // The v1 wrapper lands next to the redirected grid as <stem>.report.json.
++    let report = extra.windows(2).find(|w| w[0] == "--json").map(|w| {
++        let p = PathBuf::from(w[1]);
++        let stem = p.file_stem().unwrap().to_string_lossy().to_string();
++        p.with_file_name(format!("{stem}.report.json"))
++    });
++    Run {
++        out,
++        report,
++        stdout: String::from_utf8_lossy(&o.stdout).to_string(),
++        stderr: String::from_utf8_lossy(&o.stderr).to_string(),
++    }
++}
++
++fn json(r: &Run) -> Value {
++    let text = std::fs::read_to_string(r.out.join("heatmap.json")).unwrap();
++    serde_json::from_str(&text).unwrap_or_else(|e| panic!("heatmap.json must parse: {e}\n{text}"))
++}
++
++fn data(r: &Run) -> Vec<u8> {
++    std::fs::read(r.out.join("heatmap.data")).unwrap()
++}
++
++fn tmpdir(tag: &str) -> PathBuf {
++    let d = std::env::temp_dir().join(format!("maps_dm_fx_{tag}_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&d);
++    std::fs::create_dir_all(&d).unwrap();
++    d
++}
++
++/// Everything except the per-read stream must be identical between modes:
++/// the grid is built from `state.counts`, which the index stream never feeds.
++#[test]
++fn off_and_capped_leave_counts_and_png_exact() {
++    let fx = tmpdir("counts");
++    let fq = fixture(&fx);
++
++    let exact = run("exact", &fq, &["--data-mode", "exact"]);
++    let capped = run("capped", &fq, &["--data-mode", "capped:2"]);
++    let off = run("off", &fq, &["--data-mode", "off"]);
++
++    let je = json(&exact);
++    for (name, r) in [("capped:2", &capped), ("off", &off)] {
++        let j = json(r);
++        for key in ["size", "total_reads", "counts", "counts_r1", "counts_r2", "per_file_counts"] {
++            assert_eq!(j[key], je[key], "{name}: {key} must stay exact");
++        }
++        assert_eq!(j["preview_reads_per_pixel"], je["preview_reads_per_pixel"]);
++        assert_eq!(
++            std::fs::read(r.out.join("heatmap.png")).unwrap(),
++            std::fs::read(exact.out.join("heatmap.png")).unwrap(),
++            "{name}: PNG must stay byte-identical"
++        );
++        assert_eq!(
++            std::fs::read(r.out.join("heatmap.preview")).unwrap(),
++            std::fs::read(exact.out.join("heatmap.preview")).unwrap(),
++            "{name}: previews must stay byte-identical"
++        );
++    }
++
++    // Sanity: the fixture really does put 4 reads on one pixel.
++    assert_eq!(je["counts"][0], 4);
++}
++
++/// `off` deletes the stream without breaking the file's row structure: every
++/// row's encoding is the empty pixel list, so `data_row_offsets` still points
++/// at a valid offset in a `size`-byte file.
++#[test]
++fn off_writes_only_empty_rows() {
++    let fx = tmpdir("offrows");
++    let fq = fixture(&fx);
++    let r = run("offrows", &fq, &["--data-mode", "off"]);
++    let j = json(&r);
++
++    let d = data(&r);
++    assert_eq!(d.len(), SIZE, "off: one empty varint(0) row per grid row");
++    assert!(d.iter().all(|&b| b == 0), "off: every row must be empty");
++
++    let offs: Vec<u64> = j["data_row_offsets"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|v| v.as_u64().unwrap())
++        .collect();
++    assert_eq!(offs.len(), SIZE + 1);
++    assert_eq!(offs, (0..=SIZE as u64).collect::<Vec<_>>());
++}
++
++/// `capped:N` keeps at most N reads per (pixel, file) and shrinks the stream.
++#[test]
++fn capped_limits_reads_per_pixel_and_labels_json() {
++    let fx = tmpdir("caprows");
++    let fq = fixture(&fx);
++
++    let exact = run("capex", &fq, &["--data-mode", "exact"]);
++    let capped = run("capcap", &fq, &["--data-mode", "capped:2"]);
++
++    let je = json(&exact);
++    assert!(
++        je.get("data_complete").is_none(),
++        "exact mode must not carry a data-completeness label: {je}"
++    );
++    assert!(
++        je.get("data_reads_per_pixel").is_none(),
++        "exact mode must not carry a cap label: {je}"
++    );
++
++    let jc = json(&capped);
++    assert_eq!(jc["data_complete"], Value::Bool(false));
++    assert_eq!(jc["data_reads_per_pixel"], 2);
++
++    let de = data(&exact);
++    let dc = data(&capped);
++    assert!(
++        dc.len() < de.len(),
++        "capped:2 must shrink heatmap.data ({} vs {})",
++        dc.len(),
++        de.len()
++    );
++    assert_ne!(dc, de, "capped:2 must not reproduce the exact stream");
++
++    // 14 reads, 4 pixels, cap 2 → 4 pixels × 2 reads kept = 8 of 14.
++    // Decode `n_stored` per pixel and check the cap held everywhere.
++    let mut pos = 0usize;
++    let mut total = 0usize;
++    let n_rows = SIZE;
++    for _ in 0..n_rows {
++        let n_pixels = varint(&dc, &mut pos);
++        for _ in 0..n_pixels {
++            let _x = varint(&dc, &mut pos);
++            let n_groups = varint(&dc, &mut pos);
++            // groups: varint(file_id) varint(n_reads) varint*n_reads
++            let mut stored = 0u64;
++            for _ in 0..n_groups {
++                let _fid = varint(&dc, &mut pos);
++                let n_reads = varint(&dc, &mut pos);
++                assert!(n_reads <= 2, "capped:2 stored {n_reads} reads in one group");
++                for _ in 0..n_reads {
++                    let _ = varint(&dc, &mut pos);
++                }
++                stored += n_reads;
++            }
++            assert!(stored <= 2, "capped:2 stored {stored} reads at one pixel");
++            total += stored as usize;
++        }
++    }
++    assert_eq!(pos, dc.len(), "capped:2 stream must decode exactly");
++    assert_eq!(total, 8, "4 pixels × cap 2 = 8 reads kept");
++}
++
++fn varint(buf: &[u8], pos: &mut usize) -> u64 {
++    let mut shift = 0u32;
++    let mut out = 0u64;
++    loop {
++        let b = buf[*pos];
++        *pos += 1;
++        out |= ((b & 0x7f) as u64) << shift;
++        if b & 0x80 == 0 {
++            return out;
++        }
++        shift += 7;
++    }
++}
++
++/// The v1 wrapper carries the same two flags as metrics, so a downstream
++/// consumer cannot mistake an approximation for the exact stream.
++#[test]
++fn non_exact_modes_label_the_v1_wrapper() {
++    let fx = tmpdir("wrapper");
++    let fq = fixture(&fx);
++
++    for (tag, mode, cap) in [("w_off", "off", 0.0), ("w_cap", "capped:2", 2.0)] {
++        let dir = std::env::temp_dir().join(format!("maps_dm_{tag}_{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let jsonp = dir.join("grid.json");
++        let r = run(
++            tag,
++            &fq,
++            &[
++                "--data-mode",
++                mode,
++                "--json",
++                jsonp.to_str().unwrap(),
++            ],
++        );
++        let rp = r.report.expect("report path recorded");
++        let text = std::fs::read_to_string(&rp).unwrap();
++        let v: Value = serde_json::from_str(&text).unwrap();
++        assert_eq!(v["schema"], "fastsuite.report.v1");
++        assert_eq!(v["metrics"]["data_complete"].as_f64().unwrap(), 0.0);
++        assert_eq!(v["metrics"]["data_reads_per_pixel"].as_f64().unwrap(), cap);
++    }
++
++    // Exact mode: no metrics, no keys — the wrapper shape is untouched.
++    let dir = std::env::temp_dir().join(format!("maps_dm_w_ex_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    let jsonp = dir.join("grid.json");
++    let r = run(
++        "w_exact",
++        &fq,
++        &["--data-mode", "exact", "--json", jsonp.to_str().unwrap()],
++    );
++    let text = std::fs::read_to_string(r.report.unwrap()).unwrap();
++    let v: Value = serde_json::from_str(&text).unwrap();
++    assert!(v["metrics"].get("data_complete").is_none(), "{text}");
++    assert!(v["metrics"].get("data_reads_per_pixel").is_none(), "{text}");
++}
++
++/// The run summary has to say which stream the user got.
++#[test]
++fn run_summary_names_a_non_exact_mode() {
++    let fx = tmpdir("summary");
++    let fq = fixture(&fx);
++
++    let off = run("sum_off", &fq, &["--data-mode", "off"]);
++    assert!(
++        off.stderr.contains("data-mode off") || off.stderr.contains("data mode = off"),
++        "off: run summary must name the mode; stderr:\n{}",
++        off.stderr
++    );
++    assert!(
++        off.stderr.contains("data_complete=false"),
++        "off: run summary must flag the approximation; stderr:\n{}",
++        off.stderr
++    );
++
++    let cap = run("sum_cap", &fq, &["--data-mode", "capped:3"]);
++    assert!(
++        cap.stderr.contains("capped:3"),
++        "capped: run summary must name the cap; stderr:\n{}",
++        cap.stderr
++    );
++
++    let ex = run("sum_ex", &fq, &[]);
++    assert!(
++        !ex.stderr.contains("data_complete")
++            && !ex.stdout.contains("data_complete")
++            && !ex.stdout.contains("data-mode"),
++        "exact (default): the summary must stay silent about data mode"
++    );
++}
+diff --git a/tools/fastmaps/tests/crlf_test.rs b/tools/fastmaps/tests/crlf_test.rs
+new file mode 100644
+index 0000000..205a648
+--- /dev/null
++++ b/tools/fastmaps/tests/crlf_test.rs
+@@ -0,0 +1,91 @@
++//! FM-10 — the FASTQ loop reads bytes, not `String`s.
++//!
++//! `BufRead::lines()` allocates a `String` per line and validates UTF-8;
++//! `read_until` into reused `Vec<u8>` does neither. The two must agree byte for
++//! byte, including on CRLF input: `lines()` strips a trailing `\r`, so the
++//! byte loop has to strip it too or every `\r` read would gain a base of length
++//! and move the (x, y) plane.
++//!
++//! The same path is overwritten between runs so the file path embedded in
++//! `heatmap.json` is identical and *all five* outputs can be compared.
++
++use std::path::Path;
++use std::process::Command;
++
++fn bin() -> &'static str {
++    env!("CARGO_BIN_EXE_fastmaps")
++}
++
++fn body(eol: &str) -> String {
++    let reads = [
++        ("@r0", "A".repeat(150)),
++        ("@r1", "ACGT".repeat(37) + "AC"),
++        ("@r2", "T".repeat(140) + &"G".repeat(10)),
++        ("@r3", "N".repeat(150)),
++        ("@r4", "ACGTACGTAC".repeat(15)),
++    ];
++    let mut s = String::new();
++    for (h, seq) in reads {
++        s.push_str(&format!("{h}{eol}{seq}{eol}+{eol}{}{eol}", "I".repeat(seq.len())));
++    }
++    s
++}
++
++fn run(fq: &Path, out: &Path) {
++    let o = Command::new(bin())
++        .arg("-o")
++        .arg(out)
++        .arg("--force")
++        .arg(fq)
++        .output()
++        .unwrap();
++    assert!(
++        o.status.success(),
++        "run failed: {}",
++        String::from_utf8_lossy(&o.stderr)
++    );
++}
++
++#[test]
++fn crlf_input_matches_lf_input_byte_for_byte() {
++    let dir = std::env::temp_dir().join(format!("maps_crlf_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++
++    let fq = dir.join("x_R1.fastq");
++    let out_lf = dir.join("out_lf");
++    let out_crlf = dir.join("out_crlf");
++
++    std::fs::write(&fq, body("\n")).unwrap();
++    run(&fq, &out_lf);
++
++    std::fs::write(&fq, body("\r\n")).unwrap();
++    run(&fq, &out_crlf);
++
++    for f in [
++        "heatmap.json",
++        "heatmap.png",
++        "heatmap.data",
++        "heatmap.preview",
++        "heatmap_3d.html",
++    ] {
++        let a = std::fs::read(out_lf.join(f)).unwrap();
++        let b = std::fs::read(out_crlf.join(f)).unwrap();
++        assert_eq!(
++            a.len(),
++            b.len(),
++            "{f}: CRLF input must not change the output size ({} vs {})",
++            a.len(),
++            b.len()
++        );
++        assert!(a == b, "{f}: CRLF input must be byte-identical to LF input");
++    }
++
++    // And the read length really is 150 for every read in both runs.
++    let text = std::fs::read_to_string(out_crlf.join("heatmap.json")).unwrap();
++    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
++    assert_eq!(v["size"], 151, "a stray \\r would make size 152");
++    assert_eq!(v["total_reads"], 5);
++
++    let _ = std::fs::remove_dir_all(&dir);
++}
+diff --git a/tools/fastmaps/tests/buffer_independence_test.rs b/tools/fastmaps/tests/buffer_independence_test.rs
+new file mode 100644
+index 0000000..05499fa
+--- /dev/null
++++ b/tools/fastmaps/tests/buffer_independence_test.rs
+@@ -0,0 +1,111 @@
++//! FM-2 / FM-3 / FM-9 — the spill path must be invisible in the outputs.
++//!
++//! `--buffer-mb` is a memory knob, not an output knob. This test drives the
++//! same input through three budgets that take three different code paths:
++//! `--buffer-mb 1` (one worker, 1 MiB share, so the index buffer spills several
++//! times and rows get reopened by the spiller), `--buffer-mb 2` (two spills)
++//! and `--buffer-mb 64` (nothing ever spills).
++//!
++//! All four gated outputs must hash the same. It also exercises the preview
++//! flush while spilling (previews are flushed on their own, much smaller,
++//! threshold), so a budget-derived preview threshold that split previews
++//! differently would show up here.
++
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++fn bin() -> &'static str {
++    env!("CARGO_BIN_EXE_fastmaps")
++}
++
++/// Deterministic 150 bp reads with a spread of compositions (so the grid has
++/// many pixels and the preview buffer actually fills) and varied qualities.
++fn fixture(dir: &Path, n_reads: usize) -> String {
++    let fq = dir.join("buf_R1.fastq");
++    let mut s = String::with_capacity(n_reads * 320);
++    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
++    let mut next = || {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        state
++    };
++    for i in 0..n_reads {
++        let mut seq = String::with_capacity(150);
++        for _ in 0..150 {
++            seq.push(match next() % 4 {
++                0 => 'A',
++                1 => 'C',
++                2 => 'G',
++                _ => 'T',
++            });
++        }
++        let mut qual = String::with_capacity(150);
++        for _ in 0..150 {
++            // '!'..'J' → Q0..Q41, so mean quality varies per read.
++            qual.push((33 + (next() % 42) as u8) as char);
++        }
++        s.push_str(&format!("@b{i}\n{seq}\n+\n{qual}\n"));
++    }
++    std::fs::write(&fq, s).unwrap();
++    fq.to_string_lossy().to_string()
++}
++
++fn run(tag: &str, fq: &str, extra: &[&str]) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("maps_buf_{tag}_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    let o = Command::new(bin())
++        .arg("-o")
++        .arg(&dir)
++        .arg("--force")
++        .arg(fq)
++        .args(extra)
++        .output()
++        .unwrap();
++    assert!(
++        o.status.success(),
++        "run {tag} failed: {}",
++        String::from_utf8_lossy(&o.stderr)
++    );
++    dir
++}
++
++#[test]
++fn output_is_identical_across_buffer_budgets() {
++    let fx = std::env::temp_dir().join(format!("maps_buf_fx_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&fx);
++    std::fs::create_dir_all(&fx).unwrap();
++    // 70 000 reads × 8 B spilled = 560 KB per record stream; with one worker
++    // the 1 MiB share holds 65 536 of them, so this spills at least once.
++    let fq = fixture(&fx, 70_000);
++
++    let a = run("mb1", &fq, &["--buffer-mb", "1", "-j", "1"]);
++    let b = run("mb2", &fq, &["--buffer-mb", "2", "-j", "1"]);
++    let c = run("mb64", &fq, &["--buffer-mb", "64", "-j", "1"]);
++
++    for f in ["heatmap.json", "heatmap.png", "heatmap.data", "heatmap.preview"] {
++        let ra = std::fs::read(a.join(f)).unwrap();
++        for (tag, dir) in [("--buffer-mb 2", &b), ("--buffer-mb 64", &c)] {
++            let rb = std::fs::read(dir.join(f)).unwrap();
++            assert!(
++                ra == rb,
++                "{f} differs between --buffer-mb 1 and {tag} ({} vs {} bytes)",
++                ra.len(),
++                rb.len()
++            );
++        }
++    }
++
++    // Sanity: the grid is not degenerate, so the comparison is meaningful.
++    let j: serde_json::Value =
++        serde_json::from_str(&std::fs::read_to_string(a.join("heatmap.json")).unwrap()).unwrap();
++    assert_eq!(j["total_reads"], 70_000);
++    let occupied = j["counts"].as_array().unwrap().iter().filter(|c| c.as_u64().unwrap() > 0).count();
++    assert!(occupied > 500, "fixture should populate many pixels, got {occupied}");
++
++    let _ = std::fs::remove_dir_all(&fx);
++    let _ = std::fs::remove_dir_all(&a);
++    let _ = std::fs::remove_dir_all(&b);
++    let _ = std::fs::remove_dir_all(&c);
++}
+diff --git a/tools/fastmaps/tests/heatmap_3d_determinism_test.rs b/tools/fastmaps/tests/heatmap_3d_determinism_test.rs
+new file mode 100644
+index 0000000..4541c9b
+--- /dev/null
++++ b/tools/fastmaps/tests/heatmap_3d_determinism_test.rs
+@@ -0,0 +1,122 @@
++//! FM-12 — `heatmap_3d.html` must be reproducible.
++//!
++//! Two independent sources of non-determinism fed this file:
++//!
++//!   1. the per-pixel mean quality was an `f64` partial per worker, merged in
++//!      *thread-completion* order (`Done` messages race), and
++//!   2. the series was emitted in `HashMap` iteration order, which is seeded
++//!      per process.
++//!
++//! So the file differed between two runs of the identical command. It is now
++//! built from integer `(sum_q, sum_len)` accumulators and sorted by `(x, y)`.
++//! Every other output was already deterministic (integer counts + a sorted
++//! encoder); this test pins the last one.
++
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++fn bin() -> &'static str {
++    env!("CARGO_BIN_EXE_fastmaps")
++}
++
++fn write_fq(path: &Path, seed: u64, n: usize) {
++    let mut state = seed | 1;
++    let mut next = || {
++        state ^= state << 13;
++        state ^= state >> 7;
++        state ^= state << 17;
++        state
++    };
++    let mut s = String::with_capacity(n * 330);
++    for i in 0..n {
++        let mut seq = String::with_capacity(150);
++        for _ in 0..150 {
++            seq.push(match next() % 4 {
++                0 => 'A',
++                1 => 'C',
++                2 => 'G',
++                _ => 'T',
++            });
++        }
++        let mut qual = String::with_capacity(150);
++        for _ in 0..150 {
++            qual.push((33 + (next() % 42) as u8) as char);
++        }
++        s.push_str(&format!("@d{i}\n{seq}\n+\n{qual}\n"));
++    }
++    std::fs::write(path, s).unwrap();
++}
++
++fn run(files: &[String], j: &str, tag: &str) -> PathBuf {
++    let dir = std::env::temp_dir().join(format!("maps_3d_{tag}_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(&dir).unwrap();
++    let mut c = Command::new(bin());
++    c.arg("-o").arg(&dir).arg("--force").args(files).args(["-j", j]);
++    let o = c.output().unwrap();
++    assert!(
++        o.status.success(),
++        "-j {j} run failed: {}",
++        String::from_utf8_lossy(&o.stderr)
++    );
++    dir
++}
++
++#[test]
++fn heatmap_3d_html_is_stable_across_runs_and_threads() {
++    let fx = std::env::temp_dir().join(format!("maps_3d_fx_{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&fx);
++    std::fs::create_dir_all(&fx).unwrap();
++
++    // One mate pair: two files, so -j 2 gives two workers with four files worth
++    // of nothing — the file→worker partition is forced (no race over which
++    // worker owns which file), which is what makes the *other* outputs
++    // comparable run to run. The html comparison still spans the thread split.
++    let mut files = Vec::new();
++    for (i, seed) in [11u64, 23].iter().enumerate() {
++        let p = fx.join(format!("s{i}_R{}.fastq", 1 + i));
++        write_fq(&p, *seed, 6_000);
++        files.push(p.to_string_lossy().to_string());
++    }
++
++    // Two runs per -j: the first pair isolates the per-process `HashMap` seed,
++    // the rest isolate thread scheduling.
++    let mut dirs = Vec::new();
++    for j in ["1", "2"] {
++        for rep in ["a", "b"] {
++            dirs.push((j, run(&files, j, &format!("j{j}{rep}"))));
++        }
++    }
++
++    // `heatmap_3d.html` must be identical across *every* run, including across
++    // -j: its series is sorted and its quality values are exact integers now.
++    let first = std::fs::read(dirs[0].1.join("heatmap_3d.html")).unwrap();
++    assert!(!first.is_empty());
++    for (j, d) in dirs.iter().skip(1) {
++        let other = std::fs::read(d.join("heatmap_3d.html")).unwrap();
++        assert!(
++            first == other,
++            "heatmap_3d.html differs between -j {} run a and -j {j} ({} vs {} bytes)",
++            dirs[0].0,
++            first.len(),
++            other.len()
++        );
++    }
++
++    // The other outputs must be identical between two runs *at the same -j*
++    // (`heatmap.preview` is not -j invariant: the per-(pixel, kind) quota is
++    // per worker by design, and that predates this change).
++    for pair in dirs.chunks(2) {
++        let ((j, a), (_, b)) = (&pair[0], &pair[1]);
++        for f in ["heatmap.json", "heatmap.data", "heatmap.preview", "heatmap.png"] {
++            let ra = std::fs::read(a.join(f)).unwrap();
++            let rb = std::fs::read(b.join(f)).unwrap();
++            assert!(ra == rb, "{f} differs between two -j {j} runs");
++        }
++    }
++
++    let _ = std::fs::remove_dir_all(&fx);
++    for (_, d) in &dirs {
++        let _ = std::fs::remove_dir_all(d);
++    }
++}

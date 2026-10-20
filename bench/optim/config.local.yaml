@@ -1,0 +1,12 @@
+repo: /home/raphael/hermes_scratch/FastSuite
+results: /tmp/fs-optim/results
+reads: /tmp/fs-optim/reads
+profile: /home/raphael/hermes_scratch/FastSuite/tools/fastsim/profiles/mandrill_E358.json
+bins:
+  baseline: /tmp/fs-optim/baseline-bin
+  new: /tmp/fs-optim/new-bin
+tools: [fastcheck, fastmaps, fastprep, fastdedup, fastsim]
+sizes: [100000]
+threads: [1, 2]
+fastsim_gz_levels: [0]
+helper_samples: [50]

@@ -55,3 +55,6 @@ __pycache__/
 .tmp_pixitainer_apptainer/
 fastsuite.sif
 fastsuite.def
+
+# optimisation dossier build products
+docs/optim/report/*.pdf

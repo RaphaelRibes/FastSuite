@@ -1,0 +1,1548 @@
+diff --git a/tools/fasthelper/src/config.rs b/tools/fasthelper/src/config.rs
+index d853475..32eff5d 100644
+--- a/tools/fasthelper/src/config.rs
++++ b/tools/fasthelper/src/config.rs
+@@ -162,6 +162,20 @@ impl Config {
+                 path.display()
+             );
+         }
++        // The work dir and the resume key derive from the sample name alone
++        // (runner.rs), so two entries with one name would have two workers
++        // create, unlink and write the same paths. Refuse it at minute zero.
++        let mut seen = std::collections::BTreeSet::new();
++        for s in &cfg.samples {
++            if !seen.insert(s.name.as_str()) {
++                anyhow::bail!(
++                    "config {}: duplicate sample name '{}' — every [[samples]] name must be \
++                     unique, it names the sample's output directory",
++                    path.display(),
++                    s.name
++                );
++            }
++        }
+         Ok(cfg)
+     }
+ 
+diff --git a/tools/fasthelper/src/positions.rs b/tools/fasthelper/src/positions.rs
+index f184244..fa9a4dc 100644
+--- a/tools/fasthelper/src/positions.rs
++++ b/tools/fasthelper/src/positions.rs
+@@ -15,6 +15,7 @@
+ //! zero that would fake a measurement.
+ 
+ use std::collections::BTreeMap;
++use std::io::Write;
+ use std::path::{Path, PathBuf};
+ 
+ use anyhow::{bail, Context, Result};
+@@ -140,6 +141,34 @@ fn fmt(v: f64) -> String {
+     }
+ }
+ 
++/// The tidy shape: `sample, pos, metric, value`, one row per cell, in input
++/// order — no transpose, so it streams straight out.
++fn write_tidy(w: &mut dyn std::io::Write, samples: &[SamplePositions]) -> Result<()> {
++    w.write_all(b"sample\tpos\tmetric\tvalue\n")?;
++    for s in samples {
++        for (pos, values) in &s.rows {
++            for (name, v) in s.metrics.iter().zip(values.iter()) {
++                writeln!(w, "{}\t{}\t{}\t{}", s.sample, pos, name, fmt(*v))?;
++            }
++        }
++    }
++    Ok(())
++}
++
++/// Write a streamed table to `path`, through an 8 KB buffer.
++fn write_file<F>(path: &Path, body: F) -> Result<()>
++where
++    F: FnOnce(&mut dyn std::io::Write) -> Result<()>,
++{
++    let file = std::fs::File::create(path)
++        .with_context(|| format!("creating {}", path.display()))?;
++    let mut w = std::io::BufWriter::new(file);
++    body(&mut w)?;
++    w.flush()
++        .with_context(|| format!("writing {}", path.display()))?;
++    Ok(())
++}
++
+ /// Concatenate. `metric` selects the wide-matrix column; `all_metrics` selects
+ /// the tidy shape instead.
+ pub fn concatenate_positions(
+@@ -190,15 +219,30 @@ pub fn concatenate_positions(
+     }
+     samples.sort_by(|a, b| a.sample.cmp(&b.sample));
+ 
+-    let mut out = String::new();
++    let positions_count = samples
++        .iter()
++        .map(|s| s.rows.len())
++        .max()
++        .unwrap_or(0);
+     if all_metrics {
+-        out.push_str("sample\tpos\tmetric\tvalue\n");
+-        for s in &samples {
+-            for (pos, values) in &s.rows {
+-                for (name, v) in s.metrics.iter().zip(values.iter()) {
+-                    out.push_str(&format!("{}\t{}\t{}\t{}\n", s.sample, pos, name, fmt(*v)));
+-                }
+-            }
++        // Tidy shape: input order already, so it streams — the table used to be
++        // one String (138 MB at 2 k samples for an 88 MB file).
++        if to_stdout {
++            let stdout = std::io::stdout();
++            let mut w = std::io::BufWriter::new(stdout.lock());
++            write_tidy(&mut w, &samples)?;
++            w.flush()?;
++        } else {
++            std::fs::create_dir_all(outdir)
++                .with_context(|| format!("creating {}", outdir.display()))?;
++            let path = outdir.join("positions_matrix.tsv");
++            write_file(&path, |w| write_tidy(w, &samples))?;
++            println!(
++                "fasthelper: concatenated {} sample(s), up to {} position(s) -> {}",
++                samples.len(),
++                positions_count,
++                path.display()
++            );
+         }
+     } else {
+         let missing: Vec<&str> = samples
+@@ -216,13 +260,12 @@ pub fn concatenate_positions(
+                     .unwrap_or_default()
+             );
+         }
+-        out.push_str("pos");
+-        for s in &samples {
+-            out.push('\t');
+-            out.push_str(&s.sample);
+-        }
+-        out.push('\n');
+-
++        // A per-sample column index, resolved once: the wide table looks the
++        // metric up per cell otherwise.
++        let columns: Vec<Option<usize>> = samples
++            .iter()
++            .map(|s| s.metrics.iter().position(|m| m == metric))
++            .collect();
+         let mut positions: Vec<u32> = Vec::new();
+         for s in &samples {
+             positions.extend(s.rows.keys().copied());
+@@ -230,40 +273,42 @@ pub fn concatenate_positions(
+         positions.sort_unstable();
+         positions.dedup();
+ 
+-        for pos in positions {
+-            out.push_str(&pos.to_string());
++        let write_wide = |w: &mut dyn std::io::Write| -> Result<()> {
++            write!(w, "pos")?;
+             for s in &samples {
+-                out.push('\t');
+-                if let (Some(idx), Some(values)) = (
+-                    s.metrics.iter().position(|m| m == metric),
+-                    s.rows.get(&pos),
+-                ) {
+-                    out.push_str(&fmt(values[idx]));
++                write!(w, "\t{}", s.sample)?;
++            }
++            w.write_all(b"\n")?;
++            for pos in &positions {
++                write!(w, "{pos}")?;
++                for (s, idx) in samples.iter().zip(&columns) {
++                    w.write_all(b"\t")?;
++                    if let (Some(idx), Some(values)) = (idx, s.rows.get(pos)) {
++                        write!(w, "{}", fmt(values[*idx]))?;
++                    }
+                 }
++                w.write_all(b"\n")?;
+             }
+-            out.push('\n');
++            Ok(())
++        };
++        if to_stdout {
++            let stdout = std::io::stdout();
++            let mut w = std::io::BufWriter::new(stdout.lock());
++            write_wide(&mut w)?;
++            w.flush()?;
++        } else {
++            std::fs::create_dir_all(outdir)
++                .with_context(|| format!("creating {}", outdir.display()))?;
++            let path = outdir.join("positions_matrix.tsv");
++            write_file(&path, write_wide)?;
++            println!(
++                "fasthelper: concatenated {} sample(s), up to {} position(s) -> {}",
++                samples.len(),
++                positions_count,
++                path.display()
++            );
+         }
+     }
+-
+-    let positions_count = samples
+-        .iter()
+-        .map(|s| s.rows.len())
+-        .max()
+-        .unwrap_or(0);
+-    if to_stdout {
+-        print!("{out}");
+-    } else {
+-        std::fs::create_dir_all(outdir)
+-            .with_context(|| format!("creating {}", outdir.display()))?;
+-        let path = outdir.join("positions_matrix.tsv");
+-        std::fs::write(&path, &out).with_context(|| format!("writing {}", path.display()))?;
+-        println!(
+-            "fasthelper: concatenated {} sample(s), up to {} position(s) -> {}",
+-            samples.len(),
+-            positions_count,
+-            path.display()
+-        );
+-    }
+     if skipped > 0 {
+         eprintln!(
+             "fasthelper: {} file(s) skipped (not positions tables)",
+diff --git a/tools/fasthelper/src/report.rs b/tools/fasthelper/src/report.rs
+index fa25e68..6e656c2 100644
+--- a/tools/fasthelper/src/report.rs
++++ b/tools/fasthelper/src/report.rs
+@@ -10,7 +10,12 @@
+ //!     report files) that predate the wrapper.
+ 
+ use anyhow::{Context, Result};
++use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
++use serde::Serialize;
++use std::borrow::Cow;
+ use std::collections::{BTreeMap, BTreeSet};
++use std::fmt;
++use std::io::{BufWriter, Write};
+ use std::path::{Path, PathBuf};
+ 
+ use crate::cli::ReportArgs;
+@@ -70,6 +75,10 @@ pub struct ToolReport {
+     pub source: PathBuf,
+     pub metrics: BTreeMap<String, f64>,
+     pub notes: Vec<String>,
++    /// True when this came from a `fastsuite.report.v1` wrapper. A v1 report
++    /// wins over a legacy/raw file describing the same (sample, tool): the
++    /// wrapper is the tool's own statement, the raw file a derivation of it.
++    pub from_v1: bool,
+ }
+ 
+ fn num(v: &serde_json::Value) -> Option<f64> {
+@@ -86,6 +95,13 @@ fn get_num(o: &serde_json::Value, key: &str) -> f64 {
+ 
+ /// Sample name from a path: file stem, unless that stem is a generic report
+ /// name — then the parent directory carries the sample identity.
++///
++/// A `fastsuite.report.v1` wrapper written *beside* its grid
++/// (`<stem>.report.json`, what `fastmaps --json <dir>/heatmap.json` leaves
++/// behind) inherits the grid's stem, so `heatmap.report` is tested as
++/// `heatmap`: generic, and the directory supplies the name. The strip is
++/// gated on the remainder being generic, so a library genuinely called
++/// `align.report` keeps its own name.
+ pub fn sample_from_path(path: &Path) -> String {
+     const GENERIC: &[&str] = &[
+         "report", "reports", "stats", "json", "out", "output", "heatmap", "fastprep",
+@@ -97,6 +113,10 @@ pub fn sample_from_path(path: &Path) -> String {
+         .and_then(|s| s.to_str())
+         .unwrap_or("sample")
+         .to_string();
++    let stem = match stem.strip_suffix(".report") {
++        Some(base) if GENERIC.contains(&base.to_ascii_lowercase().as_str()) => base.to_string(),
++        _ => stem,
++    };
+     if GENERIC.contains(&stem.to_ascii_lowercase().as_str()) {
+         // Walk up until a directory that is not itself a generic report name:
+         // runs/demo/<sample>/maps/heatmap.json must yield "<sample>", not "maps".
+@@ -118,20 +138,342 @@ pub fn sample_from_path(path: &Path) -> String {
+     stem
+ }
+ 
++// ------------------------------------------------------ fastmaps grid ----
++//
++// `heatmap.json` is a `size × size` raster of (T+C, T+G) counts plus metadata:
++// 140 KB at 151 bp against 3.9 KB for an ordinary report, one per sample. It
++// is read through a typed visitor rather than a `Value` tree, because the old
++// reader's cost was one enum construction per cell (22 801 per file). The five
++// corner sums and the total are accumulated in the same x-major order with the
++// same f64 operations as before, so every fraction stays bit-identical.
++
++/// Accumulator for one grid window: the five corner sums and the total.
++#[derive(Debug, Default, Clone, Copy)]
++struct WindowSums {
++    /// polyA, polyT, polyG, polyC, off-diagonal
++    corner: [f64; 5],
++    total: f64,
++    /// cells seen, including any past `size²`
++    cells: usize,
++    /// cells a complete window has
++    needed: usize,
++}
++
++impl WindowSums {
++    fn new(size: i64) -> Self {
++        Self {
++            needed: (size * size) as usize,
++            ..Self::default()
++        }
++    }
++
++    /// Fold one cell in, at linear index `i` (x-major: x = i % size,
++    /// y = i / size). The `n == 0.0` shortcut and the order of the five tests
++    /// are what keep the sums bit-identical to the previous reader.
++    fn push(&mut self, size: i64, c: i64, i: usize, n: f64) {
++        self.cells += 1;
++        if size <= 0 || i >= self.needed || n == 0.0 {
++            return;
++        }
++        let (x, y) = ((i as i64) % size, (i as i64) / size);
++        self.total += n;
++        let low_x = x <= c;
++        let high_x = x >= size - 1 - c;
++        let low_y = y <= c;
++        let high_y = y >= size - 1 - c;
++        if low_x && low_y {
++            self.corner[0] += n;
++        }
++        if high_x && high_y {
++            self.corner[1] += n;
++        }
++        if low_x && high_y {
++            self.corner[2] += n;
++        }
++        if high_x && low_y {
++            self.corner[3] += n;
++        }
++        if (x - y).abs() > size / 10 {
++            self.corner[4] += n;
++        }
++    }
++
++    /// A window shorter than the grid is not a measurement of that grid: the
++    /// previous reader skipped it entirely, and so does this one.
++    fn complete(&self) -> bool {
++        self.cells >= self.needed
++    }
++}
++
++/// One window: a bare array of counts (`counts`), or an object carrying one
++/// under a nested `counts` key. `bare_array` is false for `counts_r1`/
++/// `counts_r2`, which fastmaps writes as bare arrays — the previous reader
++/// looked for a nested key there and so never used them; that is preserved.
++struct WindowVisitor {
++    size: i64,
++    c: i64,
++    bare_array: bool,
++}
++
++impl<'de> Visitor<'de> for WindowVisitor {
++    type Value = Option<WindowSums>;
++
++    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("a grid of counts (an array, or an object with \"counts\")")
++    }
++
++    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
++        if !self.bare_array {
++            while seq.next_element::<IgnoredAny>()?.is_some() {}
++            return Ok(None);
++        }
++        let mut sums = WindowSums::new(self.size);
++        let mut i = 0usize;
++        while let Some(n) = seq.next_element::<f64>()? {
++            sums.push(self.size, self.c, i, n);
++            i += 1;
++        }
++        Ok(Some(sums))
++    }
++
++    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
++        let mut out = None;
++        while let Some(key) = map.next_key::<Cow<'_, str>>()? {
++            if key == "counts" {
++                out = map.next_value_seed(WindowSeed {
++                    size: self.size,
++                    c: self.c,
++                    bare_array: true,
++                })?;
++            } else {
++                map.next_value::<IgnoredAny>()?;
++            }
++        }
++        Ok(out)
++    }
++
++    fn visit_unit<E>(self) -> Result<Self::Value, E> {
++        Ok(None)
++    }
++    fn visit_none<E>(self) -> Result<Self::Value, E> {
++        Ok(None)
++    }
++    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
++        Ok(None)
++    }
++    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
++        Ok(None)
++    }
++    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
++        Ok(None)
++    }
++    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
++        Ok(None)
++    }
++    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
++        Ok(None)
++    }
++}
++
++struct WindowSeed {
++    size: i64,
++    c: i64,
++    bare_array: bool,
++}
++
++impl<'de> serde::de::DeserializeSeed<'de> for WindowSeed {
++    type Value = Option<WindowSums>;
++
++    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
++        d.deserialize_any(WindowVisitor {
++            size: self.size,
++            c: self.c,
++            bare_array: self.bare_array,
++        })
++    }
++}
++
++/// The keys of `heatmap.json` fasthelper uses. Everything else (`files`,
++/// `per_file_counts`, `data_row_offsets`, …) is skipped without being built.
++struct GridDoc {
++    size: Option<i64>,
++    total_reads: Option<f64>,
++    version: Option<f64>,
++    /// windows in metric order: all, r1, r2
++    windows: [Option<WindowSums>; 3],
++    /// `counts` numbers buffered because `size` had not been seen yet — JSON
++    /// object order is not guaranteed, so a grid may list them in any order.
++    deferred: [Option<Vec<f64>>; 3],
++    has_counts: bool,
++}
++
++impl Default for GridDoc {
++    fn default() -> Self {
++        Self {
++            size: None,
++            total_reads: None,
++            version: None,
++            windows: [None, None, None],
++            deferred: [None, None, None],
++            has_counts: false,
++        }
++    }
++}
++
++fn read_window<'de, A: MapAccess<'de>>(
++    map: &mut A,
++    doc: &mut GridDoc,
++    idx: usize,
++    top_level: bool,
++) -> Result<(), A::Error> {
++    match doc.size.filter(|s| *s > 0) {
++        Some(size) => {
++            let c = (size / 50).max(2); // corner window: 2% of the read length
++            doc.windows[idx] = map.next_value_seed(WindowSeed {
++                size,
++                c,
++                bare_array: top_level,
++            })?;
++        }
++        None if top_level => {
++            doc.deferred[idx] = Some(map.next_value::<Vec<f64>>()?);
++        }
++        None => {
++            map.next_value::<IgnoredAny>()?;
++        }
++    }
++    Ok(())
++}
++
++impl<'de> Deserialize<'de> for GridDoc {
++    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
++        d.deserialize_map(GridDocVisitor)
++    }
++}
++
++struct GridDocVisitor;
++
++impl<'de> Visitor<'de> for GridDocVisitor {
++    type Value = GridDoc;
++
++    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("a fastmaps heatmap object")
++    }
++
++    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<GridDoc, A::Error> {
++        let mut doc = GridDoc::default();
++        while let Some(key) = map.next_key::<Cow<'_, str>>()? {
++            match key.as_ref() {
++                "size" => doc.size = Some(map.next_value::<f64>()? as i64),
++                "total_reads" => doc.total_reads = Some(map.next_value::<f64>()?),
++                "version" => doc.version = Some(map.next_value::<f64>()?),
++                "counts" => {
++                    doc.has_counts = true;
++                    read_window(&mut map, &mut doc, 0, true)?;
++                }
++                "counts_r1" => read_window(&mut map, &mut doc, 1, false)?,
++                "counts_r2" => read_window(&mut map, &mut doc, 2, false)?,
++                _ => {
++                    map.next_value::<IgnoredAny>()?;
++                }
++            }
++        }
++        Ok(doc)
++    }
++}
++
++impl GridDoc {
++    /// `counts` and `size` both present: this is a grid, not some other JSON
++    /// object that happens to carry a `counts` key.
++    fn is_grid(&self) -> bool {
++        self.has_counts && self.size.is_some()
++    }
++
++    fn into_report(mut self, sample: String, path: &Path) -> ToolReport {
++        self.fold_deferred();
++        let size = self.size.unwrap_or(0);
++        let mut metrics = BTreeMap::new();
++        metrics.insert("total_reads".into(), self.total_reads.unwrap_or(0.0));
++        metrics.insert("grid_size".into(), size as f64);
++        for (idx, label) in ["all", "r1", "r2"].into_iter().enumerate() {
++            let Some(w) = self.windows[idx] else { continue };
++            if !w.complete() || w.total == 0.0 {
++                continue;
++            }
++            let p = |n: f64| n / w.total;
++            let pre = if label == "all" {
++                String::new()
++            } else {
++                format!("{label}_")
++            };
++            metrics.insert(format!("{pre}polyA_frac"), p(w.corner[0]));
++            metrics.insert(format!("{pre}polyT_frac"), p(w.corner[1]));
++            metrics.insert(format!("{pre}polyG_frac"), p(w.corner[2]));
++            metrics.insert(format!("{pre}polyC_frac"), p(w.corner[3]));
++            metrics.insert(format!("{pre}off_diagonal_frac"), p(w.corner[4]));
++            if label == "all" {
++                metrics.insert("total_reads".into(), w.total);
++            }
++        }
++        ToolReport {
++            sample,
++            tool: "fastmaps".into(),
++            version: self.version.map(|n| format!("grid v{n}")),
++            source: path.to_path_buf(),
++            metrics,
++            notes: Vec::new(),
++            from_v1: false,
++        }
++    }
++
++    /// Fold a `counts` array that arrived before `size` into its window.
++    fn fold_deferred(&mut self) {
++        let Some(size) = self.size.filter(|s| *s > 0) else {
++            return;
++        };
++        let c = (size / 50).max(2);
++        let deferred = std::mem::replace(&mut self.deferred, [None, None, None]);
++        for (idx, cells) in deferred.into_iter().enumerate() {
++            if let Some(cells) = cells {
++                let mut sums = WindowSums::new(size);
++                for (i, n) in cells.into_iter().enumerate() {
++                    sums.push(size, c, i, n);
++                }
++                self.windows[idx] = Some(sums);
++            }
++        }
++    }
++}
++
+ /// Normalise one JSON file. Returns Ok(None) when the file is not a report we
+-/// recognise (caller decides whether that is worth a warning).
++/// recognise (caller decides whether that is a warning).
+ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolReport>> {
+     let text = std::fs::read_to_string(path)
+         .with_context(|| format!("reading {}", path.display()))?;
++    let sample = sample_hint
++        .map(str::to_string)
++        .unwrap_or_else(|| sample_from_path(path));
++    // A fastmaps grid is 36× the bytes of an ordinary report and every sample
++    // gets one, so it is read through a typed visitor instead of a `Value`
++    // tree (one enum construction per cell used to be the cost). The `Value`
++    // branch further down still handles any grid this reader cannot claim.
++    if text.contains("\"counts\"") {
++        if let Ok(doc) = serde_json::from_str::<GridDoc>(&text) {
++            if doc.is_grid() {
++                return Ok(Some(doc.into_report(sample, path)));
++            }
++        }
++    }
+     let v: serde_json::Value = match serde_json::from_str(&text) {
+         Ok(v) => v,
+         Err(e) => return Ok(Some(ToolReport {
+-            sample: sample_hint.map(str::to_string).unwrap_or_else(|| sample_from_path(path)),
++            sample,
+             tool: "unparsable".into(),
+             version: None,
+             source: path.to_path_buf(),
+             metrics: BTreeMap::new(),
+             notes: vec![format!("not valid JSON: {e}")],
++            from_v1: false,
+         })),
+     };
+     if !v.is_object() {
+@@ -146,9 +488,6 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
+     {
+         return Ok(None);
+     }
+-    let sample = sample_hint
+-        .map(str::to_string)
+-        .unwrap_or_else(|| sample_from_path(path));
+ 
+     // --- canonical v1 wrapper ---
+     if v.get("schema").and_then(|s| s.as_str()) == Some(SCHEMA_VERSION) {
+@@ -186,6 +525,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
+             source: path.to_path_buf(),
+             metrics,
+             notes: Vec::new(),
++            from_v1: true,
+         }));
+     }
+ 
+@@ -261,6 +601,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
+             source: path.to_path_buf(),
+             metrics,
+             notes: Vec::new(),
++            from_v1: false,
+         }));
+     }
+ 
+@@ -333,6 +674,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
+             source: path.to_path_buf(),
+             metrics,
+             notes: vec!["legacy raw stats (no schema wrapper)".into()],
++            from_v1: false,
+         }));
+     }
+ 
+@@ -359,6 +701,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
+         source: path.to_path_buf(),
+         metrics: numeric,
+         notes: vec!["unrecognised schema: top-level numbers only".into()],
++        from_v1: false,
+     }))
+ }
+ 
+@@ -411,21 +754,36 @@ pub fn collect(inputs: &[PathBuf], sample: Option<&str>) -> Result<Vec<ToolRepor
+             Err(e) => eprintln!("fasthelper: skipping {}: {e}", f.display()),
+         }
+     }
++    // One measurement, one row: a `fastsuite.report.v1` wrapper and the raw
++    // file it was derived from (fastmaps' grid beside its `<stem>.report.json`)
++    // describe the same (sample, tool). Keep the v1 report — it is the tool's
++    // own statement — and drop the derivation, so nothing double-counts.
++    let v1: BTreeSet<(String, String)> = reports
++        .iter()
++        .filter(|r| r.from_v1)
++        .map(|r| (r.sample.clone(), r.tool.clone()))
++        .collect();
++    if !v1.is_empty() {
++        reports.retain(|r| r.from_v1 || !v1.contains(&(r.sample.clone(), r.tool.clone())));
++    }
+     Ok(reports)
+ }
+ 
+ /// Wide metric matrix: one row per (sample, tool), union of metric columns.
+-pub struct Matrix {
+-    pub columns: Vec<String>,
+-    pub rows: Vec<(String, String, BTreeMap<String, f64>)>,
++///
++/// Borrowed, not cloned: at 10 k samples the owned copy cost ~61 MB of row
++/// maps that existed only to be printed once.
++pub struct Matrix<'a> {
++    pub columns: Vec<&'a str>,
++    pub rows: Vec<(&'a str, &'a str, &'a BTreeMap<String, f64>)>,
+ }
+ 
+-pub fn build_matrix(reports: &[ToolReport]) -> Matrix {
+-    let mut columns: BTreeSet<String> = BTreeSet::new();
+-    let mut rows: Vec<(String, String, BTreeMap<String, f64>)> = Vec::new();
++pub fn build_matrix(reports: &[ToolReport]) -> Matrix<'_> {
++    let mut columns: BTreeSet<&str> = BTreeSet::new();
++    let mut rows: Vec<(&str, &str, &BTreeMap<String, f64>)> = Vec::with_capacity(reports.len());
+     for r in reports {
+-        columns.extend(r.metrics.keys().cloned());
+-        rows.push((r.sample.clone(), r.tool.clone(), r.metrics.clone()));
++        columns.extend(r.metrics.keys().map(|k| k.as_str()));
++        rows.push((r.sample.as_str(), r.tool.as_str(), &r.metrics));
+     }
+     Matrix {
+         columns: columns.into_iter().collect(),
+@@ -445,26 +803,35 @@ fn fmt_val(v: f64) -> String {
+     }
+ }
+ 
+-pub fn matrix_tsv(m: &Matrix) -> String {
+-    let mut s = String::from("sample\ttool");
++/// Write the wide matrix as TSV. Streaming: the 10 k table is 2 MB of cells
++/// looked up in a borrowed row, so nothing but the 8 KB buffer is held.
++pub fn write_matrix_tsv<W: Write>(w: &mut W, m: &Matrix<'_>) -> std::io::Result<()> {
++    w.write_all(b"sample\ttool")?;
+     for c in &m.columns {
+-        s.push('\t');
+-        s.push_str(c);
++        w.write_all(b"\t")?;
++        w.write_all(c.as_bytes())?;
+     }
+-    s.push('\n');
++    w.write_all(b"\n")?;
+     for (sample, tool, metrics) in &m.rows {
+-        s.push_str(sample);
+-        s.push('\t');
+-        s.push_str(tool);
++        w.write_all(sample.as_bytes())?;
++        w.write_all(b"\t")?;
++        w.write_all(tool.as_bytes())?;
+         for c in &m.columns {
+-            s.push('\t');
+-            if let Some(v) = metrics.get(c) {
+-                s.push_str(&fmt_val(*v));
++            w.write_all(b"\t")?;
++            if let Some(v) = metrics.get(*c) {
++                write!(w, "{}", fmt_val(*v))?;
+             }
+         }
+-        s.push('\n');
++        w.write_all(b"\n")?;
+     }
+-    s
++    Ok(())
++}
++
++/// In-memory convenience wrapper over [`write_matrix_tsv`] (tests, compare).
++pub fn matrix_tsv(m: &Matrix<'_>) -> String {
++    let mut buf = Vec::new();
++    write_matrix_tsv(&mut buf, m).expect("writing a TSV into a Vec cannot fail");
++    String::from_utf8(buf).expect("fmt_val and the header are ASCII")
+ }
+ 
+ pub fn matrix_md(reports: &[ToolReport]) -> String {
+@@ -611,50 +978,99 @@ code{{background:#f2f3f5;padding:0 .25rem;border-radius:3px}}\
+     out
+ }
+ 
+-pub fn render_json(title: &str, reports: &[ToolReport]) -> String {
+-    let samples: Vec<serde_json::Value> = reports
++/// One report as it appears inside the aggregate document. Field order is
++/// declaration order, and it is alphabetical — the aggregate is a `BTreeMap`
++/// document today and its bytes are part of the contract.
++#[derive(Serialize)]
++struct JsonRow<'a> {
++    metrics: &'a BTreeMap<String, f64>,
++    notes: &'a [String],
++    sample: &'a str,
++    source: Cow<'a, str>,
++    tool: &'a str,
++    tool_version: Option<&'a str>,
++}
++
++#[derive(Serialize)]
++struct JsonDoc<'a> {
++    generator: &'a str,
++    generator_version: &'a str,
++    reports: Vec<JsonRow<'a>>,
++    schema: &'a str,
++    title: &'a str,
++}
++
++/// Serialise the aggregate straight into `w`, borrowing the reports.
++///
++/// The document used to be a `serde_json::Value` tree plus one pretty `String`
++/// before the first byte reached the file: at 10 k samples (20 k reports) that
++/// peaked at 273 MB of RSS for a 23 MB file, ~20 k objects each with ~30 key
++/// `String`s. Only the 20 k-row view below is built now, and the buffer belongs
++/// to the caller's `BufWriter`.
++pub fn write_json<W: Write>(w: &mut W, title: &str, reports: &[ToolReport]) -> Result<()> {
++    let rows: Vec<JsonRow<'_>> = reports
+         .iter()
+-        .map(|r| {
+-            serde_json::json!({
+-                "sample": r.sample,
+-                "tool": r.tool,
+-                "tool_version": r.version,
+-                "source": r.source.to_string_lossy(),
+-                "metrics": r.metrics,
+-                "notes": r.notes,
+-            })
++        .map(|r| JsonRow {
++            metrics: &r.metrics,
++            notes: &r.notes,
++            sample: &r.sample,
++            source: r.source.to_string_lossy(),
++            tool: &r.tool,
++            tool_version: r.version.as_deref(),
+         })
+         .collect();
+-    let doc = serde_json::json!({
+-        "schema": SCHEMA_VERSION,
+-        "generator": "fasthelper",
+-        "generator_version": env!("CARGO_PKG_VERSION"),
+-        "title": title,
+-        "reports": samples,
+-    });
+-    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()) + "\n"
++    let doc = JsonDoc {
++        generator: "fasthelper",
++        generator_version: env!("CARGO_PKG_VERSION"),
++        reports: rows,
++        schema: SCHEMA_VERSION,
++        title,
++    };
++    serde_json::to_writer_pretty(&mut *w, &doc).context("serialising report.json")?;
++    w.write_all(b"\n")?;
++    Ok(())
+ }
+ 
+ /// Write the aggregate report in the requested formats. Returns written paths.
++///
++/// Every format is streamed into its own `BufWriter`; `matrix` is the wide
++/// table built once by the caller (so `--stdout` does not build it twice).
+ pub fn write_reports(
+     title: &str,
+     reports: &[ToolReport],
+     outdir: &Path,
+     formats: &[String],
++    matrix: Option<&Matrix<'_>>,
+ ) -> Result<Vec<PathBuf>> {
+     std::fs::create_dir_all(outdir)
+         .with_context(|| format!("creating {}", outdir.display()))?;
+     let mut written = Vec::new();
++    let mut owned_matrix: Option<Matrix<'_>> = None;
+     for f in formats {
+-        let (name, body) = match f.trim() {
+-            "json" => ("report.json", render_json(title, reports)),
+-            "tsv" => ("report.tsv", matrix_tsv(&build_matrix(reports))),
+-            "md" => ("report.md", matrix_md(reports)),
+-            "html" => ("report.html", render_html(title, reports)),
++        let name = match f.trim() {
++            "json" => "report.json",
++            "tsv" => "report.tsv",
++            "md" => "report.md",
++            "html" => "report.html",
+             other => anyhow::bail!("unknown format '{other}' (json,tsv,md,html)"),
+         };
+         let path = outdir.join(name);
+-        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
++        let file = std::fs::File::create(&path)
++            .with_context(|| format!("creating {}", path.display()))?;
++        let mut w = BufWriter::new(file);
++        match f.trim() {
++            "json" => write_json(&mut w, title, reports)?,
++            "tsv" => {
++                if matrix.is_none() && owned_matrix.is_none() {
++                    owned_matrix = Some(build_matrix(reports));
++                }
++                write_matrix_tsv(&mut w, matrix.or(owned_matrix.as_ref()).expect("built above"))?;
++            }
++            "md" => w.write_all(matrix_md(reports).as_bytes())?,
++            _ => w.write_all(render_html(title, reports).as_bytes())?,
++        }
++        w.flush()
++            .with_context(|| format!("writing {}", path.display()))?;
+         written.push(path);
+     }
+     Ok(written)
+@@ -777,7 +1193,14 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
+     }
+     let formats: Vec<String> = a.format.split(',').map(|s| s.trim().to_string()).collect();
+     let title = "FastSuite report";
+-    let written = write_reports(title, &reports, &a.outdir, &formats)?;
++    // Built once: the TSV writer and --stdout are the same table, and the
++    // matrix borrows the reports instead of cloning them.
++    let matrix = if a.stdout || formats.iter().any(|f| f == "tsv") {
++        Some(build_matrix(&reports))
++    } else {
++        None
++    };
++    let written = write_reports(title, &reports, &a.outdir, &formats, matrix.as_ref())?;
+     if !a.fail_on.is_empty() {
+         let thresholds: Vec<Threshold> = a
+             .fail_on
+@@ -797,7 +1220,11 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
+         }
+     }
+     if a.stdout {
+-        print!("{}", matrix_tsv(&build_matrix(&reports)));
++        let stdout = std::io::stdout();
++        let mut w = BufWriter::new(stdout.lock());
++        write_matrix_tsv(&mut w, matrix.as_ref().expect("built when --stdout"))
++            .context("printing report.tsv")?;
++        w.flush()?;
+     }
+     println!(
+         "fasthelper: concatenated {} report(s) from {} sample(s) -> {}",
+diff --git a/tools/fasthelper/src/runner.rs b/tools/fasthelper/src/runner.rs
+index 790bda4..886a10d 100644
+--- a/tools/fasthelper/src/runner.rs
++++ b/tools/fasthelper/src/runner.rs
+@@ -132,6 +132,7 @@ fn run_sample(
+     threads: usize,
+     guard: &Policy,
+     resume: &BTreeMap<String, ResumeEntry>,
++    versions: &BTreeMap<String, Option<String>>,
+     from: Option<&str>,
+ ) -> Result<SampleOutcome> {
+     let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
+@@ -274,13 +275,16 @@ fn run_sample(
+             from_reached = true;
+         }
+         let key = format!("{}/{}", sample.name, tool);
++        // Resolved once per run (see resolve_versions): a version string cannot
++        // change inside one run, and it used to fork once per sample per step.
++        let version = versions.get(tool.as_str()).cloned().flatten();
+         if !forced && !from_reached {
+             if let Some(prev) = resume.get(&key) {
+                 let inputs_match = prev.inputs == cur_sig;
+                 let outputs_present = expect_outputs.iter().all(|p| p.is_file());
+                 if prev.argv == argv
+                     && prev.binary == s(&bin)
+-                    && prev.version == tool_version(&bin)
++                    && prev.version == version
+                     && inputs_match
+                     && outputs_present
+                 {
+@@ -345,7 +349,7 @@ fn run_sample(
+                 "exit": outcome.exit,
+                 "elapsed_s": outcome.elapsed,
+                 "log": s(&outcome.log),
+-                "tool_version": tool_version(&bin),
++                "tool_version": version.clone(),
+                 "inputs": inputs_json(&cur_sig),
+             }),
+         ));
+@@ -482,6 +486,24 @@ fn tool_version(bin: &Path) -> Option<String> {
+         .map(|s| s.trim().to_string())
+ }
+ 
++/// `--version` for every tool the run will use, resolved once.
++///
++/// A version string cannot change inside one run, and the value is needed both
++/// by the resume comparison and by every manifest entry: resolving it at the
++/// call site forked once per sample per step (30 000 forks ≈ 25 s at 10 k
++/// samples, paid on `--dry-run` too).
++fn resolve_versions(cfg: &Config, ts: &ToolSet) -> BTreeMap<String, Option<String>> {
++    let mut out: BTreeMap<String, Option<String>> = BTreeMap::new();
++    for tool in &cfg.run.steps {
++        if !cfg.step(tool).enabled || out.contains_key(tool.as_str()) {
++            continue;
++        }
++        let version = ts.get(tool).map(|bin| tool_version(bin)).unwrap_or(None);
++        out.insert(tool.clone(), version);
++    }
++    out
++}
++
+ /// What a previous run recorded for one `sample/tool` step: the argv it ran,
+ /// the binary path, that binary's `--version` AT THE TIME, and the identity
+ /// (size + mtime) of each input it consumed. A step is only resumed when all of
+@@ -704,6 +726,8 @@ pub fn run(args: &RunArgs) -> Result<()> {
+         );
+     }
+ 
++    let versions = resolve_versions(&cfg, &ts);
++
+     let guard = Policy {
+         enabled: !args.no_adapter_guard,
+         threshold: args.adapter_residual_threshold,
+@@ -832,6 +856,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
+                     per_sample_threads,
+                     &guard,
+                     &resume,
++                    &versions,
+                     args.from.as_deref(),
+                 ) {
+                     Ok(mut o) => {
+@@ -924,7 +949,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
+     let reports = report::collect(&[outdir.clone()], None)?;
+     let formats: Vec<String> = vec!["json".into(), "tsv".into(), "md".into(), "html".into()];
+     let title = format!("FastSuite report — {}", cfg.run.name);
+-    let written = report::write_reports(&title, &reports, &outdir, &formats)?;
++    let written = report::write_reports(&title, &reports, &outdir, &formats, None)?;
+     println!(
+         "fasthelper: {} report(s) aggregated -> {}",
+         reports.len(),
+diff --git a/tools/fasthelper/tests/adapters.rs b/tools/fasthelper/tests/adapters.rs
+index b5e3a05..e624b98 100644
+--- a/tools/fasthelper/tests/adapters.rs
++++ b/tools/fasthelper/tests/adapters.rs
+@@ -4,7 +4,9 @@
+ use std::collections::BTreeMap;
+ use std::path::{Path, PathBuf};
+ 
+-use fasthelper::report::{adapt_file, build_matrix, matrix_tsv, sample_from_path, ToolReport};
++use fasthelper::report::{
++    adapt_file, build_matrix, collect, matrix_tsv, sample_from_path, write_json, ToolReport,
++};
+ 
+ fn tmp(name: &str) -> PathBuf {
+     let dir = std::env::temp_dir().join(format!("fasthelper_test_{}_{}", std::process::id(), name));
+@@ -170,6 +172,7 @@ fn matrix_has_one_row_per_sample_tool_pair_and_union_columns() {
+         source: PathBuf::from("x.json"),
+         metrics: BTreeMap::from([(k.to_string(), v)]),
+         notes: vec![],
++        from_v1: true,
+     };
+     let reports = vec![
+         mk("A", "fastdedup", "reads_in", 10.0),
+@@ -182,3 +185,281 @@ fn matrix_has_one_row_per_sample_tool_pair_and_union_columns() {
+     assert_eq!(lines[0], "sample\ttool\treads_in\treads_out");
+     assert!(tsv.contains("A\tfastprep\t\t9"));
+ }
++
++// ---------------------------------------------------------------- FH-1 ----
++
++/// A grid exactly as `fastmaps -o <dir> …` writes it (counts + metadata).
++fn write_grid(path: &Path, size: u64) {
++    let mut counts = vec![0u64; (size * size) as usize];
++    counts[0] = 4;
++    counts[(size * size - 1) as usize] = 2;
++    let doc = serde_json::json!({
++        "version": 2,
++        "size": size,
++        "files": ["r1.fastq.gz", "r2.fastq.gz"],
++        "file_kinds": {"r1": 1, "r2": 1},
++        "total_reads": 6,
++        "per_file_counts": [4, 2],
++        "preview_reads_per_pixel": 1,
++        "counts": counts,
++        "counts_r1": counts,
++        "counts_r2": counts,
++        "data_row_offsets": [0],
++        "preview_row_offsets": [0],
++    });
++    std::fs::write(path, serde_json::to_string(&doc).unwrap()).unwrap();
++}
++
++/// The v1 wrapper `fastmaps --json <dir>/heatmap.json` leaves beside the grid
++/// (`format.rs`: `<stem>.report.json`).
++fn write_maps_wrapper(path: &Path) {
++    let doc = serde_json::json!({
++        "schema": "fastsuite.report.v1",
++        "tool": "fastmaps",
++        "tool_version": "0.1.0",
++        "mode": "composition",
++        "elapsed_s": 0.06,
++        "inputs": {"files": ["r1.fastq.gz", "r2.fastq.gz"]},
++        "metrics": {
++            "no_call_reads": 0,
++            "off_diagonal_frac": 0.111275,
++            "polyA_frac": 0.001175,
++            "polyC_frac": 0.0,
++            "polyG_frac": 0.0,
++            "polyT_frac": 0.0,
++            "total_reads": 6
++        }
++    });
++    std::fs::write(path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
++}
++
++#[test]
++fn fastmaps_wrapper_beside_its_grid_is_not_a_phantom_sample() {
++    // FH-1 regression: `fastmaps --json <sample>/maps/heatmap.json` writes the
++    // grid AND `<sample>/maps/heatmap.report.json`. Only an exact stem was
++    // tested against GENERIC, so `heatmap.report` became a sample name: both
++    // libraries collapsed into one phantom sample and each appeared twice.
++    let root = tmp("fh1_phantom");
++    let _ = std::fs::remove_dir_all(&root);
++    for sample in ["alpha", "beta"] {
++        let maps = root.join(sample).join("maps");
++        std::fs::create_dir_all(&maps).unwrap();
++        write_grid(&maps.join("heatmap.json"), 4);
++        write_maps_wrapper(&maps.join("heatmap.report.json"));
++    }
++
++    // The name resolution itself: the `.report` suffix is stripped before the
++    // GENERIC test, so the directory carries the identity — but only when the
++    // stripped stem is generic (a library named `align.report` keeps its name).
++    assert_eq!(
++        sample_from_path(Path::new("run/alpha/maps/heatmap.report.json")),
++        "alpha"
++    );
++    assert_eq!(
++        sample_from_path(Path::new("libs/align.report.json")),
++        "align.report"
++    );
++
++    let reports = collect(&[root.clone()], None).unwrap();
++    let rows: Vec<(String, String)> = reports
++        .iter()
++        .map(|r| (r.sample.clone(), r.tool.clone()))
++        .collect();
++    assert_eq!(
++        rows,
++        vec![
++            ("alpha".to_string(), "fastmaps".to_string()),
++            ("beta".to_string(), "fastmaps".to_string())
++        ],
++        "one row per (sample, tool) — the grid must not survive beside its wrapper"
++    );
++    // The survivor is the v1 wrapper: it carries the tool version and the
++    // metrics only the wrapper knows (`grid_size` is the grid adapter's).
++    for r in &reports {
++        assert!(r.from_v1, "the v1 report must win the dedup: {r:?}");
++        assert_eq!(r.version.as_deref(), Some("0.1.0"));
++        assert_eq!(r.metrics["total_reads"], 6.0);
++        assert!(r.metrics.contains_key("no_call_reads"), "{:?}", r.metrics);
++        assert!(!r.metrics.contains_key("grid_size"), "{:?}", r.metrics);
++    }
++}
++
++// ---------------------------------------------------------------- FH-5 ----
++
++/// The pre-streaming reader, verbatim, as an oracle: x-major accumulation,
++/// `n == 0.0` shortcut, pitch as f64.
++fn reference_grid_metrics(
++    size: i64,
++    counts: &[u64],
++    header_total: f64,
++) -> BTreeMap<String, f64> {
++    let mut metrics = BTreeMap::new();
++    metrics.insert("total_reads".to_string(), header_total);
++    metrics.insert("grid_size".to_string(), size as f64);
++    let c = (size / 50).max(2);
++    if counts.len() < (size * size) as usize {
++        return metrics;
++    }
++    let (mut poly_a, mut poly_t, mut poly_g, mut poly_c, mut off_diag) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
++    let mut total = 0.0f64;
++    for y in 0..size {
++        for x in 0..size {
++            let n = counts[(y * size + x) as usize] as f64;
++            if n == 0.0 {
++                continue;
++            }
++            total += n;
++            let low_x = x <= c;
++            let high_x = x >= size - 1 - c;
++            let low_y = y <= c;
++            let high_y = y >= size - 1 - c;
++            if low_x && low_y {
++                poly_a += n;
++            }
++            if high_x && high_y {
++                poly_t += n;
++            }
++            if low_x && high_y {
++                poly_g += n;
++            }
++            if high_x && low_y {
++                poly_c += n;
++            }
++            if (x - y).abs() > size / 10 {
++                off_diag += n;
++            }
++        }
++    }
++    if total == 0.0 {
++        return metrics;
++    }
++    let p = |n: f64| n / total;
++    metrics.insert("polyA_frac".to_string(), p(poly_a));
++    metrics.insert("polyT_frac".to_string(), p(poly_t));
++    metrics.insert("polyG_frac".to_string(), p(poly_g));
++    metrics.insert("polyC_frac".to_string(), p(poly_c));
++    metrics.insert("off_diagonal_frac".to_string(), p(off_diag));
++    metrics.insert("total_reads".to_string(), total);
++    metrics
++}
++
++#[test]
++fn streamed_grid_matches_the_value_based_reference_bit_for_bit() {
++    // Every cell of a raster is visited in the same order and the same f64
++    // operations are applied, so the fractions must be equal — not "close".
++    let size = 151i64;
++    let mut counts = vec![0u64; (size * size) as usize];
++    let mut seed = 12345u64;
++    for (i, c) in counts.iter_mut().enumerate() {
++        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
++        let r = (seed >> 33) as u64 % 97;
++        // Sparse, like a real heatmap: most cells are empty.
++        *c = if r < 3 { r * 7 + (i % 5) as u64 } else { 0 };
++    }
++    counts[0] = 11;
++    counts[(size * size - 1) as usize] = 13;
++    let header_total: u64 = counts.iter().sum();
++
++    let doc = serde_json::json!({
++        "version": 2,
++        "size": size,
++        "total_reads": header_total,
++        "counts": counts,
++    });
++    let path = tmp("fh5_grid").join("heatmap.json");
++    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
++
++    let r = adapt_file(&path, None).unwrap().unwrap();
++    assert_eq!(r.metrics, reference_grid_metrics(size, &counts, header_total as f64));
++    assert_eq!(r.version.as_deref(), Some("grid v2"));
++}
++
++#[test]
++fn streamed_grid_keeps_short_windows_and_key_order_independent() {
++    // `counts_r1`/`counts_r2` are bare arrays in fastmaps' output, which the
++    // reader has always ignored (it looks for a nested "counts" key); a window
++    // shorter than size*size contributes nothing at all.
++    let size = 5i64;
++    let full: Vec<u64> = (0..(size * size)).map(|i| (i % 3) as u64).collect();
++    let short: Vec<u64> = full[..3].to_vec();
++    // `counts` BEFORE `size`: the reader must not depend on field order.
++    let json = format!(
++        "{{\"counts\": {}, \"counts_r1\": {}, \"total_reads\": 9, \"size\": {size}, \"version\": 3}}",
++        serde_json::to_string(&full).unwrap(),
++        serde_json::to_string(&short).unwrap(),
++    );
++    let path = tmp("fh5_order").join("heatmap.json");
++    std::fs::write(&path, json).unwrap();
++
++    let r = adapt_file(&path, None).unwrap().unwrap();
++    assert_eq!(r.metrics, reference_grid_metrics(size, &full, 9.0));
++    assert!(
++        !r.metrics.contains_key("r1_polyA_frac"),
++        "a bare counts_r1 array is not a window: {:?}",
++        r.metrics
++    );
++}
++
++// ---------------------------------------------------------------- FH-3 ----
++
++#[test]
++fn streamed_report_json_is_byte_identical_to_the_value_tree() {
++    // The streaming writer must reproduce the `serde_json::Value` +
++    // `to_string_pretty` document exactly, including the alphabetical key
++    // order that a `json!` BTreeMap gives for free.
++    let reports = vec![
++        ToolReport {
++            sample: "A".into(),
++            tool: "fastcheck".into(),
++            version: Some("0.1.0".into()),
++            source: PathBuf::from("/tmp/a fastcheck.json"),
++            metrics: BTreeMap::from([
++                ("reads_in".to_string(), 10.0),
++                ("gc_fraction".to_string(), 0.4125),
++                ("huge".to_string(), 1.0e300),
++                ("negzero".to_string(), -0.0),
++                ("integral".to_string(), 40000.0),
++                ("nan".to_string(), f64::NAN),
++            ]),
++            notes: vec!["a note".into()],
++            from_v1: true,
++        },
++        ToolReport {
++            sample: "B".into(),
++            tool: "fastprep".into(),
++            version: None,
++            source: PathBuf::from("b.json"),
++            metrics: BTreeMap::new(),
++            notes: vec![],
++            from_v1: false,
++        },
++    ];
++    let expected = {
++        let samples: Vec<serde_json::Value> = reports
++            .iter()
++            .map(|r| {
++                serde_json::json!({
++                    "sample": r.sample,
++                    "tool": r.tool,
++                    "tool_version": r.version,
++                    "source": r.source.to_string_lossy(),
++                    "metrics": r.metrics,
++                    "notes": r.notes,
++                })
++            })
++            .collect();
++        serde_json::to_string_pretty(&serde_json::json!({
++            "schema": fasthelper::report::SCHEMA_VERSION,
++            "generator": "fasthelper",
++            "generator_version": env!("CARGO_PKG_VERSION"),
++            "title": "T",
++            "reports": samples,
++        }))
++        .unwrap()
++            + "\n"
++    };
++    let mut out = Vec::new();
++    write_json(&mut out, "T", &reports).unwrap();
++    assert_eq!(String::from_utf8(out).unwrap(), expected);
++}
++
+diff --git a/tools/fasthelper/tests/cli.rs b/tools/fasthelper/tests/cli.rs
+index f0af5e4..c137f7b 100644
+--- a/tools/fasthelper/tests/cli.rs
++++ b/tools/fasthelper/tests/cli.rs
+@@ -867,3 +867,257 @@ fn manifest_keeps_entries_from_a_previous_run() {
+     );
+     assert_eq!(tools.iter().filter(|t| **t == "fastdedup").count(), 1, "{man}");
+ }
++
++// ---------------------------------------------------------------- FH-2 ----
++
++#[test]
++fn check_refuses_duplicate_sample_names() {
++    // FH-2 regression: two [[samples]] entries with the same name were taken
++    // verbatim, yet the work dir and the resume key derive from the name alone
++    // (runner.rs) — both workers created, unlinked and wrote the same paths.
++    // The validator meant to catch this class passed it with exit 0.
++    let d = tmpdir("fh2_dup");
++    let a = d.join("a_R1.fastq");
++    let b = d.join("b_R1.fastq");
++    std::fs::write(&a, "@r1\nACGT\n+\nIIII\n").unwrap();
++    std::fs::write(&b, "@r1\nACGT\n+\nIIII\n").unwrap();
++    let cfg = d.join("dup.toml");
++    std::fs::write(
++        &cfg,
++        format!(
++            "[run]\nname = \"dup\"\nsteps = []\n\n[[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n\n\
++             [[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n",
++            a.display(),
++            b.display()
++        ),
++    )
++    .unwrap();
++
++    let (_, stderr, code) = run(&["check", "-c", cfg.to_str().unwrap()]);
++    assert_ne!(code, 0, "a duplicate sample name must fail: {stderr}");
++    assert!(
++        stderr.contains("duplicate sample name") && stderr.contains("lib1"),
++        "the refusal must name the duplicate: {stderr}"
++    );
++
++    // The same config with distinct names still validates: the new check must
++    // not reject anything that was legitimately valid.
++    let ok = d.join("ok.toml");
++    std::fs::write(
++        &ok,
++        format!(
++            "[run]\nname = \"ok\"\nsteps = []\n\n[[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n\n\
++             [[samples]]\nname = \"lib2\"\nr1 = \"{}\"\n",
++            a.display(),
++            b.display()
++        ),
++    )
++    .unwrap();
++    let (_, stderr, code) = run(&["check", "-c", ok.to_str().unwrap()]);
++    assert_eq!(code, 0, "distinct names must stay valid: {stderr}");
++}
++
++#[test]
++fn check_still_accepts_the_repo_example_config() {
++    // The duplicate-name refusal must not change the verdict on the config the
++    // repo ships: `examples/fastsuite.toml` (simulate-only, three steps).
++    for tool in ["fastcheck", "fastdedup", "fastprep"] {
++        require_tool(tool);
++    }
++    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("../..")
++        .join("examples/fastsuite.toml");
++    let (stdout, stderr, code) = run(&[
++        "check",
++        "-c",
++        example.to_str().unwrap(),
++        "--tools-dir",
++        tools_dir().to_str().unwrap(),
++    ]);
++    assert_eq!(code, 0, "examples/fastsuite.toml must validate: {stderr}");
++    assert!(
++        stdout.contains("OK") && !stderr.contains("duplicate"),
++        "{stdout}{stderr}"
++    );
++}
++
++// ---------------------------------------------------------------- FH-3 ----
++
++#[test]
++fn report_json_keeps_its_alphabetical_field_order() {
++    // The writer streams a borrowed view instead of building a Value tree, so
++    // the order is now a struct declaration order rather than a BTreeMap's.
++    // Alphabetical order is part of the file's stability contract.
++    let d = tmpdir("fh3_order");
++    let reports = d.join("reports");
++    std::fs::create_dir_all(&reports).unwrap();
++    write_report(&reports, "sampleA.json", 100, 0.41);
++    let out = d.join("out");
++    let (_, stderr, code) = run(&[
++        "concatenate",
++        reports.to_str().unwrap(),
++        "-o",
++        out.to_str().unwrap(),
++        "--format",
++        "json",
++    ]);
++    assert_eq!(code, 0, "{stderr}");
++    let text = std::fs::read_to_string(out.join("report.json")).unwrap();
++    let mut last = 0usize;
++    for key in ["\"generator\":", "\"generator_version\":", "\"reports\":", "\"schema\":", "\"title\":"] {
++        let at = text.find(key).unwrap_or_else(|| panic!("{key} missing"));
++        assert!(at >= last, "{key} is out of alphabetical order:\n{text}");
++        last = at;
++    }
++    for key in ["\"metrics\":", "\"notes\":", "\"sample\":", "\"source\":", "\"tool\":", "\"tool_version\":"] {
++        assert!(text.contains(key), "{key} missing");
++    }
++    assert!(text.ends_with("}\n"), "the document must end with a newline");
++}
++
++// ---------------------------------------------------------------- FH-6 ----
++
++#[test]
++fn positions_all_metrics_stdout_matches_the_written_file() {
++    // The tidy table is streamed to a BufWriter now; the file and the stdout
++    // path must still produce the same bytes.
++    let d = tmpdir("fh6_stdout");
++    let src = d.join("p1");
++    std::fs::create_dir_all(&src).unwrap();
++    let mut tsv = String::from("pos\tmean_q\tdepth\n");
++    for pos in 1..=5 {
++        tsv.push_str(&format!("{pos}\t{}\t{}\n", 30.0 + pos as f64 / 4.0, 100 + pos));
++    }
++    std::fs::write(src.join("positions.tsv"), tsv).unwrap();
++
++    let out = d.join("out");
++    let (_, stderr, code) = run(&[
++        "concatenate",
++        src.to_str().unwrap(),
++        "--positions",
++        "--all-metrics",
++        "-o",
++        out.to_str().unwrap(),
++    ]);
++    assert_eq!(code, 0, "{stderr}");
++    let written = std::fs::read_to_string(out.join("positions_matrix.tsv")).unwrap();
++
++    let (stdout, stderr, code) = run(&[
++        "concatenate",
++        src.to_str().unwrap(),
++        "--positions",
++        "--all-metrics",
++        "--stdout",
++    ]);
++    assert_eq!(code, 0, "{stderr}");
++    assert_eq!(stdout, written, "--stdout must be byte-identical to the file");
++}
++
++// ---------------------------------------------------------------- FH-8 ----
++
++#[test]
++fn concatenate_stdout_matches_the_written_tsv() {
++    // --stdout used to build the matrix a second time; it now reuses the one
++    // the writer built. The bytes must not change either way.
++    let d = tmpdir("fh8_stdout");
++    let reports = d.join("reports");
++    std::fs::create_dir_all(&reports).unwrap();
++    write_report(&reports, "sampleA.json", 100, 0.41);
++    write_report(&reports, "sampleB.json", 200, 0.52);
++    let out = d.join("out");
++    let (_, stderr, code) = run(&[
++        "concatenate",
++        reports.to_str().unwrap(),
++        "-o",
++        out.to_str().unwrap(),
++        "--format",
++        "tsv",
++    ]);
++    assert_eq!(code, 0, "{stderr}");
++    let written = std::fs::read_to_string(out.join("report.tsv")).unwrap();
++
++    let (stdout, stderr, code) = run(&[
++        "concatenate",
++        reports.to_str().unwrap(),
++        "--format",
++        "tsv",
++        "--stdout",
++    ]);
++    assert_eq!(code, 0, "{stderr}");
++    // stdout carries the table followed by the status line; the table itself
++    // must be exactly the file.
++    let table_end = stdout
++        .find("fasthelper: concatenated")
++        .unwrap_or_else(|| panic!("status line missing: {stdout}"));
++    assert_eq!(
++        &stdout[..table_end],
++        written,
++        "--stdout must be byte-identical to report.tsv"
++    );
++}
++
++// ---------------------------------------------------------------- FH-9 ----
++
++/// A stand-in fastdedup that records every invocation in `LOG` before doing
++/// anything else, so `--version` forks are countable.
++const COUNTING_DEDUP: &str = r#"#!/usr/bin/env bash
++echo "$@" >> "@LOG@"
++if [ "$1" = "--version" ]; then echo "fastdedup 9.9.9"; exit 0; fi
++exit 0
++"#;
++
++#[test]
++fn tool_version_is_resolved_once_per_run_not_once_per_sample() {
++    // FH-9 regression: `--version` was forked per sample per step (30 000
++    // forks at 10 k samples), including on --dry-run.
++    let d = tmpdir("fh9_version");
++    let tools = d.join("tools");
++    std::fs::create_dir_all(&tools).unwrap();
++    let log = d.join("invocations.log");
++    let bin = tools.join("fastdedup");
++    std::fs::write(&bin, COUNTING_DEDUP.replace("@LOG@", log.to_str().unwrap())).unwrap();
++    let mut perm = std::fs::metadata(&bin).unwrap().permissions();
++    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
++    std::fs::set_permissions(&bin, perm).unwrap();
++
++    let mut cfg = String::from(
++        "[run]\nname = \"v\"\nsteps = [\"fastdedup\"]\nthreads = 1\ngz_level = 1\n",
++    );
++    for s in ["s1", "s2", "s3"] {
++        let fq = d.join(format!("{s}_R1.fastq"));
++        std::fs::write(&fq, "@r0\nACGT\n+\nIIII\n").unwrap();
++        cfg.push_str(&format!(
++            "\n[[samples]]\nname = \"{s}\"\nr1 = \"{}\"\n",
++            fq.display()
++        ));
++    }
++    let path = d.join("cfg.toml");
++    std::fs::write(&path, cfg).unwrap();
++
++    let (stdout, stderr, code) = run(&[
++        "run",
++        "-c",
++        path.to_str().unwrap(),
++        "--tools-dir",
++        tools.to_str().unwrap(),
++        "--dry-run",
++    ]);
++    assert_eq!(code, 0, "{stderr}");
++    assert_eq!(
++        stdout.matches("[dry-run]").count(),
++        3,
++        "all three samples must still be planned: {stdout}"
++    );
++
++    let calls = std::fs::read_to_string(&log).unwrap_or_default();
++    let versions = calls.lines().filter(|l| l.trim() == "--version").count();
++    assert_eq!(
++        versions, 1,
++        "one `--version` per distinct tool, not one per sample: {calls}"
++    );
++    assert_eq!(
++        calls.lines().count(),
++        versions,
++        "dry-run must not execute any step: {calls}"
++    );
++}

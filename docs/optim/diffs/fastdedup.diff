@@ -1,0 +1,482 @@
+diff --git a/tools/fastdedup/src/parallel.rs b/tools/fastdedup/src/parallel.rs
+index f670660..642b080 100644
+--- a/tools/fastdedup/src/parallel.rs
++++ b/tools/fastdedup/src/parallel.rs
+@@ -3,6 +3,7 @@ use std::io::Read;
+ 
+ use anyhow::{Context, Result, bail};
+ use crossbeam_channel::{Receiver, Sender, bounded};
++use needletail::parser::LineEnding;
+ use needletail::{parse_fastx_file, parse_fastx_reader};
+ use rustc_hash::{FxBuildHasher, FxHashSet};
+ 
+@@ -53,11 +54,23 @@ impl<T: Hash + Eq> ShardedHashVerifier<T> {
+ }
+ 
+ /// Owned single-end record data that can be sent across threads.
++///
++/// FD-9: `crlf` carries the record's own line ending. The serial path writes
++/// through needletail, which re-emits the line ending it parsed, so a CRLF
++/// library round-tripped as CRLF at `-j 1` and as LF at `-j 4` — an
++/// untested output difference between the two engines.
+ #[derive(Clone, Debug)]
+ pub(crate) struct RawRecord {
+     pub id: Vec<u8>,
+     pub seq: Vec<u8>,
+     pub qual: Vec<u8>,
++    pub crlf: bool,
++}
++
++/// The line ending a record was parsed with.
++#[inline]
++fn ending(crlf: bool) -> &'static [u8] {
++    if crlf { b"\r\n" } else { b"\n" }
+ }
+ 
+ /// Owned paired-end record data.
+@@ -85,20 +98,60 @@ const CHUNK_SIZE: usize = 4096;
+ // CHANNEL-BASED PIPE for gzippy streaming
+ // ==========================================
+ 
+-/// Writer side: implements `Write` by sending chunks through a crossbeam channel.
++/// Writer side: implements `Write` by shipping whole chunks through a crossbeam channel.
++///
++/// FD-8: the bytes are appended into one reusable buffer and the buffer is
++/// MOVED to the compression thread when it fills. The previous form allocated a
++/// `Vec` per `write` call (`buf.to_vec()`) and the reader copied it again, so
++/// every output byte was memcpy'd twice plus one allocation per chunk.
+ struct ChanWriter {
+     tx: Sender<Vec<u8>>,
++    buf: Vec<u8>,
++}
++
++/// Chunk size handed to the compression thread. Large enough that the channel
++/// never sees a fragment, small enough that one buffer is ~256 KiB.
++const CHUNK_BYTES: usize = 256 * 1024;
++
++impl ChanWriter {
++    fn new(tx: Sender<Vec<u8>>) -> Self {
++        Self {
++            tx,
++            buf: Vec::with_capacity(CHUNK_BYTES),
++        }
++    }
++
++    /// Move the buffered bytes to the compression thread.
++    fn ship(&mut self) -> std::io::Result<()> {
++        if self.buf.is_empty() {
++            return Ok(());
++        }
++        let filled = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK_BYTES));
++        self.tx.send(filled).map_err(|_| {
++            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gzippy compression thread died")
++        })
++    }
+ }
+ 
+ impl Write for ChanWriter {
+     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+-        self.tx.send(buf.to_vec()).map_err(|_| {
+-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gzippy compression thread died")
+-        })?;
++        self.buf.extend_from_slice(buf);
++        if self.buf.len() >= CHUNK_BYTES {
++            self.ship()?;
++        }
+         Ok(buf.len())
+     }
++
+     fn flush(&mut self) -> std::io::Result<()> {
+-        Ok(())
++        self.ship()
++    }
++}
++
++impl Drop for ChanWriter {
++    /// Close the pipe with the tail. `BufWriter` above this flushes on drop, but
++    /// a caller that only drops the writer must still not lose the last chunk.
++    fn drop(&mut self) {
++        let _ = self.ship();
+     }
+ }
+ 
+@@ -190,8 +243,32 @@ fn create_output_writer(
+     Option<std::thread::JoinHandle<Result<()>>>,
+ )> {
+     if crate::stream::is_stream(path) {
+-        // D-4: stdout cannot be seeked or reopened, so there is no gzippy
+-        // thread and no resume — serial flate2 gzip when asked for.
++        // D-4: stdout cannot be seeked or reopened, so there is no resume — but
++        // there is no reason to give up parallel compression: gzippy writes to
++        // any `Write + Send` and never seeks, so the stream path takes the same
++        // channel pipe as the file path (FD-2). The level >= 6 guard matches the
++        // file path: below it, threads produce gzippy's non-standard multi-block
++        // format.
++        if out_compression == StreamCompression::Gz
++            && num_threads > 1
++            && compression_level >= 6
++        {
++            let (tx, rx) = bounded::<Vec<u8>>(16);
++            let writer: Box<dyn Write> = Box::new(ChanWriter::new(tx));
++            let level = compression_level.min(12) as u8;
++            let handle = std::thread::spawn(move || -> Result<()> {
++                let reader = ChanReader {
++                    rx,
++                    current: Vec::new(),
++                    pos: 0,
++                };
++                let out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout());
++                gzippy::compress_to_writer_with_threads(reader, out, level, num_threads)
++                    .context("gzippy compression failed for the output stream")?;
++                Ok(())
++            });
++            return Ok((writer, out_format, Some(handle)));
++        }
+         let writer = crate::writer::prepare_stream_writer(out_compression, compression_level);
+         return Ok((writer, out_format, None));
+     }
+@@ -206,7 +283,7 @@ fn create_output_writer(
+         // Gzippy parallel compression path — channel-based streaming pipe
+         // Levels 6+ with threads>1 use PipelinedGzEncoder → standard gzip
+         let (tx, rx) = bounded::<Vec<u8>>(16);
+-        let writer: Box<dyn Write> = Box::new(ChanWriter { tx });
++        let writer: Box<dyn Write> = Box::new(ChanWriter::new(tx));
+ 
+         let out_path = path.to_string();
+         let level = compression_level.min(12) as u8;
+@@ -379,10 +456,17 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
+     }
+ 
+     let num_workers = resolve_thread_count(cfg.threads);
++    // FD-3: a run is 1 reader thread + N workers + C compression workers + 1
++    // gzippy coordinator, so `-j` has to budget all four. Before this, `-j 4`
++    // put 1 + 4 + 4 + 1 = 10 runnable threads on the 4 pinned cores the bench
++    // uses: deflate competed with the table insert for a core, and the thread
++    // holding a cache-hot output buffer was the one preempted. Workers keep one
++    // core for the reader/commit thread; compression takes the rest.
++    let worker_threads = num_workers.saturating_sub(1).max(1);
+ 
+     // Resume an existing output before any thread starts, so the preload pass
+     // cannot race the unbounded worker channel.
+-    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
++    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, worker_threads)?;
+     resume_existing_output(output_path, cfg, &mut verifier)?;
+ 
+     let (chunk_tx, chunk_rx): (Sender<Vec<RawRecord>>, Receiver<Vec<RawRecord>>) =
+@@ -419,8 +503,9 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
+                 let id = rec.id().to_vec();
+                 let seq = rec.seq().to_vec();
+                 let qual = rec.qual().map(|q| q.to_vec()).unwrap_or_default();
++                let crlf = matches!(rec.line_ending(), LineEnding::Windows);
+ 
+-                chunk.push(RawRecord { id, seq, qual });
++                chunk.push(RawRecord { id, seq, qual, crlf });
+                 total += 1;
+ 
+                 if chunk.len() >= CHUNK_SIZE {
+@@ -439,8 +524,8 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
+     });
+ 
+     // --- WORKER THREADS ---
+-    let mut worker_handles = Vec::with_capacity(num_workers);
+-    for _ in 0..num_workers {
++    let mut worker_handles = Vec::with_capacity(worker_threads);
++    for _ in 0..worker_threads {
+         let chunk_rx = chunk_rx.clone();
+         let hash_tx = hash_tx.clone();
+         worker_handles.push(std::thread::spawn(move || {
+@@ -462,7 +547,11 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
+     // --- WRITER (this thread) — runs concurrently with reader & workers ---
+     let output_path_str = output_path;
+     let output_path = Path::new(output_path_str);
+-    let gzip_threads = if num_workers > 1 { num_workers } else { 0 };
++    let gzip_threads = if num_workers > 1 {
++        num_workers.saturating_sub(2).max(1)
++    } else {
++        0
++    };
+     let (writer, output_format, gzip_handle) = create_output_writer(
+         output_path_str,
+         cfg.compression_level,
+@@ -487,8 +576,8 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
+ 
+     if cfg.verbose {
+         println!(
+-            "Multi-threaded mode: {} workers, {} shards",
+-            num_workers, num_workers
++            "Multi-threaded mode: {} workers, {} shards, {} compression threads",
++            worker_threads, worker_threads, gzip_threads
+         );
+     }
+ 
+@@ -501,13 +590,16 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
+                     write_fasta_record(&mut buffered_writer, &hr.record.id, &hr.record.seq)?;
+                 }
+                 OutputFormat::Fastq => {
++                    let nl = ending(hr.record.crlf);
+                     buffered_writer.write_all(b"@")?;
+                     buffered_writer.write_all(&hr.record.id)?;
+-                    buffered_writer.write_all(b"\n")?;
++                    buffered_writer.write_all(nl)?;
+                     buffered_writer.write_all(&hr.record.seq)?;
+-                    buffered_writer.write_all(b"\n+\n")?;
++                    buffered_writer.write_all(nl)?;
++                    buffered_writer.write_all(b"+")?;
++                    buffered_writer.write_all(nl)?;
+                     buffered_writer.write_all(&hr.record.qual)?;
+-                    buffered_writer.write_all(b"\n")?;
++                    buffered_writer.write_all(nl)?;
+                 }
+             }
+         } else {
+@@ -575,10 +667,13 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
+     }
+ 
+     let num_workers = resolve_thread_count(cfg.threads);
++    // FD-3, paired twin: 1 reader + N workers + two compression pools + their
++    // coordinators. Same budget as the single-end path.
++    let worker_threads = num_workers.saturating_sub(1).max(1);
+ 
+     // Resume existing outputs before any thread starts, so the preload pass
+     // cannot race the unbounded worker channel.
+-    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, num_workers)?;
++    let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, worker_threads)?;
+     resume_existing_paired_outputs(output_r1_path, output_r2_path, cfg, &mut verifier)?;
+ 
+     let (chunk_tx, chunk_rx): (Sender<Vec<RawPair>>, Receiver<Vec<RawPair>>) =
+@@ -642,11 +737,13 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
+                         id: r1.id().to_vec(),
+                         seq: r1.seq().to_vec(),
+                         qual: r1.qual().map(|q| q.to_vec()).unwrap_or_default(),
++                        crlf: matches!(r1.line_ending(), LineEnding::Windows),
+                     },
+                     r2: RawRecord {
+                         id: r2.id().to_vec(),
+                         seq: r2.seq().to_vec(),
+                         qual: r2.qual().map(|q| q.to_vec()).unwrap_or_default(),
++                        crlf: matches!(r2.line_ending(), LineEnding::Windows),
+                     },
+                 };
+ 
+@@ -675,8 +772,8 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
+     });
+ 
+     // --- WORKER THREADS ---
+-    let mut worker_handles = Vec::with_capacity(num_workers);
+-    for _ in 0..num_workers {
++    let mut worker_handles = Vec::with_capacity(worker_threads);
++    for _ in 0..worker_threads {
+         let chunk_rx = chunk_rx.clone();
+         let hash_tx = hash_tx.clone();
+         worker_handles.push(std::thread::spawn(move || {
+@@ -695,8 +792,9 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
+     drop(hash_tx);
+ 
+     // --- WRITER (this thread) — runs concurrently with reader & workers ---
++    // Two pools share what the workers left, one per mate.
+     let gzip_threads = if num_workers > 1 {
+-        (num_workers / 2).max(1)
++        (num_workers.saturating_sub(2) / 2).max(1)
+     } else {
+         0
+     };
+@@ -732,8 +830,8 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
+ 
+     if cfg.verbose {
+         println!(
+-            "Multi-threaded PE mode: {} workers, {} shards",
+-            num_workers, num_workers
++            "Multi-threaded PE mode: {} workers, {} shards, {} compression threads per mate",
++            worker_threads, worker_threads, gzip_threads
+         );
+     }
+ 
+@@ -746,21 +844,27 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
+                     write_fasta_record(&mut buf_r2, &hp.pair.r2.id, &hp.pair.r2.seq)?;
+                 }
+                 OutputFormat::Fastq => {
++                    let nl1 = ending(hp.pair.r1.crlf);
++                    let nl2 = ending(hp.pair.r2.crlf);
+                     buf_r1.write_all(b"@")?;
+                     buf_r1.write_all(&hp.pair.r1.id)?;
+-                    buf_r1.write_all(b"\n")?;
++                    buf_r1.write_all(nl1)?;
+                     buf_r1.write_all(&hp.pair.r1.seq)?;
+-                    buf_r1.write_all(b"\n+\n")?;
++                    buf_r1.write_all(nl1)?;
++                    buf_r1.write_all(b"+")?;
++                    buf_r1.write_all(nl1)?;
+                     buf_r1.write_all(&hp.pair.r1.qual)?;
+-                    buf_r1.write_all(b"\n")?;
++                    buf_r1.write_all(nl1)?;
+ 
+                     buf_r2.write_all(b"@")?;
+                     buf_r2.write_all(&hp.pair.r2.id)?;
+-                    buf_r2.write_all(b"\n")?;
++                    buf_r2.write_all(nl2)?;
+                     buf_r2.write_all(&hp.pair.r2.seq)?;
+-                    buf_r2.write_all(b"\n+\n")?;
++                    buf_r2.write_all(nl2)?;
++                    buf_r2.write_all(b"+")?;
++                    buf_r2.write_all(nl2)?;
+                     buf_r2.write_all(&hp.pair.r2.qual)?;
+-                    buf_r2.write_all(b"\n")?;
++                    buf_r2.write_all(nl2)?;
+                 }
+             }
+         } else {
+diff --git a/tools/fastdedup/src/writer.rs b/tools/fastdedup/src/writer.rs
+index 531a227..1c65589 100644
+--- a/tools/fastdedup/src/writer.rs
++++ b/tools/fastdedup/src/writer.rs
+@@ -99,7 +99,13 @@ pub fn prepare_writer(
+     };
+ 
+     let writer: Box<dyn Write> = if is_gz {
+-        Box::new(GzEncoder::new(file, Compression::new(compression_level)))
++        // FD-7: deflate emits ~32 KiB units, so an unbuffered `File` here costs
++        // one write syscall (and a possible short-write memmove) per block.
++        // The plain branch is buffered by the caller; this branch was not.
++        Box::new(GzEncoder::new(
++            io::BufWriter::with_capacity(1 << 20, file),
++            Compression::new(compression_level),
++        ))
+     } else {
+         Box::new(file)
+     };
+diff --git a/tools/fastdedup/tests/cli.rs b/tools/fastdedup/tests/cli.rs
+index b984fb2..c756246 100644
+--- a/tools/fastdedup/tests/cli.rs
++++ b/tools/fastdedup/tests/cli.rs
+@@ -2282,3 +2282,131 @@ fn test_reprise_parallele_tronque_queue_incomplete() {
+ // ================================================================
+ // TESTS PAIRED-END — REPRISE / RÉSILIANCE
+ // ================================================================
++
++// ================================================================
++// RÉGRESSIONS D'OPTIMISATION (docs/optim/fastdedup.md)
++// ================================================================
++
++/// FD-9 : une bibliothèque CRLF doit ressortir **identique** en `-j 1` et `-j 4`.
++///
++/// Avant ce correctif le chemin parallèle écrivait `\n` en dur alors que le
++/// chemin série passe par needletail, qui restitue la fin de ligne qu'il a
++/// analysée : une entrée CRLF ressortait en CRLF à un thread et en LF à quatre.
++/// Le test de parité existant (`..._serial_et_parallele_identique`) ne couvrait
++/// que des fixtures LF, donc l'écart était invisible.
++#[test]
++fn test_crlf_serial_et_parallele_identique() {
++    let temp_dir = assert_fs::TempDir::new().unwrap();
++    let entree = temp_dir.child("crlf.fastq");
++    let mut corps = String::new();
++    for i in 0..6 {
++        corps.push_str(&format!(
++            "@read{i}\r\n{}\r\n+\r\n{}\r\n",
++            generer_sequence(i, 0),
++            "I".repeat(150)
++        ));
++    }
++    entree.write_str(&corps).unwrap();
++
++    let ser = temp_dir.child("ser.fastq");
++    let par = temp_dir.child("par.fastq");
++    for (sortie, threads) in [(&ser, "1"), (&par, "4")] {
++        cmd()
++            .arg("-1")
++            .arg(entree.path())
++            .arg("-o")
++            .arg(sortie.path())
++            .arg("-j")
++            .arg(threads)
++            .arg("-q")
++            .arg("--force")
++            .assert()
++            .success();
++    }
++
++    let a = fs::read(ser.path()).unwrap();
++    let b = fs::read(par.path()).unwrap();
++    assert_eq!(
++        a, b,
++        "-j 1 et -j 4 doivent produire les mêmes octets sur une entrée CRLF"
++    );
++    assert!(
++        a.windows(2).any(|w| w == b"\r\n"),
++        "le CRLF de l'entrée doit être préservé"
++    );
++    assert!(
++        !a.windows(3).any(|w| w == b"\r\n\r"),
++        "aucun CRLF double ne doit apparaître"
++    );
++}
++
++/// FD-2 : le chemin flux compresse en parallèle et reste lisible.
++///
++/// `-o - --out-compression gz -j 4` passait par un unique fil flate2 ; gzippy
++/// n'a besoin d'aucun `seek`, donc le détour était gratuit. Ce test vérifie les
++/// deux propriétés qui comptent : le flux se décompresse, et il donne exactement
++/// les mêmes octets que la sortie fichier à un thread.
++#[test]
++fn test_flux_gz_parallele_decompresse_identique() {
++    use flate2::read::GzDecoder;
++    use std::io::Read;
++
++    let temp_dir = assert_fs::TempDir::new().unwrap();
++    let entree = temp_dir.child("in.fastq");
++    let mut corps = String::new();
++    for i in 0..500 {
++        corps.push_str(&format!(
++            "@read{i}\n{}\n+\n{}\n",
++            generer_sequence(i, 0),
++            "I".repeat(150)
++        ));
++    }
++    entree.write_str(&corps).unwrap();
++
++    let reference = temp_dir.child("ref.fastq.gz");
++    cmd()
++        .arg("-1")
++        .arg(entree.path())
++        .arg("-o")
++        .arg(reference.path())
++        .arg("-j")
++        .arg("1")
++        .arg("-q")
++        .arg("--force")
++        .assert()
++        .success();
++
++    let flux = cmd()
++        .arg("-1")
++        .arg(entree.path())
++        .arg("-o")
++        .arg("-")
++        .arg("--out-compression")
++        .arg("gz")
++        .arg("-j")
++        .arg("4")
++        .arg("-q")
++        .output()
++        .unwrap();
++    assert!(flux.status.success(), "le chemin flux doit réussir");
++    assert_eq!(
++        &flux.stdout[..2],
++        &[0x1f, 0x8b],
++        "la sortie doit commencer par la signature gzip"
++    );
++
++    let mut decode = Vec::new();
++    GzDecoder::new(&flux.stdout[..])
++        .read_to_end(&mut decode)
++        .expect("le flux gzip parallèle doit se décompresser");
++
++    let mut attendu = Vec::new();
++    GzDecoder::new(File::open(reference.path()).unwrap())
++        .read_to_end(&mut attendu)
++        .expect("la référence doit se décompresser");
++
++    assert_eq!(
++        decode, attendu,
++        "le flux parallèle doit décoder exactement la sortie à un thread"
++    );
++}

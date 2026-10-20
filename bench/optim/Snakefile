@@ -1,0 +1,244 @@
+"""FastSuite optimisation benchmark — baseline binary vs new binary, pinned.
+
+Every cell is one tool invocation under `taskset`, measured by
+`scripts/measure.py`, which refuses to emit a row unless the child exited 0,
+produced non-empty output and wrote nothing to stderr except the citation line.
+The design rules below exist because each one is a documented failure of an
+earlier bench in this project:
+
+* **One row per file, aggregate with a count assertion.** A shared CSV that a
+  driver opens for a header and never appends to silently empties a campaign;
+  an appending driver silently doubles it on a re-run. Here each cell owns its
+  file, and `aggregate` refuses unless the row count equals the cell count.
+* **Pinned by construction.** `-j N` is always paired with `taskset -c 0..N-1`,
+  so no cell can win wall time by spending cores it was not given, and the
+  `cpu_over_wall` column makes an escaped process obvious (> 1.05 on a pinned
+  cell means the child kept threads of its own).
+* **The corpus is generated once, by a pinned binary.** Reads are the expensive
+  input and the only thing that must not move between the two arms: they are
+  produced by `fastsim --seed 42` from the committed profile and never
+  regenerated, so a change to fastsim cannot move the input under the bench.
+* **The baseline binaries are frozen copies**, not "whatever was built last":
+  `bins.baseline` must point at the six binaries built from the pre-change
+  commit, `bins.new` at the tree under measurement.
+
+Usage on the desktop:
+    cd ~/FastSuite/bench/optim
+    snakemake -c 4 --rerun-triggers=mtime
+"""
+
+import json
+import os
+import subprocess
+
+REPO = config["repo"]
+RES = config["results"]
+READS = config["reads"]
+PROFILE = config["profile"]
+BINS = config["bins"]
+SIZES = config["sizes"]
+THREADS = config["threads"]
+TOOLS = config["tools"]
+HELPER_SAMPLES = config.get("helper_samples", [2000, 5000])
+MEASURE = os.path.join(os.path.dirname(workflow.snakefile), "scripts", "measure.py")
+MAKE_TREE = os.path.join(os.path.dirname(workflow.snakefile), "scripts", "helper_tree.py")
+
+
+def cells():
+    out = []
+    for tool in TOOLS:
+        for size in SIZES:
+            for t in THREADS:
+                if tool == "fastsim" and t != 1:
+                    # fastsim is single-threaded by construction; its -j is
+                    # accepted and ignored, so a threads axis for it would be a
+                    # fabricated scaling curve.
+                    continue
+                for kind in BINS:
+                    # The baseline binary predates --gz-level, so it only carries
+                    # the default-level cell; measuring it under a flag it does
+                    # not have would be a fabricated comparison.
+                    if tool == "fastsim" and kind == "baseline":
+                        gz_levels = [0]
+                    elif tool == "fastsim":
+                        gz_levels = config.get("fastsim_gz_levels", [0])
+                    else:
+                        gz_levels = [0]
+                    for gz in gz_levels:
+                        gz_tag = f"_gz{gz}" if gz else ""
+                        out.append(dict(
+                            tool=tool, reads=size, threads=t, kind=kind, gz=gz,
+                            id=f"{tool}__{kind}__{size}__j{t}{gz_tag}",
+                        ))
+    return out
+
+
+CELLS = cells()
+CELL = {c["id"]: c for c in CELLS}
+
+
+def cell_file(cid):
+    return f"{RES}/cells/{cid}.tsv"
+
+
+def helper_file(n):
+    # A distinct name: `cells/{cid}.tsv` would also match this path and the
+    # generic `cell` rule would then try to run a tool named "fasthelper__50".
+    return f"{RES}/cells/helper__{n}.tsv"
+
+
+rule all:
+    input:
+        f"{RES}/results.tsv",
+
+
+# ---------------------------------------------------------------------------
+# corpus: generated ONCE by the baseline fastsim, never regenerated
+# ---------------------------------------------------------------------------
+rule reads:
+    output:
+        f"{READS}/{{size}}_R1.fastq.gz",
+        f"{READS}/{{size}}_R2.fastq.gz",
+    params:
+        profile=PROFILE,
+        bin_sim=os.path.join(BINS["baseline"], "fastsim"),
+    run:
+        os.makedirs(READS, exist_ok=True)
+        prefix = os.path.join(READS, wildcards.size)
+        subprocess.run(
+            [params.bin_sim, "--pairs", wildcards.size, "--profile", params.profile,
+             "--seed", "42", "-o", prefix, "--force", "-q"],
+            check=True)
+
+
+# ---------------------------------------------------------------------------
+# one measured cell
+# ---------------------------------------------------------------------------
+rule cell:
+    input:
+        # The reads a cell uses are a property of the cell, not a wildcard of
+        # its output name, so they are resolved through the cell table.
+        lambda w: [
+            f"{READS}/{CELL[w.cid]['reads']}_R1.fastq.gz",
+            f"{READS}/{CELL[w.cid]['reads']}_R2.fastq.gz",
+            MEASURE,
+        ],
+    output:
+        # The cid pattern is constrained so this rule cannot claim the
+        # fasthelper cells (helper__N), whose argument list is different.
+        "{RES}/cells/{cid,[a-z]+__[a-z]+__[0-9]+__j[0-9]+(_gz[0-9]+)?}.tsv",
+    threads: 1
+    run:
+        c = CELL[wildcards.cid]
+        out_dir = f"{RES}/work/{wildcards.cid}"
+        argv = [
+            "python3", MEASURE,
+            "--bin", os.path.join(BINS[c["kind"]], c["tool"]),
+            "--tool", c["tool"],
+            "--reads", str(c["reads"]),
+            "--threads", str(c["threads"]),
+            "--kind", c["kind"],
+            "--reads-dir", READS,
+            "--out-dir", out_dir,
+        ]
+        if c["gz"]:
+            argv += ["--gz-level", str(c["gz"])]
+        if c["tool"] == "fastsim":
+            argv += ["--profile", PROFILE]
+        with open(output[0], "w") as fh:
+            subprocess.run(argv, check=True, stdout=fh)
+
+
+# ---------------------------------------------------------------------------
+# fasthelper: aggregation over a synthetic report tree
+# ---------------------------------------------------------------------------
+rule helper_tree:
+    input:
+        f"{READS}/{SIZES[0]}_R1.fastq.gz",
+        f"{READS}/{SIZES[0]}_R2.fastq.gz",
+    output:
+        f"{RES}/helper_tree/.built",
+    params:
+        bin_fastcheck=os.path.join(BINS["baseline"], "fastcheck"),
+        samples=max(HELPER_SAMPLES),
+    run:
+        subprocess.run([
+            "python3", MAKE_TREE,
+            "--out", f"{RES}/helper_tree",
+            "--samples", str(params.samples),
+            "--fastcheck", params.bin_fastcheck,
+            "--fastmaps-bin", os.path.join(BINS["baseline"], "fastmaps"),
+            "--reads-dir", READS,
+        ], check=True)
+        open(output[0], "w").write("ok\n")
+
+
+rule helper_cell:
+    input:
+        f"{RES}/helper_tree/.built",
+        MEASURE,
+    output:
+        f"{RES}/cells/helper__{{n}}.tsv",
+    run:
+        # Both arms run over the same tree, so the row records the tree size and
+        # the binary that produced it in the kind column.
+        rows = []
+        header = None
+        for kind, bin_dir in BINS.items():
+            argv = [
+                "python3", MEASURE,
+                "--bin", os.path.join(bin_dir, "fasthelper"),
+                "--tool", "fasthelper",
+                "--reads", wildcards.n,
+                "--threads", "1",
+                "--kind", kind,
+                "--reads-dir", READS,
+                "--out-dir", f"{RES}/work/fasthelper__{kind}__{wildcards.n}",
+                "--tree", f"{RES}/helper_tree",
+            ]
+            env_extra = {"FASTHELPER_TREE": f"{RES}/helper_tree", "FASTHELPER_SAMPLES": wildcards.n}
+            del env_extra
+            out = subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+            lines = [l for l in out.splitlines() if l.strip()]
+            if len(lines) != 2:
+                raise ValueError(f"helper cell for {kind}: expected header+row, got {len(lines)}")
+            header = lines[0] if header is None else header
+            if lines[0] != header:
+                raise ValueError(f"helper cell for {kind}: header mismatch")
+            rows.append(lines[1])
+        with open(output[0], "w") as fh:
+            fh.write(header + "\n")
+            fh.write("\n".join(rows) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# aggregate: one header, a row-count assertion
+# ---------------------------------------------------------------------------
+rule aggregate:
+    input:
+        [cell_file(cid) for cid in CELL] + [helper_file(n) for n in HELPER_SAMPLES],
+    output:
+        f"{RES}/results.tsv",
+    run:
+        raw_header = None
+        rows = []
+        for path in input:
+            with open(path) as fh:
+                lines = [l.rstrip("\n") for l in fh if l.strip()]
+            if len(lines) < 2:
+                raise ValueError(f"{path}: no data row")
+            if raw_header is None:
+                raw_header = lines[0]
+            elif lines[0] != raw_header:
+                raise ValueError(f"{path}: header differs from the first cell's")
+            rows.extend(lines[1:])
+        # Every config cell owns exactly one row; a fasthelper cell owns one row
+        # per arm. The count is asserted, because a silent subset or a doubled
+        # re-run is the failure mode this file exists to prevent.
+        expected = len(CELL) + len(HELPER_SAMPLES) * len(BINS)
+        if len(rows) != expected:
+            raise ValueError(f"row count {len(rows)} != expected {expected}")
+        with open(output[0], "w") as fh:
+            fh.write(raw_header + "\textra\n")
+            fh.write("\n".join(r + "\t." for r in rows) + "\n")
+        print(f"aggregate: {len(rows)} rows -> {output[0]}")

@@ -99,7 +99,13 @@ pub fn prepare_writer(
     };
 
     let writer: Box<dyn Write> = if is_gz {
-        Box::new(GzEncoder::new(file, Compression::new(compression_level)))
+        // FD-7: deflate emits ~32 KiB units, so an unbuffered `File` here costs
+        // one write syscall (and a possible short-write memmove) per block.
+        // The plain branch is buffered by the caller; this branch was not.
+        Box::new(GzEncoder::new(
+            io::BufWriter::with_capacity(1 << 20, file),
+            Compression::new(compression_level),
+        ))
     } else {
         Box::new(file)
     };

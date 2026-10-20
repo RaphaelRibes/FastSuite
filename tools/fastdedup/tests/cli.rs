@@ -2282,3 +2282,131 @@ fn test_reprise_parallele_tronque_queue_incomplete() {
 // ================================================================
 // TESTS PAIRED-END — REPRISE / RÉSILIANCE
 // ================================================================
+
+// ================================================================
+// RÉGRESSIONS D'OPTIMISATION (docs/optim/fastdedup.md)
+// ================================================================
+
+/// FD-9 : une bibliothèque CRLF doit ressortir **identique** en `-j 1` et `-j 4`.
+///
+/// Avant ce correctif le chemin parallèle écrivait `\n` en dur alors que le
+/// chemin série passe par needletail, qui restitue la fin de ligne qu'il a
+/// analysée : une entrée CRLF ressortait en CRLF à un thread et en LF à quatre.
+/// Le test de parité existant (`..._serial_et_parallele_identique`) ne couvrait
+/// que des fixtures LF, donc l'écart était invisible.
+#[test]
+fn test_crlf_serial_et_parallele_identique() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = temp_dir.child("crlf.fastq");
+    let mut corps = String::new();
+    for i in 0..6 {
+        corps.push_str(&format!(
+            "@read{i}\r\n{}\r\n+\r\n{}\r\n",
+            generer_sequence(i, 0),
+            "I".repeat(150)
+        ));
+    }
+    entree.write_str(&corps).unwrap();
+
+    let ser = temp_dir.child("ser.fastq");
+    let par = temp_dir.child("par.fastq");
+    for (sortie, threads) in [(&ser, "1"), (&par, "4")] {
+        cmd()
+            .arg("-1")
+            .arg(entree.path())
+            .arg("-o")
+            .arg(sortie.path())
+            .arg("-j")
+            .arg(threads)
+            .arg("-q")
+            .arg("--force")
+            .assert()
+            .success();
+    }
+
+    let a = fs::read(ser.path()).unwrap();
+    let b = fs::read(par.path()).unwrap();
+    assert_eq!(
+        a, b,
+        "-j 1 et -j 4 doivent produire les mêmes octets sur une entrée CRLF"
+    );
+    assert!(
+        a.windows(2).any(|w| w == b"\r\n"),
+        "le CRLF de l'entrée doit être préservé"
+    );
+    assert!(
+        !a.windows(3).any(|w| w == b"\r\n\r"),
+        "aucun CRLF double ne doit apparaître"
+    );
+}
+
+/// FD-2 : le chemin flux compresse en parallèle et reste lisible.
+///
+/// `-o - --out-compression gz -j 4` passait par un unique fil flate2 ; gzippy
+/// n'a besoin d'aucun `seek`, donc le détour était gratuit. Ce test vérifie les
+/// deux propriétés qui comptent : le flux se décompresse, et il donne exactement
+/// les mêmes octets que la sortie fichier à un thread.
+#[test]
+fn test_flux_gz_parallele_decompresse_identique() {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = temp_dir.child("in.fastq");
+    let mut corps = String::new();
+    for i in 0..500 {
+        corps.push_str(&format!(
+            "@read{i}\n{}\n+\n{}\n",
+            generer_sequence(i, 0),
+            "I".repeat(150)
+        ));
+    }
+    entree.write_str(&corps).unwrap();
+
+    let reference = temp_dir.child("ref.fastq.gz");
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(reference.path())
+        .arg("-j")
+        .arg("1")
+        .arg("-q")
+        .arg("--force")
+        .assert()
+        .success();
+
+    let flux = cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg("-")
+        .arg("--out-compression")
+        .arg("gz")
+        .arg("-j")
+        .arg("4")
+        .arg("-q")
+        .output()
+        .unwrap();
+    assert!(flux.status.success(), "le chemin flux doit réussir");
+    assert_eq!(
+        &flux.stdout[..2],
+        &[0x1f, 0x8b],
+        "la sortie doit commencer par la signature gzip"
+    );
+
+    let mut decode = Vec::new();
+    GzDecoder::new(&flux.stdout[..])
+        .read_to_end(&mut decode)
+        .expect("le flux gzip parallèle doit se décompresser");
+
+    let mut attendu = Vec::new();
+    GzDecoder::new(File::open(reference.path()).unwrap())
+        .read_to_end(&mut attendu)
+        .expect("la référence doit se décompresser");
+
+    assert_eq!(
+        decode, attendu,
+        "le flux parallèle doit décoder exactement la sortie à un thread"
+    );
+}

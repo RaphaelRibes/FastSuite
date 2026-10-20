@@ -1,0 +1,84 @@
+# fastsim cost probe — raw readings (artifact for docs/optim/raw/fastsim.md)
+
+Host: AMD Ryzen 7 7730U (16 hw threads), CachyOS, load avg 1.9-2.1 during the runs.
+Binary: tools/fastsim/target/release/fastsim, mtime 2026-10-20 09:22 (newer than every
+src/*.rs, newest = src/main.rs 09:09). Not rebuilt for this probe.
+Profile: tools/fastsim/profiles/mandrill_E358.json (read_len 150, dup_rate 0.0141,
+read_meanq 6 bins/mate, insert CDF 146 bins, n_run absent).
+All runs pinned with `taskset -c 0`, best of 2 (200k) / 2 (20k). Outputs to a scratch dir.
+
+## A. Pipeline split, 200 000 pairs
+
+| cell | wall (s) | pairs/s | peak RSS (VmHWM) |
+|---|---|---|---|
+| default (gzip, level 6) | 14.34 | 13 950 | 139 MB |
+| `--no-gzip` | 3.49 | 57 285 | 139 MB |
+| `--no-gzip --dup-pool 4096` | 14.36 (gzip) | 13 932 | 9 MB |
+
+Commands:
+  taskset -c 0 fastsim --pairs 200000 --profile profiles/mandrill_E358.json -o OUT -q
+  taskset -c 0 fastsim --pairs 200000 --profile profiles/mandrill_E358.json -o OUT -q --no-gzip
+  taskset -c 0 fastsim --pairs 200000 --profile profiles/mandrill_E358.json -o OUT -q --dup-pool 4096
+
+Deflate share of wall = (14.34 - 3.49) / 14.34 = 75.7 %  -> 54.2 us/pair
+Compute (plain) = 17.5 us/pair
+Plain output size = 141 MB (2 x 70.7 MB) -> 353 B/record.
+
+## B. 20 000 pairs (noise reference: +-20 % on this host)
+
+| cell | wall (s) | pairs/s |
+|---|---|---|
+| gzip | 1.48 | 13 535 |
+| `--no-gzip` | 0.34 | 58 028 |
+| `--dup-rate 0` (gzip) | 1.47 | 13 634 |
+| `--no-gzip --dup-rate 0` | 0.41 | 48 738 |
+| `--dup-pool 1024` (gzip) | 1.51 | 13 283 |
+
+The dup-free cell is not faster than the default: the pool costs memory, not time.
+
+## C. Deflate level sweep — `gzip -<n>` CLI over 14.12 MB of fastsim output
+
+| level | wall (s) | MB/s | size (MB) | % of -6 size |
+|---|---|---|---|---|
+| 1 | 0.130 | 108.5 | 4.51 | 117.4 |
+| 2 | 0.163 | 86.5 | 4.34 | 113.0 |
+| 3 | 0.333 | 42.4 | 4.14 | 107.8 |
+| 4 | 0.236 | 59.8 | 4.09 | 106.5 |
+| 6 | 1.520 | 9.3 | 3.84 | 100.0 |
+| 9 | 4.851 | 2.9 | 3.74 | 97.3 |
+
+## D. Multi-process deflate scaling (block-parallel proxy), 14.12 MB
+
+| procs | level | MB/s |
+|---|---|---|
+| 1 | 6 | 9.3 |
+| 1 | 1 | 108.5 |
+| 2 | 6 | 8.7 / 9.1 |
+| 4 | 6 | 16.0 / 16.4 |
+| 4 | 1 | 211.4 / 211.6 |
+
+Level 6 deflate multiplies only 1.8x on 4 processes on this host (contended 15 W part);
+level 1 multiplies 2.0x. Do not read these as a clean 4-core scaling curve.
+
+## E. In-process vs C zlib at level 6
+
+In-process flate2 (miniz_oxide, Cargo.lock:149-155) deflates 14.1 MB in the 10.85 s
+delta = ~13 MB/s. C zlib via `gzip -6` does 9.3 MB/s. The Rust backend is NOT slower
+than zlib here, so a backend swap has no measured support at level 6.
+
+## F. Counted from source (not measured, exact by inspection)
+
+RNG draws and transcendentals per emitted base in `qualify` (non-full read):
+  1 ziggurat normal draw (quality.rs:120, randutil.rs:41-45)
+  1 uniform f64      (quality.rs:194)
+  2 exp              (quality.rs:38, quality.rs:52 inside erf)
+  1 sqrt             (randutil.rs:44, Normal::new per call)
+  1 powf             (quality.rs:193)
+  1 virtual write_all of one byte per quality byte (fastq.rs:82)
+
+Insert generation: 1 uniform f64 per base (biology.rs:82) + occasional gen_range for the
+boundary rule (artefact.rs:199, artefact.rs:212).
+
+Per-pair heap allocations: 2 read seqs (artefact.rs:161), 2 qual vecs (quality.rs:65),
+2 error seqs (quality.rs:183), 1 insert (biology.rs:55), 1 insert clone for the pool
+(main.rs:256), 2 header Strings (fastq.rs:68) ~= 10.
