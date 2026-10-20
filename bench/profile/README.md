@@ -7,6 +7,12 @@ Unlike the per-tool campaigns in `bench/`, these numbers are **same machine, sam
 input, same I/O mode**, so the stages are comparable to each other rather than to
 their own papers.
 
+**Reference machine: the desktop** (`cachyos-x8664`, 16 threads, 46 GB RAM, NVMe,
+build `ea4a744`). Benchmarks belong there. The laptop campaign (`cachyoss117`, AMD
+Ryzen 7 7730U, 16 threads, 15 GB) is kept as `*_laptop.csv` for the cross-machine
+comparison: the desktop is 1.1x faster on simulation, 1.4x on dedup, 1.6x on
+trimming, 1.2x on mapping and **2.9x on `fastcheck`** at 5 M pairs.
+
 ## What was measured
 
 `profile_pipeline.py` generates one library with `fastsim` and carries it through
