@@ -489,7 +489,13 @@ qui ne laisse aucune place à un enfant échappé ni à un autre calcul sur le m
   [fastsim, niveau 1], [68,38], [10,52], [6,50×], [139 / 100],
   [fastdedup], [18,28], [18,02], [1,01×], [23 / 25],
   [fasthelper, 2000 éch.], [2,98], [3,98], [0,75×], [42 / 16],
+  [fastp, comparateur], [15,79], [---], [---], [1 186 / 1 186],
 )
+
+La dernière ligne n'est pas un avant/après : c'est `fastp` mesuré par la même campagne, sur le
+même fichier, avec le même épinglage, et elle existe pour une seule raison — la cellule `fastprep`
+après vaut 14,21 s contre 15,79 s, donc l'écart avec le comparateur est de 1,11× et il est mesuré
+ici, pas emprunté. Sa mémoire, en revanche, parle d'elle-même : 1 186 Mo contre 49.
 
 Deux lignes de ce tableau vont dans le sens inverse du premier, et elles sont instructives.
 `fasthelper` ralentit de 2,98 à 3,98 s à 2 000 échantillons alors que son pic mémoire tombe de 42 à
