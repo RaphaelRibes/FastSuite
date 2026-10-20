@@ -21,10 +21,12 @@ use clap::Parser;
 
 use cli::{corners_filename, parse_corners, Args};
 use file_kind::{classify_all, default_r1_patterns, default_r2_patterns};
-use format::write_format;
+use format::{write_format, FormatOpts};
 use output::{write_html, write_png, write_svg};
 use spiller::spiller_thread;
-use worker::{flush_local, CornerExtractor, SpillerMsg, WorkerCfg, WorkerLocal};
+use worker::{
+    flush_local, preview_flush_bytes, CornerExtractor, PixelAcc, SpillerMsg, WorkerCfg, WorkerLocal,
+};
 
 fn main() {
     let started = Instant::now();
@@ -164,7 +166,24 @@ fn main() {
     let cfg = WorkerCfg {
         preview_n: args.preview_reads,
         threshold_bytes,
+        preview_flush_bytes: preview_flush_bytes(threshold_bytes),
+        data_mode: args.data_mode,
     };
+
+    // FM-1: a non-exact data mode must be visible in the run summary, not only
+    // in the JSON — the user has to know heatmap.data is a sample even when
+    // they never open it. Printed unconditionally (like the citation note):
+    // `--quiet` silences the progress lines, not a caveat about the outputs.
+    if !args.data_mode.is_exact() {
+        eprintln!(
+            "fastmaps: --data-mode {} → heatmap.data holds {} reads per (pixel, file) \
+             (data_reads_per_pixel={}, data_complete=false); counts, PNG and corner \
+             metrics stay exact",
+            args.data_mode,
+            args.data_mode.reads_per_pixel(),
+            args.data_mode.reads_per_pixel(),
+        );
+    }
 
     // ── Work queue ────────────────────────────────────────────────────────
     let work_queue: Vec<(u16, String)> = files
@@ -252,18 +271,25 @@ fn main() {
     );
 
     // Build u32-keyed map for PNG/HTML before write_format consumes state.
-    let counts_u32: HashMap<(u32, u32), (u64, f64)> = state
+    let counts_u32: HashMap<(u32, u32), PixelAcc> = state
         .counts
         .iter()
         .map(|(&(x, y), &v)| ((x as u32, y as u32), v))
         .collect();
 
-    if let Err(e) = write_format(
-        state, &files, &file_kinds, args.preview_reads, &output_dir, &json_path,
+    let fmt_opts = FormatOpts {
+        files: &files,
+        file_kinds: &file_kinds,
+        preview_n: args.preview_reads,
+        data_mode: args.data_mode,
+        output_dir: &output_dir,
+        json_path: &json_path,
         with_wrapper,
-        started.elapsed().as_secs_f64(),
-        args.quiet,
-    ) {
+        elapsed_s: started.elapsed().as_secs_f64(),
+        quiet: args.quiet,
+    };
+
+    if let Err(e) = write_format(state, &fmt_opts) {
         eprintln!("Error writing heatmap files: {e}");
         std::process::exit(1);
     }
@@ -280,7 +306,7 @@ fn main() {
         let n: u64 = counts_u32
             .iter()
             .filter(|(&(x, y), _)| x >= ce.x1 && x <= ce.x2 && y >= ce.y1 && y <= ce.y2)
-            .map(|(_, (c, _))| c)
+            .map(|(_, acc)| acc.count)
             .sum();
         let fname = corners_filename(((ce.x1, ce.y1), (ce.x2, ce.y2)));
         if !args.quiet {

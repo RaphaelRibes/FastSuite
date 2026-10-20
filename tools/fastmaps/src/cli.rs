@@ -1,6 +1,89 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use clap::Parser;
+
+/// What to record in the per-read index stream that `heatmap.data` is built
+/// from (FM-1).
+///
+/// The stream is the only structural cost in the tool: 12 B per read in RAM,
+/// 8 B per read of temp disk, and a full render pass — all of it to serve one
+/// output file. The counting grid, the PNG, the corner metrics and the report
+/// come from `state.counts`, which needs no per-read record, so every mode
+/// below is exact for them.
+///
+/// * `Exact`  — every read, as before. The default.
+/// * `Capped(n)` — at most `n` reads per `(pixel, file)`: `heatmap.data` becomes
+///   a labelled sample (pixel *membership* is sampled; pixel *counts* are not).
+/// * `Off` — no index buffer, no spill, no render pass: `heatmap.data` is
+///   written as empty rows, so the file and its offsets stay valid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DataMode {
+    #[default]
+    Exact,
+    Capped(u8),
+    Off,
+}
+
+impl DataMode {
+    pub fn is_exact(self) -> bool {
+        matches!(self, DataMode::Exact)
+    }
+
+    /// Reads stored per `(pixel, file)`; `None` in exact mode (unbounded).
+    pub fn cap(self) -> Option<u8> {
+        match self {
+            DataMode::Exact => None,
+            DataMode::Capped(n) => Some(n),
+            DataMode::Off => Some(0),
+        }
+    }
+
+    /// Value for the `data_reads_per_pixel` JSON/report field in a non-exact
+    /// mode (0 in exact mode, where the field is omitted).
+    pub fn reads_per_pixel(self) -> u8 {
+        self.cap().unwrap_or(0)
+    }
+}
+
+impl fmt::Display for DataMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataMode::Exact => f.write_str("exact"),
+            DataMode::Capped(n) => write!(f, "capped:{n}"),
+            DataMode::Off => f.write_str("off"),
+        }
+    }
+}
+
+/// Parse `--data-mode`: `exact`, `off`, or `capped:N` (`capped=N` is accepted
+/// too, as is a space-free `capped` with the count attached by the caller).
+pub fn parse_data_mode(s: &str) -> Result<DataMode, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("exact") {
+        return Ok(DataMode::Exact);
+    }
+    if t.eq_ignore_ascii_case("off") {
+        return Ok(DataMode::Off);
+    }
+    let lower = t.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("capped") {
+        let rest = rest.trim_start_matches([':', '=']);
+        let n: u16 = rest
+            .parse()
+            .map_err(|_| format!("--data-mode: {s:?} is not exact|off|capped:N"))?;
+        if n == 0 {
+            return Err("--data-mode capped:0 is meaningless; use --data-mode off".into());
+        }
+        if n > u8::MAX as u16 {
+            return Err(format!("--data-mode capped max is {}", u8::MAX));
+        }
+        return Ok(DataMode::Capped(n as u8));
+    }
+    Err(format!(
+        "--data-mode: {s:?} is not exact|off|capped:N (e.g. capped:4)"
+    ))
+}
 
 /// 2-D heatmap of FASTQ reads by base composition.
 ///
@@ -29,10 +112,14 @@ pub struct Args {
     pub preview_reads: usize,
 
     /// Approximate total RAM budget for the worker index buffer before it is
-    /// spilled to the spiller thread (megabytes). Preview reads are streamed
-    /// to disk independently and do not count against it. The budget is divided
-    /// across workers, so an input file smaller than a worker's share is held
-    /// whole without spilling.
+    /// spilled to the spiller thread (megabytes). The budget is divided across
+    /// workers, so an input file smaller than a worker's share is held whole
+    /// without spilling.
+    ///
+    /// Preview reads are streamed to disk on their own threshold too, but that
+    /// threshold is derived from this one (bounded by 256 KiB) instead of being
+    /// a fixed 4 MiB per worker — before that, previews imposed a memory floor
+    /// `--buffer-mb 1` could not move.
     ///
     /// Measured: on a real 5M-read library ~141 MB peak RSS at 512 MB against
     /// ~36 MB at 8 MB, and on 2M real reads 48.6 MB against 22.7 MB, at
@@ -41,6 +128,21 @@ pub struct Args {
     /// a worker's share to bind.
     #[arg(long, default_value = "8", value_name = "MB")]
     pub buffer_mb: usize,
+
+    /// Per-read index stream mode for heatmap.data: `exact` (default) stores
+    /// every read, `capped:N` stores at most N reads per (pixel, file) and
+    /// `off` stores none (no buffer, no spill, no render pass).
+    ///
+    /// Only heatmap.data is affected: heatmap.json carries
+    /// `"data_reads_per_pixel"` and `"data_complete": false` when the mode is
+    /// not exact, and the counts, PNG, corner metrics and report stay exact.
+    #[arg(
+        long,
+        default_value = "exact",
+        value_name = "exact|capped:N|off",
+        value_parser = parse_data_mode
+    )]
+    pub data_mode: DataMode,
 
     /// Write all output files into this directory (created if absent).
     #[arg(short = 'o', long, default_value = ".", value_name = "PATH")]
@@ -217,5 +319,45 @@ mod tests {
         // No env in tests: falls back to available cores, clamped by file count.
         let n = a.resolved_threads(1);
         assert!(n >= 1 && n <= 16, "got {n}");
+    }
+
+    // ── FM-1: --data-mode ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_data_mode_default_is_exact() {
+        let a = Args::parse_from(["fastmaps", "a.fq"]);
+        assert_eq!(a.data_mode, DataMode::Exact);
+        assert!(a.data_mode.is_exact());
+        assert_eq!(a.data_mode.cap(), None);
+    }
+
+    #[test]
+    fn test_data_mode_parses_all_forms() {
+        let p = |s: &str| parse_data_mode(s).unwrap();
+        assert_eq!(p("exact"), DataMode::Exact);
+        assert_eq!(p("EXACT"), DataMode::Exact);
+        assert_eq!(p("off"), DataMode::Off);
+        assert_eq!(p("capped:1"), DataMode::Capped(1));
+        assert_eq!(p("capped:255"), DataMode::Capped(255));
+        assert_eq!(p("capped=7"), DataMode::Capped(7));
+        assert_eq!(p("capped:4").to_string(), "capped:4");
+        assert_eq!(p("off").to_string(), "off");
+        assert_eq!(DataMode::Off.reads_per_pixel(), 0);
+        assert_eq!(DataMode::Capped(6).reads_per_pixel(), 6);
+
+        let a = Args::parse_from(["fastmaps", "a.fq", "--data-mode", "off"]);
+        assert_eq!(a.data_mode, DataMode::Off);
+        let a = Args::parse_from(["fastmaps", "a.fq", "--data-mode", "capped:3"]);
+        assert_eq!(a.data_mode, DataMode::Capped(3));
+    }
+
+    #[test]
+    fn test_data_mode_rejects_garbage() {
+        assert!(parse_data_mode("capped:0").is_err(), "cap 0 is `off`, not 0 reads");
+        assert!(parse_data_mode("capped:256").is_err(), "u8 cap");
+        assert!(parse_data_mode("capped:").is_err());
+        assert!(parse_data_mode("mostly").is_err());
+        assert!(parse_data_mode("").is_err());
+        assert!(Args::try_parse_from(["fastmaps", "a.fq", "--data-mode", "nope"]).is_err());
     }
 }

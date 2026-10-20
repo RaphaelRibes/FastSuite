@@ -3,11 +3,27 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::cli::DataMode;
 use crate::encode::json_escape;
 use crate::file_kind::FileKind;
 use crate::spiller::{preview_row_temp_path, row_temp_path, SpillerState};
 use crate::varint::varint_write;
 use crate::worker::PreviewRead;
+
+/// Everything `write_format` needs besides the spiller's state. A struct
+/// rather than ten positional arguments: the data-mode knob (FM-1) was the
+/// eleventh.
+pub struct FormatOpts<'a> {
+    pub files: &'a [String],
+    pub file_kinds: &'a [FileKind],
+    pub preview_n: usize,
+    pub data_mode: DataMode,
+    pub output_dir: &'a Path,
+    pub json_path: &'a Path,
+    pub with_wrapper: bool,
+    pub elapsed_s: f64,
+    pub quiet: bool,
+}
 
 // ── Row encoding ─────────────────────────────────────────────────────────────
 
@@ -191,17 +207,24 @@ pub fn decode_preview_row(raw: &[u8], y: u16) -> Vec<PreviewRead> {
 /// Index entries are read one row at a time from the per-y temp files written
 /// by the spiller, then deleted, so peak RAM ≈ the largest single row's data.
 /// Preview payloads are read back the same way (one row file at a time).
-pub fn write_format(
-    state: SpillerState,
-    files: &[String],
-    file_kinds: &[FileKind],
-    preview_n: usize,
-    output_dir: &Path,
-    json_path: &Path,
-    with_wrapper: bool,
-    elapsed_s: f64,
-    quiet: bool,
-) -> std::io::Result<()> {
+///
+/// With `--data-mode off` there is no render pass at all: no row file is read,
+/// no decoder runs, and each row is written as the empty pixel list so the file
+/// and its offsets stay structurally valid. `capped:N` renders whatever the
+/// worker kept (at most N reads per (pixel, file)).
+pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Result<()> {
+    let FormatOpts {
+        files,
+        file_kinds,
+        preview_n,
+        data_mode,
+        output_dir,
+        json_path,
+        with_wrapper,
+        elapsed_s,
+        quiet,
+    } = *opts;
+
     let size = (state.max_seq_len + 1) as usize;
     if size > u16::MAX as usize {
         eprintln!("Error: max read length {} exceeds u16::MAX", state.max_seq_len);
@@ -218,26 +241,34 @@ pub fn write_format(
     let mut data_file    = BufWriter::new(File::create(output_dir.join("heatmap.data"))?);
     let mut preview_file = BufWriter::new(File::create(output_dir.join("heatmap.preview"))?);
 
+    // `varint(0)`: a row with no pixels. Off mode emits this for every row.
+    const EMPTY_ROW: [u8; 1] = [0];
+
     for y in 0..size as u16 {
-        // Read temp file for this row, then delete it immediately.
-        let temp = row_temp_path(&state.temp_dir, y);
-        let indices: Vec<(u16, u16, u32)> = if temp.exists() {
-            let raw = std::fs::read(&temp)?;
-            if raw.len() % 8 != 0 {
-                eprintln!("Corrupt temp file {} (len {})", temp.display(), raw.len());
-                std::process::exit(1);
-            }
-            let mut v = Vec::with_capacity(raw.len() / 8);
-            for chunk in raw.chunks_exact(8) {
-                let x   = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
-                let fid = u16::from_le_bytes(chunk[2..4].try_into().unwrap());
-                let rn  = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                v.push((x, fid, rn));
-            }
-            std::fs::remove_file(&temp)?;
-            v
+        let drow: Vec<u8> = if data_mode == DataMode::Off {
+            EMPTY_ROW.to_vec()
         } else {
-            vec![]
+            // Read temp file for this row, then delete it immediately.
+            let temp = row_temp_path(&state.temp_dir, y);
+            let indices: Vec<(u16, u16, u32)> = if temp.exists() {
+                let raw = std::fs::read(&temp)?;
+                if raw.len() % 8 != 0 {
+                    eprintln!("Corrupt temp file {} (len {})", temp.display(), raw.len());
+                    std::process::exit(1);
+                }
+                let mut v = Vec::with_capacity(raw.len() / 8);
+                for chunk in raw.chunks_exact(8) {
+                    let x   = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
+                    let fid = u16::from_le_bytes(chunk[2..4].try_into().unwrap());
+                    let rn  = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                    v.push((x, fid, rn));
+                }
+                std::fs::remove_file(&temp)?;
+                v
+            } else {
+                vec![]
+            };
+            encode_data_row(indices)
         };
 
         let previews = {
@@ -254,7 +285,6 @@ pub fn write_format(
             }
         };
 
-        let drow = encode_data_row(indices);
         let prow = encode_preview_row(previews, preview_n, file_kinds);
 
         data_file.write_all(&drow)?;
@@ -271,8 +301,8 @@ pub fn write_format(
 
     // Flat row-major counts grid: index = y*size + x.
     let mut counts_arr = vec![0u64; size * size];
-    for (&(x, y), &(c, _)) in &state.counts {
-        counts_arr[y as usize * size + x as usize] = c;
+    for (&(x, y), acc) in &state.counts {
+        counts_arr[y as usize * size + x as usize] = acc.count;
     }
     let mut counts_r1_arr = vec![0u64; size * size];
     for (&(x, y), &c) in &state.counts_r1 {
@@ -287,7 +317,7 @@ pub fn write_format(
     // No-call reads (zero ACGT bases) sit on (0,0) in the grid like an all-A
     // read; each window passes its own count so the fractions can leave them
     // out instead of reporting them as polyA.
-    let metrics = crate::report::corner_metrics(
+    let mut metrics = crate::report::corner_metrics(
         size as u32,
         &[
             ("", &counts_arr, state.no_call),
@@ -295,6 +325,24 @@ pub fn write_format(
             ("r2", &counts_r2_arr, state.no_call_r2),
         ],
     );
+    // FM-1: a non-exact data mode is a labelled approximation of
+    // `heatmap.data` alone. Both the grid JSON and the v1 wrapper carry the
+    // label, so no consumer can mistake a capped/absent stream for the exact
+    // one. `data_complete` is a boolean in the grid JSON and 0.0 in the metric
+    // map (which is `f64`-valued by schema).
+    let data_labels = if data_mode.is_exact() {
+        String::new()
+    } else {
+        metrics.insert("data_complete".into(), 0.0);
+        metrics.insert(
+            "data_reads_per_pixel".into(),
+            data_mode.reads_per_pixel() as f64,
+        );
+        format!(
+            "  \"data_reads_per_pixel\": {},\n  \"data_complete\": false,\n",
+            data_mode.reads_per_pixel()
+        )
+    };
     let per_file_json = (0..files.len())
         .map(|i| {
             state
@@ -327,6 +375,7 @@ pub fn write_format(
             "  \"total_reads\": {total},\n",
             "  \"per_file_counts\": [{pfc}],\n",
             "  \"preview_reads_per_pixel\": {pn},\n",
+            "{labels}",
             "  \"counts\": [{counts}],\n",
             "  \"counts_r1\": [{counts_r1}],\n",
             "  \"counts_r2\": [{counts_r2}],\n",
@@ -340,6 +389,7 @@ pub fn write_format(
         total     = state.total_reads,
         pfc       = per_file_json,
         pn        = preview_n,
+        labels    = data_labels,
         counts    = counts_join(&counts_arr),
         counts_r1 = counts_join(&counts_r1_arr),
         counts_r2 = counts_join(&counts_r2_arr),

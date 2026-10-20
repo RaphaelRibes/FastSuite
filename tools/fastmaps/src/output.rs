@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::worker::PixelAcc;
+
 /// Normalised log-count `t` in `[0, 1]` for the heat scale: `ln(c) / ln(max)`.
 ///
 /// The degenerate case `max_count <= 1` (every occupied pixel holds exactly
@@ -41,7 +43,7 @@ fn heat_color(t: f64) -> [u8; 3] {
     ]
 }
 
-pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
+pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
     let w = max_x + 1;
@@ -52,7 +54,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
     let view_w = margin + w as u32 * cell + 10 + 50;
     let view_h = y_axis;
 
-    let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
+    let max_count = counts.values().map(|a| a.count).max().unwrap();
 
     let f = BufWriter::new(File::create(output_dir.join("heatmap.svg")).unwrap());
     let mut f = f;
@@ -73,8 +75,8 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
             let px = margin + x * cell;
             let py = view_h - (margin + (y + 1) * cell);
             let (r, g, b) = match counts.get(&(x, y)) {
-                Some((c, _)) => {
-                    let t = log_norm(*c, max_count);
+                Some(acc) => {
+                    let t = log_norm(acc.count, max_count);
                     let [r, g, b] = heat_color(t);
                     (r, g, b)
                 }
@@ -163,16 +165,16 @@ pub fn write_svg(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
         println!("Saved heatmap.svg  ({}x{} cells, {} unique)", w, h, counts.len());
     }
 }
-pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
+pub fn write_png(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
-    let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
+    let max_count = counts.values().map(|a| a.count).max().unwrap();
 
     let w = max_x + 1;
     let h = max_y + 1;
     let mut pixels = vec![[0u8; 3]; w * h];
-    for (&(x, y), &(c, _)) in counts {
-        let t = log_norm(c, max_count);
+    for (&(x, y), acc) in counts {
+        let t = log_norm(acc.count, max_count);
         pixels[y as usize * w + x as usize] = heat_color(t);
     }
 
@@ -195,20 +197,29 @@ pub fn write_png(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, qu
 
 /// Write an interactive Plotly 3-D scatter HTML to `output_dir/heatmap_3d.html`.
 /// z = mean Phred quality, colour = log(count).
-pub fn write_html(counts: &HashMap<(u32, u32), (u64, f64)>, output_dir: &Path, quiet: bool) {
-    let max_count = counts.values().map(|(c, _)| *c).max().unwrap();
-    let total: u64 = counts.values().map(|(c, _)| c).sum();
+///
+/// The series is sorted by `(x, y)` (FM-12). It used to be emitted in `HashMap`
+/// iteration order, which std seeds per process — so two runs of the identical
+/// command produced different files even at `-j 1`. Together with the integer
+/// quality accumulators this makes the page reproducible.
+pub fn write_html(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
+    let max_count = counts.values().map(|a| a.count).max().unwrap();
+    let total: u64 = counts.values().map(|a| a.count).sum();
 
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    let mut zs = Vec::new();
-    let mut cs = Vec::new();
+    let mut series: Vec<((u32, u32), PixelAcc)> =
+        counts.iter().map(|(&xy, &acc)| (xy, acc)).collect();
+    series.sort_unstable_by_key(|&(xy, _)| xy);
 
-    for (&(x, y), &(c, cq)) in counts {
+    let mut xs = Vec::with_capacity(series.len());
+    let mut ys = Vec::with_capacity(series.len());
+    let mut zs = Vec::with_capacity(series.len());
+    let mut cs = Vec::with_capacity(series.len());
+
+    for ((x, y), acc) in series {
         xs.push(x);
         ys.push(y);
-        zs.push(cq / c as f64);
-        cs.push(log_norm(c, max_count));
+        zs.push(acc.mean_quality());
+        cs.push(log_norm(acc.count, max_count));
     }
 
     let fmt_vec = |v: &[f64]| v.iter().map(|n| format!("{n:.4}")).collect::<Vec<_>>().join(",");
@@ -299,5 +310,45 @@ mod tests {
         assert!((log_norm(1, 10) - 0.0).abs() < 1e-12);
         let mid = log_norm(5, 100);
         assert!((mid - (5f64.ln() / 100f64.ln())).abs() < 1e-12);
+    }
+
+    /// FM-12: the Plotly series is sorted by `(x, y)`, not emitted in `HashMap`
+    /// iteration order (which is randomised per process, so the file used to
+    /// change between two runs of the same command).
+    #[test]
+    fn html_series_is_sorted_by_xy() {
+        let dir = std::env::temp_dir().join(format!("maps_html_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut counts: HashMap<(u32, u32), PixelAcc> = HashMap::new();
+        // Inserted out of order on purpose.
+        for (x, y, c) in [(9u32, 1u32, 4u64), (2, 7, 2), (2, 3, 7), (5, 5, 1)] {
+            counts.insert(
+                (x, y),
+                PixelAcc { count: c, sum_q: 30 * c, sum_len: c },
+            );
+        }
+        write_html(&counts, &dir, true);
+        let text = std::fs::read_to_string(dir.join("heatmap_3d.html")).unwrap();
+
+        let grab = |open: &str, close: &str| -> Vec<u32> {
+            let start = text.find(open).unwrap_or_else(|| panic!("no {open}")) + open.len();
+            let end = start + text[start..].find(close).unwrap();
+            text[start..end]
+                .split(',')
+                .map(|s| s.trim().parse::<u32>().unwrap())
+                .collect()
+        };
+        let xs = grab("x: [", "], y: [");
+        let ys = grab("y: [", "], z: [");
+        assert_eq!(xs, vec![2, 2, 5, 9]);
+        assert_eq!(ys, vec![3, 7, 5, 1]);
+        assert!(
+            (1..xs.len()).all(|i| (xs[i - 1], ys[i - 1]) < (xs[i], ys[i])),
+            "series must be strictly ordered by (x, y): {xs:?} {ys:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
