@@ -1,0 +1,1723 @@
+diff --git a/tools/fastcheck/src/accum.rs b/tools/fastcheck/src/accum.rs
+index af25918..97909ae 100644
+--- a/tools/fastcheck/src/accum.rs
++++ b/tools/fastcheck/src/accum.rs
+@@ -16,14 +16,62 @@
+ //!
+ //! Sizing at R = 150, per file:
+ //!   base_pos  R x 5 x 8 B   = 6 KB
+-//!   qual_pos  R x 256 x 8 B = 307 KB
+-//! `qual_pos` is indexed by the raw quality byte rather than by Phred, so the
+-//! accumulator never needs to know the encoding: the offset is decided once,
+-//! at report time, from the exact byte census. A run therefore cannot be
+-//! silently wrong about +33/+64.
++//!   qual_pos  R x 128 x 8 B = 154 KB
++//! `qual_pos` is indexed by the raw quality byte (`byte - 33`) rather than by
++//! Phred, so the accumulator never needs to know the encoding: the offset is
++//! decided once, at report time, from the exact byte census. A run therefore
++//! cannot be silently wrong about +33/+64.
++//!
++//! The plane is 128 cells wide because the only bytes a Phred quality can be are
++//! 33..=126 — `byte - 33` is the cell. The census below is still 256 bytes wide:
++//! it is what proves +33 vs +64 and what reports the byte range, so a byte
++//! outside 33..=126 must be *counted* there even though it is excluded from the
++//! per-position rows (FC-8). That exclusion is the only place where a malformed
++//! file and a valid one can report different per-position quality.
+ 
+ pub const NT: usize = 5; // A, C, G, T, other/N
+-pub const QBINS: usize = 256;
++/// Width of the exact quality-byte census: one cell per possible byte.
++pub const QBYTES: usize = 256;
++/// Lowest and highest byte a Phred quality can be (Phred+33, Q0..Q93).
++pub const QMIN: u8 = 33;
++pub const QMAX: u8 = 126;
++/// Cells in a per-position quality row: indexed by `byte - QMIN`, so only 94 of them
++/// can ever be touched (33..=126). The row is padded to 128 cells so it stays a power
++/// of two — 1 024 B, 16 cache lines — which is half the 2 048 B the 256-cell row cost.
++pub const QBINS: usize = 128;
++
++/// The per-position quality cell for a raw byte, or `None` when the byte is not a
++/// Phred quality at all (it goes to the census, not to the rows).
++#[inline]
++pub fn qbin(b: u8) -> Option<usize> {
++    if b >= QMIN && b <= QMAX {
++        Some((b - QMIN) as usize)
++    } else {
++        None
++    }
++}
++
++/// 256-entry base LUT: A=0 C=1 G=2 T=3 (either case), N and every other IUPAC code 4.
++/// One table lookup replaces the `to_ascii_uppercase()` + five-arm match the loop used
++/// to run per base, per pass.
++pub const BASE_CODE: [u8; 256] = {
++    let mut t = [4u8; 256];
++    let mut i = 0usize;
++    while i < 256 {
++        t[i] = match i as u8 {
++            b'A' | b'a' => 0,
++            b'C' | b'c' => 1,
++            b'G' | b'g' => 2,
++            b'T' | b't' => 3,
++            _ => 4,
++        };
++        i += 1;
++    }
++    t
++};
++
++/// The 12-mer rolling register's mask: 12 bases x 2 bits.
++const KMER_MASK: u32 = (1 << (2 * repeated::KMER_K)) - 1;
+ 
+ fn grow<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
+     if v.len() < n {
+@@ -31,14 +79,15 @@ fn grow<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
+     }
+ }
+ 
+-// [u64; 256] has no `Default`, so rows are grown with an explicit literal.
++// [u64; QBINS] has no `Default`, so rows are grown with an explicit literal.
+ const QUAL_ROW: [u64; QBINS] = [0; QBINS];
+ 
+ 
+ use crate::heatmap;
+ use crate::polyx;
+ use crate::repeated;
+-use crate::repeated::RepeatedCounter;
++use crate::repeated::KmerTable;
++
+ #[derive(Clone)]
+ pub struct Accum {
+     /// Position rows are grown to the longest read seen; reads longer than
+@@ -68,12 +117,16 @@ pub struct Accum {
+     /// floor(raw byte mean) of each read -> count. For an integer offset `k`,
+     /// `floor(x) - k == floor(x - k)`, so the Phred offset is applied at report
+     /// time without touching the data again.
+-    pub meanq_raw_hist: [u64; QBINS],
++    pub meanq_raw_hist: [u64; QBYTES],
+     /// Exact census of quality bytes; this is what decides +33 vs +64.
+-    pub qual_byte: [u64; QBINS],
++    pub qual_byte: [u64; QBYTES],
++    /// Quality bytes outside `33..=126`: counted here, in the census, and NOT folded
++    /// into the per-position rows (which are indexed by `byte - 33`). Zero on a valid
++    /// FASTQ, and the report says so only when it is not.
++    pub qual_out_of_range: u64,
+     /// `base_pos[pos][code]`, position-major.
+     pub base_pos: Vec<[u64; NT]>,
+-    /// `qual_pos[pos][byte]`, position-major.
++    /// `qual_pos[pos][byte - 33]`, position-major; 128 cells, 33..=126.
+     pub qual_pos: Vec<[u64; QBINS]>,
+     /// Adapter-prefix hits per catalogue entry (TruSeq, Nextera), and the G+C of
+     /// the adapter-free reads with the 5' G-run stripped. Both feed the fitter's
+@@ -103,8 +156,9 @@ pub struct Accum {
+     /// ignored (stated in the report). This is the baseline every --overrep-mode builds on
+     /// (PLAN-QC §5.9): it gives the exact multiplicity histogram with no sequence text.
+     pub seq_counts: crate::fingerprint::FingerprintTable,
+-    /// Bounded 12-mer counter (packed u64 keys).
+-    pub kmer_counts: RepeatedCounter<u64>,
++    /// Exact 12-mer counter: a dense 4^12 `u16` table plus an exact width-overflow map
++    /// (`crate::repeated::KmerTable`). No cap, no eviction, no approximation.
++    pub kmer_counts: KmerTable,
+     /// 2-bit packed sequence table, filled only in `--overrep-mode table` (the memory is
+     /// real: ~46 B per unique 150 bp read, admission-checked in main.rs).
+     pub overrep_table: crate::overrep::SequenceTable,
+@@ -124,13 +178,81 @@ pub const ADAPTER_PREFIXES: [(&str, &str); 2] =
+     [("TruSeq", "AGATCGGAAGAGC"), ("Nextera", "CTGTCTCTTATA")];
+ 
+ /// Case-insensitive substring search (the adapter prefix in a read).
+-fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+-    if needle.is_empty() || hay.len() < needle.len() {
++///
++/// Word-at-a-time prefilter, no dependency: eight candidate start offsets are tested
++/// per `u64` load by folding the haystack word and the needle's first byte with
++/// `& 0xDF` and looking for a zero byte (`x - 0x0101..` & `!x` & `0x8080..`). The
++/// 13-byte pattern is then compared — still folded, word at a time — only at the
++/// candidates, and confirmed byte-exactly with `to_ascii_uppercase`.
++///
++/// `& 0xDF` is a *superset* of case-insensitive equality: `'@'` and ``'`'`` fold
++/// together without being the same letter case, so a folded match is a candidate, never
++/// an answer. Folded *inequality* is conclusive, which is what makes the reject cheap:
++/// the 2 x 138 x 13 `to_ascii_uppercase` calls the window scan performed per read
++/// become ~19 `u64` loads plus one exact verification at each real candidate.
++pub(crate) fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
++    const FOLD: u64 = 0xDFDF_DFDF_DFDF_DFDF;
++    const ONES: u64 = 0x0101_0101_0101_0101;
++    const HIGH: u64 = 0x8080_8080_8080_8080;
++    let n = needle.len();
++    if n == 0 || hay.len() < n {
+         return false;
+     }
+-    hay.windows(needle.len()).any(|w| {
+-        w.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+-    })
++    #[inline]
++    fn word(s: &[u8]) -> u64 {
++        u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
++    }
++    // Reject fast on folded words, then confirm exactly. Only ever called at a
++    // candidate, so its cost is paid once per genuine first-byte match.
++    #[inline]
++    fn verify(h: &[u8], needle: &[u8]) -> bool {
++        let n = needle.len();
++        let mut i = 0;
++        while i + 8 <= n {
++            if (word(&h[i..]) & FOLD) != (word(&needle[i..]) & FOLD) {
++                return false;
++            }
++            i += 8;
++        }
++        while i < n {
++            if (h[i] & 0xDF) != (needle[i] & 0xDF) {
++                return false;
++            }
++            i += 1;
++        }
++        h.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
++    }
++
++    let first = (needle[0] & 0xDF) as u64 * ONES;
++    let last = hay.len() - n;
++    let mut i = 0usize;
++    while i <= last {
++        if last - i + 1 >= 8 {
++            // Eight candidate starts in one load; the lanes are all <= `last` because
++            // eight candidates remain, so a match here is a legal window.
++            let x = (word(&hay[i..]) & FOLD) ^ first;
++            let z = x.wrapping_sub(ONES) & !x & HIGH;
++            if z == 0 {
++                i += 8;
++                continue;
++            }
++            let mut bits = z;
++            while bits != 0 {
++                let lane = (bits.trailing_zeros() / 8) as usize;
++                if verify(&hay[i + lane..], needle) {
++                    return true;
++                }
++                bits &= bits - 1;
++            }
++            i += 8;
++        } else {
++            if (hay[i] & 0xDF) == (needle[0] & 0xDF) && verify(&hay[i..], needle) {
++                return true;
++            }
++            i += 1;
++        }
++    }
++    false
+ }
+ 
+ impl Accum {
+@@ -147,8 +269,9 @@ impl Accum {
+             len_hist: Vec::new(),
+             acgt_hist: Vec::new(),
+             gc_hist: Vec::new(),
+-            meanq_raw_hist: [0; QBINS],
+-            qual_byte: [0; QBINS],
++            meanq_raw_hist: [0; QBYTES],
++            qual_byte: [0; QBYTES],
++            qual_out_of_range: 0,
+             base_pos: Vec::new(),
+             qual_pos: Vec::new(),
+             adapter_hits: [0; 2],
+@@ -161,7 +284,7 @@ impl Accum {
+             run_q_tail: (0, 0),
+             heatmap: vec![0; heatmap::SIZE * heatmap::SIZE],
+             seq_counts: crate::fingerprint::FingerprintTable::with_capacity(1024),
+-            kmer_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
++            kmer_counts: KmerTable::new(),
+             overrep_table: crate::overrep::SequenceTable::default(),
+             track_overrep_table: false,
+             adapter_pos: None,
+@@ -177,7 +300,8 @@ impl Accum {
+             + self.qual_pos.len() * std::mem::size_of::<[u64; QBINS]>()
+             + (self.len_hist.len() + self.acgt_hist.len() + self.gc_hist.len()) * 8
+             + self.n_run_hist.len() * 8
+-            + 2 * QBINS * 8
++            + 2 * QBYTES * 8
++            + self.kmer_counts.resident_bytes()
+     }
+ 
+     /// Record one ambiguous run `[start, end)` of a read of length `read_len`.
+@@ -193,8 +317,22 @@ impl Accum {
+         }
+     }
+ 
+-    /// One record. `header` carries the tile coordinates for `--tiles`; `seq` and `qual`
+-    /// must have equal length (the scanner enforces it: a mismatch is an error, not an
++    /// One record, in one pass over the sequence.
++    ///
++    /// Every per-base consumer reads the same decoded base: the composition cell and
++    /// the N-run state machine, the heatmap's `(x = #(T+C), y = #(T+G))`, the rolling
++    /// 12-mer register, and the fragment start the `--profile` fit needs. Before this
++    /// the sequence was walked four times (composition, heatmap, xxh3, 12-mer windows)
++    /// and the 12-mer loop decoded each base 11.1x; now it is decoded once through the
++    /// 256-entry [`BASE_CODE`] LUT.
++    ///
++    /// The N-run state machine and the polyX measurement are unchanged: a run is
++    /// `record_n_run`ed where it ends, exactly as before, and `polyx::measure_polyx`
++    /// is still its own read (it breaks at the first transition, so it costs 2–3 byte
++    /// compares per read, not per base).
++    ///
++    /// `header` carries the tile coordinates for `--tiles`; `seq` and `qual` must have
++    /// equal length (the scanner enforces it: a mismatch is an error, not an
+     /// assumption).
+     pub fn observe(&mut self, header: &[u8], seq: &[u8], qual: &[u8]) {
+         let len = seq.len();
+@@ -215,32 +353,57 @@ impl Accum {
+         let (mut acgt, mut gc, mut has_n) = (0u64, 0u64, false);
+         let mut run_start: usize = 0; // first base of the ambiguous run in progress
+         let mut in_run = false;
++        // Heatmap counters: x = #(T+C), y = #(T+G), capped at the grid edge at the end
++        // (`heatmap::encode`'s own rule, so both paths agree on a saturating read).
++        let (mut hx, mut hy) = (0u64, 0u64);
++        // Rolling 12-mer: 24 bits of 2-bit codes, and how many consecutive valid bases
++        // it holds. Any other code (N, IUPAC) resets the run, which is exactly
++        // `pack_kmer`'s "contains a non-ACGT base" rule.
++        let mut win: u32 = 0;
++        let mut valid: u32 = 0;
++        // First non-G base: the fragment start the profile fitter measures from.
++        let mut first_non_g: Option<usize> = None;
+         for (i, &raw) in seq.iter().enumerate() {
+-            let code = match raw.to_ascii_uppercase() {
+-                b'A' => 0,
+-                b'C' => 1,
+-                b'G' => 2,
+-                b'T' => 3,
+-                _ => 4, // N and every other IUPAC code: counted, never folded into ACGT
+-            };
++            let code = BASE_CODE[raw as usize];
++            win = ((win << 2) | code as u32) & KMER_MASK;
+             if code == 4 {
++                valid = 0;
+                 if !in_run {
+                     in_run = true;
+                     run_start = i;
+                 }
+                 has_n = true;
+             } else {
++                valid = (valid + 1).min(repeated::KMER_K as u32);
+                 if in_run {
+                     self.record_n_run(run_start, i, len);
+                     in_run = false;
+                 }
+                 acgt += 1;
+-                if code == 1 || code == 2 {
+-                    gc += 1;
++                match code {
++                    1 => {
++                        gc += 1;
++                        hx += 1;
++                    }
++                    2 => {
++                        gc += 1;
++                        hy += 1;
++                    }
++                    3 => {
++                        hx += 1;
++                        hy += 1;
++                    }
++                    _ => {}
+                 }
+             }
++            if first_non_g.is_none() && code != 2 {
++                first_non_g = Some(i);
++            }
+             if i < per_pos {
+-                self.base_pos[i][code] += 1;
++                self.base_pos[i][code as usize] += 1;
++            }
++            if valid == repeated::KMER_K as u32 {
++                self.kmer_counts.add(win);
+             }
+         }
+         if in_run {
+@@ -258,8 +421,14 @@ impl Accum {
+         for (i, &q) in qual.iter().enumerate() {
+             self.qual_byte[q as usize] += 1;
+             qsum += q as u64;
+-            if i < per_pos {
+-                self.qual_pos[i][q as usize] += 1;
++            match qbin(q) {
++                Some(b) => {
++                    if i < per_pos {
++                        self.qual_pos[i][b] += 1;
++                    }
++                }
++                // Not a Phred byte: in the census above, never in a per-position row.
++                None => self.qual_out_of_range += 1,
+             }
+         }
+         let raw_mean = if qual.is_empty() {
+@@ -267,7 +436,7 @@ impl Accum {
+         } else {
+             (qsum / qual.len() as u64) as usize
+         };
+-        self.meanq_raw_hist[raw_mean.min(QBINS - 1)] += 1;
++        self.meanq_raw_hist[raw_mean.min(QBYTES - 1)] += 1;
+ 
+         // Profile extras (only when a profile was requested): the adapter
+         // readthrough rate and the FRAGMENT gc. Readthrough is the adapter
+@@ -284,14 +453,13 @@ impl Accum {
+                 }
+             }
+             if !hit {
+-                let start = seq.iter().position(|&b| b.to_ascii_uppercase() != b'G').unwrap_or(seq.len());
+-                for &b in &seq[start..] {
+-                    match b.to_ascii_uppercase() {
+-                        b'G' | b'C' => { self.frag_gc += 1; self.frag_bases += 1; }
+-                        b'A' | b'T' => { self.frag_bases += 1; }
+-                        _ => {}
+-                    }
+-                }
++                // The fragment starts at the first non-G base. Every base before it is a
++                // G, so it contributes exactly `lead` to both ACGT and GC: the fragment's
++                // counts are the read's own counts minus `lead`, with no second pass.
++                let lead = first_non_g.unwrap_or(len) as u64;
++                debug_assert!(lead <= gc && lead <= acgt);
++                self.frag_gc += gc - lead;
++                self.frag_bases += acgt - lead;
+             }
+         }
+ 
+@@ -320,9 +488,11 @@ impl Accum {
+             self.run_q_tail.1 += (qual.len() - start) as u64;
+         }
+ 
+-        // Heatmap cell.
+-        let (hx, hy) = heatmap::encode(seq);
+-        self.heatmap[heatmap::index(hx, hy)] += 1;
++        // Heatmap cell, from the counters the base loop already kept.
++        self.heatmap[heatmap::index(
++            (hx as usize).min(heatmap::SIZE - 1),
++            (hy as usize).min(heatmap::SIZE - 1),
++        )] += 1;
+ 
+         // Duplication: every read is fingerprinted, exactly, with no sample and no cap.
+         // The table starts at 1024 entries and grows (main.rs admission-checks the size it
+@@ -349,13 +519,6 @@ impl Accum {
+         if let Some(t) = self.tile.as_mut() {
+             t.observe(header, qual);
+         }
+-        if seq.len() >= 12 {
+-            for w in seq.windows(12) {
+-                if let Some(pk) = repeated::pack_kmer(w) {
+-                    self.kmer_counts.insert(pk);
+-                }
+-            }
+-        }
+     }
+ 
+     /// Exact sum of two accumulators.
+@@ -385,9 +548,10 @@ impl Accum {
+         }
+         // The fingerprint table merges exactly, like every other accumulator here.
+         self.seq_counts.merge(&o.seq_counts);
+-        // The 12-mer counter merges under the same cap/singleton-eviction rule as the
+-        // per-file one. Without this the merged accumulator carries an empty spectrum and
+-        // every report says kmer_top_count 0 however over-represented the k-mers are.
++        // The 12-mer table merges exactly, cell by cell, with the width overflow carried
++        // through `hot`: the merged spectrum is the spectrum of the concatenated input.
++        // Without this the merged accumulator carries an empty spectrum and every report
++        // says kmer_top_count 0 however over-represented the k-mers are.
+         self.kmer_counts.merge(&o.kmer_counts);
+         match (self.adapter_pos.as_mut(), o.adapter_pos.as_ref()) {
+             (Some(a), Some(b)) => a.merge(b),
+@@ -411,10 +575,11 @@ impl Accum {
+         add_hist(&mut self.len_hist, &o.len_hist);
+         add_hist(&mut self.acgt_hist, &o.acgt_hist);
+         add_hist(&mut self.gc_hist, &o.gc_hist);
+-        for i in 0..QBINS {
++        for i in 0..QBYTES {
+             self.meanq_raw_hist[i] += o.meanq_raw_hist[i];
+             self.qual_byte[i] += o.qual_byte[i];
+         }
++        self.qual_out_of_range += o.qual_out_of_range;
+         grow(&mut self.base_pos, o.base_pos.len());
+         for (i, row) in o.base_pos.iter().enumerate() {
+             for (d, s) in self.base_pos[i].iter_mut().zip(row.iter()) {
+@@ -435,7 +600,7 @@ impl Accum {
+         self.base_pos.get(pos).map_or(0, |r| r[code])
+     }
+ 
+-    /// All 256 per-position quality bins for `pos`.
++    /// The 128 per-position quality cells for `pos`, indexed by `byte - 33`.
+     pub fn qual_at(&self, pos: usize) -> [u64; QBINS] {
+         self.qual_pos.get(pos).copied().unwrap_or(QUAL_ROW)
+     }
+@@ -492,8 +657,8 @@ pub struct OffsetVerdict {
+ /// absence proves nothing: a +33 file whose lowest quality is Q31 also sits
+ /// entirely above 64. In that case we report the ambiguity instead of
+ /// asserting a guess, and `--phred-offset` settles it.
+-pub fn offset_verdict(census: &[u64; QBINS], requested: Option<u8>) -> OffsetVerdict {
+-    let min = (0..QBINS).find(|&b| census[b] > 0).map(|b| b as u8);
++pub fn offset_verdict(census: &[u64; QBYTES], requested: Option<u8>) -> OffsetVerdict {
++    let min = (0..QBYTES).find(|&b| census[b] > 0).map(|b| b as u8);
+     let malformed = min.map_or(false, |m| m < 33);
+ 
+     match requested {
+@@ -607,7 +772,7 @@ mod tests {
+ 
+     #[test]
+     fn offset_stays_unasserted_when_ambiguous() {
+-        let mut census = [0u64; QBINS];
++        let mut census = [0u64; QBYTES];
+         census[70] = 5; // 'F' = Q37 under +33, Q6 under +64
+         let v = offset_verdict(&census, None);
+         assert_eq!(v.offset, 33, "default, but not claimed as certain");
+@@ -617,7 +782,7 @@ mod tests {
+         assert_eq!(v64.offset, 64);
+         assert!(v64.certain);
+         // Forcing +64 on a census that cannot be +64 is reported, not hidden.
+-        let mut low = [0u64; QBINS];
++        let mut low = [0u64; QBYTES];
+         low[33] = 1;
+         let forced = offset_verdict(&low, Some(64));
+         assert!(!forced.certain);
+@@ -626,7 +791,7 @@ mod tests {
+ 
+     #[test]
+     fn malformed_quality_bytes_are_flagged() {
+-        let mut census = [0u64; QBINS];
++        let mut census = [0u64; QBYTES];
+         census[10] = 1;
+         let v = offset_verdict(&census, None);
+         assert!(v.malformed);
+@@ -650,12 +815,57 @@ mod tests {
+     fn per_position_quality_is_binned_by_byte() {
+         let a = fixture();
+         let row = a.qual_at(0);
+-        assert_eq!(row[73], 1); // 'I'
+-        assert_eq!(row[33], 1); // '!'
+-        assert_eq!(row[53], 1); // '5'
++        assert_eq!(row[73 - 33], 1); // 'I' = 73 -> cell 40
++        assert_eq!(row[0], 1); // '!' = 33 -> cell 0
++        assert_eq!(row[53 - 33], 1); // '5' = 53 -> cell 20
+         assert_eq!(a.covered_positions(), 4);
+     }
+ 
++    /// FC-8: the per-position plane is 128 cells, indexed by `byte - 33`, because the
++    /// only bytes a valid FASTQ can carry are 33..=126. A byte outside that range is
++    /// still in the exact byte census (which decides the offset and reports the range),
++    /// but it is not folded into a per-position row where it would silently shift the
++    /// position's mean and quantiles.
++    #[test]
++    fn per_position_quality_plane_covers_only_valid_phred_bytes() {
++        let mut a = Accum::new(8);
++        // One read per interesting byte, so every position carries the same quality and
++        // the row can be read cell by cell.
++        a.observe(b"@r", b"ACGT", &[33u8, 33, 33, 33]);
++        a.observe(b"@r", b"ACGT", &[73u8, 73, 73, 73]);
++        a.observe(b"@r", b"ACGT", &[126u8, 126, 126, 126]);
++        a.observe(b"@r", b"ACGT", &[200u8, 200, 200, 200]);
++        let row = a.qual_at(0);
++        assert_eq!(row.len(), 128, "the plane is 128 cells, not 256");
++        assert_eq!(row[0], 1, "'!' = 33 -> cell 0");
++        assert_eq!(row[73 - 33], 1, "'I' = 73 -> cell 40");
++        assert_eq!(row[126 - 33], 1, "the highest valid byte, 126, is the last used cell");
++        assert_eq!(row.iter().sum::<u64>(), 3, "byte 200 is not a per-position quality");
++        assert_eq!(a.qual_byte[200], 4, "but it is still in the exact byte census");
++        // The census, and therefore the offset verdict and the reported byte range, are
++        // untouched: a malformed file is still named as one.
++        let v = offset_verdict(&a.qual_byte, None);
++        assert!(v.certain, "byte 33 proves +33, exactly as before");
++        assert!(!v.malformed, "the malformed flag is about bytes BELOW 33");
++    }
++
++    /// FC-8, the other half: a byte above 126 is out of range for a Phred byte too, and
++    /// it is counted where the report can name it rather than dropped.
++    #[test]
++    fn quality_bytes_above_the_phred_range_are_counted_not_dropped() {
++        let mut a = Accum::new(8);
++        a.observe(b"@r", b"ACGT", &[33u8, 73, 126, 200]);
++        assert_eq!(a.qual_out_of_range, 1, "byte 200 is outside 33..=126");
++        let mut ok = Accum::new(8);
++        ok.observe(b"@r", b"ACGT", &[33u8, 73, 126, 40]);
++        assert_eq!(ok.qual_out_of_range, 0, "a valid file pays nothing and reports nothing");
++        // Both merge exactly, like every other counter here.
++        let mut m = Accum::new(8);
++        m.merge(&a);
++        m.merge(&ok);
++        assert_eq!(m.qual_out_of_range, 1);
++    }
++
+     #[test]
+     fn positions_beyond_max_read_len_are_excluded_not_misattributed() {
+         let mut a = Accum::new(4);
+@@ -722,22 +932,313 @@ mod tests {
+         assert_eq!(block["top"][0]["count"], json!(16_000));
+     }
+ 
+-    /// Merge keeps the bound: an over-cap merge drops singletons and leaves the frequent
+-    /// k-mers counted exactly.
++    /// FC-1: the spectrum is exact now, and it says so. A 16 bp read carries five
++    /// 12-mer windows; every one of them is counted, `distinct` comes off the non-zero
++    /// cells, and the block no longer claims an approximation.
+     #[test]
+-    fn kmer_merge_respects_the_cap_and_evicts_only_singletons() {
+-        let mut a = RepeatedCounter::new(100);
+-        let mut b = RepeatedCounter::new(100);
+-        let common = repeated::pack_kmer(b"ACGTACGTACGT").unwrap();
+-        for _ in 0..50 {
+-            a.insert(common);
+-        }
+-        for i in 0..200u64 {
+-            b.insert(1 << 40 | i); // 200 distinct singletons, over the cap
+-        }
+-        a.merge(&b);
+-        assert!(a.len() <= 100, "the merged map must stay under the cap, got {}", a.len());
+-        assert_eq!(a.report(10), vec![(common, 50)], "the frequent k-mer keeps its exact count");
+-        assert_eq!(a.total, 250, "total is the number of inserts seen");
++    fn kmer_spectrum_is_exact_and_reports_distinct() {
++        let mut a = Accum::new(32);
++        for _ in 0..20 {
++            // 16 bp, five windows, all five different. 20 reads puts the top count (20)
++            // above the report's 0.1%-of-reads / 10-count threshold.
++            a.observe(b"@r", b"ACGTACGTACGTACGA", &[b'I'; 16]);
++        }
++        let (m, block) = crate::rich::kmer_metrics(&a);
++        assert_eq!(block["approximate"], json!(false), "the dense table is exact");
++        assert!(
++            block.get("approximation").is_none(),
++            "there is no bound left to state: {block}"
++        );
++        assert_eq!(block["distinct"], json!(5), "5 windows, all distinct");
++        assert_eq!(m["kmer_top_count"], json!(20));
++        assert_eq!(block["top"].as_array().unwrap().len(), 5);
++        let named: Vec<&str> = block["top"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .map(|e| e["kmer"].as_str().unwrap())
++            .collect();
++        assert!(named.contains(&"ACGTACGTACGT"), "{named:?}");
++    }
++
++    // ---------------------------------------------------------------------------
++    // FC-2: the fused single pass, held to the per-function path it replaced.
++    // ---------------------------------------------------------------------------
++
++    /// Deterministic xorshift64 — no dev-dependency, and the same reads every run.
++    struct Rng(u64);
++    impl Rng {
++        fn next(&mut self) -> u64 {
++            let mut x = self.0;
++            x ^= x << 13;
++            x ^= x >> 7;
++            x ^= x << 17;
++            self.0 = x;
++            x
++        }
++        fn below(&mut self, n: usize) -> usize {
++            (self.next() % n as u64) as usize
++        }
++    }
++
++    /// The pre-FC-2 path, kept verbatim as the reference the fused loop is held to:
++    /// an inline composition/N-run pass, then `heatmap::encode`, then `pack_kmer` per
++    /// window, then `contains_ci` per adapter prefix plus the fragment-GC loop, then
++    /// `polyx::measure_polyx`. Everything here is a separate function call over the
++    /// whole read, which is exactly what `observe` no longer does.
++    fn reference(reads: &[(Vec<u8>, Vec<u8>)], max_pos: usize) -> (Accum, Vec<(u64, u32)>) {
++        let mut a = Accum::new(max_pos);
++        a.track_profile = true;
++        let mut kmers: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
++        for (seq, qual) in reads {
++            let len = seq.len();
++            a.reads += 1;
++            a.bases += len as u64;
++            grow(&mut a.len_hist, len + 1);
++            a.len_hist[len] += 1;
++            let per_pos = len.min(max_pos);
++            if len > max_pos {
++                a.reads_over_max_len += 1;
++            }
++            grow(&mut a.base_pos, per_pos);
++            if a.qual_pos.len() < per_pos {
++                a.qual_pos.resize(per_pos, QUAL_ROW);
++            }
++
++            let (mut acgt, mut gc, mut has_n) = (0u64, 0u64, false);
++            let mut run_start = 0usize;
++            let mut in_run = false;
++            for (i, &raw) in seq.iter().enumerate() {
++                let code = match raw.to_ascii_uppercase() {
++                    b'A' => 0,
++                    b'C' => 1,
++                    b'G' => 2,
++                    b'T' => 3,
++                    _ => 4,
++                };
++                if code == 4 {
++                    if !in_run {
++                        in_run = true;
++                        run_start = i;
++                    }
++                    has_n = true;
++                } else {
++                    if in_run {
++                        a.record_n_run(run_start, i, len);
++                        in_run = false;
++                    }
++                    acgt += 1;
++                    if code == 1 || code == 2 {
++                        gc += 1;
++                    }
++                }
++                if i < per_pos {
++                    a.base_pos[i][code] += 1;
++                }
++            }
++            if in_run {
++                a.record_n_run(run_start, len, len);
++            }
++            if has_n {
++                a.reads_with_n += 1;
++            }
++            grow(&mut a.acgt_hist, acgt as usize + 1);
++            a.acgt_hist[acgt as usize] += 1;
++            grow(&mut a.gc_hist, gc as usize + 1);
++            a.gc_hist[gc as usize] += 1;
++
++            let mut qsum = 0u64;
++            for (i, &q) in qual.iter().enumerate() {
++                a.qual_byte[q as usize] += 1;
++                qsum += q as u64;
++                if (33..=126).contains(&q) {
++                    if i < per_pos {
++                        a.qual_pos[i][(q - 33) as usize] += 1;
++                    }
++                } else {
++                    a.qual_out_of_range += 1;
++                }
++            }
++            let raw_mean = if qual.is_empty() { 0 } else { (qsum / qual.len() as u64) as usize };
++            a.meanq_raw_hist[raw_mean.min(QBYTES - 1)] += 1;
++
++            let mut hit = false;
++            for (i, (_, pat)) in ADAPTER_PREFIXES.iter().enumerate() {
++                if contains_ci(seq, pat.as_bytes()) {
++                    a.adapter_hits[i] += 1;
++                    hit = true;
++                }
++            }
++            if !hit {
++                let start = seq
++                    .iter()
++                    .position(|&b| b.to_ascii_uppercase() != b'G')
++                    .unwrap_or(seq.len());
++                for &b in &seq[start..] {
++                    match b.to_ascii_uppercase() {
++                        b'G' | b'C' => {
++                            a.frag_gc += 1;
++                            a.frag_bases += 1;
++                        }
++                        b'A' | b'T' => a.frag_bases += 1,
++                        _ => {}
++                    }
++                }
++            }
++
++            let (lb, ll, tb, tl) = polyx::measure_polyx(seq);
++            if lb != usize::MAX {
++                grow(&mut a.polyx5[lb], ll + 1);
++                a.polyx5[lb][ll] += 1;
++            }
++            if tb != usize::MAX {
++                grow(&mut a.polyx3[tb], tl + 1);
++                a.polyx3[tb][tl] += 1;
++            }
++            const G: usize = 2;
++            if lb == G {
++                let n = ll.min(qual.len());
++                a.run_q_head.0 += qual[..n].iter().map(|&b| b as u64).sum::<u64>();
++                a.run_q_head.1 += n as u64;
++            }
++            if tb == G {
++                let start = qual.len().saturating_sub(tl);
++                a.run_q_tail.0 += qual[start..].iter().map(|&b| b as u64).sum::<u64>();
++                a.run_q_tail.1 += (qual.len() - start) as u64;
++            }
++
++            let (hx, hy) = heatmap::encode(seq);
++            a.heatmap[heatmap::index(hx, hy)] += 1;
++
++            if seq.len() >= 12 {
++                for w in seq.windows(12) {
++                    if let Some(pk) = repeated::pack_kmer(w) {
++                        *kmers.entry(pk).or_insert(0) += 1;
++                    }
++                }
++            }
++        }
++        let mut kv: Vec<(u64, u32)> = kmers.into_iter().collect();
++        kv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
++        (a, kv)
++    }
++
++    /// Reads with everything the loop has to get right: both cases, N and other IUPAC
++    /// codes, empty reads, reads shorter and longer than 12 bp, and a max_pos that
++    /// truncates the per-position planes.
++    fn random_reads(seed: u64, n: usize, max_len: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
++        const ALPHABET: &[u8] = b"ACGTACGTacgtNNnRYry.-";
++        let mut rng = Rng(seed | 1);
++        let mut out = Vec::with_capacity(n);
++        for _ in 0..n {
++            let len = rng.below(max_len + 1);
++            let mut seq = Vec::with_capacity(len);
++            for _ in 0..len {
++                seq.push(ALPHABET[rng.below(ALPHABET.len())]);
++            }
++            // Every 7th read carries a real adapter prefix, in a random case, so both
++            // the hit path and the fragment path are exercised.
++            if rng.below(7) == 0 && seq.len() >= 13 {
++                let pat: &[u8] = ADAPTER_PREFIXES[rng.below(2)].1.as_bytes();
++                let at = rng.below(seq.len() - 12);
++                for (j, &b) in pat.iter().enumerate() {
++                    seq[at + j] = if j % 2 == 0 { b } else { b.to_ascii_lowercase() };
++                }
++            }
++            let qual: Vec<u8> = (0..len).map(|_| (33 + rng.below(94)) as u8).collect();
++            out.push((seq, qual));
++        }
++        out
++    }
++
++    /// The fused loop must be the per-function path, counter for counter. If a base is
++    /// decoded once instead of four times, the four answers must not move.
++    #[test]
++    fn the_fused_pass_is_the_per_function_path() {
++        let reads = random_reads(0x5EED_1234, 400, 40);
++        let mut fused = Accum::new(24); // shorter than the longest read: truncation too
++        fused.track_profile = true;
++        for (seq, qual) in &reads {
++            fused.observe(b"@r", seq, qual);
++        }
++        let (want, want_kmers) = reference(&reads, 24);
++
++        assert_eq!(fused.reads, want.reads);
++        assert_eq!(fused.bases, want.bases);
++        assert_eq!(fused.reads_with_n, want.reads_with_n);
++        assert_eq!(fused.reads_over_max_len, want.reads_over_max_len);
++        assert_eq!(fused.n_run_hist, want.n_run_hist, "N-run lengths");
++        assert_eq!(fused.n_run_leading, want.n_run_leading);
++        assert_eq!(fused.n_run_trailing, want.n_run_trailing);
++        assert_eq!(fused.len_hist, want.len_hist);
++        assert_eq!(fused.acgt_hist, want.acgt_hist);
++        assert_eq!(fused.gc_hist, want.gc_hist);
++        assert_eq!(fused.meanq_raw_hist, want.meanq_raw_hist);
++        assert_eq!(fused.qual_byte, want.qual_byte);
++        assert_eq!(fused.qual_out_of_range, want.qual_out_of_range);
++        assert_eq!(fused.base_pos, want.base_pos, "composition plane");
++        assert_eq!(fused.qual_pos, want.qual_pos, "quality plane");
++        assert_eq!(fused.polyx3, want.polyx3);
++        assert_eq!(fused.polyx5, want.polyx5);
++        assert_eq!(fused.run_q_head, want.run_q_head);
++        assert_eq!(fused.run_q_tail, want.run_q_tail);
++        assert_eq!(fused.heatmap, want.heatmap, "heatmap grid");
++        assert_eq!(fused.adapter_hits, want.adapter_hits, "adapter readthrough rate");
++        assert_eq!(fused.frag_gc, want.frag_gc, "fragment GC");
++        assert_eq!(fused.frag_bases, want.frag_bases);
++        assert_eq!(fused.kmer_counts.report(1), want_kmers, "12-mer spectrum");
++    }
++
++    /// FC-6: the word-at-a-time prefilter must answer exactly what the double-fold
++    /// window scan answered, including the bytes that survive `& 0xDF` together
++    /// ('@' and '`' fold to the same value but are not the same letter case).
++    #[test]
++    fn contains_ci_agrees_with_the_window_reference() {
++        fn reference(hay: &[u8], needle: &[u8]) -> bool {
++            if needle.is_empty() || hay.len() < needle.len() {
++                return false;
++            }
++            hay.windows(needle.len())
++                .any(|w| w.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase()))
++        }
++        let mut cases: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
++        // the two real prefixes, present and absent, in every case mix
++        for pat in ["AGATCGGAAGAGC", "CTGTCTCTTATA"] {
++            cases.push((pat.as_bytes().to_vec(), pat.as_bytes().to_vec()));
++            cases.push((pat.to_ascii_lowercase().into_bytes(), pat.as_bytes().to_vec()));
++            cases.push((b"ACGTACGTACGTACGT".to_vec(), pat.as_bytes().to_vec()));
++            let mut h = vec![b'g'; 40];
++            h.extend_from_slice(pat.as_bytes());
++            cases.push((h, pat.as_bytes().to_vec()));
++        }
++        // fold collisions: '@'/'`' and '['/'{' differ by 0x20 but are not one letter
++        cases.push((b"@@@AGATCGGAAGAGC".to_vec(), b"AGATCGGAAGAGC".to_vec()));
++        cases.push((b"@@@`GATCGGAAGAGC".to_vec(), b"AGATCGGAAGAGC".to_vec()));
++        cases.push((b"[{][{][{][{][{][{][{".to_vec(), b"[{][{][{][{][{".to_vec()));
++        // needles shorter than a word and exactly a word
++        cases.push((b"aaAAaa".to_vec(), b"AAAA".to_vec()));
++        cases.push((b"xACGTACGTx".to_vec(), b"acgtacgt".to_vec()));
++        // random haystacks over a nasty alphabet, and a random needle from each
++        const HAY_ALPHABET: &[u8] = b"ACGTacgt@`[{N. nAGATCG";
++        const NEEDLE_ALPHABET: &[u8] = b"ACGTacgt@`[";
++        let mut rng = Rng(0xC0FF_EE11);
++        for _ in 0..300 {
++            let hl = rng.below(60);
++            let hay: Vec<u8> = (0..hl).map(|_| HAY_ALPHABET[rng.below(HAY_ALPHABET.len())]).collect();
++            let nl = 1 + rng.below(13);
++            let needle: Vec<u8> =
++                (0..nl).map(|_| NEEDLE_ALPHABET[rng.below(NEEDLE_ALPHABET.len())]).collect();
++            cases.push((hay, needle));
++        }
++        for (hay, needle) in &cases {
++            assert_eq!(
++                contains_ci(hay, needle),
++                reference(hay, needle),
++                "hay {hay:?} needle {needle:?}"
++            );
++        }
++        // and the semantics the fitter relies on: an empty needle never matches
++        assert!(!contains_ci(b"ACGT", b""));
++        assert!(contains_ci(b"xxagatcggaagagcxx", b"AGATCGGAAGAGC"));
+     }
+ }
+diff --git a/tools/fastcheck/src/gated.rs b/tools/fastcheck/src/gated.rs
+index 298ff92..23da0b4 100644
+--- a/tools/fastcheck/src/gated.rs
++++ b/tools/fastcheck/src/gated.rs
+@@ -20,13 +20,12 @@
+ //!
+ //! [`observe_gated`]: Accum::observe_gated
+ 
+-use crate::accum::{Accum, QBINS};
++use crate::accum::{contains_ci, qbin, Accum, QBYTES, QBINS};
+ use crate::cli::Modules;
+ use crate::heatmap;
+ use crate::polyx;
+-use crate::repeated;
+ 
+-/// `[u64; 256]` has no `Default`, so rows are grown with an explicit literal
++/// `[u64; QBINS]` has no `Default`, so rows are grown with an explicit literal
+ /// (the same one `accum.rs` uses).
+ const QUAL_ROW: [u64; QBINS] = [0; QBINS];
+ 
+@@ -62,15 +61,9 @@ fn record_n_run(a: &mut Accum, start: usize, end: usize, read_len: usize) {
+     }
+ }
+ 
+-/// Case-insensitive substring search (copy of `accum::contains_ci`, used only by
+-/// the `--profile` readthrough scan).
+-fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+-    if needle.is_empty() || hay.len() < needle.len() {
+-        return false;
+-    }
+-    hay.windows(needle.len())
+-        .any(|w| w.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase()))
+-}
++// Case-insensitive substring search: the gated twin calls `accum::contains_ci` rather
++// than carrying a copy, so the two paths cannot drift (the copy that lived here had to
++// be kept byte-identical by hand).
+ 
+ /// What a gated pass actually measured, in units of work rather than of output.
+ ///
+@@ -211,9 +204,15 @@ impl Accum {
+             for (i, &q) in qual.iter().enumerate() {
+                 self.qual_byte[q as usize] += 1;
+                 qsum += q as u64;
+-                if i < per_pos {
+-                    self.qual_pos[i][q as usize] += 1;
+-                    w.qual_cells += 1;
++                match qbin(q) {
++                    Some(b) => {
++                        if i < per_pos {
++                            self.qual_pos[i][b] += 1;
++                            w.qual_cells += 1;
++                        }
++                    }
++                    // Not a Phred byte: in the census, never in a per-position row.
++                    None => self.qual_out_of_range += 1,
+                 }
+             }
+             w.quality_bytes = qual.len() as u64;
+@@ -222,7 +221,7 @@ impl Accum {
+             } else {
+                 (qsum / qual.len() as u64) as usize
+             };
+-            self.meanq_raw_hist[raw_mean.min(QBINS - 1)] += 1;
++            self.meanq_raw_hist[raw_mean.min(QBYTES - 1)] += 1;
+         }
+ 
+         // The --profile extras are not a module: they are the price of the profile
+@@ -320,8 +319,8 @@ impl Accum {
+ 
+         if m.kmer && seq.len() >= 12 {
+             for win in seq.windows(12) {
+-                if let Some(pk) = repeated::pack_kmer(win) {
+-                    self.kmer_counts.insert(pk);
++                if let Some(pk) = crate::repeated::pack_kmer(win) {
++                    self.kmer_counts.add(pk as u32);
+                     w.kmer_windows += 1;
+                 }
+             }
+diff --git a/tools/fastcheck/src/main.rs b/tools/fastcheck/src/main.rs
+index 73a45ed..a2ff5d9 100644
+--- a/tools/fastcheck/src/main.rs
++++ b/tools/fastcheck/src/main.rs
+@@ -365,6 +365,7 @@ fn main() -> Result<()> {
+             if processed_reports.is_empty() { None } else { Some(&processed_total) },
+             overrep,
+             min_count,
++            threads,
+             total.adapter_pos.as_ref().map(|ap| {
+                 (ap, cli.adapter_error_rate, cli.min_adapter_overlap)
+             }),
+diff --git a/tools/fastcheck/src/profile.rs b/tools/fastcheck/src/profile.rs
+index 53d84d2..b43fdde 100644
+--- a/tools/fastcheck/src/profile.rs
++++ b/tools/fastcheck/src/profile.rs
+@@ -246,7 +246,9 @@ fn per_position_mean_q(acc: &Accum, offset: u8) -> Vec<f64> {
+             let sum: f64 = row
+                 .iter()
+                 .enumerate()
+-                .map(|(b, &c)| ((b as i64 - offset as i64).max(0) as f64) * c as f64)
++                // The row is indexed by `byte - 33` (128 cells): recover the byte first,
++                // then the Phred value, exactly as the report does.
++                .map(|(b, &c)| ((b + crate::accum::QMIN as usize) as i64 - offset as i64).max(0) as f64 * c as f64)
+                 .sum();
+             sum / depth as f64
+         })
+diff --git a/tools/fastcheck/src/repeated.rs b/tools/fastcheck/src/repeated.rs
+index a358326..4b59d89 100644
+--- a/tools/fastcheck/src/repeated.rs
++++ b/tools/fastcheck/src/repeated.rs
+@@ -1,93 +1,134 @@
+-//! Bounded over-represented-sequence and k-mer counters.
++//! Exact 12-mer counting.
+ //!
+-//! Streaming with singleton eviction: when the number of distinct keys exceeds
+-//! a cap, every key with count == 1 is dropped. A singleton can never be
+-//! over-represented, and losing its first occurrence costs at most 1 of a count
+-//! that must reach a large threshold to be reported, so memory stays bounded on
+-//! 50 M-read files while the frequent sequences are counted exactly.
++//! k is fixed at 12, so the key space is 4¹² = 16 777 216 and a dense `Vec<u16>` of
++//! that size is 32 MiB — **independent of the number of reads**, which is the property
++//! the tool is sold on. There is no cap, no eviction and no sampling, so the spectrum is
++//! exact and `distinct` (the number of 12-mers seen at least once) is countable from the
++//! non-zero cells; neither was knowable from the bounded map this replaces
++//! (`RepeatedCounter<u64>`, capped at 1e6 keys with singleton eviction, which also made
++//! the block depend on read order and therefore on `-j`).
+ //!
+-//! SCOPE (as of the exactness work): this counter is used for the **k-mer spectrum only**.
+-//! Full-sequence duplication and over-representation moved to the exact fingerprint table
+-//! (`crate::fingerprint`) and the packed sequence table (`crate::overrep`), because a
+-//! fingerprint is 8 B where a sequence is 46 B and the exactness is affordable. The
+-//! approximation that remains is labelled in the report (`kmer_spectrum.approximate`).
+-
+-use std::collections::HashMap;
+-use std::hash::Hash;
+-
+-/// Default cap on distinct keys before singleton eviction kicks in.
+-pub const DEFAULT_CAP: usize = 1_000_000;
+-
+-/// A bounded counter keyed by any `Hash + Eq + Clone` key (a full read
+-/// sequence as `Vec<u8>`, or a packed k-mer as `u64`).
+-#[derive(Clone)]
+-pub struct RepeatedCounter<K> {
+-    map: HashMap<K, u32>,
+-    cap: usize,
+-    /// Total inserts seen (for the fraction).
+-    pub total: u64,
+-    /// Map length at which the next singleton eviction fires. Keeps the
+-    /// eviction amortized O(1) per insert (see `insert`).
+-    evict_at: usize,
++//! The one bound left is the **width**, not the count: a cell is a `u16`, so a 12-mer
++//! that occurs more than 65 535 times keeps its exact count in a small
++//! `FxHashMap<u32, u32>` overflow (`hot`). Only the hottest k-mers of a library —
++//! adapters, polyA — ever reach it, and the count stays exact; see the mean count per
++//! 12-mer of ~167 on a 20 M-read cell, which is three orders of magnitude below the
++//! ceiling for an ordinary k-mer.
++//!
++//! The table is allocated on first use rather than in `Accum::new`, so a gated run that
++//! does not measure the k-mer module (`--only dup`) never pays for it.
++
++use rustc_hash::FxHashMap;
++
++/// Bases per k-mer. Fixed: the dense table's size is its key space.
++pub const KMER_K: usize = 12;
++/// 4^KMER_K: the number of cells in the dense table.
++pub const KMER_CELLS: usize = 1 << (2 * KMER_K);
++
++/// Exact 12-mer counter: a dense table plus a width-overflow map.
++#[derive(Clone, Default)]
++pub struct KmerTable {
++    /// `cells[key]` = count of `key`, saturating at `u16::MAX` (the true total is then
++    /// in `hot`). Empty until the first insert: a run that measures no k-mer allocates
++    /// nothing.
++    cells: Vec<u16>,
++    /// Keys that exceeded `u16::MAX`, with their exact count.
++    hot: FxHashMap<u32, u32>,
+ }
+ 
+-impl<K: Hash + Eq + Clone + Ord> RepeatedCounter<K> {
+-    pub fn new(cap: usize) -> Self {
+-        Self {
+-            map: HashMap::with_capacity(cap.min(1 << 20)),
+-            cap,
+-            total: 0,
+-            evict_at: cap + cap / 4,
++impl KmerTable {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// One occurrence of a packed 12-mer (`pack_kmer`, 24 bits).
++    #[inline]
++    pub fn add(&mut self, key: u32) {
++        debug_assert!((key as usize) < KMER_CELLS, "a 12-mer packs into 24 bits");
++        if self.cells.is_empty() {
++            self.cells = vec![0u16; KMER_CELLS];
++        }
++        let v = &mut self.cells[key as usize];
++        if *v == u16::MAX {
++            let e = self.hot.entry(key).or_insert(u16::MAX as u32);
++            *e += 1;
++        } else {
++            *v += 1;
+         }
+     }
+ 
+-    /// Record one occurrence of `key`, evicting singletons if over the cap.
+-    ///
+-    /// AMORTIZED EVICTION: running `retain` on every insert while over the
+-    /// cap is O(n) per call — on a saturated k-mer space (100k reads x ~140
+-    /// 12-mers against 4^12 = 16.7M keys) the map sits at the cap
+-    /// permanently and every insert pays a full 1M-entry rehash: ~10^13
+-    /// operations, an unbounded spin at ~200% CPU with flat RSS (measured on
+-    /// DRR509062: 40 min of CPU on a 100k-pair unit, no output). Retain only
+-    /// frees singletons, so re-checking on every insert buys nothing once the
+-    /// map is diverse. Evict lazily instead: when the map grows `cap/4` past
+-    /// the last eviction, drop to `cap` in one pass. Amortized O(1) per
+-    /// insert, same memory bound, no pathological case.
+-    pub fn insert(&mut self, key: K) {
+-        self.total += 1;
+-        let e = self.map.entry(key).or_insert(0);
+-        *e += 1;
+-        if self.map.len() > self.evict_at {
+-            self.map.retain(|_, c| *c > 1);
+-            self.evict_at = self.map.len().max(self.cap) + self.cap / 4;
++    /// Exact count of one key (0 if never seen).
++    pub fn count(&self, key: u32) -> u32 {
++        if self.cells.is_empty() {
++            return 0;
+         }
++        self.total_at(key)
++    }
++
++    #[inline]
++    fn total_at(&self, key: u32) -> u32 {
++        let c = self.cells[key as usize];
++        if c == u16::MAX {
++            self.hot.get(&key).copied().unwrap_or(u16::MAX as u32)
++        } else {
++            c as u32
++        }
++    }
++
++    /// Number of distinct 12-mers seen at least once, read off the non-zero cells.
++    pub fn distinct(&self) -> u64 {
++        self.cells.iter().filter(|&&c| c != 0).count() as u64
++    }
++
++    /// Resident bytes of the table, for the run's memory projection.
++    pub fn resident_bytes(&self) -> usize {
++        self.cells.len() * std::mem::size_of::<u16>()
++            + self.hot.len() * (std::mem::size_of::<(u32, u32)>() + 1)
+     }
+ 
+-    /// Exact sum of two counters, under the same bound: every key's count is added in one
+-    /// batch, then singletons are evicted if the map is over `evict_at` — the rule `insert`
+-    /// applies, applied once per merge rather than once per insert.
+-    pub fn merge(&mut self, o: &RepeatedCounter<K>) {
+-        self.total += o.total;
+-        for (k, &c) in &o.map {
+-            *self.map.entry(k.clone()).or_insert(0) += c;
++    /// Exact sum of two tables. Cells that stay inside the `u16` width are summed in
++    /// place; a cell that would overflow keeps its true total in `hot`, so the merged
++    /// spectrum is the spectrum of the concatenated input — which is what makes the
++    /// per-file accumulators mergeable and the block independent of `-j`.
++    pub fn merge(&mut self, o: &KmerTable) {
++        if o.cells.is_empty() {
++            return;
+         }
+-        if self.map.len() > self.evict_at {
+-            self.map.retain(|_, c| *c > 1);
+-            self.evict_at = self.map.len().max(self.cap) + self.cap / 4;
++        if self.cells.is_empty() {
++            self.cells = vec![0u16; KMER_CELLS];
++        }
++        for (i, &ov) in o.cells.iter().enumerate() {
++            if ov == 0 {
++                continue;
++            }
++            let k = i as u32;
++            let sum = self.total_at(k) as u64 + o.total_at(k) as u64;
++            if sum < u16::MAX as u64 {
++                self.cells[i] = sum as u16;
++                self.hot.remove(&k);
++            } else {
++                self.cells[i] = u16::MAX;
++                self.hot.insert(k, sum as u32);
++            }
+         }
+     }
+ 
+-    /// Keys with `count >= min_count`, most frequent first.
+-    pub fn report(&self, min_count: u32) -> Vec<(K, u32)> {
+-        let mut v: Vec<(K, u32)> =
+-            self.map.iter().filter(|(_, &c)| c >= min_count).map(|(k, &c)| (k.clone(), c)).collect();
++    /// Keys with `count >= min_count`, most frequent first, ties broken by key so the
++    /// order is a function of the data and not of insertion order.
++    pub fn report(&self, min_count: u32) -> Vec<(u64, u32)> {
++        let mut v: Vec<(u64, u32)> = Vec::new();
++        for (i, &c) in self.cells.iter().enumerate() {
++            if c == 0 || (c < u16::MAX && (c as u32) < min_count) {
++                continue;
++            }
++            let n = self.total_at(i as u32);
++            if n >= min_count {
++                v.push((i as u64, n));
++            }
++        }
+         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+         v
+     }
+-
+-    pub fn len(&self) -> usize {
+-        self.map.len()
+-    }
+ }
+ 
+ /// Pack a k-mer into a u64 (2 bits per base: A=00, C=01, G=10, T=11).
+@@ -122,84 +163,84 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn reports_only_frequent_sequences() {
+-        let mut c = RepeatedCounter::new(100);
+-        let common = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+-        let rare = b"TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT";
+-        for _ in 0..5 {
+-            c.insert(common.to_vec());
+-        }
+-        for _ in 0..2 {
+-            c.insert(rare.to_vec());
+-        }
+-        // 100 genuinely distinct singletons.
+-        for i in 0..100u8 {
+-            c.insert(vec![b'A', b'C', b'G', b'T', i]);
+-        }
+-        let rep = c.report(3);
+-        assert_eq!(rep.len(), 1, "only the 5x sequence clears the threshold");
+-        assert_eq!(rep[0].0, common);
+-        assert_eq!(rep[0].1, 5);
++    fn kmer_pack_roundtrip() {
++        let v = pack_kmer(b"ACGT").unwrap();
++        assert_eq!(v, 0b00011011, "A=00 C=01 G=10 T=11 -> 0b00011011");
++        assert_eq!(unpack_kmer(v, 4), "ACGT");
++        assert_eq!(pack_kmer(b"ACGN"), None, "N cannot be packed");
+     }
+ 
++    /// The width bound, exercised: past 65 535 occurrences the cell saturates and the
++    /// exact total moves to the overflow map. Nothing is lost and nothing is capped.
+     #[test]
+-    fn eviction_keeps_memory_bounded_and_preserves_frequent() {
+-        // A realistic cap: eviction fires only after ~100 distinct keys, by
+-        // which time the frequent sequence (every 10th read) has a count well
+-        // above 1, so it survives. A cap of 10 would evict it between its own
+-        // insertions — that is a pathological cap, not the shipped default.
+-        let mut c = RepeatedCounter::new(100);
+-        let common = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+-        for i in 0..1000u16 {
+-            c.insert(vec![b'A', b'C', b'G', b'T', (i >> 8) as u8, i as u8]);
+-            if i % 10 == 0 {
+-                c.insert(common.to_vec());
+-            }
++    fn the_table_counts_exactly_past_the_u16_width() {
++        let mut t = KmerTable::new();
++        let key = pack_kmer(b"ACGTACGTACGT").unwrap() as u32;
++        for _ in 0..70_000 {
++            t.add(key);
+         }
+-        assert!(c.len() <= 100, "the map must stay under the cap, got {}", c.len());
+-        let rep = c.report(50);
+-        assert!(rep.iter().any(|(k, _)| k == common), "the frequent sequence survives eviction");
++        assert_eq!(t.count(key), 70_000, "the count is exact above u16::MAX");
++        assert_eq!(t.distinct(), 1);
++        assert_eq!(t.report(1), vec![(key as u64, 70_000)]);
+     }
+ 
++    /// The cap the dense table replaces was 1e6 keys with singleton eviction, so a
++    /// spectrum with more distinct 12-mers than that lost its singletons entirely and
++    /// could not report a distinct count at all. 1.1 M distinct keys, every one of them
++    /// a singleton: all of them are still there.
+     #[test]
+-    fn kmer_pack_roundtrip() {
+-        let v = pack_kmer(b"ACGT").unwrap();
+-        assert_eq!(v, 0b00011011, "A=00 C=01 G=10 T=11 -> 0b00011011");
+-        assert_eq!(unpack_kmer(v, 4), "ACGT");
+-        assert_eq!(pack_kmer(b"ACGN"), None, "N cannot be packed");
++    fn distinct_is_exact_past_the_old_one_million_key_cap() {
++        let mut t = KmerTable::new();
++        for i in 0..1_100_000u32 {
++            t.add(i);
++        }
++        assert_eq!(t.distinct(), 1_100_000);
++        assert!(t.report(2).is_empty(), "every key is a singleton");
++        assert_eq!(t.count(0), 1);
++        assert_eq!(t.count(1_099_999), 1);
+     }
+ 
+-    /// The approximation, stated as a bound rather than hidden: a singleton evicted before
+-    /// its second occurrence costs exactly 1 count. This is why the counter is only used
+-    /// below the 0.1% reporting threshold, where 1 count cannot change a verdict.
++    /// Merge is exact across the width boundary in both directions: a hot key whose two
++    /// halves each sit below the ceiling, and a cold key that must stay a plain sum.
+     #[test]
+-    fn eviction_costs_at_most_one_count_per_evicted_singleton() {
+-        let mut c = RepeatedCounter::new(4);
+-        // 4 distinct singletons fill the cap; the eviction is amortized (fires at
+-        // cap + cap/4 = 5), so the 5th and 6th distinct keys are the two that push
+-        // the map past that threshold and trigger the retain(count > 1).
+-        for i in 0..4u8 {
+-            c.insert(vec![i]);
+-        }
+-        assert_eq!(c.len(), 4);
+-        c.insert(vec![9]); // 5th key: at the threshold, not over it -> no eviction yet
+-        assert_eq!(c.len(), 5);
+-        c.insert(vec![10]); // 6th key: over the threshold -> retain drops all five singletons
+-        // Every key was a singleton, so the eviction takes the new one too: the map is
+-        // empty, not "the just-inserted key survives". The bound is on the COST, not on
+-        // which key is kept — each evicted singleton had exactly one occurrence.
+-        assert_eq!(c.len(), 0, "every key was a singleton, so all are evicted");
+-        // The frequent key is counted exactly once it clears 1.
+-        let mut c = RepeatedCounter::new(4);
+-        for _ in 0..3 {
+-            c.insert(b"ACGT".to_vec());
++    fn merge_is_exact_across_the_width_boundary() {
++        let hot = pack_kmer(b"AAAAAAAAAAAA").unwrap() as u32;
++        let cold = pack_kmer(b"CCCCCCCCCCCC").unwrap() as u32;
++        let mut a = KmerTable::new();
++        let mut b = KmerTable::new();
++        for _ in 0..40_000 {
++            a.add(hot);
++            b.add(hot);
+         }
+-        for i in 0..4u8 {
+-            c.insert(vec![i]);
++        a.add(cold);
++        b.add(cold);
++        b.add(cold);
++        a.merge(&b);
++        assert_eq!(a.count(hot), 80_000, "the summed hot count is exact");
++        assert_eq!(a.count(cold), 3);
++        assert_eq!(a.distinct(), 2);
++        assert_eq!(a.report(1), vec![(hot as u64, 80_000), (cold as u64, 3)]);
++
++        // An empty side changes nothing, including the allocation.
++        let empty = KmerTable::new();
++        let mut c = a.clone();
++        c.merge(&empty);
++        assert_eq!(c.report(1), a.report(1));
++    }
++
++    /// Report order is data-determined: count descending, then key ascending, so two
++    /// runs over the same input in a different order (or with a different `-j`) name the
++    /// same k-mers in the same order.
++    #[test]
++    fn report_orders_by_count_then_key() {
++        let mut t = KmerTable::new();
++        for k in [9u32, 3, 7] {
++            for _ in 0..2 {
++                t.add(k);
++            }
+         }
+-        c.insert(vec![9]);
+-        let rep = c.report(2);
+-        assert_eq!(rep.len(), 1);
+-        assert_eq!(rep[0].1, 3, "the frequent key survives with its exact count");
++        t.add(5);
++        assert_eq!(t.report(1), vec![(3, 2), (7, 2), (9, 2), (5, 1)]);
++        assert_eq!(t.report(2), vec![(3, 2), (7, 2), (9, 2)]);
+     }
+ }
+diff --git a/tools/fastcheck/src/report.rs b/tools/fastcheck/src/report.rs
+index ce603ef..1c7049c 100644
+--- a/tools/fastcheck/src/report.rs
++++ b/tools/fastcheck/src/report.rs
+@@ -6,7 +6,7 @@ use crate::rich;
+ use anyhow::{Context, Result};
+ use serde_json::json;
+ 
+-use crate::accum::{quantile, Accum, OffsetVerdict, QBINS};
++use crate::accum::{quantile, Accum, OffsetVerdict, QBYTES, QBINS};
+ use crate::cli::Modules;
+ use crate::reader::ScanResult;
+ 
+@@ -86,13 +86,17 @@ pub(crate) fn hist_json(hist: &[u64]) -> serde_json::Value {
+     serde_json::Value::Object(m)
+ }
+ 
+-fn byte_range(census: &[u64; QBINS]) -> (u64, u64) {
+-    let min = (0..QBINS).find(|&b| census[b] > 0).unwrap_or(0) as u64;
+-    let max = (0..QBINS).rev().find(|&b| census[b] > 0).unwrap_or(0) as u64;
++fn byte_range(census: &[u64; QBYTES]) -> (u64, u64) {
++    let min = (0..QBYTES).find(|&b| census[b] > 0).unwrap_or(0) as u64;
++    let max = (0..QBYTES).rev().find(|&b| census[b] > 0).unwrap_or(0) as u64;
+     (min, max)
+ }
+ 
+ /// Per-position quality summary from the exact histogram at that position.
++///
++/// The row is indexed by `byte - 33` (128 cells), so the byte is recovered before the
++/// Phred offset is applied. A valid FASTQ can only land in those cells, which is why
++/// this is the same mean and the same q10/q50/q90 it always was.
+ pub(crate) fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) {
+     let depth: u64 = row.iter().sum();
+     if depth == 0 {
+@@ -102,7 +106,7 @@ pub(crate) fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64)
+     let mut q = vec![0u64; QBINS];
+     let mut sum = 0.0;
+     for (b, &c) in row.iter().enumerate() {
+-        let phred = (b as i64 - offset as i64).max(0) as usize;
++        let phred = ((b + crate::accum::QMIN as usize) as i64 - offset as i64).max(0) as usize;
+         let phred = phred.min(QBINS - 1);
+         q[phred] += c;
+         sum += phred as f64 * c as f64;
+@@ -171,6 +175,10 @@ pub fn write_report(
+     processed: Option<&Accum>,
+     overrep: crate::overrep::OverrepMode,
+     overrep_min_count: u32,
++    // The resolved `-j` thread count: the overrep second pass re-reads the files and
++    // builds its BGZF inflate pool from it, so the one mode that pays a second read does
++    // not pay it with one thread because a literal said so.
++    threads: usize,
+     adapter_content: Option<(&crate::adapter_pos::AdapterPos, f64, usize)>,
+     modules: Option<&Modules>,
+     tile: Option<&crate::tile::TileQual>,
+@@ -228,6 +236,13 @@ pub fn write_report(
+             "quality bytes below 33 observed (min {byte_min}): the file is not valid Phred+33"
+         ));
+     }
++    if total.qual_out_of_range > 0 {
++        notes.push(format!(
++            "{} quality bytes outside 33..=126 are in the byte census but excluded from the \
++             per-position quality rows, which are indexed by byte - 33",
++            total.qual_out_of_range
++        ));
++    }
+     if total.reads_over_max_len > 0 {
+         notes.push(format!(
+             "{} reads longer than --max-read-len are counted in the summary but excluded from \
+@@ -366,7 +381,7 @@ pub fn write_report(
+         "base_position": base_position_json(total),
+         "polyx": polyx_block,
+         "repeated_sequences": rep_block,
+-        "overrep": crate::overrep::report(overrep, total, &files_paths(files), 1, overrep_min_count)?,
++        "overrep": crate::overrep::report(overrep, total, &files_paths(files), threads.max(1), overrep_min_count)?,
+         "kmer_spectrum": kmer_block,
+         "heatmap": hm_block,
+         "processed": match processed {
+diff --git a/tools/fastcheck/src/rich.rs b/tools/fastcheck/src/rich.rs
+index 607b7bb..a975c64 100644
+--- a/tools/fastcheck/src/rich.rs
++++ b/tools/fastcheck/src/rich.rs
+@@ -116,6 +116,12 @@ pub fn repeated_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
+ }
+ 
+ /// 12-mer spectrum: metrics + the top list.
++///
++/// Exact: the counter is a dense 4^12 `u16` table (32 MiB, allocated once, independent
++/// of the number of reads) with an exact overflow map for k-mers that occur more than
++/// 65 535 times. There is no cap and no eviction, so `approximate` is `false`, `distinct`
++/// is a count of non-zero cells rather than an estimate, and the block is the same
++/// whatever `-j` is.
+ pub fn kmer_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
+     let reads = acc.reads.max(1) as f64;
+     let min_count = (reads * 0.001).max(10.0) as u32;
+@@ -143,13 +149,12 @@ pub fn kmer_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
+     (
+         m,
+         json!({
+-            "approximate": true,
+-            "approximation": "the 12-mer counter is bounded at 1e6 distinct keys and evicts \
+-                              singletons when it overflows: a k-mer whose every occurrence \
+-                              was evicted loses its count entirely, and one whose first \
+-                              occurrence was evicted loses exactly 1. Counts are exact for \
+-                              k-mers above the 0.1% reporting threshold; below it the number \
+-                              is a lower bound.",
++            "approximate": false,
++            "exactness": "dense 4^12 = 16 777 216-cell u16 table, one allocation at scan \
++                          start, merged cell by cell; counts above 65 535 are carried exactly \
++                          in an overflow map, so only the cell WIDTH is bounded and the count \
++                          is not",
++            "distinct": acc.kmer_counts.distinct(),
+             "top": list,
+         }),
+     )
+diff --git a/tools/fastcheck/src/tile.rs b/tools/fastcheck/src/tile.rs
+index b113a0a..907b73d 100644
+--- a/tools/fastcheck/src/tile.rs
++++ b/tools/fastcheck/src/tile.rs
+@@ -2,7 +2,7 @@
+ //!
+ //! FastQC's per-tile modules answer "is one region of the flowcell failing", which a
+ //! whole-file quality curve cannot see: a bad tile is invisible once its reads are averaged
+-//! with the good ones. The accumulator is `tile x position x quality bin`, ~5 MB per 100
++//! with the good ones. The accumulator is `tile x position x quality cell`, ~2.5 MB per 100
+ //! tiles at R=150, so it is off by default (`--tiles`) and the projection is printed when
+ //! it is on.
+ //!
+@@ -12,23 +12,42 @@
+ 
+ use std::collections::BTreeMap;
+ 
+-use crate::accum::{quantile, QBINS};
++use crate::accum::{qbin, quantile, QBINS};
+ 
+ /// Extract the tile number from a FASTQ header, if it has the 7-field Illumina form.
+ ///
+ /// `@instrument:run:flowcell:lane:tile:x:y <rest>` — the tile is field 5 (index 4) of the
+ /// part before the first space. Anything else (a plain name, a rewritten header, a
+ /// different vendor's layout) returns `None`.
++///
++/// The seven field starts are walked with an index and held in a fixed array: the
++/// `split(':').collect::<Vec<_>>()` this replaces allocated a `Vec` per read — 20 M
++/// allocations on the 20 M-record cell — to read one field.
+ pub fn tile_of(header: &[u8]) -> Option<u32> {
+     let end = header.iter().position(|&b| b == b' ').unwrap_or(header.len());
+-    let fields: Vec<&[u8]> = header[..end].split(|&b| b == b':').collect();
+-    if fields.len() != 7 {
++    let f = &header[..end];
++    let mut starts = [0usize; 7];
++    let mut nfields = 0usize;
++    let mut field_start = 0usize;
++    for i in 0..=f.len() {
++        if i == f.len() || f[i] == b':' {
++            if nfields == 7 {
++                return None; // more than seven fields
++            }
++            starts[nfields] = field_start;
++            nfields += 1;
++            field_start = i + 1;
++        }
++    }
++    if nfields != 7 {
+         return None;
+     }
+-    std::str::from_utf8(fields[4]).ok()?.parse::<u32>().ok()
++    // Field 4 runs from its start to the colon before field 5.
++    let tile = &f[starts[4]..starts[5] - 1];
++    std::str::from_utf8(tile).ok()?.parse::<u32>().ok()
+ }
+ 
+-/// `tile -> position -> quality-byte counts`.
++/// `tile -> position -> quality-byte counts` (128 cells per position, `byte - 33`).
+ #[derive(Clone, Default)]
+ pub struct TileQual {
+     pub tiles: BTreeMap<u32, Vec<[u64; QBINS]>>,
+@@ -43,11 +62,15 @@ impl TileQual {
+             Some(t) => {
+                 self.reads_with_coordinates += 1;
+                 let rows = self.tiles.entry(t).or_default();
++                // One resize for the whole read, not one length test and possible resize
++                // per base: after this `rows[i]` is in bounds for every base of the read.
++                if rows.len() < qual.len() {
++                    rows.resize(qual.len(), [0; QBINS]);
++                }
+                 for (i, &q) in qual.iter().enumerate() {
+-                    if rows.len() <= i {
+-                        rows.resize(i + 1, [0; QBINS]);
++                    if let Some(b) = qbin(q) {
++                        rows[i][b] += 1;
+                     }
+-                    rows[i][q as usize] += 1;
+                 }
+             }
+             // No coordinates: counted, never dropped.
+@@ -119,7 +142,8 @@ impl TileQual {
+     }
+ }
+ 
+-/// Mean quality of one position's exact histogram, in Phred space.
++/// Mean quality of one position's exact histogram, in Phred space. The row is indexed
++/// by `byte - 33`, so the byte is recovered before the offset is applied.
+ fn pos_mean(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) {
+     let depth: u64 = row.iter().sum();
+     if depth == 0 {
+@@ -128,7 +152,8 @@ fn pos_mean(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) {
+     let mut q = vec![0u64; QBINS];
+     let mut sum = 0.0;
+     for (b, &c) in row.iter().enumerate() {
+-        let phred = ((b as i64 - offset as i64).max(0) as usize).min(QBINS - 1);
++        let byte = b + crate::accum::QMIN as usize;
++        let phred = ((byte as i64 - offset as i64).max(0) as usize).min(QBINS - 1);
+         q[phred] += c;
+         sum += phred as f64 * c as f64;
+     }
+@@ -152,6 +177,32 @@ mod tests {
+         assert_eq!(tile_of(b"@LH00916:1:SIMFLOW1:1:notanumber:1:1 1:N:0:x"), None);
+     }
+ 
++    /// The index walk must accept and reject exactly what `split(':')` did: an empty
++    /// leading field still counts, an eighth field still disqualifies, and an empty tile
++    /// field is not a number.
++    #[test]
++    fn the_index_walk_agrees_with_split_on_odd_headers() {
++        assert_eq!(tile_of(b"@:1:2:3:77:5:6 1:N:0:x"), Some(77), "empty first field");
++        assert_eq!(tile_of(b"@a:b:c:d:1234:f:g:x 1:N:0:x"), None, "eight fields");
++        assert_eq!(tile_of(b"@a:b:c:d::f:g 1:N:0:x"), None, "empty tile field");
++        assert_eq!(tile_of(b":1:2:3:9:5:6"), Some(9), "no '@', no space");
++        assert_eq!(tile_of(b""), None, "the empty header splits into one field");
++        // Same answer as the Vec-based reference for every prefix of a real header.
++        let h: &[u8] = b"@LH00916:1:SIMFLOW1:1:1101:1:1 1:N:0:ATCGATCG";
++        for cut in 0..h.len() {
++            // The reference: cut at the first space, split on every colon, take field 5.
++            let f = &h[..cut];
++            let end = f.iter().position(|&b| b == b' ').unwrap_or(f.len());
++            let fields: Vec<&[u8]> = f[..end].split(|&b| b == b':').collect();
++            let want = if fields.len() == 7 {
++                std::str::from_utf8(fields[4]).ok().and_then(|s| s.parse::<u32>().ok())
++            } else {
++                None
++            };
++            assert_eq!(tile_of(&h[..cut]), want, "prefix of length {cut}");
++        }
++    }
++
+     #[test]
+     fn quality_is_separated_by_tile() {
+         let mut t = TileQual::default();
+@@ -171,6 +222,22 @@ mod tests {
+         assert!((mean - 2.0).abs() < 1e-9, "'#' = 35 -> Q2, got {mean}");
+     }
+ 
++    /// A read longer than any seen before grows the rows once, and a later read reuses
++    /// them: the resize is not inside the per-base loop any more, so this is the state it
++    /// has to produce.
++    #[test]
++    fn rows_grow_once_to_the_longest_read() {
++        let mut t = TileQual::default();
++        t.observe(b"@i:1:f:1:1101:1:1 1:N:0:x", b"II");
++        assert_eq!(t.tiles[&1101].len(), 2);
++        t.observe(b"@i:1:f:1:1101:1:1 1:N:0:x", b"IIIIII");
++        assert_eq!(t.tiles[&1101].len(), 6);
++        t.observe(b"@i:1:f:1:1101:1:1 1:N:0:x", b"IIII");
++        assert_eq!(t.tiles[&1101].len(), 6, "a shorter read does not shrink the rows");
++        assert_eq!(t.tiles[&1101][0][73 - 33], 3);
++        assert_eq!(t.tiles[&1101][5][73 - 33], 1);
++    }
++
+     #[test]
+     fn merge_is_exact() {
+         let mut a = TileQual::default();
+@@ -178,7 +245,7 @@ mod tests {
+         let mut b = TileQual::default();
+         b.observe(b"@i:1:f:1:1101:2:2 1:N:0:x", b"IIII");
+         a.merge(&b);
+-        assert_eq!(a.tiles[&1101][0][73], 2);
++        assert_eq!(a.tiles[&1101][0][73 - 33], 2);
+         assert_eq!(a.reads_with_coordinates, 2);
+     }
+ }
+diff --git a/tools/fastcheck/tests/cli.rs b/tools/fastcheck/tests/cli.rs
+index 6bcc329..15732cb 100644
+--- a/tools/fastcheck/tests/cli.rs
++++ b/tools/fastcheck/tests/cli.rs
+@@ -398,17 +398,30 @@ fn a_projection_above_max_mem_refuses_before_reading() {
+ }
+ 
+ #[test]
+-fn the_kmer_spectrum_is_labelled_approximate_because_its_counter_evicts() {
+-    let d = tmpdir("kmer_approx");
+-    let fq = write_fixture(&d);
++fn the_kmer_spectrum_is_exact_and_says_so() {
++    let d = tmpdir("kmer_exact");
++    // 32 bp reads: 21 windows each, so the block has something to count.
++    let fq = write_overrep(&d);
+     let json = d.join("k.json");
+-    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
++    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
++    assert_eq!(code, 0, "stderr: {stderr}");
+     let v = read_json(&json);
+-    assert_eq!(v["kmer_spectrum"]["approximate"], true);
+-    // The approximation and its bound must be stated, not implied.
+-    let note = v["kmer_spectrum"]["approximation"].as_str().unwrap();
+-    assert!(note.contains("singleton"), "{note}");
+-    assert!(note.contains("evict"), "{note}");
++    let k = &v["kmer_spectrum"];
++    assert_eq!(k["approximate"], false, "the dense 4^12 table is exact");
++    assert!(
++        k.get("approximation").is_none(),
++        "there is no bound left to state, so nothing may claim one: {k}"
++    );
++    // `distinct` is counted from the non-zero cells, and the packed fixture is dominated
++    // by one 32 bp sequence appearing 4 times: its 21 windows are its own.
++    let distinct = k["distinct"].as_u64().unwrap();
++    assert!(distinct >= 21, "distinct = {distinct}, expected at least one read's windows");
++    // The block is a function of the data, not of the thread split (FC-1's bonus: the
++    // old counter evicted in read order, so -j could change the top list).
++    let json8 = d.join("k8.json");
++    run(&d, &[fq.to_str().unwrap(), "--json", json8.to_str().unwrap(), "-j", "8", "-q"]);
++    let v8 = read_json(&json8);
++    assert_eq!(v8["kmer_spectrum"], *k, "-j must not move a single k-mer count");
+ }
+ 
+ /// A fixture where one sequence appears 4 times out of 12 reads.
+@@ -561,6 +574,54 @@ fn overrep_mode_table_names_the_sequences_and_second_pass_records_two_passes() {
+     assert_eq!(seqs2[0]["seq"], "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA");
+ }
+ 
++#[test]
++fn overrep_second_pass_is_thread_count_invariant() {
++    let d = tmpdir("overrep_threads");
++    // BGZF: the one input whose second pass actually builds an inflate pool, so the
++    // resolved -j reaches `overrep::second_pass` -> `reader::open` (FC-12).
++    let plain = write_overrep(&d);
++    let mut src = std::fs::File::open(&plain).unwrap();
++    let bgzf = d.join("over.fastq.gz");
++    let mut w = gzp::par::compress::ParCompressBuilder::<gzp::deflate::Bgzf>::new()
++        .num_threads(2)
++        .unwrap()
++        .from_writer(std::fs::File::create(&bgzf).unwrap());
++    std::io::copy(&mut src, &mut w).unwrap();
++    drop(w);
++
++    let mut reports = Vec::new();
++    // -j 2 and -j 8 both inflate BGZF in parallel, so the reports must be identical;
++    // -j 1 would legitimately report "bgzf-serial" (a different decompression MODE, not
++    // a different number) and is covered by the plain-file identity tests.
++    for j in ["2", "8"] {
++        let json = d.join(format!("s{j}.json"));
++        let (_, stderr, code) = run(
++            &d,
++            &[bgzf.to_str().unwrap(), "--json", json.to_str().unwrap(),
++              "--overrep-mode", "second-pass", "--overrep-min-count", "3", "-j", j, "-q"],
++        );
++        assert_eq!(code, 0, "-j {j}: {stderr}");
++        let mut v = read_json(&json);
++        assert_eq!(v["overrep"]["passes"], 2, "the second read must still be declared");
++        blank_run_variance(&mut v);
++        reports.push(v);
++    }
++    if reports[0] != reports[1] {
++        let a = reports[0].as_object().unwrap();
++        let b = reports[1].as_object().unwrap();
++        for (k, v) in a {
++            if b.get(k) != Some(v) {
++                panic!("-j changed {k}:\n 1: {v}\n 8: {}", b.get(k).unwrap());
++            }
++        }
++        panic!("-j changed the report in a way the top-level keys do not name");
++    }
++    // The pass still finds what it found with one thread.
++    let seqs = reports[0]["overrep"]["sequences"].as_array().unwrap();
++    assert_eq!(seqs.len(), 1);
++    assert_eq!(seqs[0]["count"], 4);
++}
++
+ #[test]
+ fn overrep_mode_table_refuses_above_max_mem_like_the_fingerprint_table() {
+     let d = tmpdir("overrep_refuse");

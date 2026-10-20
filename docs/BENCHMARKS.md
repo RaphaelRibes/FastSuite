@@ -90,31 +90,44 @@ not perturb the timed runs.
 
 ### Runtime and memory (largest library, 5 M pairs)
 
-| tool | cores | wall (s) | CPU (s) | peak RSS (MB) |
-|---|---|---|---|---|
-| fastprep | 1 | 34.37 | 81.8 | 106 |
-| fastprep | 2 | 25.84 | 81.2 | 106 |
-| fastp | 1 | 28.5 | 83.6 | 1185 |
-| fastp | 2 | 39.61 | 84.4 | 1131 |
-| cutadapt | 1 | 131.12 | 130.7 | 24 |
-| cutadapt | 2 | 49.98 | 118.7 | 51 |
+| tool | cores | wall (s) | CPU (s) | CPU/wall | peak RSS (MB) |
+|---|---|---|---|---|---|
+| fastprep | 1 | 73.99 | 73.83 | 1.00 | 103 |
+| fastprep | 2 | 37.55 | 74.84 | 1.99 | 106 |
+| fastp | 1 | 80.03 | 79.83 | 1.00 | 1171 |
+| fastp | 2 | 40.55 | 80.32 | 1.98 | 1132 |
+| cutadapt | 1 | 130.60 | 130.27 | 1.00 | 24 |
+| cutadapt | 2 | 68.51 | 114.47 | 1.67 | 49 |
 
 Full per-cell matrix (4 sizes × 3 tools × 2 core counts) is in
-`FastPrep-Paper/benchmark/results.csv`; `FastPrep-Bench/results/results_gz6.csv`
-is the raw equal-level run and `results/results_cores.csv` the core sweep.
+`FastPrep-Paper/benchmark/results.csv`. **That file is the source of truth, and
+its `cpu_s/wall_s` ratio is the audit: a pinned run sits at 1.00, an escaped one
+above it.**
+
+`FastPrep-Bench/results/results_gz6.csv` is the earlier raw equal-level run and
+**must not be quoted for a pinned cell**: its rows marked `pinned` carry
+`cpu_s/wall_s` = 2.43–2.44 for fastprep (33.0 s wall, 80.5 s CPU) while fastp and
+cutadapt sit at 0.98–0.99, so only the fastprep arm escaped `taskset`. Every
+number derived from those rows — including the one-core win they attributed to
+fastp — is superseded below.
 
 ### What the table says
 
-* **fastp's second core makes it slower** — 39.61 s at two cores against 28.5 s
-  at one. Its threads contend over the global duplicate index. fastprep's second
-  core buys a real 1.33× (34.37 → 25.84 s).
-* **Memory is the decisive axis**: 106 MB vs fastp's 1185 MB at 5 M pairs, and
-  31 MB vs 1156 MB at 100 k — a 38× gap that is structural, not a tuning
+* **fastprep leads fastp at every size, on one core and on two.** One core:
+  1.51 vs 1.83 s at 100 k (1.21×), 7.41 vs 8.21 at 500 k, 14.79 vs 16.09 at 1 M,
+  73.99 vs 80.03 at 5 M (1.08×). Two cores: 0.79 vs 1.01, 3.87 vs 4.19, 7.49 vs
+  8.20, 37.55 vs 40.55 (1.08–1.28×). The previous revision of this table had
+  fastp *leading* the 5 M one-core cell; that was the unpinned-harness artefact
+  described above, not a fastprep deficit, and it is withdrawn.
+* **Both tools scale ~1.98× on the second core when pinned.** The earlier claim
+  that fastp's second core makes it *slower* came from the same unpinned rows
+  (39.61 s at "two cores" against 28.5 s at "one") and is likewise withdrawn.
+* **Memory is the decisive axis**: 103 MB vs fastp's 1171 MB at 5 M pairs, and
+  32 MB vs 1148 MB at 100 k — a 36× gap that is structural, not a tuning
   artefact.
-* **fastprep is 3.8× faster than cutadapt on one core** (34.37 vs 131.12 s).
-* **fastprep leads fastp at every size except 5 M**, where fastp leads 0.83×
-  (28.5 vs 34.37 s on one core). This is stated plainly rather than rounded
-  away.
+* **fastprep is 1.77× faster than cutadapt on one core** (73.99 vs 130.60 s),
+  and cutadapt's second core is the one that genuinely helps it (130.60 →
+  68.51 s).
 
 ### The quality axis — drop rate vs ground truth
 
@@ -172,13 +185,18 @@ timing and memory comparison on identical inputs.
 
 **Conditions.** fastmaps at shipped defaults (all cores) and pinned
 (`taskset -c 0`, `-j 1`). FastQC 0.12.1 and Falco 2.0.2 are single-threaded.
+**Every fastmaps cell must name its `--buffer-mb`**: the 512 MB figure was the
+default until 2026-10-18 and is 4× the peak of the 8 MB default, so a row that
+omits it is unreadable and looks like a 9× memory gap against FastQC that the
+shipped tool does not have.
 
 ### Runtime and memory (largest library, 5 M pairs)
 
-| tool | mode | wall (s) | peak RSS (MB) |
-|---|---|---|---|
-| fastmaps | all cores | 9.17 | 145.2 |
-| fastmaps | pinned 1 core | 17.91 | 142.6 |
+| tool | mode | `--buffer-mb` | wall (s) | peak RSS (MB) |
+|---|---|---|---|---|
+| fastmaps | all cores | 512 (pre-2026-10-18 default) | 9.17 | 145.2 |
+| fastmaps | pinned 1 core | 512 | 17.91 | 142.6 |
+| fastmaps | all cores | **8 (shipped default)** | not re-measured on this corpus | **36.1** at 10 M reads (`§2` preview-streaming table) |
 | fastqc | default | 16.1 | 16.4 |
 | falco | default | 8.27 | 641.5 |
 
@@ -266,8 +284,12 @@ correctness axes: exactness against an independent Python implementation
 both histograms and all 150 per-position rows) and, via the simulator, against
 ground truth.
 
-**Conditions.** fastcheck uses all available threads by default; FastQC 0.12.1
-and Falco 2.0.2 are single-threaded.
+**Conditions.** fastcheck *accepts* `-j` and defaults to all cores, but a single
+input file is scanned on **one thread** whatever the flag says (`main.rs` takes
+the serial branch when `files.len() == 1`, and the decompression pool is only
+used for BGZF). So the single-file cells below are single-core numbers on both
+sides, which is the fair comparison; the flag only parallelises across files.
+FastQC 0.12.1 and Falco 2.0.2 are single-threaded.
 
 ### Runtime and memory
 
@@ -607,18 +629,21 @@ propagated.
 
 | claim | where | stale value | committed value |
 |---|---|---|---|
-| fastmaps vs FastQC, 5 M pairs | `docs/STATUS.md` "Measured this week" | 12.25 s / 143 MB vs 72.22 s / 375 MB | 9.17 s / 145.2 MB vs 16.1 s / 16.4 MB |
+| fastmaps vs FastQC, 5 M pairs | `docs/STATUS.md` "Measured this week" | 12.25 s / 143 MB vs 72.22 s / 375 MB | 9.17 s / 145.2 MB vs 16.1 s / 16.4 MB — **both fastmaps cells are the 512 MB-buffer era**; the shipped 8 MB default measures 9.17 s / 36.1 MB (`docs/BENCHMARKS.md` §2 table) |
 | fastqc at 100 k | `FastMaps-Bench/.bench_run.log` | 4.36 s | 2.1 s (`FastMaps-Paper/benchmark/results.csv`) |
-| fastprep vs fastp, 5 M pairs | `docs/STATUS.md` | 32.9 s vs 84.7 s (2.58×) | 34.37 s vs 28.5 s — fastp **leads** this cell |
+| fastprep vs fastp, 5 M pairs | `docs/STATUS.md` | 32.9 s vs 84.7 s (2.58×) | **73.99 s vs 80.03 s on one properly pinned core** — fastprep leads, 1.08× (`FastPrep-Paper/benchmark/results.csv`; the `pinned` rows of `results_gz6.csv` are NOT pinned, they burn 2.4 cores) |
 | fastsim recovery | `docs/STATUS.md` | 7 / 10 parameters | 10 / 10 (`FastSim-Paper/benchmark/recovery.csv`) |
 | fasthelper orchestration | `FastHelper-Paper` abstract | "0.69 s vs 0.69 s" | 0.667 s vs 0.647 s |
 | fasthelper aggregation peak | `FastHelper-Paper` abstract | "~50 MB" | 0.02–3.89 MB (multiqc 137 MB) |
 
-Two of these are worth flagging beyond the arithmetic: **fastp leads the 5 M
-one-core cell** (so the STATUS.md "2.58×" win is not the committed result), and
-**fastsim recovery is 10/10, not 7/10** — the 7/10 figure is the older
-`FastSim-Bench` commit message and the 8/10 one is the pre-fix fitter,
-superseded by the final CSV and the paper's caption. The two papers whose CSV
+Two of these are worth flagging beyond the arithmetic. **The fastprep one-core
+cell has been re-measured twice for two different reasons**: the old harness was
+not pinned (its `pinned` rows burn 2.4 cores), and the first correction of this
+table carried the *unpinned* verdict forward as "fastp leads". With `taskset`
+actually applied and `cpu_s/wall_s` ≈ 1.00 on every row, fastprep leads fastp at
+every size on one and two cores. Second, **fastsim recovery is 10/10, not 7/10**
+— the 7/10 figure is an older `FastSim-Bench` commit message and the 8/10 one the
+pre-fix fitter, superseded by the final CSV and the paper's caption. The two papers whose CSV
 differs from their own `-Bench` repo's CSV
 (FastPrep, FastHelper, FastSim) were resolved in favour of the paper per the
 rule above.

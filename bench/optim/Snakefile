@@ -74,6 +74,17 @@ def cells():
 
 
 CELLS = cells()
+
+# Comparators (if any are installed) reuse fastprep's grid: that head-to-head is
+# the one comparison this round changes, and it is the one whose earlier numbers
+# turned out not to be pinned at all.
+for comp, comp_bin in config.get("comparators", {}).items():
+    for size in SIZES:
+        for th in THREADS:
+            CELLS.append(dict(tool=comp, reads=size, threads=th, kind="comparator",
+                              gz=0, bin=comp_bin,
+                              id=f"{comp}__comparator__{size}__j{th}"))
+
 CELL = {c["id"]: c for c in CELLS}
 
 
@@ -133,7 +144,7 @@ rule cell:
         out_dir = f"{RES}/work/{wildcards.cid}"
         argv = [
             "python3", MEASURE,
-            "--bin", os.path.join(BINS[c["kind"]], c["tool"]),
+            "--bin", c.get("bin") or os.path.join(BINS[c["kind"]], c["tool"]),
             "--tool", c["tool"],
             "--reads", str(c["reads"]),
             "--threads", str(c["threads"]),
@@ -145,6 +156,8 @@ rule cell:
             argv += ["--gz-level", str(c["gz"])]
         if c["tool"] == "fastsim":
             argv += ["--profile", PROFILE]
+        if c["kind"] == "comparator":
+            argv += ["--allow-stderr"]
         with open(output[0], "w") as fh:
             subprocess.run(argv, check=True, stdout=fh)
 

@@ -70,6 +70,15 @@ def tool_argv(args):
                 die(f"{args.bin} has no --gz-level; the gz axis is meaningless for it")
             argv += ["--gz-level", str(args.gz_level)]
         return argv
+    if args.tool == "fastp":
+        # The comparator for the fastprep head-to-head. Same gzip level, same
+        # thread count, same taskset as the FastSuite arm — the three things an
+        # earlier bench got wrong (fastp defaults to -z 4 and -w 3).
+        return [args.bin, "-i", r1, "-I", r2,
+                "-o", os.path.join(out, "fastp_R1.fastq.gz"),
+                "-O", os.path.join(out, "fastp_R2.fastq.gz"),
+                "-w", t, "-z", "6", "-j", os.path.join(out, "fastp.json"),
+                "--dont_overwrite"]
     if args.tool == "fasthelper":
         # Aggregation over a pre-built report tree; `reads` carries the sample
         # count, which is the axis that matters for this tool.
@@ -101,6 +110,9 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--kind", required=True)
     ap.add_argument("--tree", default="")
+    # Comparators write their summary to stderr by design (fastp), so their
+    # cells relax the stderr rule to "exit 0 and non-empty output".
+    ap.add_argument("--allow-stderr", action="store_true")
     args = ap.parse_args()
 
     if not os.path.exists(args.bin):
@@ -156,7 +168,10 @@ def main():
     )
     fatal = re.compile(r"(?i)\b(error|panicked|failed to|cannot|no such file)\b")
     stderr_lines = [l for l in err.decode("utf-8", "replace").splitlines() if l.strip()]
-    unexpected = [l for l in stderr_lines if fatal.search(l) or not benign.match(l)]
+    if args.allow_stderr:
+        unexpected = [l for l in stderr_lines if fatal.search(l)]
+    else:
+        unexpected = [l for l in stderr_lines if fatal.search(l) or not benign.match(l)]
     if rc != 0:
         die(f"{args.tool} exited {rc} on {args.reads} reads at -j{args.threads}: "
             f"{' | '.join(unexpected[-3:]) or 'no stderr'}")

@@ -55,12 +55,16 @@ Revue de lecture seule du dépôt `~/hermes_scratch/FastSuite`#linebreak()
 
 Trois familles de résultats, dans cet ordre d'importance.
 
-*1. Quatre chiffres publiés ne mesurent pas ce qu'ils annoncent.* La cellule « fastprep 34 s contre
-fastp 28 s sur un cœur » n'est pas une cellule sur un cœur : les lignes fastprep étiquetées
-`pinned` du CSV committé brûlent 2,44 cœurs. Les 145 Mo de fastmaps sont une configuration à tampon
-de 512 Mo, pas le défaut livré, qui mesure 36,1 Mo. Le temps de fastcheck sur un fichier est un temps
-mono-thread quelle que soit la valeur de `-j`, par construction. Et fastsim compresse au niveau 6
-codé en dur, ce qui représente 75,5 % de son temps d'exécution mesuré.
+*1. Quatre chiffres ne mesurent pas ce qu'ils annoncent, et trois d'entre eux avaient déjà été
+corrigés dans les articles sans que la correction atteigne les documents du dépôt.* La cellule
+« fastprep 34 s contre fastp 28 s sur un cœur » vient d'un harnais qui posait `-j N` sans `taskset` :
+ses lignes `pinned` brûlent 2,44 cœurs. L'article FastPrep l'a vue, l'a écrite et a re-mesuré ; à un
+cœur réellement épinglé c'est 73,99 contre 80,03, et fastprep mène. Les 145 Mo de fastmaps sont la
+configuration à tampon de 512 Mo, pas le défaut livré qui mesure 36,1 Mo, et sur ce point c'est
+l'article qui est en retard. Le temps de fastcheck sur un fichier unique est mono-thread par
+construction, ce que l'article dit correctement et que la ligne de conditions des docs contredisait.
+Reste un chiffre que personne ne documentait : fastsim compressait au niveau 6 codé en dur, sans
+option, pour 75,5 % de son temps d'exécution mesuré.
 
 *2. Deux défauts de sortie, tous deux sur le chemin documenté.* `fasthelper concatenate` compte un
 échantillon fantôme et duplique une ligne quand un échantillon porte la sortie `fastmaps --json`,
@@ -168,64 +172,73 @@ dominent le classement, et pourquoi les propositions de micro-optimisation sont 
 rangées après celles qui suppriment du travail.
 
 // ---------------------------------------------------------------------------
-= Quatre constats qui changent la lecture des chiffres publiés
+= Quatre chiffres à corriger, et qui les corrige
 
-== La cellule « un cœur » de fastprep n'est pas une cellule à un cœur
+La revue a trouvé quatre nombres qui ne mesurent pas ce qu'ils annoncent. Trois
+avaient déjà été corrigés dans les articles et n'avaient jamais atteint les
+documents du dépôt ; le quatrième n'était documenté nulle part. La distinction
+compte : dans trois cas sur quatre, la science était juste et la documentation
+du dépôt était en retard sur elle.
 
-`docs/STATUS.md` et `docs/BENCHMARKS.md` citent fastprep à 34,37 s contre fastp à 28,50 s sur un
-cœur. Le CSV committé `~/work/FastPrep-Bench/results/results_gz6.csv` contient ceci #{tag-v}.
+== La cellule « un cœur » de fastprep : épinglée dans l'article, pas dans les docs
+
+Le CSV `FastPrep-Bench/results/results_gz6.csv` contient des lignes fastprep
+étiquetées `pinned` qui brûlent 2,44 cœurs : 33,0 s de temps réel pour 80,5 s de
+temps CPU, là où fastp et cutadapt tombent à 0,98 et 0,99. Un processus confiné à
+un cœur ne peut pas faire cela. Le harnais posait `-j N` sans `taskset`, donc
+seul le bras fastprep s'échappait.
+
+L'article FastPrep a déjà trouvé ce défaut, l'a écrit dans sa section de méthode
+et a re-mesuré avec `taskset` ; son CSV porte désormais une colonne `cores` dont
+le rapport `cpu_s/wall_s` vaut 1,00 sur chaque ligne. Les nombres corrigés, à
+5 millions de paires :
 
 #table(
-  columns: (auto, auto, auto, auto, auto, auto),
-  table.header([*lectures*], [*outil*], [*pinned*], [*wall s*], [*cpu s*], [*cpu/wall*]),
-  [5 M], [fastprep], [non], [33,508], [81,458], [2,43],
-  [5 M], [fastprep], [oui], [32,983], [80,510], [*2,44*],
-  [5 M], [fastp], [non], [28,197], [88,200], [3,13],
-  [5 M], [fastp], [oui], [83,254], [82,341], [*0,99*],
-  [5 M], [cutadapt], [oui], [135,759], [133,079], [0,98],
+  columns: (auto, auto, auto, auto, auto),
+  table.header([*outil*], [*cœurs*], [*wall s*], [*CPU s*], [*CPU/wall*]),
+  [fastprep], [1], [*73,99*], [73,83], [1,00],
+  [fastp], [1], [*80,03*], [79,83], [1,00],
+  [cutadapt], [1], [130,60], [130,27], [1,00],
+  [fastprep], [2], [37,55], [74,84], [1,99],
+  [fastp], [2], [40,55], [80,32], [1,98],
 )
 
-Un processus confiné à un seul cœur ne peut pas accumuler 80,5 secondes de CPU en 33,0 secondes de
-temps réel. fastp et cutadapt retombent à 0,98 et 0,99, donc le harnais contraint bien ces deux-là,
-et les lignes fastprep étiquetées `pinned` et `non pinned` sont indistinguables à toutes les tailles.
-Elles sont sorties de `taskset`.
+fastprep mène donc à toutes les tailles, sur un et deux cœurs, de 1,08 à 1,28.
+Ce qui restait faux était la documentation du dépôt : `docs/STATUS.md` affirmait
+« fastp LEADS this cell » avec 34,37 contre 28,50, et `docs/BENCHMARKS.md`
+répétait ces valeurs dans quatre endroits, dont un tableau qui se contredisait
+lui-même. Les deux fichiers sont corrigés dans cette passe, et la ligne de
+garde ajoutée est celle qui manquait : un rapport `cpu_s/wall_s` supérieur à 1,05
+sur une cellule épinglée invalide la ligne.
 
-Deux conséquences, toutes deux inconfortables.
+== Les 145 Mo de fastmaps : configuration d'un autre défaut
 
-- *La comparaison à un cœur n'existe pas.* Le seul chiffre honnête est fastp à 83,25 s, avec fastprep
-  non mesuré, et les secondes CPU de fastprep sont 2 % *sous* celles de fastp.
-- *L'écart est un écart d'occupation des cœurs, pas de travail par paire.* Sur la plage linéaire,
-  fastprep fait 6,747 s par million de paires à 16,36 s CPU, soit 2,42 cœurs occupés, quand fastp fait
-  5,579 s à 17,64 s CPU, soit 3,16 cœurs. fastprep fait 7 % de travail en moins par paire et met 21 %
-  de temps en plus. À l'occupation de fastp, son temps serait de 26 s.
+La ligne 143,2 Mo à 5 millions de paires a été obtenue avec un tampon de 512 Mo.
+Le défaut livré depuis le 18 octobre est de 8 Mo et mesure 36,1 Mo sur le corpus
+de 10 millions de lectures ; le plancher, previews désactivées, est de 16,0 Mo,
+soit le niveau de FastQC à 16,4 Mo. L'écart contesté n'est pas de 130 Mo mais
+d'environ 20 Mo.
 
-La proposition FP-0 est donc une correction de banc avant toute optimisation : forcer le bras
-fastprep dans le même `taskset`, et refuser d'écrire une ligne dont le rapport cpu/wall sort de
-l'intervalle 0,95 à 1,05. C'est la seule façon d'empêcher cette classe d'erreur de rester invisible,
-puisque les nombres restent plausibles.
+Ici la documentation du dépôt et l'article sont tous deux en retard, et l'article
+est le plus gênant : il décrit encore `--buffer-mb` comme « default 512 MB » et
+donne une série de pics 18,6 / 33,3 / 47,2 / 142,3 Mo qui est celle de l'ancien
+défaut. La règle appliquée est celle du dépôt lui-même : une cellule mémoire sans
+son `--buffer-mb` est illisible.
 
-== Les 145 Mo de fastmaps sont une configuration qui n'est plus le défaut
+== fastcheck sur un fichier : mono-thread, et c'est l'article qui a raison
 
-La ligne publiée, 5,49 s et 143,2 Mo à 5 millions de paires #{tag-v}, a été obtenue avec un tampon
-de 512 Mo. Le défaut livré depuis le 18 octobre est de 8 Mo et mesure 36,1 Mo sur le même corpus.
-Le plancher, previews désactivées, est de 16,0 Mo, soit le niveau de FastQC à 16,4 Mo.
+`main.rs` prend la branche séquentielle dès que `files.len() == 1`, et le pool de
+décompression n'est utilisé que pour du BGZF : un FASTQ nu, ou un gzip ordinaire,
+ne reçoit rien de `-j`. Les 55,68 s du tableau des 20 millions de lectures sont
+donc un temps mono-cœur, et l'affirmation de montée en charge qui s'appuyait
+dessus n'a jamais été mesurée.
 
-L'écart contesté n'est donc pas de 130 Mo mais d'environ 20 Mo. La ligne de `docs/STATUS.md` qui
-compare 145 Mo à 16 Mo compare deux configurations différentes, et devrait nommer le tampon.
+L'article FastCheck l'écrit déjà correctement : « effectively single-threaded :
+its worker threads split across files… `-j 1` and `-j 16` take the same time ».
+C'est la ligne de conditions de `docs/BENCHMARKS.md` qui affirmait le contraire
+(« uses all available threads by default ») ; elle est corrigée.
 
-== fastcheck sur un fichier est mono-thread, quelle que soit la valeur de -j
-
-`main.rs` prend la branche séquentielle dès que `files.len() == 1`, avec un commentaire qui affirme
-qu'un fichier unique utilise déjà tout le parallélisme disponible dans le pool BGZF. C'est vrai pour
-du BGZF, faux pour un FASTQ nu et faux pour un gzip ordinaire, où le paramètre ne sert à rien. Les
-55,68 s du tableau des 20 millions de lectures sont donc un temps mono-cœur, et l'affirmation de
-montée en charge qui s'appuie dessus n'a jamais été mesurée.
-
-La proposition FC-4 découpe le fichier en plages d'octets alignées sur les enregistrements, chacune
-alimentant son propre accumulateur, puis fusionne. La fusion est exacte et associative pour tous les
-champs, y compris la table d'empreintes, ce qui en fait le parallélisme le moins risqué du dépôt.
-
-== fastsim passe trois quarts de son temps à compresser au niveau 6
+== fastsim : le niveau de compression n'était réglable nulle part
 
 Mesuré sur cette machine, 200 000 paires, profil `mandrill_E358`, `taskset -c 0` :
 
@@ -236,11 +249,13 @@ Mesuré sur cette machine, 200 000 paires, profil `mandrill_E358`, `taskset -c 0
   [`--no-gzip`], [*3,56 s*], [139 Mo], [141,4 Mo],
 )
 
-Le deflate représente 75,5 % du temps. Le niveau est un `Compression::new(6)` codé en dur, sans
-option pour le changer, alors que la règle de la suite veut que tous les outils comparent à niveau
-égal. Un balayage avec le `gzip` du système sur la sortie de l'outil donne 109 Mo/s et 23,04 Mo au
-niveau 1, contre 9,2 Mo/s et 19,54 Mo au niveau 6 : le niveau 1 coûte 17,9 % de taille et divise le
-temps de compression par onze.
+Le deflate représente 75,5 % du temps, et le niveau était un
+`Compression::new(6)` codé en dur, sans option : aucun article ne pouvait le
+mentionner puisqu'il n'était pas réglable. Un balayage avec le `gzip` du système
+sur la sortie de l'outil donne 109 Mo/s et 23,04 Mo au niveau 1, contre 9,2 Mo/s
+et 19,54 Mo au niveau 6, soit 17,9 % de taille pour onze fois moins de temps de
+compression. `--gz-level` existe depuis cette passe, avec 6 pour défaut, donc
+aucun octet de sortie ne change tant qu'on ne le demande pas.
 
 #figure(
   canvas({
@@ -248,14 +263,12 @@ temps de compression par onze.
     let total = 14.55
     let gen = 3.56
     let scale = 12.0 / total
-    // barre mesurée
     rect((0, 0), (gen * scale, 0.75), fill: rgb("#0b6f3a"), stroke: none)
     rect((gen * scale, 0), (12.0, 0.75), fill: rgb("#b45309"), stroke: none)
     rect((0, 0), (12.0, 0.75), stroke: 0.5pt + rgb("#33404a"))
     content((gen * scale / 2, 0.37), text(size: 7.4pt, fill: white)[génération 3,56 s])
     content(((gen * scale + 12.0) / 2, 0.37), text(size: 7.4pt, fill: white)[deflate niveau 6 : 10,99 s, 75,5 %])
     content((0, 1.02), text(size: 7.6pt, weight: "bold")[mesuré])
-    // barre projetée
     let gen2 = 3.56
     let def2 = 1.3
     let tot2 = gen2 + def2
@@ -268,7 +281,6 @@ temps de compression par onze.
     content((0, -0.35), text(size: 7.6pt, weight: "bold")[projeté, niveau 1])
     line((tot2 * sc2 + 0.15, -0.97), (tot2 * sc2 + 1.9, -0.97), mark: (end: ">"), stroke: 0.7pt + rgb("#b45309"))
     content((tot2 * sc2 + 1.95, -0.97), anchor: "west", text(size: 7.4pt, fill: rgb("#8a4a06"))[≈ 4,9 s, facteur 3])
-    // axe
     line((0, -1.85), (12.0, -1.85), stroke: 0.5pt + rgb("#33404a"))
     for (k, lbl) in ((0, "0 s"), (1, "3,6 s"), (2, "7,2 s"), (3, "10,8 s"), (4, "14,4 s")) {
       let x = k * 3.0
@@ -277,13 +289,11 @@ temps de compression par onze.
     }
   }),
   caption: [
-    fastsim, 200 000 paires sur un cœur épinglé. Barre haute mesurée ici, barre basse projetée depuis
-    le débit du niveau 1 mesuré sur la sortie de l'outil. Le temps de deflate est l'axe à attaquer
-    avant toute optimisation du générateur.
+    fastsim, 200 000 paires sur un cœur épinglé. Barre haute mesurée ici, barre
+    basse projetée depuis le débit du niveau 1 mesuré sur la sortie de l'outil.
   ],
 )
 
-// ---------------------------------------------------------------------------
 = Deux défauts de sortie reproduits
 
 == fasthelper compte un échantillon fantôme quand fastmaps écrit son wrapper

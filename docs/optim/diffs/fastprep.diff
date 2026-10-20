@@ -1,0 +1,2528 @@
+diff --git a/tools/fastprep/src/adapter.rs b/tools/fastprep/src/adapter.rs
+index afa24ae..b3e27b9 100644
+--- a/tools/fastprep/src/adapter.rs
++++ b/tools/fastprep/src/adapter.rs
+@@ -48,10 +48,11 @@ pub struct AdapterSet {
+     pub error_rate: f64,
+     /// Minimum overlap for sequence matching.
+     pub min_overlap_se: usize,
+-    /// 6-mer seed index, built once at construction. `match_adapters` uses it
+-    /// to skip the ~118-position full scan on reads that share no 6-mer with
+-    /// any adapter (the pigeonhole argument below makes this exact, not a
+-    /// heuristic).
++    /// Seed index, built once at construction. `match_adapters` uses it to
++    /// skip the ~118-position full scan on reads that share no seed with any
++    /// adapter (the pigeonhole argument above makes this exact, not a
++    /// heuristic). The seed width is derived from the error rate, so this is
++    /// not a fixed 6-mer table.
+     pub seeds: Arc<SeedTable>,
+ }
+ 
+@@ -69,80 +70,172 @@ impl AdapterSet {
+     }
+ }
+ 
+-/// 6-mer seed index for fast rejection of adapter-free reads.
++/// Seed index for fast rejection of adapter-free reads.
+ ///
+-/// Soundness: any alignment of `k` bases with ≤ `max_mm` mismatches contains
+-/// an exactly-matching run of at least `k / (max_mm + 1)` bases (split the
+-/// window into `max_mm + 1` chunks; one must be perfect). When that run is
+-/// ≥ 6 bases it contains an adapter 6-mer that appears verbatim in the read,
+-/// so a seed lookup at that position finds the alignment. The table therefore
+-/// only needs to be consulted at positions where the read actually contains
+-/// one of the adapter's 6-mers; everything else is provably non-matching.
++/// Soundness of the pigeonhole argument, stated exactly: an alignment of `k`
++/// bases with `mm = ceil(k·ε)` mismatches has at most `mm + 1` exactly
++/// matching runs, totalling `k − mm` bases, so the longest of them is at least
++/// `floor(k / (mm + 1))`. When that is `>= s` — the seed width — the alignment
++/// contains an adapter `s`-mer that appears verbatim in the read, so a seed
++/// lookup at that position finds the alignment and everything below `s` bases
++/// of run can only be found by the direct scan.
++///
++/// The seed width is therefore a derived quantity, not a constant: `s = 6`
++/// requires `k >= 6·(mm+1)`, which has no solution once `ε >= 1/6`, so at the
++/// shipped `--adapter-error-rate 0.2` a fixed 6-mer table declared every
++/// adapter unsound (`min_sound_k = usize::MAX`) and every read took the
++/// reference full scan — 414 exact compares at L = 151 while only 2.3 % of
++/// reads carry an adapter. Sizing `s` from the bound, per adapter, revives the
++/// filter where it was dead (81 compares on random sequence, measured) and
++/// leaves it untouched where it already worked.
+ #[derive(Debug)]
+ pub struct SeedTable {
+-    /// `table[code]` = index into `pairs` of the first `(adapter, offset)`
+-    /// for this 6-mer code; `-1` when empty. Flat and small (8 KB) so the
+-    /// per-read lookup stays in L1, unlike the old `Vec<Vec<…>>` which
++    /// `table[index]` = index into `pairs` of the first `(adapter, offset)`
++    /// for this seed code; `-1` when empty. Flat and ~11 KB so the per-read
++    /// lookup stays in cache, unlike the old `Vec<Vec<…>>` which
+     /// pointer-chased on every position of every read (profile: ~49% of
+     /// runtime after the first seed optimisation).
+-    table: [i16; 1 << 12],
+-    /// Flat `(code, adapter index, offset within adapter)` list, grouped by
+-    /// code so a lookup iterates a contiguous run.
++    ///
++    /// One array holds every width: each width owns a disjoint code range
++    /// ([`code_base`]), because a 4-mer code and a 5-mer code with the same
++    /// numeric value are different seeds and must not share a bucket.
++    table: [i16; TABLE_LEN],
++    /// Flat `(tagged code, adapter index, offset within adapter)` list, grouped
++    /// by code so a lookup iterates a contiguous run.
+     pairs: Vec<(u16, u8, u8)>,
+-    /// Smallest overlap length for which the 6-mer guarantee holds, per
+-    /// adapter (`usize::MAX` = never, e.g. high error rates). Alignments
+-    /// shorter than this cannot rely on seeds and fall back to a direct scan.
++    /// Smallest overlap length for which the seed guarantee holds, per
++    /// adapter (`usize::MAX` = never: the adapter is too short to host the
++    /// bound at this error rate and falls back to a direct scan).
+     min_sound_k: Vec<usize>,
++    /// Seed width chosen per adapter, `0` when the adapter is not seeded.
++    width: Vec<usize>,
++    /// The distinct widths in use, ascending. The scan iterates exactly these
++    /// per position — normally one or two, because the wide adapters and a
++    /// short one need different widths at the same error rate.
++    widths: Vec<usize>,
++}
++
++/// Candidate seed widths, widest first.
++///
++/// A wider seed is exponentially more selective — a 4-mer is shared by almost
++/// every read, a 6-mer by almost none — so each adapter gets the widest width
++/// its own length and the error rate allow, and only shrinks when the
++/// arithmetic forces it. At the shipped `--adapter-error-rate 0.2` the 34-base
++/// TruSeq adapters take a 4-mer (sound from k = 20) and the 19-base Nextera
++/// adapter a 3-mer (sound from k = 9); with the old fixed 6 every one of them
++/// was unsound and took the reference full scan.
++const SEED_WIDTHS: [usize; 4] = [6, 5, 4, 3];
++
++/// Code ranges: width `s` owns `[code_base(s), code_base(s) + 4^s)`.
++const TABLE_LEN: usize = 5440;
++
++/// Base index of width `s`'s code range. Width 6 keeps the low range so the
++/// original 12-bit table layout is unchanged for existing error rates.
++#[inline]
++fn code_base(s: usize) -> usize {
++    match s {
++        6 => 0,
++        5 => 4096,
++        4 => 5120,
++        3 => 5376,
++        _ => unreachable!("seed width is one of 3..=6"),
++    }
++}
++
++#[inline]
++fn code_mask(s: usize) -> u32 {
++    (1u32 << (2 * s)) - 1
++}
++
++/// Smallest `k` at which an alignment of `k` bases with `ceil(k·ε)` mismatches
++/// is guaranteed to contain an exact run of at least `s` bases, or `usize::MAX`
++/// when no `k <= a_len` satisfies it.
++///
++/// The test is `k >= s * (mm + 1)` — the pigeonhole bound above, in integers —
++/// not `ceil(k / (mm + 1)) >= s`: the latter is optimistic by one seed width,
++/// because the mismatch-free chunk may be one of the short ones when `k` is not
++/// a multiple of `mm + 1`. Using it would make the filter unsound, which the
++/// conformance test catches as a changed trim, not as a slow path.
++fn min_sound_k_for(a_len: usize, error_rate: f64, s: usize) -> usize {
++    for k in s..=a_len {
++        let max_mm = (k as f64 * error_rate).ceil() as usize;
++        if k >= s * (max_mm + 1) {
++            return k;
++        }
++    }
++    usize::MAX
+ }
+ 
+ impl SeedTable {
+     fn build(adapters: &[Adapter], error_rate: f64) -> Self {
++        // Per adapter, widest sound width. `0` (no width) means the adapter
++        // cannot host any bound at this error rate; it then takes the direct
++        // scan for every position, exactly as before.
++        let width: Vec<usize> = adapters
++            .iter()
++            .map(|a| {
++                SEED_WIDTHS
++                    .iter()
++                    .copied()
++                    .find(|&s| {
++                        a.seq.len() >= s && min_sound_k_for(a.seq.len(), error_rate, s) != usize::MAX
++                    })
++                    .unwrap_or(0)
++            })
++            .collect();
++        let mut widths: Vec<usize> = width.iter().copied().filter(|&s| s > 0).collect();
++        widths.sort_unstable();
++        widths.dedup();
++
+         let mut pairs: Vec<(u16, u8, u8)> = Vec::new();
+-        for (ai, a) in adapters.iter().enumerate() {
+-            let seq = &a.seq;
+-            if seq.len() >= 6 {
+-                for off in 0..=seq.len() - 6 {
+-                    let code = seed_code(&seq[off..off + 6]);
+-                    pairs.push((code as u16, ai as u8, off as u8));
+-                }
++        for ((ai, a), &s) in adapters.iter().enumerate().zip(width.iter()) {
++            if s == 0 {
++                continue;
++            }
++            let base = code_base(s);
++            let mask = code_mask(s);
++            for off in 0..=a.seq.len() - s {
++                let code = seed_code(&a.seq[off..off + s], mask);
++                pairs.push(((base + code as usize) as u16, ai as u8, off as u8));
+             }
+         }
+         // Group by code so a lookup is a contiguous run. This matters: two
+-        // adapters (e.g. TruSeq R1/R2) share a long prefix, so the same 6-mer
++        // adapters (e.g. TruSeq R1/R2) share a long prefix, so the same seed
+         // appears in both at the same offset — without the sort, table[code]
+         // would point into R1's block and the run would stop before R2's
+         // entry, silently missing valid R2 alignments.
+         pairs.sort_unstable_by_key(|p| p.0);
+-        let mut table = [-1i16; 1 << 12];
++        let mut table = [-1i16; TABLE_LEN];
+         for (i, &(code, _, _)) in pairs.iter().enumerate() {
+             if i == 0 || pairs[i - 1].0 != code {
+                 table[code as usize] = i as i16;
+             }
+         }
+-        // Smallest k with k >= 6 * (max_mm + 1), max_mm = ceil(k·e).
+-        let mut min_sound_k = Vec::with_capacity(adapters.len());
+-        for a in adapters {
+-            let mut ms = usize::MAX;
+-            for k in 1..=a.seq.len() {
+-                let max_mm = (k as f64 * error_rate).ceil() as usize;
+-                if k >= 6 * (max_mm + 1) {
+-                    ms = k;
+-                    break;
++        let min_sound_k = adapters
++            .iter()
++            .zip(width.iter())
++            .map(|(a, &s)| {
++                if s == 0 {
++                    usize::MAX
++                } else {
++                    min_sound_k_for(a.seq.len(), error_rate, s)
+                 }
+-            }
+-            min_sound_k.push(ms);
+-        }
++            })
++            .collect();
+         SeedTable {
+             table,
+             pairs,
+             min_sound_k,
++            width,
++            widths,
+         }
+     }
+ }
+ 
+-/// 2-bit encoding of a 6-mer into a 12-bit code (A=0, C=1, G=2, T=3).
++/// 2-bit encoding of a seed into a `2 * bases.len()`-bit code (A=0, C=1, G=2,
++/// T=3), masked to the table's code space.
+ #[inline]
+-fn seed_code(bases: &[u8]) -> u32 {
++fn seed_code(bases: &[u8], mask: u32) -> u32 {
+     let mut code: u32 = 0;
+     for &b in bases {
+         let c = match b {
+@@ -153,7 +246,7 @@ fn seed_code(bases: &[u8]) -> u32 {
+         };
+         code = (code << 2) | c;
+     }
+-    code & 0xFFF
++    code & mask
+ }
+ 
+ /// Byte → 2-bit base code lookup (0=A, 1=C, 2=G, 3=T; anything else → 3).
+@@ -172,11 +265,25 @@ static BASE2: [u8; 256] = {
+     t
+ };
+ 
++/// Index reserved for the PE-overlap pseudo-adapter in [`AdapterMatch`] and in
++/// the per-adapter counters.
++///
++/// The overlap detector pins a boundary without naming an adapter, and the
++/// report still has to attribute the trim, so it owns the top index. Real
++/// adapters are `0..adapters.len()`, which no set can push past this.
++pub const PE_OVERLAP_ADAPTER: u8 = u8::MAX;
++
+ /// Result of a successful adapter match on one read.
+-#[derive(Debug, Clone, PartialEq, Eq)]
++///
++/// The match carries an INDEX into the configured set, not the adapter's name:
++/// a name is a heap `String`, and this value crosses a thread boundary and is
++/// then counted for every trimmed read (462 792 of them at 5 M pairs). The name
++/// is resolved once, at report time, from [`crate::algorithm::Params::adapter`]
++/// and [`PE_OVERLAP_ADAPTER`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct AdapterMatch {
+-    /// Name of the matched adapter.
+-    pub name: String,
++    /// Index into `AdapterSet::adapters`, or [`PE_OVERLAP_ADAPTER`].
++    pub adapter: u8,
+     /// Bases to trim from the 5′ end of this read.
+     pub t5: usize,
+     /// Bases to trim from the 3′ end of this read.
+@@ -404,19 +511,20 @@ pub fn load_fasta(path: &Path) -> Result<Vec<Adapter>> {
+ 
+ /// Find the leftmost adapter match in `seq`, or `None`.
+ ///
+-/// The scan is seed-guided: the read is walked once, a rolling 6-mer code is
+-/// looked up in the adapter seed table, and only positions where the read
+-/// actually contains an adapter 6-mer are tested with the exact
++/// The scan is seed-guided: the read is walked once, a rolling `seed_len`-base
++/// code is looked up in the adapter seed table, and only positions where the
++/// read actually contains an adapter seed are tested with the exact
+ /// [`mismatches_upto`] comparison. This is *exact*, not a heuristic:
+ ///
+-/// * any valid alignment of `k` bases with ≤ `max_mm` mismatches contains an
+-///   exactly-matching run of ≥ `k / (max_mm + 1)` bases (split the window
+-///   into `max_mm + 1` chunks; one must be perfect);
+-/// * when that run is ≥ 6 bases (i.e. `k ≥ 6·(max_mm+1)`, exactly the
+-///   `min_sound_k` bound), it contains an adapter 6-mer appearing verbatim in
++/// * any valid alignment of `k` bases with `mm = ceil(k·ε)` mismatches has at
++///   most `mm + 1` exactly-matching runs totalling `k − mm` bases, so one of
++///   them is at least `floor(k / (mm + 1))` long;
++/// * when that is `>= seed_len` (i.e. `k >= seed_len·(mm+1)`, exactly the
++///   `min_sound_k` bound) it contains an adapter seed appearing verbatim in
+ ///   the read, so the seed hit at its position finds the alignment;
+ /// * positions whose overlap `k` falls below `min_sound_k` (short truncated
+-///   tails, or short adapters at high error rates) are scanned directly.
++///   tails, or adapters too short for the bound at this error rate) are
++///   scanned directly.
+ ///
+ /// "Leftmost" = smallest `p`, tie-broken by first adapter in set order, which
+ /// is what the reference implementation produces (largest `t3 = l − p`).
+@@ -435,42 +543,46 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
+     };
+ 
+     // ---- Seed-guided pass (sound for k >= min_sound_k) -------------------
+-    // Walk the read once, rolling a 12-bit 6-mer code; every table hit yields
+-    // candidate alignment starts p = q - offset for the adapter at that
+-    // offset. Only positions that provably need checking are tested.
+-    if l >= 6 && !set.seeds.pairs.is_empty() {
+-        let mut code: u32 = 0;
++    // Walk the read once, rolling a 12-bit 6-mer code and deriving each active
++    // seed width from it by masking; every table hit yields candidate
++    // alignment starts p = q + 1 - s - offset for the adapter at that offset.
++    // Only positions that provably need checking are tested.
++    if !set.seeds.widths.is_empty() {
++        let mut code6: u32 = 0;
+         for q in 0..l {
+             let c = BASE2[seq[q] as usize] as u32;
+-            code = ((code << 2) | c) & 0xFFF;
+-            if q < 5 {
+-                continue; // window not full yet
+-            }
+-            let start = set.seeds.table[code as usize];
+-            if start < 0 {
+-                continue;
+-            }
+-            let win_start = q - 5; // start of the 6-mer ending at q
+-            for &(pc, ai, off) in &set.seeds.pairs[start as usize..] {
+-                if pc != code as u16 {
+-                    break; // contiguous run for this code ends
+-                }
+-                let a = set.adapters[ai as usize].seq.len();
+-                let ms = set.seeds.min_sound_k[ai as usize];
+-                // Soundness requires k >= ms; p must be in range.
+-                if win_start < off as usize {
+-                    continue; // p would be negative
++            code6 = ((code6 << 2) | c) & 0xFFF;
++            for &s in &set.seeds.widths {
++                if q + 1 < s {
++                    continue; // window not full yet
+                 }
+-                let p = win_start - off as usize;
+-                let k = a.min(l - p);
+-                if k < min_overlap || k < ms || p > max_p {
++                let idx = (code_base(s) + (code6 & code_mask(s)) as usize) as u16;
++                let start = set.seeds.table[idx as usize];
++                if start < 0 {
+                     continue;
+                 }
+-                let max_mm = (k as f64 * set.error_rate).ceil() as usize;
+-                if mismatches_upto(&seq[p..p + k], &set.adapters[ai as usize].seq[..k], max_mm)
+-                    <= max_mm
+-                {
+-                    consider(p, ai as usize);
++                let win_start = q + 1 - s; // start of the seed ending at q
++                for &(pc, ai, off) in &set.seeds.pairs[start as usize..] {
++                    if pc != idx {
++                        break; // contiguous run for this code ends
++                    }
++                    let a = set.adapters[ai as usize].seq.len();
++                    let ms = set.seeds.min_sound_k[ai as usize];
++                    // Soundness requires k >= ms; p must be in range.
++                    if win_start < off as usize {
++                        continue; // p would be negative
++                    }
++                    let p = win_start - off as usize;
++                    let k = a.min(l - p);
++                    if k < min_overlap || k < ms || p > max_p {
++                        continue;
++                    }
++                    let max_mm = (k as f64 * set.error_rate).ceil() as usize;
++                    if mismatches_upto(&seq[p..p + k], &set.adapters[ai as usize].seq[..k], max_mm)
++                        <= max_mm
++                    {
++                        consider(p, ai as usize);
++                    }
+                 }
+             }
+         }
+@@ -486,9 +598,11 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
+             continue;
+         }
+         let ms = set.seeds.min_sound_k[ai];
+-        if a < ms {
+-            // Adapter never seed-sound (too short, or error rate too high):
+-            // scan every position, reference-style.
++        if set.seeds.width[ai] == 0 {
++            // This adapter could not host the bound at this error rate (too
++            // short, or eps too high): every position is scanned directly,
++            // reference-style. `ms` is `usize::MAX` here, so the seed pass
++            // contributed nothing for it.
+             for p in 0..=max_p {
+                 let k = a.min(l - p);
+                 if k < min_overlap {
+@@ -523,7 +637,7 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
+     }
+ 
+     best.map(|(p, ai)| AdapterMatch {
+-        name: set.adapters[ai].name.clone(),
++        adapter: ai as u8,
+         t5: 0,
+         t3: l - p,
+     })
+@@ -546,6 +660,8 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
+ #[inline]
+ fn mismatches_upto(a: &[u8], b: &[u8], cap: usize) -> usize {
+     debug_assert_eq!(a.len(), b.len());
++    #[cfg(test)]
++    MM_CALLS.with(|c| c.set(c.get() + 1));
+     let mut mm = 0usize;
+     for (ca, cb) in a.chunks(32).zip(b.chunks(32)) {
+         for i in 0..ca.len() {
+@@ -561,6 +677,24 @@ fn mismatches_upto(a: &[u8], b: &[u8], cap: usize) -> usize {
+     mm
+ }
+ 
++// Counts exact compares. Test builds only, so the shipped binary pays nothing
++// for the instrument — without it the prefilter's value is invisible: a dead
++// prefilter and a live one produce the same trims, just at 414 calls per read
++// instead of a few dozen.
++#[cfg(test)]
++thread_local! {
++    static MM_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
++}
++
++/// Reset the exact-compare counter, run `f`, and return how many compares it
++/// took. `mismatches_upto` is otherwise invisible to a test.
++#[cfg(test)]
++fn count_mismatch_calls<R>(f: impl FnOnce() -> R) -> u64 {
++    MM_CALLS.with(|c| c.set(0));
++    let _ = f();
++    MM_CALLS.with(|c| c.get())
++}
++
+ // ---------------------------------------------------------------------------
+ 
+ #[cfg(test)]
+@@ -596,7 +730,7 @@ mod tests {
+     fn match_adapters_reference(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
+         let l = seq.len();
+         let mut best: Option<(usize, AdapterMatch)> = None;
+-        for adapter in &set.adapters {
++        for (idx, adapter) in set.adapters.iter().enumerate() {
+             let a = adapter.seq.len();
+             if a == 0 {
+                 continue;
+@@ -622,11 +756,14 @@ mod tests {
+                 if matched {
+                     let t3 = l - p;
+                     if best.as_ref().map_or(true, |(prev, _)| t3 > *prev) {
+-                        best = Some((t3, AdapterMatch {
+-                            name: adapter.name.clone(),
+-                            t5: 0,
++                        best = Some((
+                             t3,
+-                        }));
++                            AdapterMatch {
++                                adapter: idx as u8,
++                                t5: 0,
++                                t3,
++                            },
++                        ));
+                     }
+                     break;
+                 }
+@@ -677,7 +814,7 @@ mod tests {
+                     }
+                 }
+             }
+-            for &eps in &[0.0f64, 0.05, 0.1, 0.2, 0.3] {
++            for &eps in &[0.0f64, 0.05, 0.1, 0.15, 0.2, 0.3] {
+                 for &ov in &[3usize, 6, 10, 20] {
+                     let set = AdapterSet::new(
+                         presets.iter().enumerate().map(|(i, s)| Adapter {
+@@ -773,13 +910,13 @@ mod tests {
+         let mut seq = b"ACGT".repeat(25);
+         seq.extend_from_slice(&a2);
+         let m = match_adapters(&seq, &set).expect("should match a2");
+-        assert_eq!(m.name, "a2");
++        assert_eq!(m.adapter, 1);
+         assert_eq!(m.t3, a2.len());
+         // Also the reverse direction must work.
+         let mut seq = b"ACGT".repeat(25);
+         seq.extend_from_slice(&a1);
+         let m = match_adapters(&seq, &set).expect("should match a1");
+-        assert_eq!(m.name, "a1");
++        assert_eq!(m.adapter, 0);
+         assert_eq!(m.t3, a1.len());
+     }
+ 
+@@ -905,6 +1042,113 @@ mod tests {
+         assert!(c.len() >= 4);
+     }
+ 
++    /// The seed width is sized from the pigeonhole bound instead of being
++    /// fixed at 6. Which width each error rate selects, and the overlap at
++    /// which that width becomes sound, is the whole contract: a wrong
++    /// `min_sound_k` silently changes what gets trimmed.
++    ///
++    /// Derivation used (sound, and the one the code implements): an alignment
++    /// of `k` bases with `mm = ceil(k·eps)` mismatches has at most `mm + 1`
++    /// exact runs totalling `k − mm` bases, so the longest run is at least
++    /// `floor(k / (mm + 1))` and a seed of width `s` is found iff
++    /// `k >= s · (mm + 1)`. At the shipped `--adapter-error-rate 0.2` no
++    /// `k` satisfies that for `s = 6` (nor `s = 5`), which is why the old
++    /// fixed 6 made every adapter take the reference full scan.
++    #[test]
++    fn seed_width_and_sound_bound_follow_the_error_rate() {
++        let presets: Vec<Vec<u8>> = vec![
++            b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA".to_vec(), // 34
++            b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT".to_vec(), // 34
++            b"CTGTCTCTTATACACATCT".to_vec(),               // 19
++        ];
++        let set_at = |eps: f64| {
++            AdapterSet::new(
++                presets
++                    .iter()
++                    .enumerate()
++                    .map(|(i, s)| Adapter {
++                        name: format!("a{i}"),
++                        seq: s.clone(),
++                    })
++                    .collect(),
++                eps,
++                14,
++            )
++        };
++        // (eps, [width per adapter], [min_sound_k per adapter])
++        let expect: [(f64, [usize; 3], [usize; 3]); 6] = [
++            (0.0, [6, 6, 6], [6, 6, 6]),
++            (0.05, [6, 6, 6], [12, 12, 12]),
++            (0.1, [6, 6, 6], [18, 18, 18]),
++            // 6 needs k >= 6*(mm+1), impossible for a 34-base adapter once
++            // eps >= 1/6; 5 is sound from k = 20 and fits the 34-base presets
++            // but not the 19-base Nextera one, which drops to a 4-mer.
++            (0.15, [5, 5, 4], [20, 20, 12]),
++            // The shipped rate: no width above 4 is satisfiable at all.
++            (0.2, [4, 4, 3], [20, 20, 9]),
++            (0.3, [3, 3, 0], [30, 30, usize::MAX]),
++        ];
++        for (eps, widths, ms) in expect {
++            let set = set_at(eps);
++            assert_eq!(set.seeds.width, widths, "eps {eps}: seed widths");
++            assert_eq!(set.seeds.min_sound_k, ms, "eps {eps}: sound k");
++        }
++    }
++
++    /// The prefilter must actually be LOADED at the shipped error rate, not
++    /// merely sound on paper: a clean 151-base read used to take 414 exact
++    /// compares per read (3 presets × 138 positions). Sizing the seed from the
++    /// bound must leave only the truncated 3′ tail there.
++    #[test]
++    fn prefilter_is_live_at_the_shipped_error_rate() {
++        let presets: Vec<Vec<u8>> = vec![
++            b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA".to_vec(),
++            b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT".to_vec(),
++            b"CTGTCTCTTATACACATCT".to_vec(),
++        ];
++        let set = AdapterSet::new(
++            presets
++                .iter()
++                .enumerate()
++                .map(|(i, s)| Adapter {
++                    name: format!("a{i}"),
++                    seq: s.clone(),
++                })
++                .collect(),
++            0.2,
++            14,
++        );
++        // A 151-base random read with no adapter in it: the worst case for the
++        // scan, since every seed hit and every tail position must be checked.
++        // (A degenerate `ACGT` repeat would over-count: its 4-mers recur every
++        // four bases and hit the table far more often than real sequence.)
++        let mut state = 0x2545_F491_4F6C_DD1Du64;
++        let read: Vec<u8> = (0..151)
++            .map(|_| {
++                state ^= state << 13;
++                state ^= state >> 7;
++                state ^= state << 17;
++                b"ACGT"[(state % 4) as usize]
++            })
++            .collect();
++        let calls = count_mismatch_calls(|| {
++            let _ = match_adapters(&read, &set);
++        });
++        // Measured: 81 with per-adapter widths (4-mers for the 34-base
++        // presets, 3-mers for 19-base Nextera), 174 with one global 4-mer
++        // width, 414 with the old fixed 6-mer. It cannot go to a handful: at
++        // eps 0.2 a 4-mer is the widest SOUND seed (a 5-mer needs
++        // k >= 5*(mm+1), which has no solution above eps = 0.2), and a 4-mer
++        // occurs in a random read often enough that ~80 candidates are
++        // unavoidable. What matters is that the bound is now live instead of
++        // dead — and that every candidate is a real comparison, not a scan.
++        assert!(
++            calls < 120,
++            "prefilter is not doing its job at eps 0.2: {calls} exact compares \
++             (was 414 with the fixed 6-mer seed)"
++        );
++    }
++
+     #[test]
+     fn load_fasta_parses_correctly() {
+         use std::io::Write;
+diff --git a/tools/fastprep/src/algorithm.rs b/tools/fastprep/src/algorithm.rs
+index d14f7db..83e9782 100644
+--- a/tools/fastprep/src/algorithm.rs
++++ b/tools/fastprep/src/algorithm.rs
+@@ -207,13 +207,27 @@ pub struct Params {
+     /// to the original read length.
+     pub original_len: Option<usize>,
+ 
+-    /// Precomputed quality-gate values: `gate_lut[q] = g(q)`.
++    /// Precomputed quality-gate values, indexed by the RAW quality byte:
++    /// `gate_lut[b] = g(b − phred_offset)`.
++    ///
+     /// Built by [`Params::prepare`] (called automatically by
+-    /// `Default::default()` and `cli::Cli::finalize()`). On the hot
+-    /// path, `per_step_gap_and_match` reads from this table instead
+-    /// of calling `powf`, eliminating the dominant micro-cost.
++    /// `Default::default()`, by `cli::Cli::finalize()` and again by the
++    /// pipeline once the Phred offset is known). On the hot path,
++    /// `per_step_gap_and_match` reads from this table instead of calling
++    /// `powf`, eliminating the dominant micro-cost.
++    ///
++    /// The offset lives *here* and not in the data: ingestion copies the
++    /// quality bytes through untouched and egress writes them back, so the
++    /// only per-byte work left is this one table (`phred_offset = 0` keeps the
++    /// identity mapping every unit test relies on).
+     #[doc(hidden)]
+     pub gate_lut: [f64; 256],
++
++    /// Phred offset the raw quality bytes carry (33 or 64). Only used to build
++    /// [`Params::gate_lut`] and to shift the mean-quality sum; 0 means "the
++    /// bytes are already decoded values", which is what the algorithm unit
++    /// tests assume.
++    pub phred_offset: u8,
+ }
+ 
+ impl Default for Params {
+@@ -241,6 +255,7 @@ impl Default for Params {
+             extra_committed: 0,
+             original_len: None,
+             gate_lut: [0.0; 256],
++            phred_offset: 0,
+         };
+         p.prepare();
+         p
+@@ -258,17 +273,39 @@ impl Params {
+             .saturating_sub(self.extra_committed)
+     }
+ 
+-    /// Populate `gate_lut` from the current `phred_sat` and `gate_shape`.
++    /// Populate `gate_lut` from `phred_offset`, `phred_sat` and `gate_shape`.
+     /// Cheap (~256 `powf` calls, ~10 µs) but should not be done per
+     /// read.
+     ///
+     /// `Default::default()` and `cli::Cli::finalize()` call this for
+-    /// you. Tests that mutate `phred_sat` or `gate_shape` after
+-    /// construction must call `prepare()` again to keep the LUT in
+-    /// sync; tests that mutate other fields don't need to.
++    /// you, and the pipeline calls [`Params::set_phred_offset`] once the
++    /// offset is detected (it is not known until the first chunk is read).
++    /// Tests that mutate `phred_sat` or `gate_shape` after construction must
++    /// call `prepare()` again to keep the LUT in sync; tests that mutate other
++    /// fields don't need to.
++    ///
++    /// The index is the raw byte, so the table is shifted by the offset rather
++    /// than the data being decoded. `saturating_sub` is what makes a byte below
++    /// the offset gate as Q0 — the same value the old decode-then-encode path
++    /// produced, and the reason ingest clamps such a byte up to the offset (so
++    /// egress writes back exactly what the old path wrote).
+     pub fn prepare(&mut self) {
+-        for q in 0u8..=255 {
+-            self.gate_lut[q as usize] = quality_gate(q, self.phred_sat, self.gate_shape);
++        for b in 0u16..=255 {
++            let b = b as u8;
++            self.gate_lut[b as usize] =
++                quality_gate(b.saturating_sub(self.phred_offset), self.phred_sat, self.gate_shape);
++        }
++    }
++
++    /// Set the Phred offset of the raw quality bytes and rebuild [`Params::gate_lut`].
++    ///
++    /// The offset is only known once the first records are read (auto-detection),
++    /// so the pipeline calls this on its own copy of the params before the first
++    /// chunk. A no-op when the offset is unchanged.
++    pub fn set_phred_offset(&mut self, offset: u8) {
++        if self.phred_offset != offset {
++            self.phred_offset = offset;
++            self.prepare();
+         }
+     }
+ }
+@@ -289,6 +326,33 @@ fn quality_gate(q: u8, t: u8, x: f64) -> f64 {
+     }
+ }
+ 
++/// Sum of the decoded Phred values over a whole slice, read from the raw
++/// bytes.
++///
++/// `sum(raw) − offset·len` is exact, not an approximation: ingestion clamps
++/// every byte below the offset up to it, which is precisely the value the old
++/// decode path produced (`saturating_sub`) and the value egress wrote back. One
++/// vectorisable pass, and no per-byte subtract — the same reason the gate reads
++/// a shifted lookup table instead of decoding.
++#[inline]
++fn quality_sum_raw(quals: &[u8], phred_offset: u8) -> u64 {
++    let raw: u64 = quals.iter().map(|&q| q as u64).sum();
++    raw.saturating_sub(phred_offset as u64 * quals.len() as u64)
++}
++
++/// Shift an accumulated RAW quality sum covering `n` bases into decoded Phred
++/// units.
++///
++/// The streaming walk sums the bytes it visits (a plain add, once per base) and
++/// this one subtraction turns the total into the same number the pre-decode
++/// path produced. Doing it here rather than per byte keeps the inner loop a
++/// bare add — a per-byte `saturating_sub` there measured ~1.5 % of wall time on
++/// the 200 k-pair cell.
++#[inline]
++fn decode_quality_sum(raw_sum: u64, n: usize, phred_offset: u8) -> u64 {
++    raw_sum.saturating_sub(phred_offset as u64 * n as u64)
++}
++
+ /// Per-step gap contribution + match flag, for a single pair.
+ /// Per-step gap contribution + match flag for a single pair.
+ ///
+@@ -310,9 +374,9 @@ fn per_step_gap_and_match(
+         MatchRule::Homopolymer => b1 == b2,
+         MatchRule::Anchored(mask) => mask[b2 as usize],
+     };
+-    // Quality bytes are raw Phred values: pipeline::ScanInput pre-decodes
+-    // the FASTQ ASCII offset on ingestion. Tests construct raw values
+-    // directly. So no offset subtraction here.
++    // Quality bytes are RAW: the Phred offset is folded into `gate_lut` by
++    // `Params::prepare`, and ingestion clamps bytes below the offset up to it.
++    // So no offset subtraction here — and none anywhere on the hot path.
+     let w = (params.gate_lut[q1 as usize] + params.gate_lut[q2 as usize]) * 0.5;
+     let gap = if matches {
+         // σ = (1 − μ) + μW  ⇒  gap = μ(1 − W)
+@@ -583,7 +647,9 @@ fn streaming_walk<const FORWARD: bool>(
+     for i_logical in 0..l {
+         let i_phys = idx_const::<FORWARD>(i_logical, l);
+ 
+-        // Always sum quality (mean-q is over the whole read).
++        // Always sum quality (mean-q is over the whole read) as the RAW byte;
++        // the offset is subtracted once, at the end, by `decode_quality_sum`
++        // (the walk's coverage at any return point is `i_logical + 1`).
+         // Safety: i_phys < l by construction (idx_const returns either
+         // i_logical < l or l - 1 - i_logical, both < l). The compiler
+         // should hoist the bounds check; if not, we can switch to
+@@ -635,7 +701,8 @@ fn streaming_walk<const FORWARD: bool>(
+             && m_curr + 1 >= params.min_run
+         {
+             return StreamOut {
+-                quality_sum, // partial; caller still drops, doesn't use
++                // Partial coverage; the caller drops the read without using it.
++                quality_sum: decode_quality_sum(quality_sum, i_logical + 1, params.phred_offset),
+                 first_trim: 0,
+                 h_int: 0,
+                 runs: Vec::new(),
+@@ -661,7 +728,11 @@ fn streaming_walk<const FORWARD: bool>(
+                 runs.push((sub_pos, sub_trim));
+                 if first_trim + h_int > rem_budget {
+                     return StreamOut {
+-                        quality_sum,
++                        quality_sum: decode_quality_sum(
++                            quality_sum,
++                            i_logical + 1,
++                            params.phred_offset,
++                        ),
+                         first_trim,
+                         h_int,
+                         runs,
+@@ -692,7 +763,7 @@ fn streaming_walk<const FORWARD: bool>(
+     }
+ 
+     StreamOut {
+-        quality_sum,
++        quality_sum: decode_quality_sum(quality_sum, l, params.phred_offset),
+         first_trim,
+         h_int,
+         runs,
+@@ -985,7 +1056,7 @@ fn polyx_trim_inner(
+         // the bench never sets --mean-q, so this is usually a plain 0.
+         StreamOut {
+             quality_sum: if params.mean_q.is_some() {
+-                quals.iter().map(|&q| q as u64).sum()
++                quality_sum_raw(quals, params.phred_offset)
+             } else {
+                 0
+             },
+@@ -998,7 +1069,7 @@ fn polyx_trim_inner(
+         // Quality-only walk (no scan). Still cheap; one path with no
+         // direction branch.
+         StreamOut {
+-            quality_sum: quals.iter().map(|&q| q as u64).sum(),
++            quality_sum: quality_sum_raw(quals, params.phred_offset),
+             first_trim: 0,
+             h_int: 0,
+             runs: Vec::new(),
+@@ -1187,13 +1258,17 @@ fn polyx_trim_inner(
+ // Public trim() — adapter + polyX in one pass.
+ // ---------------------------------------------------------------------------
+ 
+-/// Output of [`trim`]: the trim decision plus the name of the matched
++/// Output of [`trim`]: the trim decision plus the identity of the matched
+ /// adapter (if any), used by the pipeline to update per-adapter stats.
+ #[derive(Debug)]
+ pub struct TrimOutput {
+     pub result: TrimResult,
+-    /// Name of the adapter that was trimmed, if any.
+-    pub adapter_name: Option<String>,
++    /// Index of the adapter that was trimmed, in `Params::adapter`'s set order,
++    /// or [`crate::adapter::PE_OVERLAP_ADAPTER`] for a boundary the mate pair
++    /// pinned. An index rather than a name: this value is produced for every
++    /// trimmed read and crossed two heap allocations (one here, one in the
++    /// stats hash) that bought nothing until the report is printed.
++    pub adapter: Option<u8>,
+ }
+ 
+ /// Full single-read processing: adapter detection then polyX trimming.
+@@ -1214,15 +1289,16 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
+     let l = bases.len();
+ 
+     // --- Step 1: adapter detection ---
+-    let (t5_adapter, t3_adapter, adapter_name) = match params.pe_adapter {
++    let (t5_adapter, t3_adapter, adapter) = match params.pe_adapter {
+         // PE overlap pinned the boundary on this mate: the trim is exact, and
+-        // the name records where it came from so the report can say so.
+-        Some((t5, t3)) => (t5, t3, Some("pe-overlap".to_string())),
++        // the reserved index records where it came from so the report can say
++        // so.
++        Some((t5, t3)) => (t5, t3, Some(crate::adapter::PE_OVERLAP_ADAPTER)),
+         None => match params.adapter.as_deref() {
+             None => (0, 0, None),
+             Some(set) => match crate::adapter::match_adapters(bases, set) {
+                 None => (0, 0, None),
+-                Some(m) => (m.t5, m.t3, Some(m.name)),
++                Some(m) => (m.t5, m.t3, Some(m.adapter)),
+             },
+         },
+     };
+@@ -1241,7 +1317,7 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
+                     t3_poly: 0,
+                     runs: vec![],
+                 },
+-                adapter_name,
++                adapter,
+             };
+         }
+     }
+@@ -1298,10 +1374,7 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
+         }
+     };
+ 
+-    TrimOutput {
+-        result,
+-        adapter_name,
+-    }
++    TrimOutput { result, adapter }
+ }
+ // ===========================================================================
+ 
+@@ -1400,8 +1473,115 @@ mod tests {
+         }
+     }
+ 
++    // ------- Adapter identity is an index, not a name ----------------------
++
++    /// A trimmed read carries an adapter INDEX. Materialising the name per
++    /// read was two heap allocations (one in the worker, one in the stats
++    /// hash) per adapter-trimmed read; the name is only needed once, at report
++    /// time.
++    #[test]
++    fn trim_carries_an_adapter_index_not_a_name() {
++        let adapter = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
++        let mut seq = b"ACGT".repeat(30);
++        seq.extend_from_slice(adapter);
++        let quals = vec![40u8; seq.len()];
++        let mut p = Params::default();
++        p.adapter = Some(std::sync::Arc::new(AdapterSet::new(
++            vec![crate::adapter::Adapter { name: "TruSeq/R1".into(), seq: adapter.to_vec() }],
++            0.2,
++            14,
++        )));
++        p.prepare();
++        let out = trim(&seq, &quals, &p);
++        assert_eq!(out.adapter, Some(0), "adapter index 0 in set order");
++        assert!(matches!(out.result, TrimResult::Emit { .. }));
++    }
++
++    /// The PE-overlap boundary is an adapter identity too, with the reserved
++    /// index, so the report can attribute it without a String.
++    #[test]
++    fn pe_overlap_boundary_uses_the_reserved_index() {
++        let seq = b"ACGT".repeat(38);
++        let quals = vec![40u8; seq.len()];
++        let mut p = Params::default();
++        p.pe_adapter = Some((0, 10));
++        p.prepare();
++        let out = trim(&seq, &quals, &p);
++        assert_eq!(out.adapter, Some(crate::adapter::PE_OVERLAP_ADAPTER));
++    }
++
+     // ------- Scan primitive -----------------------------------------------
+ 
++    /// The quality LUT is indexed by the RAW byte, with the Phred offset
++    /// folded in once at build time. That is what lets ingest and egress be
++    /// plain copies instead of a decode/encode round trip per byte.
++    #[test]
++    fn gate_lut_is_indexed_by_the_raw_quality_byte() {
++        let mut p = Params::default();
++        p.phred_offset = 33;
++        p.prepare();
++        for q in 0u8..=40 {
++            let raw = q + 33;
++            assert_eq!(
++                p.gate_lut[raw as usize],
++                quality_gate(q, p.phred_sat, p.gate_shape),
++                "raw byte {raw} must gate as Q{q}"
++            );
++        }
++        // Bytes below the offset are clamped to the offset on ingest, so they
++        // must gate as Q0 — and, defensively, an unclamped 0 must too, because
++        // FASTA ingestion fills quality with zeros rather than ASCII.
++        assert_eq!(p.gate_lut[0], quality_gate(0, p.phred_sat, p.gate_shape));
++        // With no offset configured (every unit test building `Params` raw),
++        // the table is the identity mapping.
++        let mut raw = Params::default();
++        raw.prepare();
++        for q in 0u8..=255 {
++            assert_eq!(raw.gate_lut[q as usize], quality_gate(q, raw.phred_sat, raw.gate_shape));
++        }
++    }
++
++    /// The mean-quality filter must stay exact on raw bytes: `sum(raw) −
++    /// offset·len`, not `sum(raw)`. A read of Q40 bases at Phred+33 must pass a
++    /// Q39 threshold and fail a Q41 one — the failure mode of keeping ASCII is
++    /// a mean of 73, which passes both.
++    #[test]
++    fn mean_quality_is_exact_over_raw_bytes() {
++        let bases: Vec<u8> = b"ACGT".iter().cycle().take(152).copied().collect();
++        let raw_quals = vec![b'I'; 152]; // 'I' = 73 = Q40 at Phred+33
++        let run = |threshold: f64| {
++            let mut p = Params::default();
++            p.min_len = MinLen::Frac(0.5);
++            p.mean_q = Some(threshold);
++            p.phred_offset = 33;
++            p.prepare();
++            trim(&bases, &raw_quals, &p).result
++        };
++        assert!(
++            matches!(run(39.0), TrimResult::Emit { .. }),
++            "mean Q40 must pass a Q39 threshold"
++        );
++        match run(41.0) {
++            TrimResult::Drop { reason, .. } => assert_eq!(reason, DropReason::MeanQ),
++            other => panic!("mean Q40 must fail a Q41 threshold, got {other:?}"),
++        }
++    }
++
++    /// Phred+64 is the LUT shift's real test: the same *decoded* quality must
++    /// gate identically whatever offset the bytes were written with.
++    #[test]
++    fn gate_lut_shift_handles_phred64() {
++        let mut p33 = Params::default();
++        p33.phred_offset = 33;
++        p33.prepare();
++        let mut p64 = Params::default();
++        p64.phred_offset = 64;
++        p64.prepare();
++        for q in 0u8..=40 {
++            assert_eq!(p33.gate_lut[q as usize + 33], p64.gate_lut[q as usize + 64]);
++        }
++    }
++
+     #[test]
+     fn scan_pure_polya_boundary() {
+         // All-A, high quality: matches all the way, mercy never fires.
+diff --git a/tools/fastprep/src/cli.rs b/tools/fastprep/src/cli.rs
+index c91fd10..7ed7096 100644
+--- a/tools/fastprep/src/cli.rs
++++ b/tools/fastprep/src/cli.rs
+@@ -34,14 +34,18 @@ pub enum AdapterPreset {
+ 
+ /// When the paired-end overlap detector may pin the adapter boundary.
+ ///
+-/// `auto` (the default) tracks the adapter source, because the safety guard
+-/// needs a set to check the boundary against: `auto` runs only when the
+-/// adapter source is EXPLICIT (`--adapter-preset` / `--adapters`), and stays
+-/// off with auto-detection or `--no-adapter`. `always` is the explicit opt-in
+-/// to run regardless of the source. Either way the detector refuses a
+-/// boundary when no set is configured (`detect_pe_overlap_trim(.., None)` is
+-/// `None`), so `always` cannot trim biology either — it only opts into running
+-/// the detector.
++/// `auto` (the default) tracks *whether the user configured an adapter set*,
++/// because the safety guard needs a set to check the boundary against: `auto`
++/// runs only when the adapter source is EXPLICIT (`--adapter-preset` /
++/// `--adapters`), and stays off with auto-detection or `--no-adapter`. A
++/// detected set is not an explicit one — [`AdapterSource::Fixed`] carries the
++/// distinction in `explicit` — so detection alone cannot switch the stage on;
++/// the mode's measured value on the cohort is a null, and running it on every
++/// pair for a set the user never named was the bug this field exists to stop.
++/// `always` is the explicit opt-in to run regardless of the source. Either way
++/// the detector refuses a boundary when no set is configured
++/// (`detect_pe_overlap_trim(.., None)` is `None`), so `always` cannot trim
++/// biology either — it only opts into running the detector.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+ pub enum PeOverlapMode {
+     /// Never run the mode (equivalent to the flag being absent).
+@@ -57,14 +61,17 @@ impl PeOverlapMode {
+     ///
+     /// `Never` never runs; `Always` always runs (the caller has opted in);
+     /// `Auto` runs only for an explicit source — the guard then has a set to
+-    /// check the boundary against. This is the one place the tri-state is
+-    /// resolved, so the mode's reach cannot drift from the source that
+-    /// justifies it.
++    /// check the boundary against, and the user asked for that set. A
++    /// *detected* set has one too, but nobody asked to run the stage, so it
++    /// does not count: measured against the cohort the mode is a null, and its
++    /// per-pair cost (a `revcomp` allocation plus ~140 anchor probes) is not.
++    /// This is the one place the tri-state is resolved, so the mode's reach
++    /// cannot drift from the source that justifies it.
+     pub fn runs_with(self, source: &AdapterSource) -> bool {
+         match self {
+             PeOverlapMode::Never => false,
+             PeOverlapMode::Always => true,
+-            PeOverlapMode::Auto => matches!(source, AdapterSource::Fixed(_)),
++            PeOverlapMode::Auto => matches!(source, AdapterSource::Fixed { explicit: true, .. }),
+         }
+     }
+ 
+@@ -475,10 +482,22 @@ pub enum Mode {
+ ///
+ /// There is no auto-detect variant: detection resolves to a `Fixed` set in
+ /// `Cli::finalize`, so by the time the pipeline runs the adapters are known.
++/// `explicit` is what distinguishes the two ways a set can come into being,
++/// because they are not interchangeable for decisions that need a *user's*
++/// configuration rather than any set at all: a preset or a FASTA is something
++/// the user asked for, a catalogue detection is the tool's own guess. Only
++/// `--adapter-preset` / `--adapters` set it to `true`.
+ #[derive(Debug, Clone)]
+ pub enum AdapterSource {
+     /// Pre-loaded set, from a preset, a FASTA, or catalogue detection.
+-    Fixed(Arc<AdapterSet>),
++    Fixed {
++        set: Arc<AdapterSet>,
++        /// `true` only when the user named the set on the command line. A
++        /// detected set is `false`, which is what keeps `--pe-overlap auto`
++        /// from running a stage the user never asked for (see
++        /// [`PeOverlapMode::runs_with`]).
++        explicit: bool,
++    },
+     /// Adapter trimming disabled.
+     None,
+ }
+@@ -525,10 +544,10 @@ pub struct Runtime {
+     pub quiet: bool,
+     pub adapter_source: AdapterSource,
+     /// `--pe-overlap`: the tri-state as resolved in `finalize()`. `Auto` is
+-    /// resolved against the adapter source here (explicit ⇒ [`PeOverlapMode::Auto`]
+-    /// stays; auto-detect/`--no-adapter` ⇒ [`PeOverlapMode::Never`]), so the
+-    /// pipeline reads the mode directly and the mode's reach cannot drift from
+-    /// the source that justifies it.
++    /// resolved against the adapter source there (explicit `Fixed` set ⇒
++    /// [`PeOverlapMode::Auto`] stays; detected set or `--no-adapter` ⇒
++    /// [`PeOverlapMode::Never`]), so the pipeline reads the mode directly and
++    /// the mode's reach cannot drift from the source that justifies it.
+     pub pe_overlap: PeOverlapMode,
+ 
+     /// Deduplication settings; `None` when `--dedup` was not given.
+@@ -750,7 +769,9 @@ impl Cli {
+             }
+         }
+ 
+-        // Build adapter source.
++        // Build adapter source. `explicit` records *which branch* produced the
++        // set: only the two the user named (preset, FASTA) are explicit, and
++        // `--pe-overlap auto` resolves against that flag alone.
+         let adapter_source = if self.no_adapter {
+             AdapterSource::None
+         } else if let Some(preset) = self.adapter_preset {
+@@ -759,18 +780,24 @@ impl Cli {
+                 AdapterPreset::Nextera  => adapter::preset_nextera(),
+                 AdapterPreset::SmallRna => adapter::preset_small_rna(),
+             };
+-            AdapterSource::Fixed(Arc::new(AdapterSet::new(
+-                adapters,
+-                self.adapter_error_rate,
+-                self.min_adapter_overlap,
+-            )))
++            AdapterSource::Fixed {
++                set: Arc::new(AdapterSet::new(
++                    adapters,
++                    self.adapter_error_rate,
++                    self.min_adapter_overlap,
++                )),
++                explicit: true,
++            }
+         } else if let Some(path) = self.adapters {
+             let adapters = adapter::load_fasta(&path)?;
+-            AdapterSource::Fixed(Arc::new(AdapterSet::new(
+-                adapters,
+-                self.adapter_error_rate,
+-                self.min_adapter_overlap,
+-            )))
++            AdapterSource::Fixed {
++                set: Arc::new(AdapterSet::new(
++                    adapters,
++                    self.adapter_error_rate,
++                    self.min_adapter_overlap,
++                )),
++                explicit: true,
++            }
+         } else {
+             // Auto-detect. The terminal k-mer is a fingerprint against the
+             // built-in catalogue; the catalogue supplies the full sequence
+@@ -834,11 +861,15 @@ impl Cli {
+                     }
+                 }
+ 
+-                AdapterSource::Fixed(Arc::new(AdapterSet::new(
+-                    det.adapters,
+-                    self.adapter_error_rate,
+-                    self.min_adapter_overlap,
+-                )))
++                AdapterSource::Fixed {
++                    set: Arc::new(AdapterSet::new(
++                        det.adapters,
++                        self.adapter_error_rate,
++                        self.min_adapter_overlap,
++                    )),
++                    // Detection is not configuration: `auto` stays off.
++                    explicit: false,
++                }
+             }
+         };
+ 
+@@ -862,7 +893,7 @@ impl Cli {
+             trim_5: self.trim_5,
+             trim_3: self.trim_3,
+             adapter: match &adapter_source {
+-                AdapterSource::Fixed(arc) => Some(Arc::clone(arc)),
++                AdapterSource::Fixed { set, .. } => Some(Arc::clone(set)),
+                 _ => None,
+             },
+             // Set per pair in `pair_chunks` when `--pe-overlap` fires; `None`
+@@ -871,6 +902,9 @@ impl Cli {
+             extra_committed: 0,
+             original_len: None,
+             gate_lut: [0.0; 256],
++            // The configured offset; `run_single`/`run_paired` re-set it from
++            // auto-detection before the first chunk and rebuild the LUT.
++            phred_offset,
+         };
+         base.prepare();
+         // Deduplication. Resolved here so the run refuses before allocating
+@@ -957,17 +991,16 @@ impl Cli {
+         };
+ 
+         // Resolve the PE-overlap tri-state against the adapter source, in the
+-        // same place the source is built: the guard needs a set to check the
+-        // boundary against, so `auto` runs only when the source is explicit.
+-        // `always` keeps its explicit opt-in, and the detector still refuses a
+-        // boundary with no set (`detect_pe_overlap_trim(.., None)` is `None`).
+-        let pe_overlap = match self.pe_overlap {
+-            PeOverlapMode::Never => PeOverlapMode::Never,
+-            PeOverlapMode::Always => PeOverlapMode::Always,
+-            PeOverlapMode::Auto => match adapter_source {
+-                AdapterSource::Fixed(_) => PeOverlapMode::Auto,
+-                AdapterSource::None => PeOverlapMode::Never,
+-            },
++        // same place the source is built and through the one function that
++        // knows the rule: the guard needs a set to check the boundary against
++        // AND the user must have named it, so `auto` runs only for an explicit
++        // source. `always` keeps its explicit opt-in, and the detector still
++        // refuses a boundary with no set (`detect_pe_overlap_trim(.., None)` is
++        // `None`).
++        let pe_overlap = if self.pe_overlap.runs_with(&adapter_source) {
++            self.pe_overlap
++        } else {
++            PeOverlapMode::Never
+         };
+ 
+         let runtime = Runtime {
+@@ -1154,15 +1187,94 @@ mod tests {
+     #[test]
+     fn auto_tracks_the_adapter_source() {
+         // The resolution the pipeline relies on: auto + explicit ⇒ runs;
+-        // auto + auto-detect or --no-adapter ⇒ off.
+-        assert!(PeOverlapMode::Auto.runs_with(&AdapterSource::Fixed(Arc::new(
+-            AdapterSet::new(adapter::preset_illumina(), 0.2, 14)
+-        ))));
++        // auto + auto-detect or --no-adapter ⇒ off. Robustness note: an adapter
++        // set EXISTING is not the same thing as one being CONFIGURED. That is
++        // the whole point of `explicit`.
++        let set = || Arc::new(AdapterSet::new(adapter::preset_illumina(), 0.2, 14));
++        let explicit = AdapterSource::Fixed { set: set(), explicit: true };
++        let detected = AdapterSource::Fixed { set: set(), explicit: false };
++        assert!(PeOverlapMode::Auto.runs_with(&explicit));
++        assert!(
++            !PeOverlapMode::Auto.runs_with(&detected),
++            "a DETECTED set is not an explicit one: auto must stay off"
++        );
+         assert!(!PeOverlapMode::Auto.runs_with(&AdapterSource::None));
+-        assert!(!PeOverlapMode::Never.runs_with(&AdapterSource::Fixed(Arc::new(
+-            AdapterSet::new(adapter::preset_illumina(), 0.2, 14)
+-        ))));
++        assert!(!PeOverlapMode::Never.runs_with(&explicit));
++        assert!(PeOverlapMode::Always.runs_with(&detected));
+         assert!(PeOverlapMode::Always.runs_with(&AdapterSource::None));
+     }
++
++    /// The resolution `finalize` performs, end to end: with no adapter flags the
++    /// source comes from auto-detection, which must leave `auto` resolved to
++    /// `Never`; `--adapter-preset` is explicit and keeps `Auto`; `always` keeps
++    /// today's reach regardless of the source.
++    #[test]
++    fn finalize_resolves_auto_against_explicit_adapters_only() {
++        use clap::Parser;
++        let dir = std::env::temp_dir().join(format!("fastprep-pe-auto-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let inp = dir.join("in.fq");
++        let inp2 = dir.join("in2.fq");
++        let out = dir.join("out.fq");
++        let out2 = dir.join("out2.fq");
++        // Nextera readthrough in every read, so catalogue detection fires and
++        // resolves to a Fixed set that no flag asked for.
++        let mut body = String::new();
++        for i in 0..200 {
++            body.push_str(&format!(
++                "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGTCTGTCTCTTATACACATCT\n+\n{}\n",
++                "I".repeat(51)
++            ));
++        }
++        std::fs::write(&inp, &body).unwrap();
++        std::fs::write(&inp2, &body).unwrap();
++
++        let argv = |extra: &[&str]| -> Vec<String> {
++            let mut v: Vec<String> = vec![
++                "fastprep".into(),
++                "-1".into(),
++                inp.to_string_lossy().into_owned(),
++                "-2".into(),
++                inp2.to_string_lossy().into_owned(),
++                "-o".into(),
++                out.to_string_lossy().into_owned(),
++                "-p".into(),
++                out2.to_string_lossy().into_owned(),
++                "--no-dedup".into(),
++                "--no-auto-phred".into(),
++                "-q".into(),
++            ];
++            v.extend(extra.iter().map(|s| s.to_string()));
++            v
++        };
++
++        // 1. No adapter flags → detected → `auto` is off.
++        let (_, rt) = Cli::parse_from(argv(&[])).finalize().unwrap();
++        assert!(
++            matches!(rt.adapter_source, AdapterSource::Fixed { explicit: false, .. }),
++            "auto-detection must be recorded as NOT explicit"
++        );
++        assert_eq!(
++            rt.pe_overlap,
++            PeOverlapMode::Never,
++            "auto must not run on a detected adapter set"
++        );
++
++        // 2. --adapter-preset is explicit → `auto` stays on.
++        let (_, rt) = Cli::parse_from(argv(&["--adapter-preset", "illumina"]))
++            .finalize()
++            .unwrap();
++        assert!(matches!(rt.adapter_source, AdapterSource::Fixed { explicit: true, .. }));
++        assert_eq!(rt.pe_overlap, PeOverlapMode::Auto);
++
++        // 3. `always` keeps today's reach, detected set or not.
++        let (_, rt) = Cli::parse_from(argv(&["--pe-overlap", "always"]))
++            .finalize()
++            .unwrap();
++        assert_eq!(rt.pe_overlap, PeOverlapMode::Always);
++
++        std::fs::remove_file(&inp).ok();
++        std::fs::remove_dir_all(&dir).ok();
++    }
+ }
+ 
+diff --git a/tools/fastprep/src/dedup.rs b/tools/fastprep/src/dedup.rs
+index 2e2957f..03e90f5 100644
+--- a/tools/fastprep/src/dedup.rs
++++ b/tools/fastprep/src/dedup.rs
+@@ -206,6 +206,11 @@ pub struct Verifier<T: Fingerprint> {
+     since_poll: u64,
+     saturated_at: Option<u64>,
+     offered: u64,
++    /// Counts table probes. Test builds only, so the shipped binary pays
++    /// nothing: whether a read costs one probe or two is invisible in the
++    /// output, and only a counter can assert it.
++    #[cfg(test)]
++    probes: u64,
+ }
+ 
+ impl<T: Fingerprint> Verifier<T> {
+@@ -218,29 +223,65 @@ impl<T: Fingerprint> Verifier<T> {
+             since_poll: 0,
+             saturated_at: None,
+             offered: 0,
++            #[cfg(test)]
++            probes: 0,
+         }
+     }
+ 
+     /// Offers a fingerprint. `&mut self`, so this runs on the ordered thread;
+     /// computing the fingerprint itself is a pure function and belongs in the
+     /// parallel stage.
++    ///
++    /// The saturation check comes **first** and the order is load-bearing: it
++    /// is the one-sidedness argument of §6.1.2 (a saturated set is a subset of
++    /// the unsaturated one at every point, so a saturated run can miss
++    /// duplicates but can never drop a read the unsaturated procedure kept).
++    /// With that out of the way the unsaturated path needs a single probe —
++    /// `insert` tells us whether the fingerprint was already there — instead of
++    /// `contains` followed by `insert`, two probes of the same open-addressed
++    /// table for every read that is not a duplicate.
+     pub fn offer(&mut self, fp: T) -> Seen {
+         self.offered += 1;
+-        if self.seen.contains(&fp) {
+-            return Seen::Duplicate;
+-        }
+         if self.saturated() {
+-            return Seen::NewUnrecorded;
++            #[cfg(test)]
++            {
++                self.probes += 1;
++            }
++            return if self.seen.contains(&fp) {
++                Seen::Duplicate
++            } else {
++                Seen::NewUnrecorded
++            };
+         }
+-        self.since_poll += 1;
+-        if self.since_poll >= POLL_INTERVAL {
++        // The poll keeps the original order (probe, then poll, then insert) and
++        // runs once per POLL_INTERVAL insertions. It has to: the poll can change
++        // THIS fingerprint's answer, and a duplicate landing on the polling read
++        // must stay a duplicate. Duplicates do not advance the counter, so
++        // `since_poll + 1` is the value the poll would see.
++        if self.since_poll + 1 >= POLL_INTERVAL {
++            #[cfg(test)]
++            {
++                self.probes += 2;
++            }
++            if self.seen.contains(&fp) {
++                return Seen::Duplicate;
++            }
+             self.since_poll = 0;
+             if self.over_ceiling() {
+                 self.saturated_at = Some(self.offered);
+                 return Seen::NewUnrecorded;
+             }
++            self.seen.insert(fp);
++            return Seen::New;
++        }
++        #[cfg(test)]
++        {
++            self.probes += 1;
++        }
++        if !self.seen.insert(fp) {
++            return Seen::Duplicate;
+         }
+-        self.seen.insert(fp);
++        self.since_poll += 1;
+         Seen::New
+     }
+ 
+@@ -423,6 +464,50 @@ mod tests {
+         assert_eq!(v.len(), 1);
+     }
+ 
++    /// One probe per read on the unsaturated path: `insert` reports whether the
++    /// fingerprint was already there, which is `contains` + `insert` collapsed.
++    /// At 5 M pairs the table is ~72 MB, so the second probe was a DRAM round
++    /// trip per read on the ordered thread.
++    #[test]
++    fn unsaturated_path_probes_the_set_once() {
++        let mut v = Verifier::<u64>::with_capacity(16, None);
++        assert_eq!(v.offer(u64::of(b"ACGT")), Seen::New);
++        assert_eq!(v.probes, 1, "a new read must take one probe, not contains+insert");
++        assert_eq!(v.offer(u64::of(b"ACGT")), Seen::Duplicate);
++        assert_eq!(v.probes, 2, "a duplicate must also take one probe");
++        // Saturated: `contains` only, and nothing is recorded.
++        v.saturated_at = Some(2);
++        assert_eq!(v.offer(u64::of(b"TGCA")), Seen::NewUnrecorded);
++        assert_eq!(v.probes, 3);
++        assert_eq!(v.len(), 1);
++    }
++
++    /// The saturation poll keeps the old two-probe order, and it must: the poll
++    /// can change THIS fingerprint's answer (a new one is reported
++    /// `NewUnrecorded` instead of `New`), while a duplicate that lands on the
++    /// polling read is still a duplicate and must not advance the counter.
++    #[test]
++    fn saturation_fires_on_the_polling_read_and_keeps_its_exact_answer() {
++        // ceiling 0: every poll finds the process over the limit.
++        let mut v = Verifier::<u64>::with_capacity(64, Some(0));
++        for i in 0..POLL_INTERVAL - 1 {
++            assert_eq!(v.offer(i as u64), Seen::New, "insert {i}");
++        }
++        assert!(!v.saturated());
++        // A duplicate on the polling read: reported as a duplicate, and the
++        // poll does not fire (the old order probed before polling).
++        assert_eq!(v.offer(0), Seen::Duplicate);
++        assert!(!v.saturated(), "a duplicate must not trigger the poll");
++        assert_eq!(v.len(), POLL_INTERVAL as usize - 1);
++        // The next NEW read is the polling one: it saturates and is not
++        // recorded (so a second copy of it passes).
++        assert_eq!(v.offer(u64::MAX), Seen::NewUnrecorded);
++        assert!(v.saturated());
++        assert_eq!(v.len(), POLL_INTERVAL as usize - 1);
++        assert_eq!(v.offer(u64::MAX), Seen::NewUnrecorded);
++        assert_eq!(v.offer(0), Seen::Duplicate);
++    }
++
+     /// The one-sidedness of §6.1.2, tested directly rather than assumed: the
+     /// saturated run's survivors are a superset of the unsaturated run's.
+     #[test]
+diff --git a/tools/fastprep/src/io.rs b/tools/fastprep/src/io.rs
+index 91292c8..67c96bf 100644
+--- a/tools/fastprep/src/io.rs
++++ b/tools/fastprep/src/io.rs
+@@ -180,49 +180,86 @@ pub fn open_input(path: &Path, gz_threads: usize) -> Result<InputReader> {
+     }
+ }
+ 
+-/// Write one FASTQ record. Includes `@` / `+` sigils and terminating
+-/// newlines. `raw_qual` contains raw Phred values (not ASCII-encoded);
+-/// `phred_offset` is added to each byte inline via a 512-byte stack
+-/// buffer, avoiding a per-read heap allocation.
+-pub fn write_fastq(
+-    w: &mut OutputWriter,
+-    id: &[u8],
+-    seq: &[u8],
+-    raw_qual: &[u8],
+-    phred_offset: u8,
+-) -> Result<()> {
+-    debug_assert_eq!(seq.len(), raw_qual.len());
+-    let id_trimmed = strip_sigil(id, b'@');
+-    w.write_all(b"@")?;
+-    w.write_all(id_trimmed)?;
+-    w.write_all(b"\n")?;
+-    w.write_all(seq)?;
+-    w.write_all(b"\n+\n")?;
+-    let mut buf = [0u8; 512];
+-    let mut rest = raw_qual;
+-    while !rest.is_empty() {
+-        let n = rest.len().min(buf.len());
+-        for (dst, &q) in buf[..n].iter_mut().zip(rest.iter()) {
+-            *dst = q.saturating_add(phred_offset);
++/// Flush threshold for the record staging buffer. A record is appended in
++/// memory and handed to the compressor in one call once the buffer passes
++/// this size, instead of six short calls per record.
++pub const STAGE_FLUSH: usize = 256 << 10;
++
++/// Record writer with a staging buffer.
++///
++/// Every FASTQ/FASTA output is one of these. The point is the syscall-free
++/// append path: six `write_all` calls per record became one per ~256 KiB, and
++/// each `ParCompress::write` (which memcpys into a `BytesMut` and re-checks the
++/// 65 280-byte BGZF block boundary) now runs once per buffer rather than once
++/// per record plus its quality slice. It also hands the compressor whole
++/// blocks, which is what it wants.
++///
++/// Quality bytes are written exactly as ingested: the Phred offset is folded
++/// into the quality-gate LUT and the mean sum, never into the data (see
++/// `algorithm::Params::prepare`), so this is a pure append and the output
++/// bytes are the input bytes.
++pub struct Out {
++    w: OutputWriter,
++    stage: Vec<u8>,
++}
++
++impl Out {
++    pub fn new(w: OutputWriter) -> Self {
++        // Slack for the record that crosses the threshold, so a spill never
++        // has to grow the buffer.
++        Self {
++            w,
++            stage: Vec::with_capacity(STAGE_FLUSH + (8 << 10)),
+         }
+-        w.write_all(&buf[..n])?;
+-        rest = &rest[n..];
+     }
+-    w.write_all(b"\n")?;
+-    Ok(())
+-}
+ 
+-/// Write one FASTA record. Includes `>` sigil and terminating newline.
+-/// Single-line FASTA (no 60/80-char wrapping) — this matches needletail's
+-/// output convention and is what every downstream tool accepts.
+-pub fn write_fasta(w: &mut OutputWriter, id: &[u8], seq: &[u8]) -> Result<()> {
+-    let id_trimmed = strip_sigil(id, b'>');
+-    w.write_all(b">")?;
+-    w.write_all(id_trimmed)?;
+-    w.write_all(b"\n")?;
+-    w.write_all(seq)?;
+-    w.write_all(b"\n")?;
+-    Ok(())
++    /// Append one FASTQ record: `@id\nseq\n+\nqual\n`.
++    pub fn fastq(&mut self, id: &[u8], seq: &[u8], qual: &[u8]) -> Result<()> {
++        debug_assert_eq!(seq.len(), qual.len());
++        self.stage.push(b'@');
++        self.stage.extend_from_slice(strip_sigil(id, b'@'));
++        self.stage.push(b'\n');
++        self.stage.extend_from_slice(seq);
++        self.stage.extend_from_slice(b"\n+\n");
++        self.stage.extend_from_slice(qual);
++        self.stage.push(b'\n');
++        if self.stage.len() >= STAGE_FLUSH {
++            self.spill()?;
++        }
++        Ok(())
++    }
++
++    /// Append one FASTA record: `>id\nseq\n`. Single-line FASTA (no 60/80-char
++    /// wrapping) — this matches needletail's output convention and is what
++    /// every downstream tool accepts.
++    pub fn fasta(&mut self, id: &[u8], seq: &[u8]) -> Result<()> {
++        self.stage.push(b'>');
++        self.stage.extend_from_slice(strip_sigil(id, b'>'));
++        self.stage.push(b'\n');
++        self.stage.extend_from_slice(seq);
++        self.stage.push(b'\n');
++        if self.stage.len() >= STAGE_FLUSH {
++            self.spill()?;
++        }
++        Ok(())
++    }
++
++    /// Hand the staged bytes to the compressor.
++    fn spill(&mut self) -> Result<()> {
++        if !self.stage.is_empty() {
++            self.w.write_all(&self.stage)?;
++            self.stage.clear();
++        }
++        Ok(())
++    }
++
++    /// Push everything staged, then flush the compressor. Must run before the
++    /// atomic rename that commits the file.
++    pub fn flush(&mut self) -> Result<()> {
++        self.spill()?;
++        self.w.flush()?;
++        Ok(())
++    }
+ }
+ 
+ fn strip_sigil<'a>(s: &'a [u8], sigil: u8) -> &'a [u8] {
+@@ -263,10 +300,9 @@ mod tests {
+     fn write_fastq_plain_roundtrip() {
+         let p = tmp_path("plain.fq");
+         {
+-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
+-            // phred_offset=0: raw bytes passed through unchanged (already ASCII).
+-            write_fastq(&mut w, b"read1", b"ACGT", b"IIII", 0).unwrap();
+-            write_fastq(&mut w, b"@read2", b"NN", b"##", 0).unwrap();
++            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
++            w.fastq(b"read1", b"ACGT", b"IIII").unwrap();
++            w.fastq(b"@read2", b"NN", b"##").unwrap();
+             w.flush().unwrap();
+         }
+         let mut data = String::new();
+@@ -275,21 +311,88 @@ mod tests {
+         std::fs::remove_file(&p).ok();
+     }
+ 
++    /// Quality bytes are written verbatim: the Phred offset lives in the
++    /// quality-gate LUT and the mean sum, never in the data, so egress is an
++    /// append and not a per-byte re-encode.
+     #[test]
+-    fn write_fastq_phred_offset_encoding() {
+-        // Raw Phred 40 + offset 33 = ASCII 73 = 'I'.
+-        let p = tmp_path("phred.fq");
++    fn write_fastq_quality_bytes_are_verbatim() {
++        let p = tmp_path("rawq.fq");
+         {
+-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
+-            write_fastq(&mut w, b"r1", b"ACGT", &[40u8; 4], 33).unwrap();
++            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
++            w.fastq(b"r1", b"ACGT", b"IIII").unwrap();
++            // A byte below any sane offset must round-trip untouched: the
++            // clamp happens once, on ingest, where the LUT is indexed.
++            w.fastq(b"r2", b"ACGT", b"!I#\x7f").unwrap();
+             w.flush().unwrap();
+         }
+-        let mut data = String::new();
+-        File::open(&p).unwrap().read_to_string(&mut data).unwrap();
+-        assert_eq!(data, "@r1\nACGT\n+\nIIII\n");
++        let mut data = Vec::new();
++        File::open(&p).unwrap().read_to_end(&mut data).unwrap();
++        assert_eq!(data, b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\n!I#\x7f\n");
+         std::fs::remove_file(&p).ok();
+     }
+ 
++    /// A `Write` that records every call, to prove the record path batches.
++    #[derive(Clone, Default)]
++    struct Counting(std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize)>>);
++
++    impl Write for Counting {
++        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++            let mut g = self.0.lock().unwrap();
++            g.0.extend_from_slice(buf);
++            g.1 += 1;
++            Ok(buf.len())
++        }
++        fn flush(&mut self) -> std::io::Result<()> {
++            Ok(())
++        }
++    }
++
++    /// Six `write_all`s per record became one per staging flush. 20 000
++    /// records are ~2.2 MB, so a 256 KiB stage must need a handful of calls —
++    /// the old code emitted 120 000.
++    #[test]
++    fn fastq_records_are_staged_not_written_one_call_per_field() {
++        let sink = Counting::default();
++        let mut w = Out::new(Box::new(sink.clone()));
++        let seq = vec![b'A'; 50];
++        let qual = vec![b'I'; 50];
++        for i in 0..20_000 {
++            w.fastq(format!("r{i}").as_bytes(), &seq, &qual).unwrap();
++        }
++        w.flush().unwrap();
++        let (bytes, calls) = { sink.0.lock().unwrap().clone() };
++        let expected_flushes = bytes.len() / STAGE_FLUSH + 1;
++        assert!(
++            calls <= expected_flushes + 1,
++            "{calls} write calls for {} bytes; staging should need ~{expected_flushes}",
++            bytes.len()
++        );
++        let mut expect = Vec::new();
++        for i in 0..20_000 {
++            expect.extend_from_slice(format!("@r{i}\n").as_bytes());
++            expect.extend_from_slice(&seq);
++            expect.extend_from_slice(b"\n+\n");
++            expect.extend_from_slice(&qual);
++            expect.push(b'\n');
++        }
++        assert_eq!(bytes, expect, "staged bytes differ from the record stream");
++    }
++
++    #[test]
++    fn fasta_records_are_staged() {
++        let sink = Counting::default();
++        let mut w = Out::new(Box::new(sink.clone()));
++        let seq = vec![b'A'; 100];
++        for i in 0..10_000 {
++            w.fasta(format!("c{i}").as_bytes(), &seq).unwrap();
++        }
++        w.flush().unwrap();
++        let (bytes, calls) = { sink.0.lock().unwrap().clone() };
++        assert!(calls <= bytes.len() / STAGE_FLUSH + 2, "{calls} write calls");
++        assert!(bytes.starts_with(b">c0\nAAAA"), "content corrupted");
++        assert!(bytes.ends_with(b"\n"));
++    }
++
+     /// Exercises the parallel path specifically: with more than one worker
+     /// and enough data to fill several blocks, the output is multi-member,
+     /// which is the case a single-member decoder would silently truncate.
+@@ -302,11 +405,11 @@ mod tests {
+             gz_threads: 4,
+         };
+         let seq = vec![b'A'; 200];
+-        let qual = vec![40u8; 200];
++        let qual = vec![b'I'; 200];
+         {
+-            let mut w = open_output(&p, levels).unwrap();
++            let mut w = Out::new(open_output(&p, levels).unwrap());
+             for i in 0..20_000 {
+-                write_fastq(&mut w, format!("read{i}").as_bytes(), &seq, &qual, 33).unwrap();
++                w.fastq(format!("read{i}").as_bytes(), &seq, &qual).unwrap();
+             }
+             w.flush().unwrap();
+         }
+@@ -333,11 +436,11 @@ mod tests {
+             gz_threads: 4,
+         };
+         let seq = vec![b'A'; 150];
+-        let qual = vec![40u8; 150];
++        let qual = vec![b'I'; 150];
+         {
+-            let mut w = open_output(&p, levels).unwrap();
++            let mut w = Out::new(open_output(&p, levels).unwrap());
+             for i in 0..50_000 {
+-                write_fastq(&mut w, format!("read{i}").as_bytes(), &seq, &qual, 33).unwrap();
++                w.fastq(format!("read{i}").as_bytes(), &seq, &qual).unwrap();
+             }
+             w.flush().unwrap();
+         }
+@@ -397,8 +500,8 @@ mod tests {
+     fn write_fastq_gz_roundtrip() {
+         let p = tmp_path("rt.fq.gz");
+         {
+-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
+-            write_fastq(&mut w, b"read1", b"ACGT", b"IIII", 0).unwrap();
++            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
++            w.fastq(b"read1", b"ACGT", b"IIII").unwrap();
+             w.flush().unwrap();
+         }
+         let f = File::open(&p).unwrap();
+@@ -413,8 +516,8 @@ mod tests {
+     fn write_fastq_zst_roundtrip() {
+         let p = tmp_path("rt.fq.zst");
+         {
+-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
+-            write_fastq(&mut w, b"read1", b"ACGT", b"IIII", 0).unwrap();
++            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
++            w.fastq(b"read1", b"ACGT", b"IIII").unwrap();
+             w.flush().unwrap();
+         }
+         let f = File::open(&p).unwrap();
+@@ -429,9 +532,9 @@ mod tests {
+     fn write_fasta_plain() {
+         let p = tmp_path("plain.fa");
+         {
+-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
+-            write_fasta(&mut w, b">contig1", b"ACGT").unwrap();
+-            write_fasta(&mut w, b"contig2", b"NN").unwrap();
++            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
++            w.fasta(b">contig1", b"ACGT").unwrap();
++            w.fasta(b">contig2", b"NN").unwrap();
+             w.flush().unwrap();
+         }
+         let mut data = String::new();
+diff --git a/tools/fastprep/src/pipeline.rs b/tools/fastprep/src/pipeline.rs
+index d0162b5..48ba8f4 100644
+--- a/tools/fastprep/src/pipeline.rs
++++ b/tools/fastprep/src/pipeline.rs
+@@ -31,7 +31,7 @@ use crate::algorithm::{trim, DropReason, Params, TrimOutput, TrimResult};
+ use crate::cli::{PeOverlapMode, Runtime};
+ use crate::dedup::{AnchorSpec, Fingerprint, Seen, Verifier};
+ use crate::io::{
+-    open_input, open_output, open_output_as, write_fasta, write_fastq, OutputWriter, RecordFormat,
++    open_input, open_output, open_output_as, Out, OutputWriter, RecordFormat,
+ };
+ use crate::metadata::{self, Mate};
+ use crate::stats::Stats;
+@@ -53,7 +53,39 @@ struct ChunkBuf {
+     qual: Vec<u8>,
+ }
+ 
++// Counts freshly allocated chunk arenas. Test builds only: recycling is
++// invisible in the output, so only a counter can show it happens. Thread-local
++// because the pipeline allocates on its own (ordered) thread, and a global
++// would be polluted by the other tests running in parallel with this one.
++#[cfg(test)]
++thread_local! {
++    static ARENAS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
++/// Take a recycled arena, or allocate one.
++///
++/// Spelled as a `match` rather than `unwrap_or_default()` on purpose: `Default`
++/// would bypass the test-only `ARENAS` counter that the recycling test asserts
++/// on.
++#[inline]
++fn pop_or_new(free: &mut Vec<ChunkBuf>) -> ChunkBuf {
++    match free.pop() {
++        Some(buf) => buf,
++        None => ChunkBuf::new(),
++    }
++}
++
+ impl ChunkBuf {
++    /// A fresh arena. Only the free-list miss path should reach this: a chunk
++    /// at 1024 reads and 151 bp is ~464 KB per mate, so allocating one per
++    /// chunk (and freeing the previous one only after reserving the next) was
++    /// ~4.5 GB of large-object churn in a 5 M-pair run.
++    fn new() -> Self {
++        #[cfg(test)]
++        ARENAS.with(|c| c.set(c.get() + 1));
++        Self::default()
++    }
++
+     fn reserve(&mut self, reads: usize, avg_len: usize) {
+         let cap = reads * avg_len;
+         self.id.reserve(cap / 4);
+@@ -87,14 +119,28 @@ impl ScanInput {
+         buf.seq.extend_from_slice(rec.seq().as_ref());
+         let (qual, format) = match rec.qual() {
+             Some(q) => {
+-                // Decode ASCII Phred. saturating_sub handles corrupted
+-                // bytes below the offset (would otherwise underflow).
++                // Quality stays in its INPUT encoding: it is copied through,
++                // used through a LUT shifted by `phred_offset`, and written
++                // back verbatim. The one transformation kept is the clamp —
++                // a byte below the offset used to decode to 0 and re-encode to
++                // `offset`, so it is stored as `offset` here and the output
++                // bytes are identical to the decode/encode path's.
++                //
++                // `max` rather than a branch: the whole slice is a memcpy plus
++                // one SIMD max, where decoding was a subtract per byte and
++                // egress an add per byte (two full passes over 151 bytes).
+                 let q_start = buf.qual.len();
+-                buf.qual
+-                    .extend(q.iter().map(|&b| b.saturating_sub(phred_offset)));
++                if phred_offset == 0 {
++                    buf.qual.extend_from_slice(q);
++                } else {
++                    buf.qual.extend(q.iter().map(|&b| b.max(phred_offset)));
++                }
+                 (q_start..buf.qual.len(), RecordFormat::Fastq)
+             }
+             None => {
++                // FASTA carries no qualities. Zeros (not ASCII) because
++                // `gate_lut[0]` is Q0 either way, and the mean-q filter is
++                // skipped for FASTA records (`fasta_params`).
+                 let q_start = buf.qual.len();
+                 buf.qual.resize(q_start + buf.seq.len() - seq_start, 0u8);
+                 (q_start..buf.qual.len(), RecordFormat::Fasta)
+@@ -115,7 +161,7 @@ struct Processed {
+ }
+ 
+ impl Processed {
+-    fn emit_to(&self, buf: &ChunkBuf, w: &mut OutputWriter, phred_offset: u8) -> Result<()> {
++    fn emit_to(&self, buf: &ChunkBuf, w: &mut Out) -> Result<()> {
+         match &self.output.result {
+             TrimResult::Drop { .. } => Ok(()),
+             TrimResult::Emit { .. } => {
+@@ -130,19 +176,14 @@ impl Processed {
+                     seq.len()
+                 );
+                 let seq = &seq[t_5..seq.len() - t_3];
++                let id = &buf.id[self.input.id.clone()];
+                 match self.input.format {
+                     RecordFormat::Fastq => {
+                         let qual = &buf.qual[self.input.qual.clone()];
+                         let raw_qual = &qual[t_5..qual.len() - t_3];
+-                        write_fastq(
+-                            w,
+-                            &buf.id[self.input.id.clone()],
+-                            seq,
+-                            raw_qual,
+-                            phred_offset,
+-                        )
++                        w.fastq(id, seq, raw_qual)
+                     }
+-                    RecordFormat::Fasta => write_fasta(w, &buf.id[self.input.id.clone()], seq),
++                    RecordFormat::Fasta => w.fasta(id, seq),
+                 }
+             }
+         }
+@@ -188,6 +229,20 @@ fn fasta_params(params: &Params) -> Option<Params> {
+     })
+ }
+ 
++/// The configured adapter names in set order, for the report.
++///
++/// Called once per run. Per-read work carries an adapter *index*
++/// (`TrimOutput::adapter`), so these strings are materialised only when the
++/// report is printed — `Stats` used to allocate one per adapter-trimmed read,
++/// twice.
++fn adapter_names(params: &Params) -> Vec<String> {
++    params
++        .adapter
++        .as_ref()
++        .map(|set| set.adapters.iter().map(|a| a.name.clone()).collect())
++        .unwrap_or_default()
++}
++
+ fn params_for<'a>(params: &'a Params, fasta: &'a Option<Params>, fmt: RecordFormat) -> &'a Params {
+     match (fmt, fasta) {
+         (RecordFormat::Fasta, Some(p)) => p,
+@@ -415,7 +470,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+     let mut writer = if rt.dry_run {
+         None
+     } else {
+-        Some(open_output_as(&tmp_out, out1, rt.compression)?)
++        Some(Out::new(open_output_as(&tmp_out, out1, rt.compression)?))
+     };
+ 
+     let tmp_meta_path = rt.metadata.as_deref().map(part_path);
+@@ -430,9 +485,15 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+     };
+ 
+     let mut stats = Stats::default();
++    // Names are resolved once for the run; per-read work carries an index.
++    stats.adapter.set_names(adapter_names(params));
+     let parallel = rt.threads > 1;
+ 
+-    let params = params.clone();
++    // Quality is never decoded: the offset is folded into the gate LUT and the
++    // mean-q sum, so the params carry it. Set before the first chunk.
++    let mut params = params.clone();
++    params.set_phred_offset(phred_offset);
++    let params = params;
+ 
+     // The anchor window is resolved once for the run from the expected read
+     // length; deriving it per read would make it vary with the polyG tail,
+@@ -464,7 +525,11 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+     let mut progress_shown = false;
+ 
+     let io_result = (|| -> Result<()> {
+-        let mut buf = ChunkBuf::default();
++        // Recycled arenas: the buffer a chunk was computed in comes back on
++        // `res_rx` and is reused for the next chunk instead of being freed
++        // after the next one was allocated.
++        let mut free: Vec<ChunkBuf> = Vec::new();
++        let mut buf = ChunkBuf::new();
+         buf.reserve(rt.chunk, 151);
+         let mut chunk = Vec::with_capacity(rt.chunk);
+         fill_chunk(&mut *reader, &mut buf, &mut chunk, rt.chunk, phred_offset)?;
+@@ -472,7 +537,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+         while !chunk.is_empty() {
+             raw_tx.send((buf, chunk)).ok();
+ 
+-            let mut next_buf = ChunkBuf::default();
++            let mut next_buf = pop_or_new(&mut free);
+             next_buf.reserve(rt.chunk, 151);
+             let mut next = Vec::with_capacity(rt.chunk);
+             fill_chunk(
+@@ -483,21 +548,26 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+                 phred_offset,
+             )?;
+ 
+-            let (res_buf, results) = res_rx.recv().context("compute thread died")?;
++            let (mut res_buf, results) = res_rx.recv().context("compute thread died")?;
+             for p in &results {
+                 // Deduplication runs on the ordered thread, so the decision
+                 // sequence is the input order regardless of thread count.
+                 let seq = &res_buf.seq[p.input.seq.clone()];
+                 let dup = dedup.as_mut().is_some_and(|d| d.is_duplicate(seq, None));
+-                let result = if dup {
+-                    duplicate_result()
++                // Borrowed, never cloned: `TrimResult::Emit` carries a heap
++                // `Vec` of interior runs and this is the per-record path on the
++                // ordered thread. `duplicate_result()` allocates nothing.
++                let dup_result;
++                let result: &TrimResult = if dup {
++                    dup_result = duplicate_result();
++                    &dup_result
+                 } else {
+-                    p.output.result.clone()
++                    &p.output.result
+                 };
+-                stats.record(seq.len(), &result, p.output.adapter_name.as_deref());
++                stats.record(seq.len(), result, p.output.adapter);
+                 if !dup {
+                     if let Some(w) = writer.as_mut() {
+-                        p.emit_to(&res_buf, w, phred_offset)?;
++                        p.emit_to(&res_buf, w)?;
+                     }
+                 }
+                 if let Some(mw) = meta.as_mut() {
+@@ -505,7 +575,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+                         &mut **mw,
+                         &res_buf.id[p.input.id.clone()],
+                         Mate::R1,
+-                        &result,
++                        result,
+                         seq.len(),
+                     )
+                     .context("writing metadata record")?;
+@@ -516,6 +586,10 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+                 eprint!("\r  {} reads processed", stats.reads_in);
+                 progress_shown = true;
+             }
++            // The arena just written from goes back on the free list, cleared,
++            // so the next chunk reuses its capacity instead of re-mapping.
++            res_buf.clear();
++            free.push(res_buf);
+             buf = next_buf;
+             chunk = next;
+         }
+@@ -531,11 +605,11 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
+             stats.record(
+                 seq.len(),
+                 &p.output.result,
+-                p.output.adapter_name.as_deref(),
++                p.output.adapter,
+             );
+             if io_result.is_ok() {
+                 if let Some(w) = writer.as_mut() {
+-                    let _ = p.emit_to(&res_buf, w, phred_offset);
++                    let _ = p.emit_to(&res_buf, w);
+                 }
+             }
+         }
+@@ -643,12 +717,12 @@ pub fn run_paired(
+     let mut w1 = if rt.dry_run {
+         None
+     } else {
+-        Some(open_output_as(&tmp_w1, out1, rt.compression)?)
++        Some(Out::new(open_output_as(&tmp_w1, out1, rt.compression)?))
+     };
+     let mut w2 = if rt.dry_run {
+         None
+     } else {
+-        Some(open_output_as(&tmp_w2, out2, rt.compression)?)
++        Some(Out::new(open_output_as(&tmp_w2, out2, rt.compression)?))
+     };
+ 
+     let tmp_ws1 = singletons1.map(part_path);
+@@ -661,7 +735,7 @@ pub fn run_paired(
+         tmp_ws1
+             .as_deref()
+             .zip(singletons1)
+-            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
++            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression).map(Out::new))
+             .transpose()?
+     };
+     let mut ws2 = if rt.dry_run {
+@@ -670,7 +744,7 @@ pub fn run_paired(
+         tmp_ws2
+             .as_deref()
+             .zip(singletons2)
+-            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
++            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression).map(Out::new))
+             .transpose()?
+     };
+ 
+@@ -700,8 +774,16 @@ pub fn run_paired(
+     };
+ 
+     let parallel = rt.threads > 1;
+-    let params_r1 = params_r1.clone();
+-    let params_r2 = params_r2.clone();
++    // Names are resolved once for the run; per-read work carries an index.
++    let names = adapter_names(&params_r1);
++    stats.r1.adapter.set_names(names.clone());
++    stats.r2.adapter.set_names(names);
++    // Quality is never decoded: the offset is folded into the gate LUT and the
++    // mean-q sum, so both mates' params carry it before the first chunk.
++    let mut params_r1 = params_r1.clone();
++    params_r1.set_phred_offset(phred_offset);
++    let mut params_r2 = params_r2.clone();
++    params_r2.set_phred_offset(phred_offset);
+ 
+     // PE overlap: resolved once per chunk, per pair, inside the work closure.
+     // The mode resolved to `Never` (the default with auto-detection or
+@@ -761,9 +843,11 @@ pub fn run_paired(
+     let mut progress_shown = false;
+ 
+     let io_result = (|| -> Result<()> {
+-        let mut buf1 = ChunkBuf::default();
++        // One free list serves both mates: an arena is an arena.
++        let mut free: Vec<ChunkBuf> = Vec::new();
++        let mut buf1 = ChunkBuf::new();
+         buf1.reserve(rt.chunk, 151);
+-        let mut buf2 = ChunkBuf::default();
++        let mut buf2 = ChunkBuf::new();
+         buf2.reserve(rt.chunk, 151);
+         let mut chunk1 = Vec::with_capacity(rt.chunk);
+         let mut chunk2 = Vec::with_capacity(rt.chunk);
+@@ -781,9 +865,9 @@ pub fn run_paired(
+         while !chunk1.is_empty() {
+             raw_tx.send(((buf1, chunk1), (buf2, chunk2))).ok();
+ 
+-            let mut next_buf1 = ChunkBuf::default();
++            let mut next_buf1 = pop_or_new(&mut free);
+             next_buf1.reserve(rt.chunk, 151);
+-            let mut next_buf2 = ChunkBuf::default();
++            let mut next_buf2 = pop_or_new(&mut free);
+             next_buf2.reserve(rt.chunk, 151);
+             let mut next1 = Vec::with_capacity(rt.chunk);
+             let mut next2 = Vec::with_capacity(rt.chunk);
+@@ -798,7 +882,7 @@ pub fn run_paired(
+                 );
+             }
+ 
+-            let ((res_b1, res_b2), pairs) = res_rx.recv().context("compute thread died")?;
++            let ((mut res_b1, mut res_b2), pairs) = res_rx.recv().context("compute thread died")?;
+             write_pairs(
+                 &res_b1,
+                 &res_b2,
+@@ -809,7 +893,6 @@ pub fn run_paired(
+                 ws1.as_mut(),
+                 ws2.as_mut(),
+                 meta.as_mut(),
+-                phred_offset,
+                 &warn_r1_once,
+                 &warn_r2_once,
+                 dedup.as_mut(),
+@@ -823,6 +906,10 @@ pub fn run_paired(
+                 );
+                 progress_shown = true;
+             }
++            res_b1.clear();
++            free.push(res_b1);
++            res_b2.clear();
++            free.push(res_b2);
+             buf1 = next_buf1;
+             buf2 = next_buf2;
+             chunk1 = next1;
+@@ -843,7 +930,6 @@ pub fn run_paired(
+             ws1.as_mut(),
+             ws2.as_mut(),
+             meta.as_mut(),
+-            phred_offset,
+             &warn_r1_once,
+             &warn_r2_once,
+             dedup.as_mut(),
+@@ -917,12 +1003,11 @@ fn write_pairs(
+     buf2: &ChunkBuf,
+     pairs: Vec<ProcessedPair>,
+     stats: &mut PairedStats,
+-    w1: &mut Option<OutputWriter>,
+-    w2: &mut Option<OutputWriter>,
+-    mut ws1: Option<&mut OutputWriter>,
+-    mut ws2: Option<&mut OutputWriter>,
++    w1: &mut Option<Out>,
++    w2: &mut Option<Out>,
++    mut ws1: Option<&mut Out>,
++    mut ws2: Option<&mut Out>,
+     mut meta: Option<&mut OutputWriter>,
+-    phred_offset: u8,
+     warn_r1_once: &AtomicBool,
+     warn_r2_once: &AtomicBool,
+     dedup: Option<&mut Dedup>,
+@@ -937,23 +1022,31 @@ fn write_pairs(
+         let dup = dedup
+             .as_deref_mut()
+             .is_some_and(|d| d.is_duplicate(s1, Some(s2)));
+-        let (res1, res2) = if dup {
+-            (duplicate_result(), duplicate_result())
++        // Borrowed, never cloned: `TrimResult::Emit` carries a heap `Vec` of
++        // interior runs, and this runs per record on the ordered thread. The
++        // duplicate case needs a zeroed result, which allocates nothing
++        // (`runs: vec![]`).
++        let dup1;
++        let dup2;
++        let (res1, res2): (&TrimResult, &TrimResult) = if dup {
++            dup1 = duplicate_result();
++            dup2 = duplicate_result();
++            (&dup1, &dup2)
+         } else {
+-            (pp.p1.output.result.clone(), pp.p2.output.result.clone())
++            (&pp.p1.output.result, &pp.p2.output.result)
+         };
+         stats
+             .r1
+-            .record(s1.len(), &res1, pp.p1.output.adapter_name.as_deref());
++            .record(s1.len(), res1, pp.p1.output.adapter);
+         stats
+             .r2
+-            .record(s2.len(), &res2, pp.p2.output.adapter_name.as_deref());
++            .record(s2.len(), res2, pp.p2.output.adapter);
+         if let Some(mw) = meta.as_deref_mut() {
+             metadata::write_record(
+                 &mut **mw,
+                 &buf1.id[pp.p1.input.id.clone()],
+                 Mate::R1,
+-                &res1,
++                res1,
+                 s1.len(),
+             )
+             .context("writing metadata record (R1)")?;
+@@ -961,16 +1054,16 @@ fn write_pairs(
+                 &mut **mw,
+                 &buf2.id[pp.p2.input.id.clone()],
+                 Mate::R2,
+-                &res2,
++                res2,
+                 s2.len(),
+             )
+             .context("writing metadata record (R2)")?;
+         }
+-        match outcome(&res1, &res2) {
++        match outcome(res1, res2) {
+             PairOutcome::BothKept => {
+                 if let (Some(w1), Some(w2)) = (w1.as_mut(), w2.as_mut()) {
+-                    pp.p1.emit_to(buf1, w1, phred_offset)?;
+-                    pp.p2.emit_to(buf2, w2, phred_offset)?;
++                    pp.p1.emit_to(buf1, w1)?;
++                    pp.p2.emit_to(buf2, w2)?;
+                 }
+                 stats.pairs_out += 1;
+             }
+@@ -979,7 +1072,7 @@ fn write_pairs(
+             }
+             PairOutcome::R1KeptR2Dropped => {
+                 if let Some(w) = ws1.as_deref_mut() {
+-                    pp.p1.emit_to(buf1, w, phred_offset)?;
++                    pp.p1.emit_to(buf1, w)?;
+                     stats.singletons_r1 += 1;
+                 } else {
+                     stats.discarded_singletons_r1 += 1;
+@@ -994,7 +1087,7 @@ fn write_pairs(
+             }
+             PairOutcome::R1DroppedR2Kept => {
+                 if let Some(w) = ws2.as_deref_mut() {
+-                    pp.p2.emit_to(buf2, w, phred_offset)?;
++                    pp.p2.emit_to(buf2, w)?;
+                     stats.singletons_r2 += 1;
+                 } else {
+                     stats.discarded_singletons_r2 += 1;
+@@ -1168,6 +1261,136 @@ mod tests {
+         Params::default()
+     }
+ 
++    // ------- Chunk arenas are recycled ------------------------------------
++
++    /// A fresh `ChunkBuf` per chunk was ~464 KB alloc + first-touch per mate per
++    /// chunk (928 KB paired), and the old one was only freed *after* the new
++    /// one was reserved. Recycling needs a handful for a whole run. The counter
++    /// is a thread-local so parallel tests cannot pollute it.
++    #[test]
++    fn chunk_arenas_are_recycled_not_reallocated() {
++        let inp = tmp_path("arena.fq");
++        let out = tmp_path("arena-out.fq");
++        let mut body = String::new();
++        for i in 0..200 {
++            body.push_str(&format!(
++                "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
++            ));
++        }
++        write_plain(&inp, &body);
++        let rt = Runtime { chunk: 8, ..default_rt() };
++        ARENAS.with(|c| c.set(0));
++        run_single(&inp, &out, &default_params(), &rt).unwrap();
++        let n = ARENAS.with(|c| c.get());
++        // 25 chunks; recycling needs one in flight, one being filled, one in
++        // the result channel.
++        assert!(n <= 3, "{n} chunk arenas allocated for 25 chunks (expected ≤ 3)");
++        std::fs::remove_file(&inp).ok();
++        std::fs::remove_file(&out).ok();
++    }
++
++    #[test]
++    fn paired_chunk_arenas_are_recycled_too() {
++        let in1 = tmp_path("arena-r1.fq");
++        let in2 = tmp_path("arena-r2.fq");
++        let out1 = tmp_path("arena-o1.fq");
++        let out2 = tmp_path("arena-o2.fq");
++        let mut body = String::new();
++        for i in 0..200 {
++            body.push_str(&format!(
++                "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
++            ));
++        }
++        write_plain(&in1, &body);
++        write_plain(&in2, &body);
++        let p = default_params();
++        let rt = Runtime { chunk: 8, ..default_rt() };
++        ARENAS.with(|c| c.set(0));
++        run_paired(&in1, &in2, &out1, &out2, None, None, &p, &p, &rt).unwrap();
++        let n = ARENAS.with(|c| c.get());
++        // Two mates per chunk → two arenas in flight is still a handful.
++        assert!(n <= 6, "{n} chunk arenas allocated for 25 paired chunks (expected ≤ 6)");
++        for f in [&in1, &in2, &out1, &out2] {
++            std::fs::remove_file(f).ok();
++        }
++    }
++
++    /// `--interior` still works after the per-record `TrimResult` clone was
++    /// removed: the runs are read through the borrowed result on the ordered
++    /// thread, and the interior mass reaches the counters.
++    #[test]
++    fn interior_runs_reach_the_counters_without_cloning() {
++        let inp = tmp_path("interior.fq");
++        let out = tmp_path("interior-out.fq");
++        // 16 random | polyA(12) interior | 16 more, ending in T so no 3' run.
++        let seq = format!("ACGTACGTACGTACGT{}{}", "A".repeat(12), "CGTACGTACGTACGT");
++        write_plain(
++            &inp,
++            &format!("@r\n{}\n+\n{}\n", seq, "I".repeat(seq.len())),
++        );
++        let mut p = default_params();
++        p.scan_interior = true;
++        let rt = default_rt();
++        let stats = run_single(&inp, &out, &p, &rt).unwrap();
++        assert_eq!(stats.reads_kept, 1);
++        assert!(
++            stats.bases_interior_mass >= 11,
++            "interior mass {} — the runs were lost with the clone",
++            stats.bases_interior_mass
++        );
++        std::fs::remove_file(&inp).ok();
++        std::fs::remove_file(&out).ok();
++    }
++
++    // ------- Ingest keeps quality raw ------------------------------------
++
++    /// Quality is not decoded on ingest: the chunk arena holds the input bytes
++    /// (clamped up to the offset), the gate LUT is indexed by them, and egress
++    /// writes them back. This is the property that makes the whole round trip
++    /// disappear; without it the arena holds decoded values and egress has to
++    /// re-encode.
++    #[test]
++    fn ingest_keeps_raw_quality_bytes_and_clamps_below_the_offset() {
++        let fq = b"@r\nACGT\n+\n I#I\n".to_vec(); // quals: ' ', 'I', '#', 'I'
++        let mut parser = needletail::parse_fastx_reader(std::io::Cursor::new(fq)).unwrap();
++        let rec = parser.next().unwrap().unwrap();
++        let mut buf = ChunkBuf::default();
++        let si = ScanInput::push_needletail(&mut buf, &rec, 33).unwrap();
++        assert_eq!(
++            &buf.qual[si.qual.clone()],
++            b"!I#I",
++            "ingest must store the input bytes, clamped up to the offset"
++        );
++        // And a second record appends rather than overwriting.
++        let si2 = ScanInput::push_needletail(&mut buf, &rec, 33).unwrap();
++        assert_eq!(&buf.qual[si2.qual.clone()], b"!I#I");
++        assert_eq!(si2.qual.start, 4);
++    }
++
++    /// End to end: a FASTQ round trip must return the quality bytes it was
++    /// given, including a sub-offset byte, which is clamped exactly as the old
++    /// decode/encode path clamped it.
++    #[test]
++    fn quality_round_trips_through_the_pipeline() {
++        let inp = tmp_path("q-rt.fq");
++        let out = tmp_path("q-rt-out.fq");
++        write_plain(
++            &inp,
++            "@r1\nACGTACGTACGTACGTACGTACGT\n+\n I#I5?+ABCDEFGHIJKLMNOPQ\n",
++        );
++        let mut rt = default_rt();
++        rt.phred_offset = 33;
++        let stats = run_single(&inp, &out, &default_params(), &rt).unwrap();
++        assert_eq!(stats.reads_kept, 1);
++        let body = read_plain(&out);
++        assert!(
++            body.contains("\n!I#I5?+ABCDEFGHIJKLMNOPQ\n"),
++            "quality bytes changed: {body:?}"
++        );
++        std::fs::remove_file(&inp).ok();
++        std::fs::remove_file(&out).ok();
++    }
++
+     // ------- Single-end plain --------------------------------------------
+ 
+     #[test]
+diff --git a/tools/fastprep/src/stats.rs b/tools/fastprep/src/stats.rs
+index db9200f..b667278 100644
+--- a/tools/fastprep/src/stats.rs
++++ b/tools/fastprep/src/stats.rs
+@@ -21,22 +21,88 @@ pub const REPORT_SCHEMA: &str = "fastsuite.report.v1";
+ // Per-adapter stats (counts by adapter name).
+ // ---------------------------------------------------------------------------
+ 
+-#[derive(Debug, Default, Clone, serde::Serialize)]
++#[derive(Debug, Clone)]
+ pub struct AdapterStats {
+-    /// reads → adapter name → count of reads where that adapter was trimmed.
+-    pub by_name: HashMap<String, u64>,
++    /// Trimmed-read count per adapter index, indexed exactly like the
++    /// configured set (`crate::adapter::PE_OVERLAP_ADAPTER` for the PE-overlap
++    /// boundary). A flat array, not a hash of names: this is written once per
++    /// trimmed read on the ordered thread, and hashing a `String` there was
++    /// pure cost — the name is only needed when the report is printed.
++    pub counts: [u64; 256],
++    /// Names by adapter index, filled ONCE per run by [`AdapterStats::set_names`].
++    /// Index `255` is `"pe-overlap"`.
++    pub names: Vec<String>,
+     pub reads_trimmed: u64,
+     pub bases_trimmed_5: u64,
+     pub bases_trimmed_3: u64,
+ }
+ 
++impl Default for AdapterStats {
++    fn default() -> Self {
++        Self {
++            counts: [0; 256],
++            names: Vec::new(),
++            reads_trimmed: 0,
++            bases_trimmed_5: 0,
++            bases_trimmed_3: 0,
++        }
++    }
++}
++
+ impl AdapterStats {
+-    pub fn record(&mut self, name: &str, t5: usize, t3: usize) {
+-        *self.by_name.entry(name.to_string()).or_insert(0) += 1;
++    /// Install the adapter names for the run. Called once from the pipeline,
++    /// with the configured set's names in set order and the reserved
++    /// `"pe-overlap"` slot filled in.
++    pub fn set_names(&mut self, mut names: Vec<String>) {
++        let reserved = crate::adapter::PE_OVERLAP_ADAPTER as usize;
++        if names.len() <= reserved {
++            names.resize_with(reserved + 1, String::new);
++        }
++        names[reserved] = "pe-overlap".to_string();
++        self.names = names;
++    }
++
++    /// Count one trimmed read against adapter `idx`.
++    pub fn record(&mut self, idx: u8, t5: usize, t3: usize) {
++        self.counts[idx as usize] += 1;
+         self.reads_trimmed += 1;
+         self.bases_trimmed_5 += t5 as u64;
+         self.bases_trimmed_3 += t3 as u64;
+     }
++
++    /// Name for an adapter index; empty when the index was never named (only
++    /// possible in tests that record without calling `set_names`).
++    pub fn name(&self, idx: usize) -> &str {
++        self.names.get(idx).map(String::as_str).unwrap_or("")
++    }
++
++    /// The legacy `by_name` map, built at report time: index → count for every
++    /// adapter that actually trimmed a read.
++    pub fn by_name(&self) -> HashMap<String, u64> {
++        let mut m = HashMap::new();
++        for (idx, &n) in self.counts.iter().enumerate() {
++            if n > 0 {
++                m.insert(self.name(idx).to_string(), n);
++            }
++        }
++        m
++    }
++}
++
++/// Serialised exactly as the old `{by_name, reads_trimmed, bases_trimmed_5,
++/// bases_trimmed_3}` object, so the `--json` adapter block does not move. Keys
++/// come out sorted because `serde_json::to_value` builds a `BTreeMap` by
++/// default, which is also what the old `HashMap` field produced.
++impl serde::Serialize for AdapterStats {
++    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
++        use serde::ser::SerializeStruct;
++        let mut st = s.serialize_struct("AdapterStats", 4)?;
++        st.serialize_field("by_name", &self.by_name())?;
++        st.serialize_field("reads_trimmed", &self.reads_trimmed)?;
++        st.serialize_field("bases_trimmed_5", &self.bases_trimmed_5)?;
++        st.serialize_field("bases_trimmed_3", &self.bases_trimmed_3)?;
++        st.end()
++    }
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -65,7 +131,7 @@ pub struct Stats {
+ }
+ 
+ impl Stats {
+-    pub fn record(&mut self, original_len: usize, res: &TrimResult, adapter_name: Option<&str>) {
++    pub fn record(&mut self, original_len: usize, res: &TrimResult, adapter: Option<u8>) {
+         self.reads_in += 1;
+         self.bases_in += original_len as u64;
+         match res {
+@@ -84,8 +150,8 @@ impl Stats {
+                     DropReason::Duplicate => self.reads_dropped_duplicate += 1,
+                 }
+                 if (t5a + t3a) > 0 {
+-                    if let Some(name) = adapter_name {
+-                        self.adapter.record(name, t5a, t3a);
++                    if let Some(idx) = adapter {
++                        self.adapter.record(idx, t5a, t3a);
+                     }
+                 }
+             }
+@@ -97,8 +163,8 @@ impl Stats {
+                 let h_int: usize = runs.iter().map(|(_, l)| l).sum();
+                 self.bases_interior_mass += h_int as u64;
+                 if (t5a + t3a) > 0 {
+-                    if let Some(name) = adapter_name {
+-                        self.adapter.record(name, t5a, t3a);
++                    if let Some(idx) = adapter {
++                        self.adapter.record(idx, t5a, t3a);
+                     }
+                 }
+             }
+@@ -263,7 +329,8 @@ pub fn report(label: &str, s: &Stats) {
+         eprintln!("      bases trimmed (5′):    {:>12}", s.adapter.bases_trimmed_5);
+         eprintln!("      bases trimmed (3′):    {:>12}", s.adapter.bases_trimmed_3);
+         // Per-adapter breakdown.
+-        let mut by_name: Vec<(&String, &u64)> = s.adapter.by_name.iter().collect();
++        let by_name_map = s.adapter.by_name();
++        let mut by_name: Vec<(&String, &u64)> = by_name_map.iter().collect();
+         by_name.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+         let last = by_name.len().saturating_sub(1);
+         for (i, (name, count)) in by_name.iter().enumerate() {
+@@ -333,14 +400,51 @@ mod tests {
+     #[test]
+     fn record_adapter_trim_updates_adapter_stats() {
+         let mut s = Stats::default();
++        s.adapter.set_names(vec!["TruSeq/R1".to_string()]);
+         s.record(
+             150,
+             &TrimResult::Emit { t5_adapter: 5, t3_adapter: 10, t5_poly: 0, t3_poly: 0, runs: vec![] },
+-            Some("TruSeq/R1"),
++            Some(0),
+         );
+         assert_eq!(s.adapter.reads_trimmed, 1);
+         assert_eq!(s.adapter.bases_trimmed_5, 5);
+         assert_eq!(s.adapter.bases_trimmed_3, 10);
+-        assert_eq!(*s.adapter.by_name.get("TruSeq/R1").unwrap(), 1);
++        assert_eq!(*s.adapter.by_name().get("TruSeq/R1").unwrap(), 1);
++    }
++
++    /// Counts are by index and names are materialised only at report time —
++    /// and the serialised `--json` block keeps the shape and the values it
++    /// always had, including the reserved `pe-overlap` slot.
++    #[test]
++    fn adapter_names_are_materialised_at_report_time() {
++        let mut s = Stats::default();
++        s.adapter.set_names(vec!["TruSeq/R1".to_string(), "Nextera".to_string()]);
++        let emit = |t5: usize, t3: usize| TrimResult::Emit {
++            t5_adapter: t5,
++            t3_adapter: t3,
++            t5_poly: 0,
++            t3_poly: 0,
++            runs: vec![],
++        };
++        s.record(150, &emit(5, 10), Some(0));
++        s.record(150, &emit(2, 0), Some(1));
++        // A boundary the mate pair pinned, and an untrimmed read.
++        s.record(150, &emit(0, 7), Some(crate::adapter::PE_OVERLAP_ADAPTER));
++        s.record(150, &emit(0, 0), Some(0));
++
++        assert_eq!(s.adapter.reads_trimmed, 3);
++        assert_eq!(s.adapter.bases_trimmed_5, 7);
++        assert_eq!(s.adapter.bases_trimmed_3, 17);
++        assert_eq!(s.adapter.counts[0], 1);
++        assert_eq!(s.adapter.counts[1], 1);
++        assert_eq!(s.adapter.counts[crate::adapter::PE_OVERLAP_ADAPTER as usize], 1);
++
++        let v = serde_json::to_value(&s.adapter).unwrap();
++        assert_eq!(v["by_name"]["TruSeq/R1"], 1);
++        assert_eq!(v["by_name"]["Nextera"], 1);
++        assert_eq!(v["by_name"]["pe-overlap"], 1);
++        assert_eq!(v["reads_trimmed"], 3);
++        assert_eq!(v["bases_trimmed_5"], 7);
++        assert_eq!(v["bases_trimmed_3"], 17);
+     }
+ }

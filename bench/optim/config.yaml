@@ -3,14 +3,14 @@
 # `bins.baseline` must hold the six binaries built from the pre-change commit
 # (frozen copies, see docs/optim/BENCH.md); `bins.new` the tree under test.
 
-repo: /mnt/Fast/fastsuite-optim/repo
+repo: /home/raphael/FastSuite
 results: /mnt/Fast/fastsuite-optim/results
 reads: /mnt/Fast/fastsuite-optim/reads
-profile: /mnt/Fast/fastsuite-optim/repo/tools/fastsim/profiles/mandrill_E358.json
+profile: /home/raphael/FastSuite/tools/fastsim/profiles/mandrill_E358.json
 
 bins:
   baseline: /mnt/Fast/fastsuite-optim/baseline-bin
-  new: /mnt/Fast/fastsuite-optim/repo/tools
+  new: /mnt/Fast/fastsuite-optim/new-bin
 
 # The measured tools. fasthelper is handled by its own rules (it aggregates a
 # synthesised report tree, not reads), and fastsim carries the gzip-level axis.
@@ -23,3 +23,9 @@ threads: [1, 2, 4]
 fastsim_gz_levels: [0, 1, 6]
 
 helper_samples: [2000, 5000]
+
+# Installed comparators (path -> binary). fastp is the one head-to-head this
+# round changes; FastQC/Falco/cutadapt/MultiQC are not installed on the desktop,
+# so their numbers stay as committed and the papers say so.
+comparators:
+  fastp: /home/raphael/.local/bin/fastp
