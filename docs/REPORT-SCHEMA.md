@@ -70,6 +70,12 @@ fasthelper schema
 
 ### fastprep raw stats
 
+Drop causes are per-read and partition `reads_dropped`. `reads_dropped_length`
+(added 2026-10-20) is the post-trim length floor: a read that survived trimming
+but ended below `--min-len` (an absolute floor above the read length is the usual
+cause). It is distinct from the trim-budget causes — the budget caps how much
+trim is *allowed*, this one rejects a read that was too short to begin with.
+
 Only reached by report files written before fastprep emitted the v1
 wrapper (PLAN.md §1.1). A current `fastprep --json` file is a v1 report
 and keeps its raw object under `legacy`.
@@ -98,6 +104,17 @@ bases:
 | `polyC_frac` | mass in the high-x/low-y corner |
 | `off_diagonal_frac` | mass with `|x − y| > size/10` — reads whose composition is nothing like the library's |
 | `total_reads`, `grid_size` | scalars from the file |
+| `min_seq_len`, `max_seq_len` | the length span the grid was built over (raw reads, per mate) |
+| `corner_window` | the window actually applied, `max(2, size/50)`; published so the bias below is visible from the report alone |
+
+**Length bias, stated.** The grid is sized for the longest read (`size =
+max_seq_len + 1`), so a read shorter than `size − 1 − corner_window` can never
+reach a corner. On a mixed-length run the corner fractions therefore describe
+only the longest reads, and a single untrimmed read can move them by more than
+any biological effect. Since 2026-10-20 the tool writes one stderr warning when
+`max_seq_len − min_seq_len > corner_window`, and both outputs carry the three
+scalars above so a consumer can detect the case without stderr. The corner
+definition itself is unchanged; a length-relative plane is the open fix.
 
 Ground-truth check of the adapter (10 reads: 5 random, 3 polyT, 2 polyG) gives
 `polyT_frac = 0.30`, `polyG_frac = 0.20`, `off_diagonal_frac = 0.20` — the two
