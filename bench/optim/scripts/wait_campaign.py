@@ -1,7 +1,13 @@
 import subprocess, sys, time, json
 
-TSV = "/mnt/Fast/fastsuite-optim/results/results.tsv"
-deadline = time.time() + 150 * 60  # give the campaign 2.5 h
+import argparse
+ap = argparse.ArgumentParser(description="Wait for a campaign's aggregate, then summarise it.")
+ap.add_argument("--tsv", default="/mnt/Fast/fastsuite-optim/results/results.tsv",
+                help="aggregate to wait for (results-papers/results.tsv for the targeted run)")
+ap.add_argument("--minutes", type=int, default=150)
+args = ap.parse_args()
+TSV = args.tsv
+deadline = time.time() + args.minutes * 60
 while time.time() < deadline:
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "desktop",
                         "test -s " + TSV], capture_output=True)
@@ -21,8 +27,8 @@ else:
 
 # summary
 code = r'''
-import csv
-rows = list(csv.DictReader(open("/mnt/Fast/fastsuite-optim/results/results.tsv"), delimiter="\t"))
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1]), delimiter="\t"))
 print("rows:", len(rows))
 bad = [r for r in rows if r["kind"] in ("baseline","new")
        and abs(float(r["cpu_over_wall"]) - 1.0) > 0.15
@@ -37,6 +43,6 @@ for t in ("fastcheck","fastprep","fastsim","fastmaps","fasthelper","fastdedup"):
         print(f"{t:11} {r['kind']:8} reads={r['reads']:>8} wall={r['wall_s']:>8} "
               f"cpu/wall={r['cpu_over_wall']:>5} rss={int(r['peak_rss_kb'])//1024:>5} MB")
 '''
-out = subprocess.run(["ssh", "-o", "BatchMode=yes", "desktop", "python3 -"],
+out = subprocess.run(["ssh", "-o", "BatchMode=yes", "desktop", "python3 - " + TSV],
                      input=code, capture_output=True, text=True)
 print(out.stdout or out.stderr[-800:])
