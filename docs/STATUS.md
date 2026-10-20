@@ -320,6 +320,14 @@ still be re-derived before the sweep numbers are quoted again.
 
 New and open after the review round:
 
+* **gzip level 6 costs ~7x the compressed output in peak memory.** The
+  multi-threaded gzippy writer buffers the stream: on 5 M pairs (888 MB compressed)
+  fastdedup peaks at 4.37 GB, against 153 MB at `--gz-level 1` on the single-threaded
+  flate2 path — which is also *faster* there (18.3 s against 29.5 s) but produces
+  1 681 MB instead of 888 MB. The footprint scales with input (~890 MB at 1 M pairs),
+  so a 100 M-pair gzipped run needs ~80 GB. It is a trade, not a leak, but nothing
+  documented it and the default is level 6. A bounded hand-off queue now caps the
+  *other* contributor (see the thread table in `bench/profile/README.md`).
 * **fastmaps' corner fractions cannot see a 3' tail.** `polyG_frac` counts reads
   that are *nearly all G* (the corner window is `max(size/50, 2)` at a grid sized
   for the longest read), so a tail is a displacement, never a corner. Measured on

@@ -26,7 +26,8 @@ that once already: see the FastHelper benchmark).
 |---|---|
 | `pipeline_1m.csv` | five stages at 1 M pairs |
 | `pipeline_5m.csv` | five stages at 5 M pairs |
-| `dedup_threads.csv` | `fastdedup` at 5 M pairs, `-j` 1/2/4/8 |
+| `dedup_threads.csv` | `fastdedup` at 5 M pairs, `-j` 1/2/4/8 (post-fix) |
+| `gz_levels.csv` | the same run at `--gz-level` 1, 6 and 9 (compression vs memory) |
 
 Machine: AMD Ryzen 7 7730U, 16 threads, 15 GB RAM, NVMe. Build `595ef4f`.
 
@@ -42,12 +43,22 @@ Each needs the release binaries built (`pixi run build`) and roughly 0.5 GB of i
 per million pairs; `dedup_threads.py` reuses `pipe5m/sim`, so run the 5 M profile
 first.
 
-## The two findings
+## The findings
 
-1. **`fastdedup`'s memory is a function of input size, not thread count, once
-   `-j > 1`.** At `-j 1` it is 15.7 B/pair (the paper's model, reproduced). Every
-   `-j > 1` carries a ~4 GB floor here (78.7 MB → 4 025 MB from one thread to two),
-   and 2 and 4 threads are *slower* than 1 while using 51x the memory.
-2. **`fastsim` is ~80% of the chain's wall time** and single-threaded by
+1. **`fastsim` is ~80% of the chain's wall time** and single-threaded by
    construction, so `-j` does nothing for it. The analysis stages total 15 s per
    million pairs; the simulator alone is 63 s.
+2. **`fastdedup`'s hashing is ~10 s and ~100 MB at 5 M pairs, at any thread count.**
+   With plain (uncompressed) output every `-j` in 1/2/4/8 lands in 9.8–10.8 s and
+   77–126 MB, so the hashing pipeline itself does not scale with threads because it
+   is I/O-bound on the read side.
+3. **The gzip writer is what costs memory, and it is a trade, not a leak.**
+   `--gz-level 6` (gzippy, multi-block) peaks at 4.37 GB for 888 MB of output;
+   `--gz-level 1` (single-threaded flate2) peaks at 153 MB for 1 681 MB of output and
+   is *faster* on this box (18.3 s against 29.5 s). The level-6 footprint scales with
+   input, so a 100 M-pair gzipped run needs ~80 GB.
+4. **A second, independent contributor was an unbounded hand-off queue** between the
+   hashers and the writer: when compression is the bottleneck the writer blocks, and
+   that queue absorbed the whole stream (4.0 GB at `-j 2` and `-j 4`, and those two
+   settings were slower than `-j 1`). It is now bounded (`53d6686`), and the same runs
+   measure 101 MB and 105 MB, with `-j 4` 22% *faster* than before.
