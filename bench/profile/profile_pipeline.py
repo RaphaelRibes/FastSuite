@@ -13,7 +13,11 @@ import os
 import sys
 import time
 
-TOOLS = os.path.expanduser("~/hermes_scratch/FastSuite/tools")
+# Repo root from this file's location (bench/profile/ -> repo), so the script
+# works from whichever checkout it lives in: both machines keep two, and a
+# hardcoded home path silently ran the wrong binaries.
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TOOLS = os.path.join(REPO, "tools")
 BIN = {t: f"{TOOLS}/{t}/target/release/{t}" for t in
        ("fastsim", "fastdedup", "fastprep", "fastmaps", "fastcheck")}
 PROFILE = f"{TOOLS}/fastsim/profiles/cellB-pe-overlap.json"

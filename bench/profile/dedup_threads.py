@@ -10,10 +10,12 @@ import os
 import sys
 import time
 
-BIN = os.path.expanduser(
-    "~/hermes_scratch/FastSuite/tools/fastdedup/target/release/fastdedup")
-SRC = "/home/raphael/.hermes/cache/scratch/fsprobe/pipe5m/sim"
-OUT = "/home/raphael/.hermes/cache/scratch/fsprobe/dedup_threads"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BIN = os.path.join(REPO, "tools/fastdedup/target/release/fastdedup")
+SRC = os.environ.get("FS_SIM_DIR",
+                     "/home/raphael/.hermes/cache/scratch/fsprobe/pipe5m/sim")
+OUT = os.environ.get("FS_OUT_DIR",
+                     "/home/raphael/.hermes/cache/scratch/fsprobe/dedup_threads")
 CSV_PATH = os.path.join(OUT, "threads.csv")
 
 
