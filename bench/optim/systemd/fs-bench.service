@@ -1,0 +1,35 @@
+# systemd user unit for the FastSuite optimisation bench.
+#
+# Install on the desktop (the only machine benchmarks run on):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/fs-bench.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start fs-bench.service        # runs to completion
+#   journalctl --user -u fs-bench.service -f       # or follow the log below
+#
+# Linger must be on for the unit to survive a logout: `loginctl enable-linger`.
+#
+# It calls run_bench.sh, which defaults to BENCH_CORES=1 and
+# BENCH_CONFIG=config-papers.yaml — serial, so each cell's taskset pin is
+# exclusive, and the targeted config that produced the numbers in
+# docs/optim/report/. The full matrix needs BENCH_CONFIG=config.yaml, which the
+# unit does not pass, so changing the matrix is an explicit edit here.
+#
+# Nice=5 keeps an interactive session responsive on the same machine; it does not
+# disturb the measurement, because the cells are pinned and serial either way.
+
+[Unit]
+Description=FastSuite optimisation bench (baseline vs new, pinned, serial)
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/raphael/FastSuite/bench/optim
+ExecStart=/bin/bash /home/raphael/FastSuite/bench/optim/run_bench.sh
+StandardOutput=append:/mnt/Fast/fastsuite-optim/bench.log
+StandardError=append:/mnt/Fast/fastsuite-optim/bench.log
+Nice=5
+
+[Install]
+WantedBy=default.target

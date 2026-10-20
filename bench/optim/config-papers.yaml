@@ -1,0 +1,24 @@
+# Targeted campaign: the cells the papers' optimisation sections need, and no
+# others. One size, one thread count (both arms pinned to one core), the gzip
+# level axis for fastsim, one helper sample count. Serial, so the pin is
+# exclusive and cpu/wall ~1.00 means the measurement is real.
+repo: /home/raphael/FastSuite
+results: /mnt/Fast/fastsuite-optim/results-papers
+reads: /mnt/Fast/fastsuite-optim/reads
+profile: /home/raphael/FastSuite/tools/fastsim/profiles/mandrill_E358.json
+
+bins:
+  baseline: /mnt/Fast/fastsuite-optim/baseline-bin
+  new: /mnt/Fast/fastsuite-optim/new-bin
+
+tools: [fastcheck, fastdedup, fastmaps, fastprep, fastsim]
+
+sizes: [1000000]
+threads: [1]
+
+fastsim_gz_levels: [0, 1, 6]
+
+helper_samples: [2000]
+
+comparators:
+  fastp: /home/raphael/.local/bin/fastp

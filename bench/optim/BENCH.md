@@ -117,6 +117,20 @@ and byte-identical (fastsim is deterministic at a fixed seed). Target the cells
 instead: `--forcerun cell` plus the aggregate, or list the targets explicitly.
 `-F all` is only right on a cold workspace.
 
+## Which config produces which table
+
+`config.yaml` is the full matrix — three sizes, three thread counts, two comparators — and serially it
+is hours of compute. `config-papers.yaml` is the targeted campaign: one size, one thread count, both
+arms, the gzip-level axis, and it is what produced the fifteen rows quoted in `docs/optim/report/` and
+in the six papers (archived at `results/2026-10-20-targeted.tsv`). It takes six minutes serially.
+
+`run_bench.sh` defaults to `config-papers.yaml` and `BENCH_CORES=1` for exactly that reason: the first
+campaign of this round ran the full matrix at `--cores 8`, which is the one combination that cannot
+produce a sound row, and 90 of its cells had to be discarded. Override with `BENCH_CONFIG` and
+`BENCH_CORES` only when you know why.
+
+The systemd unit is in `systemd/fs-bench.service` with install instructions at the top.
+
 ## Three traps that make a row unreadable rather than wrong
 
 * *The two arms can report the same version.* `baseline-bin/fastdedup` and
