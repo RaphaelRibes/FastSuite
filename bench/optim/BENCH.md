@@ -87,3 +87,24 @@ real fastmaps grid to every tenth sample), at 2 000 and 5 000 samples.
 
 Peak RSS on a pinned cell above ~1.05 in `cpu_over_wall` means the child kept
 threads of its own, which is a finding about the tool, not about the bench.
+
+## Why the campaign runs with `--cores 1`
+
+Each cell is pinned (`taskset -c 0..N-1` for `-j N`) so that `cpu_s / wall_s` near
+1.00 proves no work escaped the pin. That only means something if nothing else is
+using those cores. With `--cores 8` Snakemake happily ran several cells at once,
+and because every `-j 1` cell is pinned to core 0 they queued on one core: the
+wall times came out inflated by contention, `cpu_over_wall` fell below 1, and the
+numbers were not comparable between cells.
+
+Two rules follow.
+
+* Run the campaign serially (`--cores 1`). The whole matrix costs ~30-45 min
+  serial, which is cheaper than a contaminated table.
+* Before launching, check for orphans from an earlier run: a killed Snakemake
+  leaves its `taskset`-pinned grandchildren alive, still holding core 0, and the
+  next campaign measures against them. `pkill -f 'fastsi[m] --pairs'` (the
+  bracket keeps the pattern from matching your own shell) then confirm
+  `pgrep -c` reports 0.
+* Snakemake also refuses to rebuild after a killed run until `--unlock`, and
+  marks the interrupted cells incomplete; `--rerun-incomplete` is required.
