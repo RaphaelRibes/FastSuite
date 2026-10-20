@@ -221,6 +221,16 @@ fn main() -> Result<()> {
             "--out1 (-o) and --out2 (-p) cannot both be stdout: R1 and R2 would interleave into one corrupted stream. Send one mate to a file."
         );
     }
+    // Two independent writers on one path interleave R1 and R2 into a file that
+    // is neither valid FASTQ nor FASTA, and exit 0. Refuse before any write.
+    if let (Some(out1), Some(out2)) = (args.output.as_deref(), args.output_r2.as_deref()) {
+        if out1 == out2 {
+            bail!(
+                "--out1 (-o) and --out2 (-p) name the same file ({}): two writers would interleave R1 and R2 into one file that is neither valid FASTQ nor FASTA. Give each mate its own path.",
+                out1
+            );
+        }
+    }
     if out1_stream && args.json.as_deref() == Some("-") {
         bail!(
             "--out1 (-) and --json (-) cannot both write to stdout. Send the report to a file, or drop one of them."

@@ -292,3 +292,97 @@ fn test_pe_abundance_detects_desync() {
         .arg("-o").arg(o3.path()).arg("-p").arg(o4.path())
         .assert().failure();
 }
+
+/// Relancer `--abundance` dans la même sortie ne doit pas dupliquer les
+/// enregistrements.
+///
+/// `prepare_writer` ajoute à un fichier existant quand `--force` est absent,
+/// ce qui est correct pour les moteurs de déduplication (ils préchargent les
+/// hachages de la sortie et ignorent donc les doublons). Le chemin abundance
+/// écrivait chaque séquence unique une fois avec son compteur, sans précharger :
+/// deux lectures uniques, deux passages, donnaient 4 enregistrements et 0 erreur.
+/// Il n'y a rien à précharger ici (les compteurs viennent de l'entrée), donc la
+/// sortie existante est refusée sans `--force`, et réécrite avec.
+#[test]
+fn test_abundance_relance_sans_force_refusee_et_force_ne_duplique_pas() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq_repetitions(&temp_dir, "entree.fastq", 2, 1);
+    let temp_subdir = temp_dir.child("spill");
+    fs::create_dir_all(temp_subdir.path()).unwrap();
+
+    for (nom, spill) in [("classique", false), ("temp-dir", true)] {
+        let sortie = temp_dir.child(format!("out_{nom}.fq"));
+        let lancer = |force: bool| {
+            let mut c = cmd();
+            c.arg("-1").arg(entree.path()).arg("--abundance");
+            if spill {
+                c.arg("--temp-dir").arg(temp_subdir.path());
+            }
+            if force {
+                c.arg("--force");
+            }
+            c.arg("-o").arg(sortie.path());
+            c
+        };
+
+        lancer(false).assert().success();
+        let premier = fs::read_to_string(sortie.path()).unwrap();
+        assert_eq!(
+            compter_sequences_fastq(&premier),
+            2,
+            "{nom} : deux lectures uniques en entrée"
+        );
+
+        // Second passage, même sortie, sans --force : refus explicite.
+        lancer(false)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--force"));
+        assert_eq!(
+            compter_sequences_fastq(&fs::read_to_string(sortie.path()).unwrap()),
+            2,
+            "{nom} : un second passage refusé ne doit rien ajouter"
+        );
+
+        // Avec --force : réécriture, contenu identique au premier passage.
+        lancer(true).assert().success();
+        assert_eq!(
+            fs::read_to_string(sortie.path()).unwrap(),
+            premier,
+            "{nom} : --force doit réécrire la même sortie, pas l'empiler"
+        );
+    }
+}
+
+/// Version paired-end : R1 et R2 doivent eux aussi refuser une relance dans la
+/// même sortie, et rester synchronisés.
+#[test]
+fn test_abundance_paire_relance_sans_force_refusee() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1, r2) = generer_fastq_paire_repetitions(&temp_dir, "R1.fastq", "R2.fastq", 3, 1);
+    let sortie_r1 = temp_dir.child("out_R1.fq");
+    let sortie_r2 = temp_dir.child("out_R2.fq");
+
+    let lancer = || {
+        let mut c = cmd();
+        c.arg("-1").arg(r1.path()).arg("-2").arg(r2.path())
+            .arg("--abundance")
+            .arg("-o").arg(sortie_r1.path())
+            .arg("-p").arg(sortie_r2.path());
+        c
+    };
+
+    lancer().assert().success();
+    lancer()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--force"));
+
+    for (nom, sortie) in [("R1", &sortie_r1), ("R2", &sortie_r2)] {
+        assert_eq!(
+            compter_sequences_fastq(&fs::read_to_string(sortie.path()).unwrap()),
+            3,
+            "{nom} : la relance refusée ne doit pas dupliquer les paires"
+        );
+    }
+}

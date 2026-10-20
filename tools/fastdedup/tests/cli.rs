@@ -2410,3 +2410,120 @@ fn test_flux_gz_parallele_decompresse_identique() {
         "le flux parallèle doit décoder exactement la sortie à un thread"
     );
 }
+
+/// Entrée gzip **multi-membre** : `bgzip`/`samtools fastq` écrivent du BGZF,
+/// c'est-à-dire un gzip concaténé (plusieurs membres dans un seul fichier). Le
+/// lecteur parallèle ouvrait `.gz` avec `flate2::read::GzDecoder`, qui s'arrête
+/// à la fin du premier membre, alors que le chemin sérial passe par needletail
+/// (`MultiGzDecoder`). À `-j 4`, seul le premier membre était lu : sur deux
+/// membres de 200 lectures, 200 en sortie au lieu de 400, code de sortie 0 et
+/// rapport annonçant 200 lectures lues.
+#[test]
+fn test_entree_gzip_multimembre_lue_entierement_en_parallele() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = temp_dir.child("multimembre.fastq.gz");
+
+    // Deux membres gzip concaténés de 200 lectures chacun, 400 au total.
+    // 400 < CHUNK_SIZE (4096) : un seul chunk, donc l'ordre de sortie est
+    // celui de l'entrée et les octets sont comparables entre -j 1 et -j 4.
+    let mut octets = Vec::new();
+    for membre in 0..2 {
+        let mut corps = String::new();
+        for i in 0..200 {
+            let index = membre * 200 + i;
+            corps.push_str(&format!(
+                "@read{index}\n{}\n+\n{}\n",
+                generer_sequence(index, 0),
+                "I".repeat(150)
+            ));
+        }
+        let mut encodeur = GzEncoder::new(Vec::new(), Compression::default());
+        encodeur.write_all(corps.as_bytes()).unwrap();
+        octets.extend_from_slice(&encodeur.finish().unwrap());
+    }
+    fs::write(entree.path(), &octets).unwrap();
+
+    let ser = temp_dir.child("ser.fastq");
+    let par = temp_dir.child("par.fastq");
+    for (sortie, threads) in [(&ser, "1"), (&par, "4")] {
+        cmd()
+            .arg("-1")
+            .arg(entree.path())
+            .arg("-o")
+            .arg(sortie.path())
+            .arg("-j")
+            .arg(threads)
+            .arg("-q")
+            .arg("--force")
+            .assert()
+            .success();
+    }
+
+    let contenu_ser = fs::read(ser.path()).unwrap();
+    let contenu_par = fs::read(par.path()).unwrap();
+    assert_eq!(
+        compter_sequences_fastq(&String::from_utf8_lossy(&contenu_ser)),
+        400,
+        "-j 1 doit lire les deux membres gzip"
+    );
+    assert_eq!(
+        compter_sequences_fastq(&String::from_utf8_lossy(&contenu_par)),
+        400,
+        "-j 4 doit lire les deux membres gzip, pas seulement le premier"
+    );
+    assert_eq!(
+        contenu_ser, contenu_par,
+        "-j 1 et -j 4 doivent produire exactement les mêmes octets"
+    );
+}
+
+/// `-o` et `-p` sur le même fichier : deux écrivains indépendants entrelacent
+/// R1 et R2 dans un fichier qui n'est ni FASTQ ni FASTA, avec un code de sortie
+/// 0. Le refus doit nommer les deux options.
+#[test]
+fn test_sorties_r1_et_r2_sur_le_meme_fichier_refusees() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1, r2) = generer_fastq_paire(&temp_dir, "R1.fastq", "R2.fastq", 4, 0);
+    let sortie = temp_dir.child("meme.fq");
+
+    cmd()
+        .arg("-1")
+        .arg(r1.path())
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("-p")
+        .arg(sortie.path())
+        .arg("--force")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("-o").and(predicate::str::contains("-p")));
+    assert!(
+        !sortie.exists(),
+        "le refus doit précéder toute écriture : aucun fichier ne doit être créé"
+    );
+
+    // Contrôle : deux chemins distincts restent acceptés.
+    let o1 = temp_dir.child("R1_out.fq");
+    let o2 = temp_dir.child("R2_out.fq");
+    cmd()
+        .arg("-1")
+        .arg(r1.path())
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg(o1.path())
+        .arg("-p")
+        .arg(o2.path())
+        .arg("--force")
+        .assert()
+        .success();
+    for (nom, sortie) in [("R1", &o1), ("R2", &o2)] {
+        assert_eq!(
+            compter_sequences_fastq(&fs::read_to_string(sortie.path()).unwrap()),
+            4,
+            "{nom} : le contrôle à deux chemins doit écrire les 4 paires"
+        );
+    }
+}

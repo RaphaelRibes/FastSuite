@@ -65,6 +65,25 @@ fn open_output(path: &str, cfg: &DedupConfig) -> Result<(Box<dyn Write>, OutputF
     }
 }
 
+/// Refuse an existing abundance output when `--force` is absent.
+///
+/// The other two engines resume by preloading the hashes already present in the
+/// output, so `prepare_writer`'s append is safe for them. `--abundance` has
+/// nothing to preload (its tallies come from the input), so appending re-emits
+/// every unique record: two unique reads, run twice, left four records in the
+/// output with exit 0 — a deduplication tool producing duplicates.
+fn refuse_existing_abundance_output(path: &str, cfg: &DedupConfig) -> Result<()> {
+    if cfg.force || crate::stream::is_stream(path) || !Path::new(path).exists() {
+        return Ok(());
+    }
+    bail!(
+        "Cannot append to existing abundance output {:?}: --abundance writes each unique \
+         sequence once with its tally, so appending would duplicate records. Use --force to \
+         overwrite, or remove the file.",
+        path
+    );
+}
+
 /// Executes deduplication for single-end reads.
 pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
     input_path: &str,
@@ -429,6 +448,10 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
         return execute_deduplication::<T>(input_path, output_path, cfg);
     }
 
+    // Fail before the first pass, not after it: a re-run into the same output
+    // must not cost a full scan before the refusal.
+    refuse_existing_abundance_output(output_path, cfg)?;
+
     let mut tracker = AbundanceTracker::<T>::new(cfg.estimated_capacity)?;
     let mut total_reads = 0;
 
@@ -657,6 +680,10 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
             cfg,
         );
     }
+
+    // Same refusal as the single-end path, for both mates.
+    refuse_existing_abundance_output(output_r1_path, cfg)?;
+    refuse_existing_abundance_output(output_r2_path, cfg)?;
 
     let mut tracker = AbundanceTracker::<T>::new(cfg.estimated_capacity)?;
     let mut total_reads = 0;

@@ -185,21 +185,20 @@ impl Read for ChanReader {
 // HELPERS
 // ==========================================
 
-/// Open a FASTX input as a byte stream, using flate2 GzDecoder for gzip
-/// decompression when the path ends with `.gz` (streaming, no subprocess).
+/// Open a FASTX input as a byte stream.
+///
+/// Compression is left to needletail, which sniffs the magic bytes and wraps
+/// the reader in `MultiGzDecoder`. A `.gz` suffix is not needed to decompress,
+/// and the hand-rolled `flate2::read::GzDecoder` that used to sit here stopped
+/// at the END OF THE FIRST GZIP MEMBER: BGZF (what `bgzip`/`samtools fastq`
+/// emit) is multi-member, so `-j 2+` read the first member only and exited 0
+/// with a truncated report.
 fn open_input_reader(path: &str) -> Result<Box<dyn Read + Send + 'static>> {
     if crate::stream::is_stream(path) {
-        // needletail sniffs gzip from magic bytes on any reader, so a
-        // stdin stream decodes exactly like a mislabelled file.
         return Ok(Box::new(std::io::stdin()));
     }
-    if path.ends_with(".gz") {
-        let file = File::open(path).with_context(|| format!("Failed to open input file: {path}"))?;
-        Ok(Box::new(flate2::read::GzDecoder::new(file)))
-    } else {
-        let file = File::open(path).with_context(|| format!("Failed to open input file: {path}"))?;
-        Ok(Box::new(file))
-    }
+    let file = File::open(path).with_context(|| format!("Failed to open input file: {path}"))?;
+    Ok(Box::new(file))
 }
 
 /// Wait on an optional gzippy compression thread handle.
@@ -456,12 +455,11 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     }
 
     let num_workers = resolve_thread_count(cfg.threads);
-    // FD-3: a run is 1 reader thread + N workers + C compression workers + 1
-    // gzippy coordinator, so `-j` has to budget all four. Before this, `-j 4`
-    // put 1 + 4 + 4 + 1 = 10 runnable threads on the 4 pinned cores the bench
-    // uses: deflate competed with the table insert for a core, and the thread
-    // holding a cache-hot output buffer was the one preempted. Workers keep one
-    // core for the reader/commit thread; compression takes the rest.
+    // FD-3: `-j N` sizes the worker pool, not the thread count. A run is
+    // 1 reader + (N-1) workers + this writer thread + (N-2) gzippy compression
+    // threads, i.e. 2N-1 threads. Workers leave one core to the reader/commit
+    // thread and compression takes the rest, so deflate never competes with the
+    // table insert for every core; the budget is a split, not a cap.
     let worker_threads = num_workers.saturating_sub(1).max(1);
 
     // Resume an existing output before any thread starts, so the preload pass
@@ -667,8 +665,9 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     }
 
     let num_workers = resolve_thread_count(cfg.threads);
-    // FD-3, paired twin: 1 reader + N workers + two compression pools + their
-    // coordinators. Same budget as the single-end path.
+    // FD-3, paired twin: 1 reader + (N-1) workers + this writer thread + two
+    // pools of max(1, (N-2)/2) compression threads each — 2N-1 threads for even
+    // N, the same split as the single-end path. `-j` budgets the workers.
     let worker_threads = num_workers.saturating_sub(1).max(1);
 
     // Resume existing outputs before any thread starts, so the preload pass
