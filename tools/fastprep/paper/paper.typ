@@ -3245,6 +3245,9 @@ and the tunings of @sec:epyc (libdeflate, zstd, io_uring) provide larger
 absolute speedups for less implementation effort.
 
 
+#include "benchmark-section.typ"
+#include "scaling-section.typ"
+
 = Summary
 
 The specification of §2 fixes the indexing and boundary subtleties of the
