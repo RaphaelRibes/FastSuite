@@ -25,6 +25,11 @@ heatmap.preview
 heatmap.png
 heatmap.svg
 heatmap_3d.html
+fastp.html
+fastp.json
+
+# Snakemake run state (regenerated per sweep, machine-local)
+.snakemake/
 
 # built papers (generated from paper.typ, never committed)
 tools/*/paper/*.pdf
