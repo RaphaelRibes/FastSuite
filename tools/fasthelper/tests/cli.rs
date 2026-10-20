@@ -867,3 +867,257 @@ fn manifest_keeps_entries_from_a_previous_run() {
     );
     assert_eq!(tools.iter().filter(|t| **t == "fastdedup").count(), 1, "{man}");
 }
+
+// ---------------------------------------------------------------- FH-2 ----
+
+#[test]
+fn check_refuses_duplicate_sample_names() {
+    // FH-2 regression: two [[samples]] entries with the same name were taken
+    // verbatim, yet the work dir and the resume key derive from the name alone
+    // (runner.rs) — both workers created, unlinked and wrote the same paths.
+    // The validator meant to catch this class passed it with exit 0.
+    let d = tmpdir("fh2_dup");
+    let a = d.join("a_R1.fastq");
+    let b = d.join("b_R1.fastq");
+    std::fs::write(&a, "@r1\nACGT\n+\nIIII\n").unwrap();
+    std::fs::write(&b, "@r1\nACGT\n+\nIIII\n").unwrap();
+    let cfg = d.join("dup.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"dup\"\nsteps = []\n\n[[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n\n\
+             [[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n",
+            a.display(),
+            b.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&["check", "-c", cfg.to_str().unwrap()]);
+    assert_ne!(code, 0, "a duplicate sample name must fail: {stderr}");
+    assert!(
+        stderr.contains("duplicate sample name") && stderr.contains("lib1"),
+        "the refusal must name the duplicate: {stderr}"
+    );
+
+    // The same config with distinct names still validates: the new check must
+    // not reject anything that was legitimately valid.
+    let ok = d.join("ok.toml");
+    std::fs::write(
+        &ok,
+        format!(
+            "[run]\nname = \"ok\"\nsteps = []\n\n[[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n\n\
+             [[samples]]\nname = \"lib2\"\nr1 = \"{}\"\n",
+            a.display(),
+            b.display()
+        ),
+    )
+    .unwrap();
+    let (_, stderr, code) = run(&["check", "-c", ok.to_str().unwrap()]);
+    assert_eq!(code, 0, "distinct names must stay valid: {stderr}");
+}
+
+#[test]
+fn check_still_accepts_the_repo_example_config() {
+    // The duplicate-name refusal must not change the verdict on the config the
+    // repo ships: `examples/fastsuite.toml` (simulate-only, three steps).
+    for tool in ["fastcheck", "fastdedup", "fastprep"] {
+        require_tool(tool);
+    }
+    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("examples/fastsuite.toml");
+    let (stdout, stderr, code) = run(&[
+        "check",
+        "-c",
+        example.to_str().unwrap(),
+        "--tools-dir",
+        tools_dir().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "examples/fastsuite.toml must validate: {stderr}");
+    assert!(
+        stdout.contains("OK") && !stderr.contains("duplicate"),
+        "{stdout}{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------- FH-3 ----
+
+#[test]
+fn report_json_keeps_its_alphabetical_field_order() {
+    // The writer streams a borrowed view instead of building a Value tree, so
+    // the order is now a struct declaration order rather than a BTreeMap's.
+    // Alphabetical order is part of the file's stability contract.
+    let d = tmpdir("fh3_order");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    write_report(&reports, "sampleA.json", 100, 0.41);
+    let out = d.join("out");
+    let (_, stderr, code) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let text = std::fs::read_to_string(out.join("report.json")).unwrap();
+    let mut last = 0usize;
+    for key in ["\"generator\":", "\"generator_version\":", "\"reports\":", "\"schema\":", "\"title\":"] {
+        let at = text.find(key).unwrap_or_else(|| panic!("{key} missing"));
+        assert!(at >= last, "{key} is out of alphabetical order:\n{text}");
+        last = at;
+    }
+    for key in ["\"metrics\":", "\"notes\":", "\"sample\":", "\"source\":", "\"tool\":", "\"tool_version\":"] {
+        assert!(text.contains(key), "{key} missing");
+    }
+    assert!(text.ends_with("}\n"), "the document must end with a newline");
+}
+
+// ---------------------------------------------------------------- FH-6 ----
+
+#[test]
+fn positions_all_metrics_stdout_matches_the_written_file() {
+    // The tidy table is streamed to a BufWriter now; the file and the stdout
+    // path must still produce the same bytes.
+    let d = tmpdir("fh6_stdout");
+    let src = d.join("p1");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut tsv = String::from("pos\tmean_q\tdepth\n");
+    for pos in 1..=5 {
+        tsv.push_str(&format!("{pos}\t{}\t{}\n", 30.0 + pos as f64 / 4.0, 100 + pos));
+    }
+    std::fs::write(src.join("positions.tsv"), tsv).unwrap();
+
+    let out = d.join("out");
+    let (_, stderr, code) = run(&[
+        "concatenate",
+        src.to_str().unwrap(),
+        "--positions",
+        "--all-metrics",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let written = std::fs::read_to_string(out.join("positions_matrix.tsv")).unwrap();
+
+    let (stdout, stderr, code) = run(&[
+        "concatenate",
+        src.to_str().unwrap(),
+        "--positions",
+        "--all-metrics",
+        "--stdout",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, written, "--stdout must be byte-identical to the file");
+}
+
+// ---------------------------------------------------------------- FH-8 ----
+
+#[test]
+fn concatenate_stdout_matches_the_written_tsv() {
+    // --stdout used to build the matrix a second time; it now reuses the one
+    // the writer built. The bytes must not change either way.
+    let d = tmpdir("fh8_stdout");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    write_report(&reports, "sampleA.json", 100, 0.41);
+    write_report(&reports, "sampleB.json", 200, 0.52);
+    let out = d.join("out");
+    let (_, stderr, code) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--format",
+        "tsv",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let written = std::fs::read_to_string(out.join("report.tsv")).unwrap();
+
+    let (stdout, stderr, code) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "--format",
+        "tsv",
+        "--stdout",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    // stdout carries the table followed by the status line; the table itself
+    // must be exactly the file.
+    let table_end = stdout
+        .find("fasthelper: concatenated")
+        .unwrap_or_else(|| panic!("status line missing: {stdout}"));
+    assert_eq!(
+        &stdout[..table_end],
+        written,
+        "--stdout must be byte-identical to report.tsv"
+    );
+}
+
+// ---------------------------------------------------------------- FH-9 ----
+
+/// A stand-in fastdedup that records every invocation in `LOG` before doing
+/// anything else, so `--version` forks are countable.
+const COUNTING_DEDUP: &str = r#"#!/usr/bin/env bash
+echo "$@" >> "@LOG@"
+if [ "$1" = "--version" ]; then echo "fastdedup 9.9.9"; exit 0; fi
+exit 0
+"#;
+
+#[test]
+fn tool_version_is_resolved_once_per_run_not_once_per_sample() {
+    // FH-9 regression: `--version` was forked per sample per step (30 000
+    // forks at 10 k samples), including on --dry-run.
+    let d = tmpdir("fh9_version");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let log = d.join("invocations.log");
+    let bin = tools.join("fastdedup");
+    std::fs::write(&bin, COUNTING_DEDUP.replace("@LOG@", log.to_str().unwrap())).unwrap();
+    let mut perm = std::fs::metadata(&bin).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&bin, perm).unwrap();
+
+    let mut cfg = String::from(
+        "[run]\nname = \"v\"\nsteps = [\"fastdedup\"]\nthreads = 1\ngz_level = 1\n",
+    );
+    for s in ["s1", "s2", "s3"] {
+        let fq = d.join(format!("{s}_R1.fastq"));
+        std::fs::write(&fq, "@r0\nACGT\n+\nIIII\n").unwrap();
+        cfg.push_str(&format!(
+            "\n[[samples]]\nname = \"{s}\"\nr1 = \"{}\"\n",
+            fq.display()
+        ));
+    }
+    let path = d.join("cfg.toml");
+    std::fs::write(&path, cfg).unwrap();
+
+    let (stdout, stderr, code) = run(&[
+        "run",
+        "-c",
+        path.to_str().unwrap(),
+        "--tools-dir",
+        tools.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout.matches("[dry-run]").count(),
+        3,
+        "all three samples must still be planned: {stdout}"
+    );
+
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let versions = calls.lines().filter(|l| l.trim() == "--version").count();
+    assert_eq!(
+        versions, 1,
+        "one `--version` per distinct tool, not one per sample: {calls}"
+    );
+    assert_eq!(
+        calls.lines().count(),
+        versions,
+        "dry-run must not execute any step: {calls}"
+    );
+}

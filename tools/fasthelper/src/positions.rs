@@ -15,6 +15,7 @@
 //! zero that would fake a measurement.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -140,6 +141,34 @@ fn fmt(v: f64) -> String {
     }
 }
 
+/// The tidy shape: `sample, pos, metric, value`, one row per cell, in input
+/// order — no transpose, so it streams straight out.
+fn write_tidy(w: &mut dyn std::io::Write, samples: &[SamplePositions]) -> Result<()> {
+    w.write_all(b"sample\tpos\tmetric\tvalue\n")?;
+    for s in samples {
+        for (pos, values) in &s.rows {
+            for (name, v) in s.metrics.iter().zip(values.iter()) {
+                writeln!(w, "{}\t{}\t{}\t{}", s.sample, pos, name, fmt(*v))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a streamed table to `path`, through an 8 KB buffer.
+fn write_file<F>(path: &Path, body: F) -> Result<()>
+where
+    F: FnOnce(&mut dyn std::io::Write) -> Result<()>,
+{
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    let mut w = std::io::BufWriter::new(file);
+    body(&mut w)?;
+    w.flush()
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// Concatenate. `metric` selects the wide-matrix column; `all_metrics` selects
 /// the tidy shape instead.
 pub fn concatenate_positions(
@@ -190,15 +219,30 @@ pub fn concatenate_positions(
     }
     samples.sort_by(|a, b| a.sample.cmp(&b.sample));
 
-    let mut out = String::new();
+    let positions_count = samples
+        .iter()
+        .map(|s| s.rows.len())
+        .max()
+        .unwrap_or(0);
     if all_metrics {
-        out.push_str("sample\tpos\tmetric\tvalue\n");
-        for s in &samples {
-            for (pos, values) in &s.rows {
-                for (name, v) in s.metrics.iter().zip(values.iter()) {
-                    out.push_str(&format!("{}\t{}\t{}\t{}\n", s.sample, pos, name, fmt(*v)));
-                }
-            }
+        // Tidy shape: input order already, so it streams — the table used to be
+        // one String (138 MB at 2 k samples for an 88 MB file).
+        if to_stdout {
+            let stdout = std::io::stdout();
+            let mut w = std::io::BufWriter::new(stdout.lock());
+            write_tidy(&mut w, &samples)?;
+            w.flush()?;
+        } else {
+            std::fs::create_dir_all(outdir)
+                .with_context(|| format!("creating {}", outdir.display()))?;
+            let path = outdir.join("positions_matrix.tsv");
+            write_file(&path, |w| write_tidy(w, &samples))?;
+            println!(
+                "fasthelper: concatenated {} sample(s), up to {} position(s) -> {}",
+                samples.len(),
+                positions_count,
+                path.display()
+            );
         }
     } else {
         let missing: Vec<&str> = samples
@@ -216,13 +260,12 @@ pub fn concatenate_positions(
                     .unwrap_or_default()
             );
         }
-        out.push_str("pos");
-        for s in &samples {
-            out.push('\t');
-            out.push_str(&s.sample);
-        }
-        out.push('\n');
-
+        // A per-sample column index, resolved once: the wide table looks the
+        // metric up per cell otherwise.
+        let columns: Vec<Option<usize>> = samples
+            .iter()
+            .map(|s| s.metrics.iter().position(|m| m == metric))
+            .collect();
         let mut positions: Vec<u32> = Vec::new();
         for s in &samples {
             positions.extend(s.rows.keys().copied());
@@ -230,39 +273,41 @@ pub fn concatenate_positions(
         positions.sort_unstable();
         positions.dedup();
 
-        for pos in positions {
-            out.push_str(&pos.to_string());
+        let write_wide = |w: &mut dyn std::io::Write| -> Result<()> {
+            write!(w, "pos")?;
             for s in &samples {
-                out.push('\t');
-                if let (Some(idx), Some(values)) = (
-                    s.metrics.iter().position(|m| m == metric),
-                    s.rows.get(&pos),
-                ) {
-                    out.push_str(&fmt(values[idx]));
-                }
+                write!(w, "\t{}", s.sample)?;
             }
-            out.push('\n');
+            w.write_all(b"\n")?;
+            for pos in &positions {
+                write!(w, "{pos}")?;
+                for (s, idx) in samples.iter().zip(&columns) {
+                    w.write_all(b"\t")?;
+                    if let (Some(idx), Some(values)) = (idx, s.rows.get(pos)) {
+                        write!(w, "{}", fmt(values[*idx]))?;
+                    }
+                }
+                w.write_all(b"\n")?;
+            }
+            Ok(())
+        };
+        if to_stdout {
+            let stdout = std::io::stdout();
+            let mut w = std::io::BufWriter::new(stdout.lock());
+            write_wide(&mut w)?;
+            w.flush()?;
+        } else {
+            std::fs::create_dir_all(outdir)
+                .with_context(|| format!("creating {}", outdir.display()))?;
+            let path = outdir.join("positions_matrix.tsv");
+            write_file(&path, write_wide)?;
+            println!(
+                "fasthelper: concatenated {} sample(s), up to {} position(s) -> {}",
+                samples.len(),
+                positions_count,
+                path.display()
+            );
         }
-    }
-
-    let positions_count = samples
-        .iter()
-        .map(|s| s.rows.len())
-        .max()
-        .unwrap_or(0);
-    if to_stdout {
-        print!("{out}");
-    } else {
-        std::fs::create_dir_all(outdir)
-            .with_context(|| format!("creating {}", outdir.display()))?;
-        let path = outdir.join("positions_matrix.tsv");
-        std::fs::write(&path, &out).with_context(|| format!("writing {}", path.display()))?;
-        println!(
-            "fasthelper: concatenated {} sample(s), up to {} position(s) -> {}",
-            samples.len(),
-            positions_count,
-            path.display()
-        );
     }
     if skipped > 0 {
         eprintln!(

@@ -132,6 +132,7 @@ fn run_sample(
     threads: usize,
     guard: &Policy,
     resume: &BTreeMap<String, ResumeEntry>,
+    versions: &BTreeMap<String, Option<String>>,
     from: Option<&str>,
 ) -> Result<SampleOutcome> {
     let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
@@ -274,13 +275,16 @@ fn run_sample(
             from_reached = true;
         }
         let key = format!("{}/{}", sample.name, tool);
+        // Resolved once per run (see resolve_versions): a version string cannot
+        // change inside one run, and it used to fork once per sample per step.
+        let version = versions.get(tool.as_str()).cloned().flatten();
         if !forced && !from_reached {
             if let Some(prev) = resume.get(&key) {
                 let inputs_match = prev.inputs == cur_sig;
                 let outputs_present = expect_outputs.iter().all(|p| p.is_file());
                 if prev.argv == argv
                     && prev.binary == s(&bin)
-                    && prev.version == tool_version(&bin)
+                    && prev.version == version
                     && inputs_match
                     && outputs_present
                 {
@@ -345,7 +349,7 @@ fn run_sample(
                 "exit": outcome.exit,
                 "elapsed_s": outcome.elapsed,
                 "log": s(&outcome.log),
-                "tool_version": tool_version(&bin),
+                "tool_version": version.clone(),
                 "inputs": inputs_json(&cur_sig),
             }),
         ));
@@ -480,6 +484,24 @@ fn tool_version(bin: &Path) -> Option<String> {
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+}
+
+/// `--version` for every tool the run will use, resolved once.
+///
+/// A version string cannot change inside one run, and the value is needed both
+/// by the resume comparison and by every manifest entry: resolving it at the
+/// call site forked once per sample per step (30 000 forks ≈ 25 s at 10 k
+/// samples, paid on `--dry-run` too).
+fn resolve_versions(cfg: &Config, ts: &ToolSet) -> BTreeMap<String, Option<String>> {
+    let mut out: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for tool in &cfg.run.steps {
+        if !cfg.step(tool).enabled || out.contains_key(tool.as_str()) {
+            continue;
+        }
+        let version = ts.get(tool).map(|bin| tool_version(bin)).unwrap_or(None);
+        out.insert(tool.clone(), version);
+    }
+    out
 }
 
 /// What a previous run recorded for one `sample/tool` step: the argv it ran,
@@ -704,6 +726,8 @@ pub fn run(args: &RunArgs) -> Result<()> {
         );
     }
 
+    let versions = resolve_versions(&cfg, &ts);
+
     let guard = Policy {
         enabled: !args.no_adapter_guard,
         threshold: args.adapter_residual_threshold,
@@ -832,6 +856,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                     per_sample_threads,
                     &guard,
                     &resume,
+                    &versions,
                     args.from.as_deref(),
                 ) {
                     Ok(mut o) => {
@@ -924,7 +949,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
     let reports = report::collect(&[outdir.clone()], None)?;
     let formats: Vec<String> = vec!["json".into(), "tsv".into(), "md".into(), "html".into()];
     let title = format!("FastSuite report — {}", cfg.run.name);
-    let written = report::write_reports(&title, &reports, &outdir, &formats)?;
+    let written = report::write_reports(&title, &reports, &outdir, &formats, None)?;
     println!(
         "fasthelper: {} report(s) aggregated -> {}",
         reports.len(),

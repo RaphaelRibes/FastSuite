@@ -162,6 +162,20 @@ impl Config {
                 path.display()
             );
         }
+        // The work dir and the resume key derive from the sample name alone
+        // (runner.rs), so two entries with one name would have two workers
+        // create, unlink and write the same paths. Refuse it at minute zero.
+        let mut seen = std::collections::BTreeSet::new();
+        for s in &cfg.samples {
+            if !seen.insert(s.name.as_str()) {
+                anyhow::bail!(
+                    "config {}: duplicate sample name '{}' — every [[samples]] name must be \
+                     unique, it names the sample's output directory",
+                    path.display(),
+                    s.name
+                );
+            }
+        }
         Ok(cfg)
     }
 

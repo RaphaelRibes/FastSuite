@@ -10,7 +10,12 @@
 //!     report files) that predate the wrapper.
 
 use anyhow::{Context, Result};
+use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::cli::ReportArgs;
@@ -70,6 +75,10 @@ pub struct ToolReport {
     pub source: PathBuf,
     pub metrics: BTreeMap<String, f64>,
     pub notes: Vec<String>,
+    /// True when this came from a `fastsuite.report.v1` wrapper. A v1 report
+    /// wins over a legacy/raw file describing the same (sample, tool): the
+    /// wrapper is the tool's own statement, the raw file a derivation of it.
+    pub from_v1: bool,
 }
 
 fn num(v: &serde_json::Value) -> Option<f64> {
@@ -86,6 +95,13 @@ fn get_num(o: &serde_json::Value, key: &str) -> f64 {
 
 /// Sample name from a path: file stem, unless that stem is a generic report
 /// name — then the parent directory carries the sample identity.
+///
+/// A `fastsuite.report.v1` wrapper written *beside* its grid
+/// (`<stem>.report.json`, what `fastmaps --json <dir>/heatmap.json` leaves
+/// behind) inherits the grid's stem, so `heatmap.report` is tested as
+/// `heatmap`: generic, and the directory supplies the name. The strip is
+/// gated on the remainder being generic, so a library genuinely called
+/// `align.report` keeps its own name.
 pub fn sample_from_path(path: &Path) -> String {
     const GENERIC: &[&str] = &[
         "report", "reports", "stats", "json", "out", "output", "heatmap", "fastprep",
@@ -97,6 +113,10 @@ pub fn sample_from_path(path: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("sample")
         .to_string();
+    let stem = match stem.strip_suffix(".report") {
+        Some(base) if GENERIC.contains(&base.to_ascii_lowercase().as_str()) => base.to_string(),
+        _ => stem,
+    };
     if GENERIC.contains(&stem.to_ascii_lowercase().as_str()) {
         // Walk up until a directory that is not itself a generic report name:
         // runs/demo/<sample>/maps/heatmap.json must yield "<sample>", not "maps".
@@ -118,20 +138,342 @@ pub fn sample_from_path(path: &Path) -> String {
     stem
 }
 
+// ------------------------------------------------------ fastmaps grid ----
+//
+// `heatmap.json` is a `size × size` raster of (T+C, T+G) counts plus metadata:
+// 140 KB at 151 bp against 3.9 KB for an ordinary report, one per sample. It
+// is read through a typed visitor rather than a `Value` tree, because the old
+// reader's cost was one enum construction per cell (22 801 per file). The five
+// corner sums and the total are accumulated in the same x-major order with the
+// same f64 operations as before, so every fraction stays bit-identical.
+
+/// Accumulator for one grid window: the five corner sums and the total.
+#[derive(Debug, Default, Clone, Copy)]
+struct WindowSums {
+    /// polyA, polyT, polyG, polyC, off-diagonal
+    corner: [f64; 5],
+    total: f64,
+    /// cells seen, including any past `size²`
+    cells: usize,
+    /// cells a complete window has
+    needed: usize,
+}
+
+impl WindowSums {
+    fn new(size: i64) -> Self {
+        Self {
+            needed: (size * size) as usize,
+            ..Self::default()
+        }
+    }
+
+    /// Fold one cell in, at linear index `i` (x-major: x = i % size,
+    /// y = i / size). The `n == 0.0` shortcut and the order of the five tests
+    /// are what keep the sums bit-identical to the previous reader.
+    fn push(&mut self, size: i64, c: i64, i: usize, n: f64) {
+        self.cells += 1;
+        if size <= 0 || i >= self.needed || n == 0.0 {
+            return;
+        }
+        let (x, y) = ((i as i64) % size, (i as i64) / size);
+        self.total += n;
+        let low_x = x <= c;
+        let high_x = x >= size - 1 - c;
+        let low_y = y <= c;
+        let high_y = y >= size - 1 - c;
+        if low_x && low_y {
+            self.corner[0] += n;
+        }
+        if high_x && high_y {
+            self.corner[1] += n;
+        }
+        if low_x && high_y {
+            self.corner[2] += n;
+        }
+        if high_x && low_y {
+            self.corner[3] += n;
+        }
+        if (x - y).abs() > size / 10 {
+            self.corner[4] += n;
+        }
+    }
+
+    /// A window shorter than the grid is not a measurement of that grid: the
+    /// previous reader skipped it entirely, and so does this one.
+    fn complete(&self) -> bool {
+        self.cells >= self.needed
+    }
+}
+
+/// One window: a bare array of counts (`counts`), or an object carrying one
+/// under a nested `counts` key. `bare_array` is false for `counts_r1`/
+/// `counts_r2`, which fastmaps writes as bare arrays — the previous reader
+/// looked for a nested key there and so never used them; that is preserved.
+struct WindowVisitor {
+    size: i64,
+    c: i64,
+    bare_array: bool,
+}
+
+impl<'de> Visitor<'de> for WindowVisitor {
+    type Value = Option<WindowSums>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a grid of counts (an array, or an object with \"counts\")")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        if !self.bare_array {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            return Ok(None);
+        }
+        let mut sums = WindowSums::new(self.size);
+        let mut i = 0usize;
+        while let Some(n) = seq.next_element::<f64>()? {
+            sums.push(self.size, self.c, i, n);
+            i += 1;
+        }
+        Ok(Some(sums))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut out = None;
+        while let Some(key) = map.next_key::<Cow<'_, str>>()? {
+            if key == "counts" {
+                out = map.next_value_seed(WindowSeed {
+                    size: self.size,
+                    c: self.c,
+                    bare_array: true,
+                })?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+}
+
+struct WindowSeed {
+    size: i64,
+    c: i64,
+    bare_array: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for WindowSeed {
+    type Value = Option<WindowSums>;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(WindowVisitor {
+            size: self.size,
+            c: self.c,
+            bare_array: self.bare_array,
+        })
+    }
+}
+
+/// The keys of `heatmap.json` fasthelper uses. Everything else (`files`,
+/// `per_file_counts`, `data_row_offsets`, …) is skipped without being built.
+struct GridDoc {
+    size: Option<i64>,
+    total_reads: Option<f64>,
+    version: Option<f64>,
+    /// windows in metric order: all, r1, r2
+    windows: [Option<WindowSums>; 3],
+    /// `counts` numbers buffered because `size` had not been seen yet — JSON
+    /// object order is not guaranteed, so a grid may list them in any order.
+    deferred: [Option<Vec<f64>>; 3],
+    has_counts: bool,
+}
+
+impl Default for GridDoc {
+    fn default() -> Self {
+        Self {
+            size: None,
+            total_reads: None,
+            version: None,
+            windows: [None, None, None],
+            deferred: [None, None, None],
+            has_counts: false,
+        }
+    }
+}
+
+fn read_window<'de, A: MapAccess<'de>>(
+    map: &mut A,
+    doc: &mut GridDoc,
+    idx: usize,
+    top_level: bool,
+) -> Result<(), A::Error> {
+    match doc.size.filter(|s| *s > 0) {
+        Some(size) => {
+            let c = (size / 50).max(2); // corner window: 2% of the read length
+            doc.windows[idx] = map.next_value_seed(WindowSeed {
+                size,
+                c,
+                bare_array: top_level,
+            })?;
+        }
+        None if top_level => {
+            doc.deferred[idx] = Some(map.next_value::<Vec<f64>>()?);
+        }
+        None => {
+            map.next_value::<IgnoredAny>()?;
+        }
+    }
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for GridDoc {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_map(GridDocVisitor)
+    }
+}
+
+struct GridDocVisitor;
+
+impl<'de> Visitor<'de> for GridDocVisitor {
+    type Value = GridDoc;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a fastmaps heatmap object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<GridDoc, A::Error> {
+        let mut doc = GridDoc::default();
+        while let Some(key) = map.next_key::<Cow<'_, str>>()? {
+            match key.as_ref() {
+                "size" => doc.size = Some(map.next_value::<f64>()? as i64),
+                "total_reads" => doc.total_reads = Some(map.next_value::<f64>()?),
+                "version" => doc.version = Some(map.next_value::<f64>()?),
+                "counts" => {
+                    doc.has_counts = true;
+                    read_window(&mut map, &mut doc, 0, true)?;
+                }
+                "counts_r1" => read_window(&mut map, &mut doc, 1, false)?,
+                "counts_r2" => read_window(&mut map, &mut doc, 2, false)?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(doc)
+    }
+}
+
+impl GridDoc {
+    /// `counts` and `size` both present: this is a grid, not some other JSON
+    /// object that happens to carry a `counts` key.
+    fn is_grid(&self) -> bool {
+        self.has_counts && self.size.is_some()
+    }
+
+    fn into_report(mut self, sample: String, path: &Path) -> ToolReport {
+        self.fold_deferred();
+        let size = self.size.unwrap_or(0);
+        let mut metrics = BTreeMap::new();
+        metrics.insert("total_reads".into(), self.total_reads.unwrap_or(0.0));
+        metrics.insert("grid_size".into(), size as f64);
+        for (idx, label) in ["all", "r1", "r2"].into_iter().enumerate() {
+            let Some(w) = self.windows[idx] else { continue };
+            if !w.complete() || w.total == 0.0 {
+                continue;
+            }
+            let p = |n: f64| n / w.total;
+            let pre = if label == "all" {
+                String::new()
+            } else {
+                format!("{label}_")
+            };
+            metrics.insert(format!("{pre}polyA_frac"), p(w.corner[0]));
+            metrics.insert(format!("{pre}polyT_frac"), p(w.corner[1]));
+            metrics.insert(format!("{pre}polyG_frac"), p(w.corner[2]));
+            metrics.insert(format!("{pre}polyC_frac"), p(w.corner[3]));
+            metrics.insert(format!("{pre}off_diagonal_frac"), p(w.corner[4]));
+            if label == "all" {
+                metrics.insert("total_reads".into(), w.total);
+            }
+        }
+        ToolReport {
+            sample,
+            tool: "fastmaps".into(),
+            version: self.version.map(|n| format!("grid v{n}")),
+            source: path.to_path_buf(),
+            metrics,
+            notes: Vec::new(),
+            from_v1: false,
+        }
+    }
+
+    /// Fold a `counts` array that arrived before `size` into its window.
+    fn fold_deferred(&mut self) {
+        let Some(size) = self.size.filter(|s| *s > 0) else {
+            return;
+        };
+        let c = (size / 50).max(2);
+        let deferred = std::mem::replace(&mut self.deferred, [None, None, None]);
+        for (idx, cells) in deferred.into_iter().enumerate() {
+            if let Some(cells) = cells {
+                let mut sums = WindowSums::new(size);
+                for (i, n) in cells.into_iter().enumerate() {
+                    sums.push(size, c, i, n);
+                }
+                self.windows[idx] = Some(sums);
+            }
+        }
+    }
+}
+
 /// Normalise one JSON file. Returns Ok(None) when the file is not a report we
-/// recognise (caller decides whether that is worth a warning).
+/// recognise (caller decides whether that is a warning).
 pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolReport>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
+    let sample = sample_hint
+        .map(str::to_string)
+        .unwrap_or_else(|| sample_from_path(path));
+    // A fastmaps grid is 36× the bytes of an ordinary report and every sample
+    // gets one, so it is read through a typed visitor instead of a `Value`
+    // tree (one enum construction per cell used to be the cost). The `Value`
+    // branch further down still handles any grid this reader cannot claim.
+    if text.contains("\"counts\"") {
+        if let Ok(doc) = serde_json::from_str::<GridDoc>(&text) {
+            if doc.is_grid() {
+                return Ok(Some(doc.into_report(sample, path)));
+            }
+        }
+    }
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => return Ok(Some(ToolReport {
-            sample: sample_hint.map(str::to_string).unwrap_or_else(|| sample_from_path(path)),
+            sample,
             tool: "unparsable".into(),
             version: None,
             source: path.to_path_buf(),
             metrics: BTreeMap::new(),
             notes: vec![format!("not valid JSON: {e}")],
+            from_v1: false,
         })),
     };
     if !v.is_object() {
@@ -146,9 +488,6 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
     {
         return Ok(None);
     }
-    let sample = sample_hint
-        .map(str::to_string)
-        .unwrap_or_else(|| sample_from_path(path));
 
     // --- canonical v1 wrapper ---
     if v.get("schema").and_then(|s| s.as_str()) == Some(SCHEMA_VERSION) {
@@ -186,6 +525,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
             source: path.to_path_buf(),
             metrics,
             notes: Vec::new(),
+            from_v1: true,
         }));
     }
 
@@ -261,6 +601,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
             source: path.to_path_buf(),
             metrics,
             notes: Vec::new(),
+            from_v1: false,
         }));
     }
 
@@ -333,6 +674,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
             source: path.to_path_buf(),
             metrics,
             notes: vec!["legacy raw stats (no schema wrapper)".into()],
+            from_v1: false,
         }));
     }
 
@@ -359,6 +701,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
         source: path.to_path_buf(),
         metrics: numeric,
         notes: vec!["unrecognised schema: top-level numbers only".into()],
+        from_v1: false,
     }))
 }
 
@@ -411,21 +754,36 @@ pub fn collect(inputs: &[PathBuf], sample: Option<&str>) -> Result<Vec<ToolRepor
             Err(e) => eprintln!("fasthelper: skipping {}: {e}", f.display()),
         }
     }
+    // One measurement, one row: a `fastsuite.report.v1` wrapper and the raw
+    // file it was derived from (fastmaps' grid beside its `<stem>.report.json`)
+    // describe the same (sample, tool). Keep the v1 report — it is the tool's
+    // own statement — and drop the derivation, so nothing double-counts.
+    let v1: BTreeSet<(String, String)> = reports
+        .iter()
+        .filter(|r| r.from_v1)
+        .map(|r| (r.sample.clone(), r.tool.clone()))
+        .collect();
+    if !v1.is_empty() {
+        reports.retain(|r| r.from_v1 || !v1.contains(&(r.sample.clone(), r.tool.clone())));
+    }
     Ok(reports)
 }
 
 /// Wide metric matrix: one row per (sample, tool), union of metric columns.
-pub struct Matrix {
-    pub columns: Vec<String>,
-    pub rows: Vec<(String, String, BTreeMap<String, f64>)>,
+///
+/// Borrowed, not cloned: at 10 k samples the owned copy cost ~61 MB of row
+/// maps that existed only to be printed once.
+pub struct Matrix<'a> {
+    pub columns: Vec<&'a str>,
+    pub rows: Vec<(&'a str, &'a str, &'a BTreeMap<String, f64>)>,
 }
 
-pub fn build_matrix(reports: &[ToolReport]) -> Matrix {
-    let mut columns: BTreeSet<String> = BTreeSet::new();
-    let mut rows: Vec<(String, String, BTreeMap<String, f64>)> = Vec::new();
+pub fn build_matrix(reports: &[ToolReport]) -> Matrix<'_> {
+    let mut columns: BTreeSet<&str> = BTreeSet::new();
+    let mut rows: Vec<(&str, &str, &BTreeMap<String, f64>)> = Vec::with_capacity(reports.len());
     for r in reports {
-        columns.extend(r.metrics.keys().cloned());
-        rows.push((r.sample.clone(), r.tool.clone(), r.metrics.clone()));
+        columns.extend(r.metrics.keys().map(|k| k.as_str()));
+        rows.push((r.sample.as_str(), r.tool.as_str(), &r.metrics));
     }
     Matrix {
         columns: columns.into_iter().collect(),
@@ -445,26 +803,35 @@ fn fmt_val(v: f64) -> String {
     }
 }
 
-pub fn matrix_tsv(m: &Matrix) -> String {
-    let mut s = String::from("sample\ttool");
+/// Write the wide matrix as TSV. Streaming: the 10 k table is 2 MB of cells
+/// looked up in a borrowed row, so nothing but the 8 KB buffer is held.
+pub fn write_matrix_tsv<W: Write>(w: &mut W, m: &Matrix<'_>) -> std::io::Result<()> {
+    w.write_all(b"sample\ttool")?;
     for c in &m.columns {
-        s.push('\t');
-        s.push_str(c);
+        w.write_all(b"\t")?;
+        w.write_all(c.as_bytes())?;
     }
-    s.push('\n');
+    w.write_all(b"\n")?;
     for (sample, tool, metrics) in &m.rows {
-        s.push_str(sample);
-        s.push('\t');
-        s.push_str(tool);
+        w.write_all(sample.as_bytes())?;
+        w.write_all(b"\t")?;
+        w.write_all(tool.as_bytes())?;
         for c in &m.columns {
-            s.push('\t');
-            if let Some(v) = metrics.get(c) {
-                s.push_str(&fmt_val(*v));
+            w.write_all(b"\t")?;
+            if let Some(v) = metrics.get(*c) {
+                write!(w, "{}", fmt_val(*v))?;
             }
         }
-        s.push('\n');
+        w.write_all(b"\n")?;
     }
-    s
+    Ok(())
+}
+
+/// In-memory convenience wrapper over [`write_matrix_tsv`] (tests, compare).
+pub fn matrix_tsv(m: &Matrix<'_>) -> String {
+    let mut buf = Vec::new();
+    write_matrix_tsv(&mut buf, m).expect("writing a TSV into a Vec cannot fail");
+    String::from_utf8(buf).expect("fmt_val and the header are ASCII")
 }
 
 pub fn matrix_md(reports: &[ToolReport]) -> String {
@@ -611,50 +978,99 @@ code{{background:#f2f3f5;padding:0 .25rem;border-radius:3px}}\
     out
 }
 
-pub fn render_json(title: &str, reports: &[ToolReport]) -> String {
-    let samples: Vec<serde_json::Value> = reports
+/// One report as it appears inside the aggregate document. Field order is
+/// declaration order, and it is alphabetical — the aggregate is a `BTreeMap`
+/// document today and its bytes are part of the contract.
+#[derive(Serialize)]
+struct JsonRow<'a> {
+    metrics: &'a BTreeMap<String, f64>,
+    notes: &'a [String],
+    sample: &'a str,
+    source: Cow<'a, str>,
+    tool: &'a str,
+    tool_version: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct JsonDoc<'a> {
+    generator: &'a str,
+    generator_version: &'a str,
+    reports: Vec<JsonRow<'a>>,
+    schema: &'a str,
+    title: &'a str,
+}
+
+/// Serialise the aggregate straight into `w`, borrowing the reports.
+///
+/// The document used to be a `serde_json::Value` tree plus one pretty `String`
+/// before the first byte reached the file: at 10 k samples (20 k reports) that
+/// peaked at 273 MB of RSS for a 23 MB file, ~20 k objects each with ~30 key
+/// `String`s. Only the 20 k-row view below is built now, and the buffer belongs
+/// to the caller's `BufWriter`.
+pub fn write_json<W: Write>(w: &mut W, title: &str, reports: &[ToolReport]) -> Result<()> {
+    let rows: Vec<JsonRow<'_>> = reports
         .iter()
-        .map(|r| {
-            serde_json::json!({
-                "sample": r.sample,
-                "tool": r.tool,
-                "tool_version": r.version,
-                "source": r.source.to_string_lossy(),
-                "metrics": r.metrics,
-                "notes": r.notes,
-            })
+        .map(|r| JsonRow {
+            metrics: &r.metrics,
+            notes: &r.notes,
+            sample: &r.sample,
+            source: r.source.to_string_lossy(),
+            tool: &r.tool,
+            tool_version: r.version.as_deref(),
         })
         .collect();
-    let doc = serde_json::json!({
-        "schema": SCHEMA_VERSION,
-        "generator": "fasthelper",
-        "generator_version": env!("CARGO_PKG_VERSION"),
-        "title": title,
-        "reports": samples,
-    });
-    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".into()) + "\n"
+    let doc = JsonDoc {
+        generator: "fasthelper",
+        generator_version: env!("CARGO_PKG_VERSION"),
+        reports: rows,
+        schema: SCHEMA_VERSION,
+        title,
+    };
+    serde_json::to_writer_pretty(&mut *w, &doc).context("serialising report.json")?;
+    w.write_all(b"\n")?;
+    Ok(())
 }
 
 /// Write the aggregate report in the requested formats. Returns written paths.
+///
+/// Every format is streamed into its own `BufWriter`; `matrix` is the wide
+/// table built once by the caller (so `--stdout` does not build it twice).
 pub fn write_reports(
     title: &str,
     reports: &[ToolReport],
     outdir: &Path,
     formats: &[String],
+    matrix: Option<&Matrix<'_>>,
 ) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(outdir)
         .with_context(|| format!("creating {}", outdir.display()))?;
     let mut written = Vec::new();
+    let mut owned_matrix: Option<Matrix<'_>> = None;
     for f in formats {
-        let (name, body) = match f.trim() {
-            "json" => ("report.json", render_json(title, reports)),
-            "tsv" => ("report.tsv", matrix_tsv(&build_matrix(reports))),
-            "md" => ("report.md", matrix_md(reports)),
-            "html" => ("report.html", render_html(title, reports)),
+        let name = match f.trim() {
+            "json" => "report.json",
+            "tsv" => "report.tsv",
+            "md" => "report.md",
+            "html" => "report.html",
             other => anyhow::bail!("unknown format '{other}' (json,tsv,md,html)"),
         };
         let path = outdir.join(name);
-        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+        let file = std::fs::File::create(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        let mut w = BufWriter::new(file);
+        match f.trim() {
+            "json" => write_json(&mut w, title, reports)?,
+            "tsv" => {
+                if matrix.is_none() && owned_matrix.is_none() {
+                    owned_matrix = Some(build_matrix(reports));
+                }
+                write_matrix_tsv(&mut w, matrix.or(owned_matrix.as_ref()).expect("built above"))?;
+            }
+            "md" => w.write_all(matrix_md(reports).as_bytes())?,
+            _ => w.write_all(render_html(title, reports).as_bytes())?,
+        }
+        w.flush()
+            .with_context(|| format!("writing {}", path.display()))?;
         written.push(path);
     }
     Ok(written)
@@ -777,7 +1193,14 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
     }
     let formats: Vec<String> = a.format.split(',').map(|s| s.trim().to_string()).collect();
     let title = "FastSuite report";
-    let written = write_reports(title, &reports, &a.outdir, &formats)?;
+    // Built once: the TSV writer and --stdout are the same table, and the
+    // matrix borrows the reports instead of cloning them.
+    let matrix = if a.stdout || formats.iter().any(|f| f == "tsv") {
+        Some(build_matrix(&reports))
+    } else {
+        None
+    };
+    let written = write_reports(title, &reports, &a.outdir, &formats, matrix.as_ref())?;
     if !a.fail_on.is_empty() {
         let thresholds: Vec<Threshold> = a
             .fail_on
@@ -797,7 +1220,11 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
         }
     }
     if a.stdout {
-        print!("{}", matrix_tsv(&build_matrix(&reports)));
+        let stdout = std::io::stdout();
+        let mut w = BufWriter::new(stdout.lock());
+        write_matrix_tsv(&mut w, matrix.as_ref().expect("built when --stdout"))
+            .context("printing report.tsv")?;
+        w.flush()?;
     }
     println!(
         "fasthelper: concatenated {} report(s) from {} sample(s) -> {}",
