@@ -34,6 +34,15 @@ fn is_trimming(tool: &str) -> bool {
 /// this same list, so a config `run` accepts is never rejected by `check`.
 pub const KNOWN_STEPS: &[&str] = &["fastdedup", "fastprep", "fastmaps", "fastcheck", "fastsim"];
 
+/// Tools whose CLI accepts `--force` (fastcheck has none), so `run --force` can
+/// be forwarded to them instead of only deleting their outputs.
+const FORCE_STEPS: &[&str] = &["fastdedup", "fastprep", "fastmaps", "fastsim"];
+
+/// The one predicate `run` and `check` share for a step name.
+pub fn is_known_step(step: &str) -> bool {
+    KNOWN_STEPS.contains(&step)
+}
+
 pub struct ToolSet {
     pub check: Option<PathBuf>,
     pub dedup: Option<PathBuf>,
@@ -107,10 +116,12 @@ struct StepOutcome {
 }
 
 /// What one sample contributed to the run: its manifest entries (each tagged
-/// with its step index for deterministic merging) plus any failures, plus the
-/// names of any samples whose trimming step tripped the residual-adapter guard.
+/// with its step index for deterministic merging), the JSON reports it wrote,
+/// plus any failures, plus the names of any samples whose trimming step tripped
+/// the residual-adapter guard.
 struct SampleOutcome {
     entries: Vec<(usize, serde_json::Value)>,
+    reports: Vec<PathBuf>,
     failed: Vec<String>,
     adapter_trips: Vec<String>,
 }
@@ -129,6 +140,7 @@ fn run_sample(
     logs: &Path,
     config_dir: &Path,
     dry_run: bool,
+    force: bool,
     threads: usize,
     guard: &Policy,
     resume: &BTreeMap<String, ResumeEntry>,
@@ -136,6 +148,7 @@ fn run_sample(
     from: Option<&str>,
 ) -> Result<SampleOutcome> {
     let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
+    let mut reports: Vec<PathBuf> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut adapter_trips: Vec<String> = Vec::new();
 
@@ -152,6 +165,7 @@ fn run_sample(
         failed.push(sample.name.clone());
         return Ok(SampleOutcome {
             entries,
+            reports,
             failed,
             adapter_trips,
         });
@@ -215,10 +229,9 @@ fn run_sample(
                 work.join("fastsim.json"),
                 work.join("maps"), // unused
             ),
-            other => {
-                eprintln!("fasthelper: unsupported step '{other}' — skipped");
-                continue;
-            }
+            // Unreachable: run() validates the step list against KNOWN_STEPS
+            // before any sample starts, so this only keeps the match total.
+            _ => continue,
         };
         let argv = argv_for(
             tool,
@@ -238,6 +251,7 @@ fn run_sample(
             },
             &outdir.join(&cfg.simulate.name).join("sim"),
             config_dir,
+            force,
         );
         let log = logs.join(format!("{}.{}.log", sample.name, tool));
         // Identity of the inputs this step will consume, and the files it is
@@ -265,11 +279,12 @@ fn run_sample(
                 stale.push(maps_dir.join(f));
             }
         }
-        // Resume: skip this step only when a previous manifest recorded the
-        // exact same (argv, binary, version), the SAME inputs, and the outputs
-        // it produced are still on disk. --from <step> forces a rerun from
-        // that step onward, so once the named step is reached everything is
-        // forced regardless of what the manifest says.
+        // Resume: skip this step only when a previous manifest recorded a
+        // SUCCESSFUL run (exit 0) of the exact same (argv, binary, version) on
+        // the SAME inputs, and the outputs it produced are still byte-for-byte
+        // the ones it recorded. --from <step> forces a rerun from that step
+        // onward, and --force reruns everything, so once either is in play
+        // nothing is resumed.
         let forced = from.map(|f| f == tool).unwrap_or(false);
         if forced {
             from_reached = true;
@@ -278,14 +293,18 @@ fn run_sample(
         // Resolved once per run (see resolve_versions): a version string cannot
         // change inside one run, and it used to fork once per sample per step.
         let version = versions.get(tool.as_str()).cloned().flatten();
-        if !forced && !from_reached {
+        let prev_out_sig = output_signatures(&expect_outputs);
+        if !force && !forced && !from_reached {
             if let Some(prev) = resume.get(&key) {
                 let inputs_match = prev.inputs == cur_sig;
+                let outputs_match = prev.outputs == prev_out_sig;
                 let outputs_present = expect_outputs.iter().all(|p| p.is_file());
-                if prev.argv == argv
+                if prev.exit == 0
+                    && prev.argv == argv
                     && prev.binary == s(&bin)
                     && prev.version == version
                     && inputs_match
+                    && outputs_match
                     && outputs_present
                 {
                     println!("fasthelper: resumed {key}");
@@ -296,14 +315,16 @@ fn run_sample(
                             "tool": tool,
                             "binary": prev.binary.clone(),
                             "argv": prev.argv.clone(),
-                            "exit": 0,
+                            "exit": prev.exit,
                             "elapsed_s": 0.0,
                             "log": s(&log),
                             "resumed": true,
                             "tool_version": prev.version.clone(),
                             "inputs": inputs_json(&prev.inputs),
+                            "outputs": inputs_json(&prev.outputs),
                         }),
                     ));
+                    reports.push(json_path.clone());
                     // The chain continues from this step's output: the file
                     // the resumed step produced (same argv, same inputs) is
                     // still there — we only get here when it is.
@@ -339,6 +360,9 @@ fn run_sample(
             outcome.elapsed,
             outcome.log.display()
         );
+        // What this step actually left on disk, recorded so the next run can
+        // tell a completed step from a partial output of a failed one.
+        let out_sig = output_signatures(&expect_outputs);
         entries.push((
             step_idx,
             serde_json::json!({
@@ -351,8 +375,10 @@ fn run_sample(
                 "log": s(&outcome.log),
                 "tool_version": version.clone(),
                 "inputs": inputs_json(&cur_sig),
+                "outputs": inputs_json(&out_sig),
             }),
         ));
+        reports.push(json_path.clone());
         if outcome.exit != 0 {
             eprintln!(
                 "fasthelper: {} failed for {} (exit {}) — see {}",
@@ -424,6 +450,7 @@ fn run_sample(
     }
     Ok(SampleOutcome {
         entries,
+        reports,
         failed,
         adapter_trips,
     })
@@ -505,24 +532,30 @@ fn resolve_versions(cfg: &Config, ts: &ToolSet) -> BTreeMap<String, Option<Strin
 }
 
 /// What a previous run recorded for one `sample/tool` step: the argv it ran,
-/// the binary path, that binary's `--version` AT THE TIME, and the identity
-/// (size + mtime) of each input it consumed. A step is only resumed when all of
-/// these still match today, so a change to an input — an overwrite in place
-/// included — forces a rerun rather than reusing a stale output.
+/// the binary path, that binary's `--version` AT THE TIME, the exit code it
+/// returned, and the identity (size + mtime) of each input it consumed and each
+/// output it left behind. A step is only resumed when all of these still match
+/// today — in particular the previous attempt must have SUCCEEDED: a tool that
+/// wrote a partial output and exited 1 used to be resumed as if it had worked.
 #[derive(Debug, Clone)]
 struct ResumeEntry {
     argv: Vec<String>,
     binary: String,
     version: Option<String>,
+    /// The exit code this step returned on the run that recorded it.
+    exit: i32,
     /// (path, size, mtime_secs, mtime_nanos) for r1, then r2 when paired.
     inputs: Vec<(String, u64, i64, u32)>,
+    /// The same signature for every file the step was expected to produce.
+    outputs: Vec<(String, u64, i64, u32)>,
 }
 
-/// Identity of one step's inputs: path, size and mtime, in order. Cheap, and an
+/// (path, size, mtime_secs, mtime_nanos) for each of `paths`. Cheap, and an
 /// overwrite in place changes size or mtime, so a stale resume is not possible.
-fn input_signatures(r1: &Path, r2: Option<&Path>) -> Vec<(String, u64, i64, u32)> {
-    std::iter::once(r1)
-        .chain(r2)
+/// A path that does not exist contributes nothing, so its absence shows up as a
+/// shorter list that can never equal a recorded one.
+fn sig_of<'a>(paths: impl Iterator<Item = &'a Path>) -> Vec<(String, u64, i64, u32)> {
+    paths
         .filter_map(|p| {
             let md = std::fs::metadata(p).ok()?;
             let mtime = md.modified().ok()?;
@@ -532,7 +565,17 @@ fn input_signatures(r1: &Path, r2: Option<&Path>) -> Vec<(String, u64, i64, u32)
         .collect()
 }
 
-/// Serialise an input signature list into the manifest's `inputs` array.
+/// Identity of one step's inputs, in order.
+fn input_signatures(r1: &Path, r2: Option<&Path>) -> Vec<(String, u64, i64, u32)> {
+    sig_of(std::iter::once(r1).chain(r2))
+}
+
+/// Identity of the files one step is expected to produce.
+fn output_signatures(paths: &[PathBuf]) -> Vec<(String, u64, i64, u32)> {
+    sig_of(paths.iter().map(|p| p.as_path()))
+}
+
+/// Serialise a signature list into a manifest `inputs`/`outputs` array.
 fn inputs_json(sig: &[(String, u64, i64, u32)]) -> Vec<serde_json::Value> {
     sig.iter()
         .map(|(p, size, secs, nanos)| {
@@ -544,6 +587,24 @@ fn inputs_json(sig: &[(String, u64, i64, u32)]) -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+/// Read a signature list back from a manifest `inputs`/`outputs` array.
+fn sig_from_json(v: &serde_json::Value) -> Vec<(String, u64, i64, u32)> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    Some((
+                        e["path"].as_str()?.to_string(),
+                        e["size"].as_u64()?,
+                        e["mtime_secs"].as_i64()?,
+                        e["mtime_nanos"].as_u64()? as u32,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Read `<outdir>/manifest.json` and build the `sample/tool -> ResumeEntry`
@@ -570,28 +631,20 @@ fn load_resume(outdir: &Path) -> BTreeMap<String, ResumeEntry> {
             // here: re-resolving live made the later comparison tautological,
             // so a binary that changed under the same path was still resumed.
             let version = c["tool_version"].as_str().map(str::to_string);
-            let inputs: Vec<(String, u64, i64, u32)> = c["inputs"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| {
-                            Some((
-                                e["path"].as_str()?.to_string(),
-                                e["size"].as_u64()?,
-                                e["mtime_secs"].as_i64()?,
-                                e["mtime_nanos"].as_u64()? as u32,
-                            ))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Absent (an older manifest) reads as a failure: the safe
+            // direction is to rerun, never to adopt.
+            let exit = c["exit"].as_i64().unwrap_or(-1) as i32;
+            let inputs = sig_from_json(&c["inputs"]);
+            let outputs = sig_from_json(&c["outputs"]);
             map.insert(
                 format!("{sample}/{tool}"),
                 ResumeEntry {
                     argv,
                     binary,
                     version,
+                    exit,
                     inputs,
+                    outputs,
                 },
             );
         }
@@ -615,6 +668,7 @@ fn argv_for(
     simulate: Option<&crate::config::Simulate>,
     sim_prefix: &Path,
     config_dir: &Path,
+    force: bool,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     match tool {
@@ -699,6 +753,11 @@ fn argv_for(
         }
         _ => {}
     }
+    // `run --force` reaches the tools that can take it: they then overwrite
+    // instead of refusing, which is the documented way to redo a run.
+    if force && FORCE_STEPS.contains(&tool) {
+        a.push("--force".into());
+    }
     a.extend(extra.iter().cloned());
     a
 }
@@ -714,16 +773,36 @@ pub fn run(args: &RunArgs) -> Result<()> {
     if args.keep_intermediate {
         cfg.run.keep_intermediate = true;
     }
+    let force = args.force;
+    // Minute zero: a step name that `check` would reject must fail here too,
+    // before a sample directory exists or a tool is forked. A typo used to be
+    // skipped with a warning (and, before that, fail only after the earlier
+    // steps had already run and written reports).
+    for step in &cfg.run.steps {
+        if !is_known_step(step) {
+            bail!(
+                "unknown step '{step}' — supported: {}",
+                KNOWN_STEPS.join(", ")
+            );
+        }
+    }
     let tools_dir = cfg.tools_dir(args.tools_dir.clone());
     let ts = toolset(tools_dir.clone());
-    if ts.dedup.is_none() && ts.prep.is_none() && ts.maps.is_none() {
-        bail!(
-            "no FastSuite binaries found (looked in {} and $PATH) — build them with \
-             `cargo build --release` in each tools/<name> dir, or pass --tools-dir",
-            tools_dir
-                .map(|d| d.display().to_string())
-                .unwrap_or_else(|| "$PATH".into())
-        );
+    // Only the tools this run actually needs. Demanding the three FASTQ tools
+    // unconditionally made a QC-only chain (`steps = ["fastcheck"]`) fail with
+    // "no FastSuite binaries found" while the one binary it needed was there;
+    // and a missing one is named before any work starts.
+    for step in &cfg.run.steps {
+        if cfg.step(step).enabled && ts.get(step).is_none() {
+            bail!(
+                "step '{step}' is enabled but its binary was not found (looked in {} and $PATH) — \
+                 build it with `cargo build --release` in tools/{step}, or pass --tools-dir",
+                tools_dir
+                    .as_ref()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "$PATH".into())
+            );
+        }
     }
 
     let versions = resolve_versions(&cfg, &ts);
@@ -771,6 +850,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
 
     // Optional synthetic control: generate a known-truth sample and push it
     // through the same chain.
+    let mut sim_report: Option<PathBuf> = None;
     if cfg.simulate.enabled {
         let bin = ts
             .sim
@@ -786,35 +866,57 @@ pub fn run(args: &RunArgs) -> Result<()> {
         };
         std::fs::create_dir_all(&simdir)?;
         let prefix = simdir.join("sim");
-        let mut argv: Vec<String> = vec![
-            "--pairs".into(),
-            cfg.simulate.pairs.to_string(),
-            "-o".into(),
-            s(&prefix),
-            "--json".into(),
-            s(&simdir.join("fastsim.json")),
+        let sim_json = simdir.join("fastsim.json");
+        // fastsim refuses to overwrite its own output (sim.gt.tsv and the two
+        // FASTQ) and nothing else ever regenerates them, so the second run of
+        // the documented workflow died here with "fastsim failed" and exit 1.
+        // Reuse what a previous run left; --force regenerates it.
+        let sim_outputs: Vec<PathBuf> = vec![
+            PathBuf::from(format!("{}.gt.tsv", s(&prefix))),
+            PathBuf::from(format!("{}_R1.fastq.gz", s(&prefix))),
+            PathBuf::from(format!("{}_R2.fastq.gz", s(&prefix))),
         ];
-        if let Some(prof) = &cfg.simulate.profile {
-            argv.push("--profile".into());
-            argv.push(s(&resolve_rel(prof, &config_dir)));
+        let reuse = !force && !args.dry_run && sim_outputs.iter().all(|p| p.is_file());
+        if reuse {
+            println!(
+                "fasthelper: fastsim: reusing {} (pass --force to regenerate)",
+                sim_outputs[0].display()
+            );
+        } else {
+            let mut argv: Vec<String> = vec![
+                "--pairs".into(),
+                cfg.simulate.pairs.to_string(),
+                "-o".into(),
+                s(&prefix),
+                "--json".into(),
+                s(&sim_json),
+            ];
+            if let Some(prof) = &cfg.simulate.profile {
+                argv.push("--profile".into());
+                argv.push(s(&resolve_rel(prof, &config_dir)));
+            }
+            if let Some(seed) = cfg.simulate.seed {
+                argv.push("--seed".into());
+                argv.push(seed.to_string());
+            }
+            argv.extend(cfg.simulate.args.iter().cloned());
+            if force {
+                argv.push("--force".into());
+            }
+            let log = logs.join("fastsim.log");
+            let outcome = run_step("fastsim", &bin, &argv, &log, args.dry_run, None)?;
+            println!(
+                "fasthelper: fastsim {} pairs -> {} (exit {}, {:.2}s)",
+                cfg.simulate.pairs,
+                prefix.display(),
+                outcome.exit,
+                outcome.elapsed
+            );
+            if outcome.exit != 0 {
+                bail!("fastsim failed (see {})", log.display());
+            }
         }
-        if let Some(seed) = cfg.simulate.seed {
-            argv.push("--seed".into());
-            argv.push(seed.to_string());
-        }
-        argv.extend(cfg.simulate.args.iter().cloned());
-        let log = logs.join("fastsim.log");
-        let outcome = run_step("fastsim", &bin, &argv, &log, args.dry_run, None)?;
-        println!(
-            "fasthelper: fastsim {} pairs -> {} (exit {}, {:.2}s)",
-            cfg.simulate.pairs,
-            prefix.display(),
-            outcome.exit,
-            outcome.elapsed
-        );
-        if outcome.exit != 0 {
-            bail!("fastsim failed (see {})", log.display());
-        }
+        sim_report = Some(sim_json);
         samples.push(crate::config::Sample {
             name: cfg.simulate.name.clone(),
             r1: PathBuf::from(format!("{}_R1.fastq.gz", s(&prefix))),
@@ -839,6 +941,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
         std::sync::Mutex::new(Vec::new());
     let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let guard_trips: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let report_paths: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
     std::thread::scope(|scope| {
         for _ in 0..args.jobs.max(1) {
@@ -853,6 +956,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                     &logs,
                     &config_dir,
                     args.dry_run,
+                    force,
                     per_sample_threads,
                     &guard,
                     &resume,
@@ -864,6 +968,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                             .lock()
                             .unwrap()
                             .extend(o.entries.into_iter().map(|(step_idx, m)| (sample_idx, step_idx, m)));
+                        report_paths.lock().unwrap().append(&mut o.reports);
                         failures.lock().unwrap().append(&mut o.failed);
                         guard_trips.lock().unwrap().append(&mut o.adapter_trips);
                     }
@@ -887,7 +992,15 @@ pub fn run(args: &RunArgs) -> Result<()> {
     trips.sort();
     trips.dedup();
 
-    // Manifest + aggregate report over everything the run produced.
+    // A dry run must not touch the outdir's provenance: it used to overwrite a
+    // previous real manifest with entries claiming exit 0 and elapsed 0.0, so
+    // `--dry-run` after a paper run destroyed the record of what actually ran.
+    if args.dry_run {
+        println!("fasthelper: dry-run — nothing executed");
+        return Ok(());
+    }
+
+    // Manifest + aggregate report over everything THIS run produced.
     let manifest_path = outdir.join("manifest.json");
     // Merge with what is already on disk instead of overwriting it: an entry
     // this run did not produce (a step it never reached, or a rerun that failed
@@ -941,12 +1054,17 @@ pub fn run(args: &RunArgs) -> Result<()> {
     )
     .with_context(|| format!("writing {}", manifest_path.display()))?;
 
-    if args.dry_run {
-        println!("fasthelper: dry-run — nothing executed");
-        return Ok(());
-    }
-
-    let reports = report::collect(&[outdir.clone()], None)?;
+    // Aggregate exactly the reports this run produced (the JSON each step wrote
+    // plus the simulated control's own report). Walking the outdir instead — as
+    // this did — ingested whatever an earlier, differently configured run had
+    // left behind, so a table could carry a measurement of a step that did not
+    // run.
+    let mut report_files = report_paths.into_inner().unwrap();
+    report_files.extend(sim_report);
+    report_files.sort();
+    report_files.dedup();
+    report_files.retain(|p| p.is_file());
+    let reports = report::collect(&report_files, None)?;
     let formats: Vec<String> = vec!["json".into(), "tsv".into(), "md".into(), "html".into()];
     let title = format!("FastSuite report — {}", cfg.run.name);
     let written = report::write_reports(&title, &reports, &outdir, &formats, None)?;

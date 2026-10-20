@@ -70,6 +70,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Re-run every step even when a previous run's outputs are still there,
+    /// overwriting them. Forwarded as --force to the tools that accept it.
+    #[arg(long)]
+    pub force: bool,
+
     /// Keep intermediate files instead of deleting them after the last consumer.
     #[arg(long)]
     pub keep_intermediate: bool,

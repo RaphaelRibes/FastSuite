@@ -1121,3 +1121,305 @@ fn tool_version_is_resolved_once_per_run_not_once_per_sample() {
         "dry-run must not execute any step: {calls}"
     );
 }
+
+// ------------------------------------------- orchestration (P0-P5) -------- //
+
+/// Write a shell script and make it executable: the stand-in suite binaries
+/// these tests point `--tools-dir` at.
+fn write_exe(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    let mut perm = std::fs::metadata(path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(path, perm).unwrap();
+}
+
+/// One sample, one paired FASTQ, reusable across the orchestration tests.
+fn sample_fastq(dir: &Path) -> PathBuf {
+    let fq = dir.join("s1_R1.fastq");
+    std::fs::write(
+        &fq,
+        "@r1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n@r2\nTTTTAAAACCCCGGGG\n+\nIIIIIIIIIIIIIIII\n",
+    )
+    .unwrap();
+    fq
+}
+
+#[test]
+fn aggregate_ignores_reports_left_by_a_previous_configuration() {
+    // P0: the aggregate re-walked the whole outdir, so run B — a chain WITHOUT
+    // fastmaps — inherited run A's fastmaps row. A paper's table could carry a
+    // measurement from a different configuration.
+    require_tool("fastdedup");
+    require_tool("fastprep");
+    require_tool("fastmaps");
+    let d = tmpdir("stale_aggregate");
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = |name: &str, steps: &str| {
+        format!(
+            "[run]\nname = \"{name}\"\noutdir = \"{}\"\nsteps = [{steps}]\nthreads = 2\ngz_level = 1\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        )
+    };
+    let a = d.join("a.toml");
+    std::fs::write(&a, cfg("A", "\"fastdedup\", \"fastprep\", \"fastmaps\"")).unwrap();
+    let b = d.join("b.toml");
+    std::fs::write(&b, cfg("B", "\"fastdedup\", \"fastprep\"")).unwrap();
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+
+    let (_, e1, c1) = run(&["run", "-c", a.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c1, 0, "run A must succeed: {e1}");
+    let tsv_a = std::fs::read_to_string(out.join("report.tsv")).unwrap();
+    assert!(
+        tsv_a.contains("fastmaps"),
+        "run A's report must carry its fastmaps row: {tsv_a}"
+    );
+
+    let (_, e2, c2) = run(&["run", "-c", b.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c2, 0, "run B must succeed: {e2}");
+    let tsv_b = std::fs::read_to_string(out.join("report.tsv")).unwrap();
+    assert!(
+        tsv_b.contains("fastdedup") && tsv_b.contains("fastprep"),
+        "run B's own steps must still be reported: {tsv_b}"
+    );
+    assert!(
+        !tsv_b.contains("fastmaps"),
+        "run B does not run fastmaps, so its report must not carry run A's fastmaps row: {tsv_b}"
+    );
+}
+
+/// A stand-in fastdedup that writes a partial output and a report, then fails —
+/// the shape that used to be adopted by the next run as a completed step.
+const FAKE_FAILING_DEDUP: &str = r#"#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo "fastdedup 9.9.9"; exit 0; fi
+out=""; json=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    --json) json="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$(dirname "$out")" "$(dirname "$json")"
+printf 'partial\n' > "$out"
+printf '{"schema":"fastsuite.report.v1","tool":"fastdedup","tool_version":"9.9.9","metrics":{"duplicate_rate":0.0}}\n' > "$json"
+exit 1
+"#;
+
+#[test]
+fn resume_does_not_adopt_a_step_that_failed() {
+    // P1: the resume entry was recorded before the exit code was tested, and a
+    // resumed step was re-recorded with "exit": 0 — so a tool that left a
+    // partial output and exited 1 was "resumed" as success, and its partial
+    // output was fed to the next step.
+    let d = tmpdir("resume_failed");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    write_exe(&tools.join("fastdedup"), FAKE_FAILING_DEDUP);
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"f\"\noutdir = \"{}\"\nsteps = [\"fastdedup\"]\nthreads = 1\ngz_level = 1\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+    let td = tools.to_str().unwrap();
+
+    let (_, e1, c1) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_ne!(c1, 0, "the failing step must fail the run: {e1} {c1}");
+
+    let (stdout2, e2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert!(!stdout2.contains("resumed"), "a failed step must never be resumed: {stdout2}");
+    assert_ne!(c2, 0, "the rerun must still fail, not report success: {e2}");
+
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    for c in man["commands"].as_array().unwrap() {
+        assert_ne!(
+            c["exit"], 0,
+            "the manifest must keep the recorded failure, not overwrite it with 0: {man}"
+        );
+    }
+}
+
+#[test]
+fn the_documented_workflow_can_be_run_twice() {
+    // P2: `fasthelper run` had no --force and the simulate step refused the
+    // sim.gt.tsv the first run left behind, so the documented workflow exited 1
+    // on the second run into the same outdir.
+    require_tool("fastdedup");
+    require_tool("fastprep");
+    require_tool("fastmaps");
+    require_tool("fastsim");
+    let profile = tools_dir().join("fastsim/profiles/test_small.json");
+    assert!(profile.is_file(), "the shipped test profile must exist: {}", profile.display());
+    let d = tmpdir("documented_twice");
+    let out = d.join("out");
+    let cfg = d.join("fastsuite.toml");
+    // The shape of examples/fastsuite.toml: the canonical chain plus a
+    // simulated control sample, with per-step escape hatches.
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"demo\"\noutdir = \"{}\"\nthreads = 2\ngz_level = 1\n\
+             steps = [\"fastdedup\", \"fastprep\", \"fastmaps\"]\n\n\
+             [simulate]\nenabled = true\nname = \"sim_E\"\npairs = 200\nprofile = \"{}\"\nseed = 42\n\n\
+             [steps.fastprep]\nargs = [\"--adapter-preset\", \"nextera\", \"--r2-scan-reverse\", \"--min-len\", \"0.6L\", \"--min-run\", \"6\"]\n\n\
+             [steps.fastdedup]\nargs = [\"--pre-count\"]\n",
+            out.display(),
+            profile.display()
+        ),
+    )
+    .unwrap();
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+
+    let (_, e1, c1) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c1, 0, "first run must succeed: {e1}");
+    assert!(out.join("sim_E/sim.gt.tsv").is_file(), "the control sample must exist");
+
+    let (_, e2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(
+        c2, 0,
+        "the documented workflow must be re-runnable into the same outdir: {e2}"
+    );
+
+    let (_, e3, c3) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td, "--force"]);
+    assert_eq!(c3, 0, "--force must overwrite the previous run's outputs: {e3}");
+    assert!(
+        out.join("sim_E/sim_E_clean_R1.fastq.gz").is_file(),
+        "the chain's final output must be there after the forced rerun"
+    );
+}
+
+#[test]
+fn unknown_step_fails_before_any_work() {
+    // P3: an unknown step name was skipped with a warning while `check`
+    // rejected the same config, so a typo silently dropped a step. It must be
+    // refused up front, before a sample directory exists or a tool is forked.
+    require_tool("fastcheck");
+    let d = tmpdir("unknown_step");
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"t\"\noutdir = \"{}\"\nsteps = [\"fastcheck\", \"fastnope\"]\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+
+    let (_, stderr, code) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_ne!(code, 0, "an unknown step must fail the run: {stderr}");
+    assert!(
+        stderr.contains("unknown step") && stderr.contains("fastnope"),
+        "the refusal must name the unknown step: {stderr}"
+    );
+    assert!(
+        !out.join("S1").exists(),
+        "no sample may be started before the config is validated: {} exists",
+        out.join("S1").display()
+    );
+    assert!(
+        !out.join("report.tsv").exists(),
+        "a rejected config must not write a report"
+    );
+}
+
+/// A stand-in fastcheck: positional FASTQs in, a v1 report out via --json.
+const FAKE_CHECK: &str = r#"#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo "fastcheck 9.9.9"; exit 0; fi
+json=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) json="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$(dirname "$json")"
+printf '{"schema":"fastsuite.report.v1","tool":"fastcheck","tool_version":"9.9.9","metrics":{"reads":2}}\n' > "$json"
+exit 0
+"#;
+
+#[test]
+fn qc_only_config_needs_only_fastcheck() {
+    // P4: the precondition demanded fastdedup OR fastprep OR fastmaps, so a
+    // QC-only chain bailed with "no FastSuite binaries found" although the one
+    // tool it needed was right there.
+    let d = tmpdir("qc_only");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    write_exe(&tools.join("fastcheck"), FAKE_CHECK);
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"qc\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "a QC-only chain needs only fastcheck: {stderr}");
+    assert!(out.join("S1/fastcheck.json").is_file(), "fastcheck must have run: {stderr}");
+}
+
+#[test]
+fn dry_run_leaves_the_real_manifest_alone() {
+    // P5: --dry-run rewrote manifest.json with entries claiming exit 0 and
+    // elapsed 0.0, destroying the previous real run's provenance.
+    require_tool("fastdedup");
+    require_tool("fastprep");
+    let d = tmpdir("dryrun_manifest");
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"p5\"\noutdir = \"{}\"\nsteps = [\"fastdedup\", \"fastprep\"]\nthreads = 2\ngz_level = 1\n\n[[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+
+    let (_, e1, c1) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c1, 0, "{e1}");
+    let before = std::fs::read_to_string(out.join("manifest.json")).unwrap();
+    let man: serde_json::Value = serde_json::from_str(&before).unwrap();
+    for c in man["commands"].as_array().unwrap() {
+        assert!(
+            c["elapsed_s"].as_f64().unwrap() > 0.0,
+            "the real run must have measured something: {c}"
+        );
+    }
+
+    let (_, e2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td, "--dry-run"]);
+    assert_eq!(c2, 0, "{e2}");
+    let after = std::fs::read_to_string(out.join("manifest.json")).unwrap();
+    assert_eq!(
+        before, after,
+        "--dry-run must not rewrite the previous run's manifest"
+    );
+}

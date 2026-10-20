@@ -41,7 +41,7 @@ pub fn cmd_check(args: &CheckArgs) -> Result<()> {
 
     // 1. Step names.
     for step in &cfg.run.steps {
-        if !runner::KNOWN_STEPS.contains(&step.as_str()) {
+        if !runner::is_known_step(step) {
             errors.push(format!(
                 "unknown step '{step}' — supported: {}",
                 runner::KNOWN_STEPS.join(", ")
@@ -79,7 +79,7 @@ pub fn cmd_check(args: &CheckArgs) -> Result<()> {
 
     // 3. Tools.
     for step in &cfg.run.steps {
-        if runner::KNOWN_STEPS.contains(&step.as_str()) && cfg.step(step).enabled && ts.get(step).is_none()
+        if runner::is_known_step(step) && cfg.step(step).enabled && ts.get(step).is_none()
         {
             errors.push(format!("tool {step} not found in the tools dir or $PATH"));
         }
