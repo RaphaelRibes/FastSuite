@@ -65,6 +65,7 @@ pub enum SpillerMsg {
         no_call: u64,
         no_call_r1: u64,
         no_call_r2: u64,
+        min_seq_len: Option<u32>,
         max_seq_len: u32,
         n_reads: u64,
     },
@@ -150,6 +151,11 @@ pub struct WorkerLocal {
     pub no_call_r2: u64,
     /// Per-file total read count.
     pub per_file_counts: HashMap<u16, u64>,
+    /// Shortest read length seen (`None` until a read arrives).
+    ///
+    /// Published next to `max_seq_len` because `size` is derived from the
+    /// *longest* read: a read shorter than that cannot reach a corner pixel.
+    pub min_seq_len: Option<u32>,
     pub max_seq_len: u32,
     pub total_reads: u64,
     pub bytes_estimate: usize,
@@ -171,6 +177,7 @@ impl WorkerLocal {
             no_call_r1: 0,
             no_call_r2: 0,
             per_file_counts: HashMap::new(),
+            min_seq_len: None,
             max_seq_len: 0,
             total_reads: 0,
             bytes_estimate: 0,
@@ -331,6 +338,7 @@ pub fn process_fastq(
         if slen > state.max_seq_len {
             state.max_seq_len = slen;
         }
+        state.min_seq_len = Some(state.min_seq_len.map_or(slen, |m| m.min(slen)));
 
         let xy = (cx as u16, cy as u16);
 

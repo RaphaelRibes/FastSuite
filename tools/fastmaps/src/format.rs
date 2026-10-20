@@ -231,6 +231,24 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
         std::process::exit(1);
     }
 
+    // The grid is sized for the *longest* read, so a shorter read cannot reach
+    // a corner: on a mixed-length run the corner fractions silently describe
+    // only the longest reads. The corner definition is unchanged here; instead
+    // the run says so out loud, and both outputs publish the lengths (and the
+    // window) the fractions were computed from, so a biased run is visible
+    // after the fact even if nobody read stderr.
+    let min_seq_len = state.min_seq_len.unwrap_or(state.max_seq_len);
+    let corner_window = crate::report::corner_window(size as u32);
+    let spread = state.max_seq_len - min_seq_len;
+    if spread > corner_window {
+        eprintln!(
+            "fastmaps: warning: read lengths span {min_seq_len}..{max} bp (spread {spread} > \
+             corner window {corner_window}); corner fractions are length-biased: a read \
+             shorter than {max} bp cannot reach a corner",
+            max = state.max_seq_len,
+        );
+    }
+
     let mut data_offsets: Vec<u64>    = Vec::with_capacity(size + 1);
     let mut preview_offsets: Vec<u64> = Vec::with_capacity(size + 1);
     let mut data_written:    u64 = 0;
@@ -325,6 +343,11 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             ("r2", &counts_r2_arr, state.no_call_r2),
         ],
     );
+    // The lengths the corner window was derived from: a consumer can see a
+    // length-biased run from the report alone (`max - min > corner_window`).
+    metrics.insert("min_seq_len".into(), min_seq_len as f64);
+    metrics.insert("max_seq_len".into(), state.max_seq_len as f64);
+    metrics.insert("corner_window".into(), corner_window as f64);
     // FM-1: a non-exact data mode is a labelled approximation of
     // `heatmap.data` alone. Both the grid JSON and the v1 wrapper carry the
     // label, so no consumer can mistake a capped/absent stream for the exact
@@ -370,6 +393,9 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             "{{\n",
             "  \"version\": 2,\n",
             "  \"size\": {size},\n",
+            "  \"min_seq_len\": {min_seq_len},\n",
+            "  \"max_seq_len\": {max_len},\n",
+            "  \"corner_window\": {corner_window},\n",
             "  \"files\": [{files}],\n",
             "  \"file_kinds\": [{kinds}],\n",
             "  \"total_reads\": {total},\n",
@@ -384,6 +410,9 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             "}}\n"
         ),
         size      = size,
+        min_seq_len = min_seq_len,
+        max_len   = state.max_seq_len,
+        corner_window = corner_window,
         files     = files.iter().map(|f| json_escape(f)).collect::<Vec<_>>().join(","),
         kinds     = file_kinds_json,
         total     = state.total_reads,
@@ -404,23 +433,17 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
     // The v1 wrapper lands next to the grid JSON as <stem>.report.json —
     // only when --json redirected the grid (the historical
     // <output-dir>/heatmap.json default keeps its bare, wrapper-free shape).
-    let stem = json_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "heatmap".into());
     let mut wrapper_suffix = String::new();
     if with_wrapper {
-        if let Some(parent) = json_path.parent() {
-            let wrapper = parent.join(format!("{stem}.report.json"));
-            crate::report::write_report_v1(
-                &wrapper,
-                &std::env::args().collect::<Vec<_>>().join(" "),
-                elapsed_s,
-                files,
-                &metrics,
-            )?;
-            wrapper_suffix = format!(" + {stem}.report.json");
-        }
+        let wrapper = crate::report::wrapper_path(json_path);
+        crate::report::write_report_v1(
+            &wrapper,
+            &std::env::args().collect::<Vec<_>>().join(" "),
+            elapsed_s,
+            files,
+            &metrics,
+        )?;
+        wrapper_suffix = format!(" + {}", wrapper.file_name().unwrap().to_string_lossy());
     }
 
     if !quiet {

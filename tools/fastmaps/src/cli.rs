@@ -15,8 +15,10 @@ use clap::Parser;
 /// * `Exact`  — every read, as before. The default.
 /// * `Capped(n)` — at most `n` reads per `(pixel, file)`: `heatmap.data` becomes
 ///   a labelled sample (pixel *membership* is sampled; pixel *counts* are not).
-/// * `Off` — no index buffer, no spill, no render pass: `heatmap.data` is
-///   written as empty rows, so the file and its offsets stay valid.
+/// * `Off` — no per-read index buffer and no index spill, so there is nothing
+///   for the render pass to read: `heatmap.data` is written as empty rows, so
+///   the file and its offsets stay valid. The preview stream has its own path
+///   and is unaffected by this mode: `heatmap.preview` is still written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DataMode {
     #[default]
@@ -107,7 +109,8 @@ pub struct Args {
     pub corners: Vec<String>,
 
     /// Number of preview reads stored per pixel in heatmap.preview.
-    /// Set to 0 to disable preview generation entirely.
+    /// Set to 0 to store no reads: heatmap.preview is still written, as empty
+    /// rows, so its row offsets stay valid.
     #[arg(long, default_value = "5", value_name = "N")]
     pub preview_reads: usize,
 
@@ -131,7 +134,8 @@ pub struct Args {
 
     /// Per-read index stream mode for heatmap.data: `exact` (default) stores
     /// every read, `capped:N` stores at most N reads per (pixel, file) and
-    /// `off` stores none (no buffer, no spill, no render pass).
+    /// `off` stores none (no index buffer, no index spill, nothing to render).
+    /// `heatmap.preview` is written in every mode.
     ///
     /// Only heatmap.data is affected: heatmap.json carries
     /// `"data_reads_per_pixel"` and `"data_complete": false` when the mode is

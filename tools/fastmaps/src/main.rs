@@ -60,14 +60,58 @@ fn main() {
         }
     }
 
-    // ── Output directory ──────────────────────────────────────────────────
+    // ── Output targets ────────────────────────────────────────────────────
     let output_dir = args.output_dir;
+    // Grid JSON destination: --json redirects it (and adds the v1 wrapper
+    // next to it); otherwise the historical <output-dir>/heatmap.json.
+    let with_wrapper = args.json.is_some();
+    let json_path = args.json.clone().unwrap_or_else(|| output_dir.join("heatmap.json"));
+
+    // Each --corners spec produces a dedicated output file. Parsed up here,
+    // before the clobber guard, because that file is one of the outputs the
+    // guard must see before anything is created.
+    let corner_bounds: Vec<((u32, u32), (u32, u32))> = args
+        .corners
+        .iter()
+        .map(|spec| {
+            parse_corners(spec).unwrap_or_else(|| {
+                eprintln!(
+                    "Error: invalid --corners value {:?}, expected x1,y1:x2,y2",
+                    spec
+                );
+                std::process::exit(1);
+            })
+        })
+        .collect();
+
+    // ── Clobber guard ─────────────────────────────────────────────────────
+    // Every file this run would write, built from the same inputs the writers
+    // use — the data/preview streams, PNG and HTML always; the SVG on --svg;
+    // one file per --corners box; and the grid JSON (with its v1 wrapper) when
+    // it lands inside the output dir. Checked before the first `File::create`,
+    // so a refused run leaves the directory untouched.
     if !args.force && output_dir.exists() {
-        let existing = ["heatmap.json", "heatmap.png", "heatmap.data", "heatmap_3d.html"]
-            .iter()
-            .map(|f| output_dir.join(f))
-            .find(|p| p.exists());
-        if let Some(p) = existing {
+        let mut targets = vec![
+            output_dir.join("heatmap.data"),
+            output_dir.join("heatmap.preview"),
+            output_dir.join("heatmap.png"),
+            output_dir.join("heatmap_3d.html"),
+        ];
+        if args.svg {
+            targets.push(output_dir.join("heatmap.svg"));
+        }
+        targets.extend(
+            corner_bounds
+                .iter()
+                .map(|&bounds| output_dir.join(corners_filename(bounds))),
+        );
+        if json_path.starts_with(&output_dir) {
+            targets.push(json_path.clone());
+            if with_wrapper {
+                targets.push(report::wrapper_path(&json_path));
+            }
+        }
+        if let Some(p) = targets.iter().find(|p| p.exists()) {
             eprintln!(
                 "Error: {} already exists in {}. Pass --force to overwrite.",
                 p.file_name().unwrap().to_string_lossy(),
@@ -80,11 +124,6 @@ fn main() {
         eprintln!("Cannot create output dir {}: {e}", output_dir.display());
         std::process::exit(1);
     });
-
-    // Grid JSON destination: --json redirects it (and adds the v1 wrapper
-    // next to it); otherwise the historical <output-dir>/heatmap.json.
-    let with_wrapper = args.json.is_some();
-    let json_path = args.json.clone().unwrap_or_else(|| output_dir.join("heatmap.json"));
 
     // ── Temp directory ────────────────────────────────────────────────────
     let temp_dir: PathBuf = args.temp_dir.unwrap_or_else(|| {
@@ -126,18 +165,11 @@ fn main() {
     ));
 
     // ── Corner extractors ─────────────────────────────────────────────────
-    // Each --corners spec produces a dedicated output file.
-    let corner_extractors: Vec<CornerExtractor> = args
-        .corners
+    // One output file per box (the boxes were parsed before the clobber
+    // guard); created only now that the guard has passed.
+    let corner_extractors: Vec<CornerExtractor> = corner_bounds
         .iter()
-        .map(|spec| {
-            let bounds = parse_corners(spec).unwrap_or_else(|| {
-                eprintln!(
-                    "Error: invalid --corners value {:?}, expected x1,y1:x2,y2",
-                    spec
-                );
-                std::process::exit(1);
-            });
+        .map(|&bounds| {
             let fname = corners_filename(bounds);
             let path = output_dir.join(&fname);
             let f = File::create(&path).unwrap_or_else(|e| {
@@ -236,6 +268,7 @@ fn main() {
                 no_call:         state.no_call,
                 no_call_r1:      state.no_call_r1,
                 no_call_r2:      state.no_call_r2,
+                min_seq_len:     state.min_seq_len,
                 max_seq_len:     state.max_seq_len,
                 n_reads:         state.total_reads,
             })

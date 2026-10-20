@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 /// fraction's denominator and reported as `<pre>no_call_reads` instead. The
 /// grid itself is untouched: the pixel keeps the read.
 pub fn corner_metrics(size: u32, grids: &[(&str, &[u64], u64)]) -> BTreeMap<String, f64> {
-    let c = (size / 50).max(2) as usize;
+    let c = corner_window(size) as usize;
     let diag_lim = size / 10;
     let mut out = BTreeMap::new();
     for &(label, counts, no_call) in grids {
@@ -67,6 +67,16 @@ pub fn corner_metrics(size: u32, grids: &[(&str, &[u64], u64)]) -> BTreeMap<Stri
         }
     }
     out
+}
+
+/// Side of the corner window on a grid of side `size`: `max(size/50, 2)`.
+///
+/// Published as `corner_window` in both outputs, and derived here only, because
+/// it is the number that decides whether a read can reach a corner at all: the
+/// grid is sized for the *longest* read, so a read shorter than `size - 1 - c`
+/// never gets there.
+pub fn corner_window(size: u32) -> u32 {
+    (size / 50).max(2)
 }
 
 /// Write the `fastsuite.report.v1` wrapper (docs/REPORT-SCHEMA.md) to `path`.
@@ -122,6 +132,19 @@ pub fn write_report_v1(
     f.flush()
 }
 
+/// Path of the wrapper that accompanies a grid JSON: `<stem>.report.json`,
+/// next to it.
+///
+/// One definition because the clobber guard in `main` has to predict exactly
+/// the path the writer will create.
+pub fn wrapper_path(json_path: &std::path::Path) -> std::path::PathBuf {
+    let stem = json_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "heatmap".into());
+    json_path.with_file_name(format!("{stem}.report.json"))
+}
+
 /// Compact float rendering: integers print without a `.0`, everything else
 /// with 6 significant decimals. Keeps the hand-written JSON small.
 fn fmt_f64(x: f64) -> String {
@@ -149,12 +172,12 @@ mod tests {
         let mut r1 = vec![0u64; size * size];
         let mut r2 = vec![0u64; size * size];
         all[10 * size + 10] += 1; // T at (10,10), from file A's R1
-        all[10 * size + 0] += 2;  // G at (0,10), once per file
+        all[10 * size] += 2;      // G at (0,10), once per file
         r1[10 * size + 10] += 1;
-        r1[10 * size + 0] += 1;
-        r2[10 * size + 0] += 1;
-        all[0 * size + 0] += 1;   // A at (0,0), from file B's R2
-        r2[0 * size + 0] += 1;
+        r1[10 * size] += 1;
+        r2[10 * size] += 1;
+        all[0] += 1;              // A at (0,0), from file B's R2
+        r2[0] += 1;
         (all, r1, r2)
     }
 

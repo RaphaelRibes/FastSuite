@@ -25,6 +25,9 @@ pub struct SpillerState {
     pub no_call: u64,
     pub no_call_r1: u64,
     pub no_call_r2: u64,
+    /// Shortest / longest read length over the whole run. `min_seq_len` is
+    /// `None` only when no read was seen at all.
+    pub min_seq_len: Option<u32>,
     pub max_seq_len: u32,
     pub total_reads: u64,
     pub temp_dir: PathBuf,
@@ -96,6 +99,7 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
     let mut no_call = 0u64;
     let mut no_call_r1 = 0u64;
     let mut no_call_r2 = 0u64;
+    let mut min_seq_len: Option<u32> = None;
     let mut max_seq_len = 0u32;
     let mut total_reads = 0u64;
 
@@ -133,12 +137,18 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
                 no_call: nc,
                 no_call_r1: nc1,
                 no_call_r2: nc2,
+                min_seq_len: mn,
                 max_seq_len: m,
                 n_reads: n,
             } => {
                 if m > max_seq_len {
                     max_seq_len = m;
                 }
+                min_seq_len = match (min_seq_len, mn) {
+                    (None, x) => x,
+                    (a, None) => a,
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                };
                 total_reads += n;
                 no_call += nc;
                 no_call_r1 += nc1;
@@ -188,6 +198,7 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
         no_call,
         no_call_r1,
         no_call_r2,
+        min_seq_len,
         max_seq_len,
         total_reads,
         temp_dir,
@@ -221,6 +232,7 @@ mod tests {
             no_call: 0,
             no_call_r1: 0,
             no_call_r2: 0,
+            min_seq_len: Some(max_seq_len),
             max_seq_len,
             n_reads,
         }
