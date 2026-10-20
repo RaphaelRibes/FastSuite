@@ -14,7 +14,7 @@ production-ready** (see the README banner).
 | tool | version | tests | state | next plan |
 |---|---|---|---|---|
 | fastdedup | 1.3.0 | 104 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
-| fastprep | 0.2.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
+| fastprep | 0.3.0 | 131 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
 | fastsim | 0.1.0 | 66 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`), and **all four (plane × artefact) pairs deconvolved on the consumer side** (`7631292`, the g_frac fix order's step 1(b)) — DRR083326's R1 terminal moved 0.5292 → 0.4140 against a real 0.4245. The insert ceiling (`2L − 12 = 288 bp`) is now stated in `--help` too | — |
 | fastmaps | 0.1.0 | 45 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads`; **previews streamed instead of held resident** (`90573ea`: defaults 202.6 → 141.2 MB, `--buffer-mb 8` 100.5 → 36.1 MB, outputs verified byte-identical) | — |
 | fastcheck | 0.1.0 | 126 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), **per-tile quality modules** (`--tiles`, opt-in, `93ed54a`), harness green | `plans/2026-10-12_fastcheck-exactness.md` — **tasks 5–14 all landed**; the ground-truth recovery claim is a gate now, not a session: `pixi run ground-truth` |
@@ -173,6 +173,72 @@ on real 3′-biased libraries. That is the 54.6% → 46.4% drop above. Do not re
 "the fitter is fixed" as a settled claim: it is better at the metric it was
 tuned against and worse at the one the loop scores. See
 `docs/CLOSED-LOOP-RERUN.md` §3.
+
+## Fixed in the 2026-10-21 review round (full-suite review: six crates + six papers)
+
+Every item below was reproduced on the release binary before the fix and re-run
+after it. The row-level findings are in
+`~/.hermes/skills/bioinformatics/fastsuite/references/review-2026-10-21.md`.
+
+* **fastsim's ground truth contradicted itself.** `full_flag` was set per pair
+  (either mate full) while the doc said "the pair is entirely artefact", so an
+  R2-only full read marked a valid R1 `drop` (6.7% of rows on an R2-head-150
+  profile). The GT now carries `r1_full`/`r2_full`, and `full_flag` is the AND
+  of the two. The `rN` columns count the instrument's no-call overlay only; the
+  no-adapter `N` filler is published as `adapter_pad_bases`. `is_dup=1` always
+  has an earlier byte-identical record (the empty pool used to flag pair 0).
+  `profile.gc` is now the authority for random DNA (`--gc` overrides it; a
+  gc=0.30 profile used to emit 0.499). An empty `adapter.seq` is a no-adapter
+  run instead of a modulo panic, and `--single` names no R2 and counts one read
+  per pair. FASTQ golden pins are unchanged; the GT pin was re-based.
+* **fastdedup's guards were bypassable and its PE writer mixed formats.**
+  `-o ./x -p x` passed the string comparison and interleaved two writers into
+  one mangled file (exit 0); formats are now compared on resolved paths, PE
+  parallel refuses mismatched mate formats like the serial path, and a 0-byte
+  output resumes (the documented crash-recovery case used to abort). Paired
+  metrics gained `pairs_in`/`pairs_out`; the abundance temp file is removed on
+  failure paths; `-j 0` reports the resolved thread count.
+* **fastprep's adapter prefilter missed real matches.** The sound-k predicate is
+  not monotone (false again at k=21,22,23,26,27,31 at eps=0.2), so a 21 bp
+  TruSeq prefix with 5 mismatches was never examined (0 trimmed, 121 bp
+  emitted, exit 0). The bound is now the monotone-safe `ms_safe` and the
+  mismatch tolerance floors instead of ceilings. The dedup anchor no longer
+  degenerates to the full read at shipped defaults, the report carries
+  `assumptions` and `phred_offset` (D-6), the `--min-len` floor keeps a
+  readthrough read instead of dropping it, the metadata viewer knows cause 8,
+  and singleton salvage no longer trips the total-drop refusal. The inert
+  `-C target-cpu=native` config and its AVX2 comments are gone.
+* **fastcheck measured inserts short.** The overlap search took the leftmost
+  anchor a 3-mismatch tolerance admits; on an exact 120 bp library 13.7% of
+  pairs measured 1-10 bp short (mean 119.53, sd 1.22). It now searches from the
+  largest overlap, so the fixture measures 120.0 with sd 0.0. `--only kmer`
+  shares the fused rolling register (it was 2.6x slower than running everything),
+  a truncated mate file is refused rather than silently rescaled, `.1/.2` SRA
+  mate suffixes are accepted, `--overrep-mode second-pass` refuses stdin,
+  `kmer_top_frac`/`base_composition` have documented denominators, and the
+  fingerprint test pins the constant it claims to.
+* **fastmaps' `--json` wrote the grid, not the report.** The v1 report now goes
+  to `--json`'s PATH and the grid stays in `-o/heatmap.json`; the wrapper names
+  the real grid file. A 1 bp read no longer underflows the corner window
+  (`polyA_frac 1` for an all-T read, exit 0), qual!=seq is a refusal instead of
+  an exit-101 panic, the output plane refuses a size that would OOM instead of
+  silently allocating 3.8 GB, `--json` inside a fresh `-o` works, and the
+  clobber guard covers reports outside `-o`.
+* **fasthelper lost sample identity and could not run its own advertised chain.**
+  Reports carry the sample name instead of re-deriving it from the filename
+  (`fastcheck.json` used to resolve to sample "fastcheck"), `fastsim` works as a
+  chain step (step-private prefix; its FASTQs become the next step's input), a
+  step that exits 0 without writing its `--json` fails the run, `--from` is
+  validated, the simulated control's name joins the duplicate check,
+  `assumptions` and fastmaps' length scalars reach the aggregate, HTML/MD cells
+  are escaped, and `-j` reaches every child (fastprep resolves the 0 sentinel).
+
+Known open after this round: fastcheck's insert estimator is still a heuristic
+about paired geometry (the fix removes the systematic bias, not the tail);
+fastprep's clippy debt (~70 warnings) is reduced but not zero; the campaign TSVs
+were produced with the pre-2026-10-21 GT (`full_flag` semantics changed), so
+per-dataset reproduction of the closed loop needs a re-run before the numbers are
+quoted against this build.
 
 ## Fixed in the 2026-10-20 review round (five commits, `a70e510..b0dc9a1`)
 

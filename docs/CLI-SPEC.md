@@ -39,7 +39,8 @@ Rules:
    **Exception: `fastmaps` is file-only**, by design — taking *many* files and
    classifying R1/R2 by name is its job, and a stream has no name. It is the
    one tool where a pipe would remove information rather than save I/O.
-1. **No positional inputs** except tools whose job is many files (`fastmaps`).
+1. **No positional inputs** except tools whose job is many files (`fastmaps`,
+   and `fastcheck`, whose input is a whole-library QC scan).
 2. Short flags are a scarce resource: `-1 -2 -o -p -j -q -v -f -V -h` are the
    suite's; anything else a tool uses for its own options (`fastdedup -t`
    threshold, `-H` hash, `-P` read length) stays tool-local.
@@ -116,9 +117,9 @@ Legend: **✓** already conforms · **+** added in this reorganisation ·
 | `-o` | + | short for `--output-dir` |
 | positional `FILE...` | ✓ | deliberate: many inputs is the tool's job |
 | `--temp-dir` | ✓ | per-row spill directory |
-| `--json` | gap | writes `heatmap.json` into `-o`; no path control |
-| `-j --threads` | gap | worker count not exposed |
-| `--force` / `-q` | gap | — |
+| `--json` | ✓ | writes the `fastsuite.report.v1` report at PATH; the grid stays in `-o/heatmap.json` |
+| `-j --threads` | ✓ | worker count; `0` = all cores |
+| `--force` / `-q` | ✓ | clobber guard and quiet mode |
 | tool-local | `--corners`, `--preview-reads`, `--buffer-mb`, `--svg`, `--r1-pattern`, `--r2-pattern` | |
 
 ## 3. Composition rules
@@ -138,15 +139,15 @@ deduplication rate is reported by the tool that owns the fingerprint table.
 
 Ordered by user-visible value:
 
-1. `--json` wrapper (`fastsuite.report.v1`) for **fastprep** — today it emits the
-   legacy stats object; `fasthelper` adapts it, but new consumers should not
-   have to.
+1. ~~`--json` wrapper (`fastsuite.report.v1`) for **fastprep**.~~ **Done** — it
+   emits v1 with the raw stats under `legacy`.
 2. ~~`--force` + `--dry-run` in **fastprep**.~~ **Done 2026-10-12** (per-tool
    commits; `--force`/`-f`, `--dry-run`).
-3. `--json <PATH>` and `-j/--threads` in **fastmaps**.
-4. `--threads 0 = all cores` in **fastprep** and **fastmaps**.
-5. ~~`--quiet` in **fastprep**/**fastmaps**.~~ fastprep done 2026-10-12
-   (`-q`/`--quiet`); **fastmaps** still to do.
+3. ~~`--json <PATH>` and `-j/--threads` in **fastmaps**.~~ **Done** (2026-10-21:
+   `--json` writes the v1 report at PATH; the grid stays in `-o`).
+4. `--threads 0 = all cores` in **fastprep** — fastprep documents `>= 1` and
+   refuses 0; `fasthelper` resolves the sentinel for it.
+5. ~~`--quiet` in **fastprep**/**fastmaps**.~~ **Done** (fastmaps gained `-q`).
 6. `FASTSUITE_THREADS` honoured as a default by all four binaries. **fastsim
    done 2026-10-12** (read when `-j` is absent; the value is reported-and-ignored
    because the simulator is single-threaded); fastprep/fastmaps/fastdedup to do.

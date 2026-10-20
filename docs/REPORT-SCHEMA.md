@@ -64,7 +64,8 @@ fasthelper schema
 | `fastdedup` | native v1 | `--json report.json` |
 | `fastsim` | native v1 | synthetic control: pairs, artefact/duplicate/must-drop rates |
 | `fastprep` | native v1 | `--json report.json`; the raw stats object is preserved under `legacy` for one release |
-| `fastmaps` | **legacy** | emits `heatmap.json` (grid + `counts[_r1/_r2]`); adapter derives the corner fractions |
+| `fastmaps` | native v1 | `--json report.json` writes the v1 wrapper at PATH; the grid stays at `<output-dir>/heatmap.json`, where the legacy adapter still finds it |
+| `fastcheck` | native v1 | `--json report.json`; carries `assumptions` and the profile/fit blocks |
 
 ## Legacy adapter (what fasthelper accepts and derives)
 
@@ -121,6 +122,23 @@ Ground-truth check of the adapter (10 reads: 5 random, 3 polyT, 2 polyG) gives
 polyG reads are the only off-diagonal mass, the three polyT reads sit on the
 diagonal at (150,150). Reproduce with `examples/demo.sh`.
 
+## Assumptions (D-6)
+
+Every run states what it had to assume instead of measuring, as data rather
+than a stderr aside:
+
+```json
+"assumptions": [{"what": "quality offset", "value": "phred+33 assumed",
+                 "basis": "no explicit --phred-offset and no census that excludes +64",
+                 "consequence": "a +64 library would read ~31 Q high"}]
+```
+
+The array is empty when nothing was assumed. `fastcheck` populates it from its
+base/quality census; `fastprep` populates it for the Phred offset (and records
+`phred_offset` in `metrics`). `fasthelper` carries the block into the aggregate
+as notes on the report row, so a published table cannot silently drop the
+caveat.
+
 ## Aggregate report (fasthelper output)
 
 `fasthelper concatenate` (alias `report`) / `fasthelper run` write:
@@ -133,10 +151,13 @@ diagonal at (150,150). Reproduce with `examples/demo.sh`.
 | `report.html` | self-contained page (no scripts, no external assets), inline bars on rate metrics |
 | `manifest.json` | only for `run`: run config, resolved binaries, every argv, exit code, wall time, log path, failures |
 
-Sample naming: a report file's stem is the sample name, unless the stem is a
-generic report name (`heatmap`, `fastprep`, `report`, …) — then the nearest
-non-generic parent directory is used. So
-`runs/demo/E94/maps/heatmap.json` is correctly attributed to `E94`.
+Sample naming: `fasthelper run` records each report together with the sample it
+belongs to (the run already knows the name), so a report can never be
+misattributed. `fasthelper concatenate` on loose files still derives the name
+from the path: the file's stem, unless it is a generic report name
+(`heatmap`, `fastcheck`, `fastprep`, `report`, …) — then the nearest non-generic
+parent directory is used. So `runs/demo/E94/maps/heatmap.json` is attributed to
+`E94`, and a QC-only run attributes `alpha/fastcheck.json` to `alpha`.
 
 ## fastcheck rich report (v1, additive)
 
