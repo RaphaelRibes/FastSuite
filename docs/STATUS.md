@@ -20,9 +20,10 @@ production-ready** (see the README banner).
 | fastcheck | 0.1.0 | 126 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), **per-tile quality modules** (`--tiles`, opt-in, `93ed54a`), harness green | `plans/2026-10-12_fastcheck-exactness.md` — **tasks 5–14 all landed**; the ground-truth recovery claim is a gate now, not a session: `pixi run ground-truth` |
 | fasthelper | 0.1.0 | 36 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — **every item is landed** (`run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on`, `-P/--jobs`, `install --prefix`, and `--from`/resume, which `runner.rs` implements via the per-step `ResumeEntry` re-run rule) |
 
-**508 cargo tests, 0 failures**, plus the **pathology corpus: 9 assertions
-passed, 0 failed**. Note that `scripts/test.sh` counts the pathology suite as one
-aggregate line, so its own `GRAND` reads **509** (508 + the one aggregate line);
+**679 cargo tests, 0 failures** (143/122/187/89/77/60), plus the **pathology
+corpus: 9 assertions passed, 0 failed**. Note that `scripts/test.sh` counts the
+pathology suite as one aggregate line, so its own `GRAND` reads **680**
+(679 + the one aggregate line);
 the 9 is the number of individual assertions inside it. `pixi run ci` asserts
 every per-tool count against `scripts/expected-test-counts.txt` and refuses a
 rustc outside the pinned `>=1.99,<2`; **run it after any change** (the laptop's
@@ -173,6 +174,54 @@ on real 3′-biased libraries. That is the 54.6% → 46.4% drop above. Do not re
 tuned against and worse at the one the loop scores. See
 `docs/CLOSED-LOOP-RERUN.md` §3.
 
+## Fixed in the 2026-10-20 review round (five commits, `a70e510..b0dc9a1`)
+
+Each of these was reproduced on the built binary before the fix and re-run after
+it; the commands and the before/after output are in
+`~/.hermes/skills/bioinformatics/fastsuite/references/review-2026-10-20.md`.
+
+* **fastdedup decoded only the first gzip member on the parallel path** — a
+  200-member (BGZF-shaped) file of 20 000 reads gave 100 reads at `-j 4`, exit 0.
+  Now `-j 1/4/8` all give 20 000. `--abundance` refuses an existing output, and
+  `-o` == `-p` is refused. (`a70e510`)
+* **fastcheck's `--profile` took `read_len` from the longest read** — 1000x151 bp
+  + 1x300 bp produced a 300 bp profile, and the guard was keyed on a quantity
+  that could not catch it. Now the mode, with a fit warning naming the outliers.
+  The HTML insert table divided by the `--insert-pairs` cap (2000 pairs rendered
+  as "20000", buckets summing to 20%); now the sampled count, buckets sum to
+  100%. `--reads N --html` no longer claims "no read was skipped", and
+  `scan_pair` checks mate headers instead of trusting ordinal pairing. (`3470a0b`)
+* **fasthelper's aggregate ingested every `*.json` under the outdir** — a
+  `[dedup,prep]` run into a directory that had held `fastmaps` re-published the
+  fastmaps row. It now ingests only the paths this run's manifest records.
+  Resume ignores the recorded exit code and could chain a crashed step's
+  truncated output forward; it now requires exit 0 plus output signatures.
+  `run` gained `--force` (the documented chain could not be re-run), unknown
+  steps are refused like `check` refuses them, the tool precondition is derived
+  from the enabled steps, and `--dry-run` no longer overwrites a real manifest.
+  (`023cf9a`)
+* **fastmaps' corner fractions are length-biased** — the window is anchored to
+  `max_seq_len`, so adding one 200 bp read to ten 150 bp all-T reads took
+  `polyT_frac` from 1.0 to 0.0 with no diagnostic. The grid and the wrapper now
+  publish `min_seq_len`/`max_seq_len`/`corner_window` and warn when the spread
+  exceeds the window. The corner definition is unchanged, deliberately: a
+  length-relative plane is a design change, not a fix. clippy also builds the
+  crate now (two `erasing_op` errors in a test had left it with no lint gate).
+  (`7e05c5c`)
+* **fastprep asserted Phred+64 from a preponderance of high bytes** — a Phred+33
+  library at Q43 was read as +64, shifted down 31 and emptied by `--mean-q 25`
+  (5000/5000 reads, exit 0), and `--phred-offset 33` was silently overridden
+  because `--auto-phred` ships on. Now the auto path never asserts (+33, with
+  `--phred-offset 64` for legacy data), an explicit offset disables detection,
+  and a run that keeps nothing exits non-zero (`--allow-total-drop` opts out).
+  `--min-len` now also filters: an absolute floor above the read length drops the
+  read instead of being clamped to a no-op. (`24ac984`)
+
+**Consequences for the campaign numbers.** The `--min-len` change alters integer
+floors only (`30`, `50` on short-read datasets); the shipped `0.9L` rows behave as
+before, and the shipped-default trim-accuracy rows are unaffected. The grid should
+still be re-derived before the sweep numbers are quoted again.
+
 ## Known defects (measured, not guessed)
 
 1. **metagenomics closed-loop pass rate is 5.9% and has not moved across any
@@ -268,6 +317,21 @@ tuned against and worse at the one the loop scores. See
    committed `fastsuite.def` carries `Pixitainer_Version 0.9.0` while the
    installed tool now reports 1.0.0, and `pixi.toml`'s `test` task comment
    still says "397 tests".
+
+New and open after the review round:
+
+* **fastsim ignores `profile.gc`** (`main.rs:221` uses `--gc`): a profile with
+  `gc=0.30` emits GC 0.4881. Measured, open.
+* **fastprep's `--adapter-error-rate` rounds the mismatch tolerance UP**
+  (`ceil(k*eps)`), so 0.2 admits 3/14 = 21.4% at the shipped overlap. Switching
+  to `floor` perturbs the pigeonhole seed-width bound and the differential test
+  catches the prefilter missing a real short-overlap adapter — it needs its own
+  test-first round, not a one-line edit. Open, deliberately.
+* **`winners.tsv` and `fastp-comparison.tsv` disagree on the winning config for
+  93 of the 101 datasets they share** (11 vs 16 distinct configs). Reconcile
+  before quoting any sweep winner.
+* The clone-vs-laptop checkouts differ (`6945219` before this round, desktop
+  `57f3140`): run `fastsuite-local-artifacts/sync-fastsuite.sh` from the laptop.
 
 New and open (not defects of a measured component, but unresolved):
 
