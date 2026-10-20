@@ -246,7 +246,9 @@ fn per_position_mean_q(acc: &Accum, offset: u8) -> Vec<f64> {
             let sum: f64 = row
                 .iter()
                 .enumerate()
-                .map(|(b, &c)| ((b as i64 - offset as i64).max(0) as f64) * c as f64)
+                // The row is indexed by `byte - 33` (128 cells): recover the byte first,
+                // then the Phred value, exactly as the report does.
+                .map(|(b, &c)| ((b + crate::accum::QMIN as usize) as i64 - offset as i64).max(0) as f64 * c as f64)
                 .sum();
             sum / depth as f64
         })

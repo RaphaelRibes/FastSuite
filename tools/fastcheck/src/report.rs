@@ -6,7 +6,7 @@ use crate::rich;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::accum::{quantile, Accum, OffsetVerdict, QBINS};
+use crate::accum::{quantile, Accum, OffsetVerdict, QBYTES, QBINS};
 use crate::cli::Modules;
 use crate::reader::ScanResult;
 
@@ -86,13 +86,17 @@ pub(crate) fn hist_json(hist: &[u64]) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
-fn byte_range(census: &[u64; QBINS]) -> (u64, u64) {
-    let min = (0..QBINS).find(|&b| census[b] > 0).unwrap_or(0) as u64;
-    let max = (0..QBINS).rev().find(|&b| census[b] > 0).unwrap_or(0) as u64;
+fn byte_range(census: &[u64; QBYTES]) -> (u64, u64) {
+    let min = (0..QBYTES).find(|&b| census[b] > 0).unwrap_or(0) as u64;
+    let max = (0..QBYTES).rev().find(|&b| census[b] > 0).unwrap_or(0) as u64;
     (min, max)
 }
 
 /// Per-position quality summary from the exact histogram at that position.
+///
+/// The row is indexed by `byte - 33` (128 cells), so the byte is recovered before the
+/// Phred offset is applied. A valid FASTQ can only land in those cells, which is why
+/// this is the same mean and the same q10/q50/q90 it always was.
 pub(crate) fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) {
     let depth: u64 = row.iter().sum();
     if depth == 0 {
@@ -102,7 +106,7 @@ pub(crate) fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) 
     let mut q = vec![0u64; QBINS];
     let mut sum = 0.0;
     for (b, &c) in row.iter().enumerate() {
-        let phred = (b as i64 - offset as i64).max(0) as usize;
+        let phred = ((b + crate::accum::QMIN as usize) as i64 - offset as i64).max(0) as usize;
         let phred = phred.min(QBINS - 1);
         q[phred] += c;
         sum += phred as f64 * c as f64;
@@ -171,6 +175,10 @@ pub fn write_report(
     processed: Option<&Accum>,
     overrep: crate::overrep::OverrepMode,
     overrep_min_count: u32,
+    // The resolved `-j` thread count: the overrep second pass re-reads the files and
+    // builds its BGZF inflate pool from it, so the one mode that pays a second read does
+    // not pay it with one thread because a literal said so.
+    threads: usize,
     adapter_content: Option<(&crate::adapter_pos::AdapterPos, f64, usize)>,
     modules: Option<&Modules>,
     tile: Option<&crate::tile::TileQual>,
@@ -226,6 +234,13 @@ pub fn write_report(
     if verdict.malformed {
         notes.push(format!(
             "quality bytes below 33 observed (min {byte_min}): the file is not valid Phred+33"
+        ));
+    }
+    if total.qual_out_of_range > 0 {
+        notes.push(format!(
+            "{} quality bytes outside 33..=126 are in the byte census but excluded from the \
+             per-position quality rows, which are indexed by byte - 33",
+            total.qual_out_of_range
         ));
     }
     if total.reads_over_max_len > 0 {
@@ -366,7 +381,7 @@ pub fn write_report(
         "base_position": base_position_json(total),
         "polyx": polyx_block,
         "repeated_sequences": rep_block,
-        "overrep": crate::overrep::report(overrep, total, &files_paths(files), 1, overrep_min_count)?,
+        "overrep": crate::overrep::report(overrep, total, &files_paths(files), threads.max(1), overrep_min_count)?,
         "kmer_spectrum": kmer_block,
         "heatmap": hm_block,
         "processed": match processed {

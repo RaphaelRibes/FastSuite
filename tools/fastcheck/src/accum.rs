@@ -16,14 +16,62 @@
 //!
 //! Sizing at R = 150, per file:
 //!   base_pos  R x 5 x 8 B   = 6 KB
-//!   qual_pos  R x 256 x 8 B = 307 KB
-//! `qual_pos` is indexed by the raw quality byte rather than by Phred, so the
-//! accumulator never needs to know the encoding: the offset is decided once,
-//! at report time, from the exact byte census. A run therefore cannot be
-//! silently wrong about +33/+64.
+//!   qual_pos  R x 128 x 8 B = 154 KB
+//! `qual_pos` is indexed by the raw quality byte (`byte - 33`) rather than by
+//! Phred, so the accumulator never needs to know the encoding: the offset is
+//! decided once, at report time, from the exact byte census. A run therefore
+//! cannot be silently wrong about +33/+64.
+//!
+//! The plane is 128 cells wide because the only bytes a Phred quality can be are
+//! 33..=126 — `byte - 33` is the cell. The census below is still 256 bytes wide:
+//! it is what proves +33 vs +64 and what reports the byte range, so a byte
+//! outside 33..=126 must be *counted* there even though it is excluded from the
+//! per-position rows (FC-8). That exclusion is the only place where a malformed
+//! file and a valid one can report different per-position quality.
 
 pub const NT: usize = 5; // A, C, G, T, other/N
-pub const QBINS: usize = 256;
+/// Width of the exact quality-byte census: one cell per possible byte.
+pub const QBYTES: usize = 256;
+/// Lowest and highest byte a Phred quality can be (Phred+33, Q0..Q93).
+pub const QMIN: u8 = 33;
+pub const QMAX: u8 = 126;
+/// Cells in a per-position quality row: indexed by `byte - QMIN`, so only 94 of them
+/// can ever be touched (33..=126). The row is padded to 128 cells so it stays a power
+/// of two — 1 024 B, 16 cache lines — which is half the 2 048 B the 256-cell row cost.
+pub const QBINS: usize = 128;
+
+/// The per-position quality cell for a raw byte, or `None` when the byte is not a
+/// Phred quality at all (it goes to the census, not to the rows).
+#[inline]
+pub fn qbin(b: u8) -> Option<usize> {
+    if b >= QMIN && b <= QMAX {
+        Some((b - QMIN) as usize)
+    } else {
+        None
+    }
+}
+
+/// 256-entry base LUT: A=0 C=1 G=2 T=3 (either case), N and every other IUPAC code 4.
+/// One table lookup replaces the `to_ascii_uppercase()` + five-arm match the loop used
+/// to run per base, per pass.
+pub const BASE_CODE: [u8; 256] = {
+    let mut t = [4u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = match i as u8 {
+            b'A' | b'a' => 0,
+            b'C' | b'c' => 1,
+            b'G' | b'g' => 2,
+            b'T' | b't' => 3,
+            _ => 4,
+        };
+        i += 1;
+    }
+    t
+};
+
+/// The 12-mer rolling register's mask: 12 bases x 2 bits.
+const KMER_MASK: u32 = (1 << (2 * repeated::KMER_K)) - 1;
 
 fn grow<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
     if v.len() < n {
@@ -31,14 +79,15 @@ fn grow<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
     }
 }
 
-// [u64; 256] has no `Default`, so rows are grown with an explicit literal.
+// [u64; QBINS] has no `Default`, so rows are grown with an explicit literal.
 const QUAL_ROW: [u64; QBINS] = [0; QBINS];
 
 
 use crate::heatmap;
 use crate::polyx;
 use crate::repeated;
-use crate::repeated::RepeatedCounter;
+use crate::repeated::KmerTable;
+
 #[derive(Clone)]
 pub struct Accum {
     /// Position rows are grown to the longest read seen; reads longer than
@@ -68,12 +117,16 @@ pub struct Accum {
     /// floor(raw byte mean) of each read -> count. For an integer offset `k`,
     /// `floor(x) - k == floor(x - k)`, so the Phred offset is applied at report
     /// time without touching the data again.
-    pub meanq_raw_hist: [u64; QBINS],
+    pub meanq_raw_hist: [u64; QBYTES],
     /// Exact census of quality bytes; this is what decides +33 vs +64.
-    pub qual_byte: [u64; QBINS],
+    pub qual_byte: [u64; QBYTES],
+    /// Quality bytes outside `33..=126`: counted here, in the census, and NOT folded
+    /// into the per-position rows (which are indexed by `byte - 33`). Zero on a valid
+    /// FASTQ, and the report says so only when it is not.
+    pub qual_out_of_range: u64,
     /// `base_pos[pos][code]`, position-major.
     pub base_pos: Vec<[u64; NT]>,
-    /// `qual_pos[pos][byte]`, position-major.
+    /// `qual_pos[pos][byte - 33]`, position-major; 128 cells, 33..=126.
     pub qual_pos: Vec<[u64; QBINS]>,
     /// Adapter-prefix hits per catalogue entry (TruSeq, Nextera), and the G+C of
     /// the adapter-free reads with the 5' G-run stripped. Both feed the fitter's
@@ -103,8 +156,9 @@ pub struct Accum {
     /// ignored (stated in the report). This is the baseline every --overrep-mode builds on
     /// (PLAN-QC §5.9): it gives the exact multiplicity histogram with no sequence text.
     pub seq_counts: crate::fingerprint::FingerprintTable,
-    /// Bounded 12-mer counter (packed u64 keys).
-    pub kmer_counts: RepeatedCounter<u64>,
+    /// Exact 12-mer counter: a dense 4^12 `u16` table plus an exact width-overflow map
+    /// (`crate::repeated::KmerTable`). No cap, no eviction, no approximation.
+    pub kmer_counts: KmerTable,
     /// 2-bit packed sequence table, filled only in `--overrep-mode table` (the memory is
     /// real: ~46 B per unique 150 bp read, admission-checked in main.rs).
     pub overrep_table: crate::overrep::SequenceTable,
@@ -124,13 +178,81 @@ pub const ADAPTER_PREFIXES: [(&str, &str); 2] =
     [("TruSeq", "AGATCGGAAGAGC"), ("Nextera", "CTGTCTCTTATA")];
 
 /// Case-insensitive substring search (the adapter prefix in a read).
-fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || hay.len() < needle.len() {
+///
+/// Word-at-a-time prefilter, no dependency: eight candidate start offsets are tested
+/// per `u64` load by folding the haystack word and the needle's first byte with
+/// `& 0xDF` and looking for a zero byte (`x - 0x0101..` & `!x` & `0x8080..`). The
+/// 13-byte pattern is then compared — still folded, word at a time — only at the
+/// candidates, and confirmed byte-exactly with `to_ascii_uppercase`.
+///
+/// `& 0xDF` is a *superset* of case-insensitive equality: `'@'` and ``'`'`` fold
+/// together without being the same letter case, so a folded match is a candidate, never
+/// an answer. Folded *inequality* is conclusive, which is what makes the reject cheap:
+/// the 2 x 138 x 13 `to_ascii_uppercase` calls the window scan performed per read
+/// become ~19 `u64` loads plus one exact verification at each real candidate.
+pub(crate) fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    const FOLD: u64 = 0xDFDF_DFDF_DFDF_DFDF;
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let n = needle.len();
+    if n == 0 || hay.len() < n {
         return false;
     }
-    hay.windows(needle.len()).any(|w| {
-        w.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
-    })
+    #[inline]
+    fn word(s: &[u8]) -> u64 {
+        u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+    }
+    // Reject fast on folded words, then confirm exactly. Only ever called at a
+    // candidate, so its cost is paid once per genuine first-byte match.
+    #[inline]
+    fn verify(h: &[u8], needle: &[u8]) -> bool {
+        let n = needle.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            if (word(&h[i..]) & FOLD) != (word(&needle[i..]) & FOLD) {
+                return false;
+            }
+            i += 8;
+        }
+        while i < n {
+            if (h[i] & 0xDF) != (needle[i] & 0xDF) {
+                return false;
+            }
+            i += 1;
+        }
+        h.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+    }
+
+    let first = (needle[0] & 0xDF) as u64 * ONES;
+    let last = hay.len() - n;
+    let mut i = 0usize;
+    while i <= last {
+        if last - i + 1 >= 8 {
+            // Eight candidate starts in one load; the lanes are all <= `last` because
+            // eight candidates remain, so a match here is a legal window.
+            let x = (word(&hay[i..]) & FOLD) ^ first;
+            let z = x.wrapping_sub(ONES) & !x & HIGH;
+            if z == 0 {
+                i += 8;
+                continue;
+            }
+            let mut bits = z;
+            while bits != 0 {
+                let lane = (bits.trailing_zeros() / 8) as usize;
+                if verify(&hay[i + lane..], needle) {
+                    return true;
+                }
+                bits &= bits - 1;
+            }
+            i += 8;
+        } else {
+            if (hay[i] & 0xDF) == (needle[0] & 0xDF) && verify(&hay[i..], needle) {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
 }
 
 impl Accum {
@@ -147,8 +269,9 @@ impl Accum {
             len_hist: Vec::new(),
             acgt_hist: Vec::new(),
             gc_hist: Vec::new(),
-            meanq_raw_hist: [0; QBINS],
-            qual_byte: [0; QBINS],
+            meanq_raw_hist: [0; QBYTES],
+            qual_byte: [0; QBYTES],
+            qual_out_of_range: 0,
             base_pos: Vec::new(),
             qual_pos: Vec::new(),
             adapter_hits: [0; 2],
@@ -161,7 +284,7 @@ impl Accum {
             run_q_tail: (0, 0),
             heatmap: vec![0; heatmap::SIZE * heatmap::SIZE],
             seq_counts: crate::fingerprint::FingerprintTable::with_capacity(1024),
-            kmer_counts: RepeatedCounter::new(repeated::DEFAULT_CAP),
+            kmer_counts: KmerTable::new(),
             overrep_table: crate::overrep::SequenceTable::default(),
             track_overrep_table: false,
             adapter_pos: None,
@@ -177,7 +300,8 @@ impl Accum {
             + self.qual_pos.len() * std::mem::size_of::<[u64; QBINS]>()
             + (self.len_hist.len() + self.acgt_hist.len() + self.gc_hist.len()) * 8
             + self.n_run_hist.len() * 8
-            + 2 * QBINS * 8
+            + 2 * QBYTES * 8
+            + self.kmer_counts.resident_bytes()
     }
 
     /// Record one ambiguous run `[start, end)` of a read of length `read_len`.
@@ -193,8 +317,22 @@ impl Accum {
         }
     }
 
-    /// One record. `header` carries the tile coordinates for `--tiles`; `seq` and `qual`
-    /// must have equal length (the scanner enforces it: a mismatch is an error, not an
+    /// One record, in one pass over the sequence.
+    ///
+    /// Every per-base consumer reads the same decoded base: the composition cell and
+    /// the N-run state machine, the heatmap's `(x = #(T+C), y = #(T+G))`, the rolling
+    /// 12-mer register, and the fragment start the `--profile` fit needs. Before this
+    /// the sequence was walked four times (composition, heatmap, xxh3, 12-mer windows)
+    /// and the 12-mer loop decoded each base 11.1x; now it is decoded once through the
+    /// 256-entry [`BASE_CODE`] LUT.
+    ///
+    /// The N-run state machine and the polyX measurement are unchanged: a run is
+    /// `record_n_run`ed where it ends, exactly as before, and `polyx::measure_polyx`
+    /// is still its own read (it breaks at the first transition, so it costs 2–3 byte
+    /// compares per read, not per base).
+    ///
+    /// `header` carries the tile coordinates for `--tiles`; `seq` and `qual` must have
+    /// equal length (the scanner enforces it: a mismatch is an error, not an
     /// assumption).
     pub fn observe(&mut self, header: &[u8], seq: &[u8], qual: &[u8]) {
         let len = seq.len();
@@ -215,32 +353,57 @@ impl Accum {
         let (mut acgt, mut gc, mut has_n) = (0u64, 0u64, false);
         let mut run_start: usize = 0; // first base of the ambiguous run in progress
         let mut in_run = false;
+        // Heatmap counters: x = #(T+C), y = #(T+G), capped at the grid edge at the end
+        // (`heatmap::encode`'s own rule, so both paths agree on a saturating read).
+        let (mut hx, mut hy) = (0u64, 0u64);
+        // Rolling 12-mer: 24 bits of 2-bit codes, and how many consecutive valid bases
+        // it holds. Any other code (N, IUPAC) resets the run, which is exactly
+        // `pack_kmer`'s "contains a non-ACGT base" rule.
+        let mut win: u32 = 0;
+        let mut valid: u32 = 0;
+        // First non-G base: the fragment start the profile fitter measures from.
+        let mut first_non_g: Option<usize> = None;
         for (i, &raw) in seq.iter().enumerate() {
-            let code = match raw.to_ascii_uppercase() {
-                b'A' => 0,
-                b'C' => 1,
-                b'G' => 2,
-                b'T' => 3,
-                _ => 4, // N and every other IUPAC code: counted, never folded into ACGT
-            };
+            let code = BASE_CODE[raw as usize];
+            win = ((win << 2) | code as u32) & KMER_MASK;
             if code == 4 {
+                valid = 0;
                 if !in_run {
                     in_run = true;
                     run_start = i;
                 }
                 has_n = true;
             } else {
+                valid = (valid + 1).min(repeated::KMER_K as u32);
                 if in_run {
                     self.record_n_run(run_start, i, len);
                     in_run = false;
                 }
                 acgt += 1;
-                if code == 1 || code == 2 {
-                    gc += 1;
+                match code {
+                    1 => {
+                        gc += 1;
+                        hx += 1;
+                    }
+                    2 => {
+                        gc += 1;
+                        hy += 1;
+                    }
+                    3 => {
+                        hx += 1;
+                        hy += 1;
+                    }
+                    _ => {}
                 }
             }
+            if first_non_g.is_none() && code != 2 {
+                first_non_g = Some(i);
+            }
             if i < per_pos {
-                self.base_pos[i][code] += 1;
+                self.base_pos[i][code as usize] += 1;
+            }
+            if valid == repeated::KMER_K as u32 {
+                self.kmer_counts.add(win);
             }
         }
         if in_run {
@@ -258,8 +421,14 @@ impl Accum {
         for (i, &q) in qual.iter().enumerate() {
             self.qual_byte[q as usize] += 1;
             qsum += q as u64;
-            if i < per_pos {
-                self.qual_pos[i][q as usize] += 1;
+            match qbin(q) {
+                Some(b) => {
+                    if i < per_pos {
+                        self.qual_pos[i][b] += 1;
+                    }
+                }
+                // Not a Phred byte: in the census above, never in a per-position row.
+                None => self.qual_out_of_range += 1,
             }
         }
         let raw_mean = if qual.is_empty() {
@@ -267,7 +436,7 @@ impl Accum {
         } else {
             (qsum / qual.len() as u64) as usize
         };
-        self.meanq_raw_hist[raw_mean.min(QBINS - 1)] += 1;
+        self.meanq_raw_hist[raw_mean.min(QBYTES - 1)] += 1;
 
         // Profile extras (only when a profile was requested): the adapter
         // readthrough rate and the FRAGMENT gc. Readthrough is the adapter
@@ -284,14 +453,13 @@ impl Accum {
                 }
             }
             if !hit {
-                let start = seq.iter().position(|&b| b.to_ascii_uppercase() != b'G').unwrap_or(seq.len());
-                for &b in &seq[start..] {
-                    match b.to_ascii_uppercase() {
-                        b'G' | b'C' => { self.frag_gc += 1; self.frag_bases += 1; }
-                        b'A' | b'T' => { self.frag_bases += 1; }
-                        _ => {}
-                    }
-                }
+                // The fragment starts at the first non-G base. Every base before it is a
+                // G, so it contributes exactly `lead` to both ACGT and GC: the fragment's
+                // counts are the read's own counts minus `lead`, with no second pass.
+                let lead = first_non_g.unwrap_or(len) as u64;
+                debug_assert!(lead <= gc && lead <= acgt);
+                self.frag_gc += gc - lead;
+                self.frag_bases += acgt - lead;
             }
         }
 
@@ -320,9 +488,11 @@ impl Accum {
             self.run_q_tail.1 += (qual.len() - start) as u64;
         }
 
-        // Heatmap cell.
-        let (hx, hy) = heatmap::encode(seq);
-        self.heatmap[heatmap::index(hx, hy)] += 1;
+        // Heatmap cell, from the counters the base loop already kept.
+        self.heatmap[heatmap::index(
+            (hx as usize).min(heatmap::SIZE - 1),
+            (hy as usize).min(heatmap::SIZE - 1),
+        )] += 1;
 
         // Duplication: every read is fingerprinted, exactly, with no sample and no cap.
         // The table starts at 1024 entries and grows (main.rs admission-checks the size it
@@ -348,13 +518,6 @@ impl Accum {
         // Per-tile quality: only when --tiles is on (the accumulator is Some).
         if let Some(t) = self.tile.as_mut() {
             t.observe(header, qual);
-        }
-        if seq.len() >= 12 {
-            for w in seq.windows(12) {
-                if let Some(pk) = repeated::pack_kmer(w) {
-                    self.kmer_counts.insert(pk);
-                }
-            }
         }
     }
 
@@ -385,9 +548,10 @@ impl Accum {
         }
         // The fingerprint table merges exactly, like every other accumulator here.
         self.seq_counts.merge(&o.seq_counts);
-        // The 12-mer counter merges under the same cap/singleton-eviction rule as the
-        // per-file one. Without this the merged accumulator carries an empty spectrum and
-        // every report says kmer_top_count 0 however over-represented the k-mers are.
+        // The 12-mer table merges exactly, cell by cell, with the width overflow carried
+        // through `hot`: the merged spectrum is the spectrum of the concatenated input.
+        // Without this the merged accumulator carries an empty spectrum and every report
+        // says kmer_top_count 0 however over-represented the k-mers are.
         self.kmer_counts.merge(&o.kmer_counts);
         match (self.adapter_pos.as_mut(), o.adapter_pos.as_ref()) {
             (Some(a), Some(b)) => a.merge(b),
@@ -411,10 +575,11 @@ impl Accum {
         add_hist(&mut self.len_hist, &o.len_hist);
         add_hist(&mut self.acgt_hist, &o.acgt_hist);
         add_hist(&mut self.gc_hist, &o.gc_hist);
-        for i in 0..QBINS {
+        for i in 0..QBYTES {
             self.meanq_raw_hist[i] += o.meanq_raw_hist[i];
             self.qual_byte[i] += o.qual_byte[i];
         }
+        self.qual_out_of_range += o.qual_out_of_range;
         grow(&mut self.base_pos, o.base_pos.len());
         for (i, row) in o.base_pos.iter().enumerate() {
             for (d, s) in self.base_pos[i].iter_mut().zip(row.iter()) {
@@ -435,7 +600,7 @@ impl Accum {
         self.base_pos.get(pos).map_or(0, |r| r[code])
     }
 
-    /// All 256 per-position quality bins for `pos`.
+    /// The 128 per-position quality cells for `pos`, indexed by `byte - 33`.
     pub fn qual_at(&self, pos: usize) -> [u64; QBINS] {
         self.qual_pos.get(pos).copied().unwrap_or(QUAL_ROW)
     }
@@ -492,8 +657,8 @@ pub struct OffsetVerdict {
 /// absence proves nothing: a +33 file whose lowest quality is Q31 also sits
 /// entirely above 64. In that case we report the ambiguity instead of
 /// asserting a guess, and `--phred-offset` settles it.
-pub fn offset_verdict(census: &[u64; QBINS], requested: Option<u8>) -> OffsetVerdict {
-    let min = (0..QBINS).find(|&b| census[b] > 0).map(|b| b as u8);
+pub fn offset_verdict(census: &[u64; QBYTES], requested: Option<u8>) -> OffsetVerdict {
+    let min = (0..QBYTES).find(|&b| census[b] > 0).map(|b| b as u8);
     let malformed = min.map_or(false, |m| m < 33);
 
     match requested {
@@ -607,7 +772,7 @@ mod tests {
 
     #[test]
     fn offset_stays_unasserted_when_ambiguous() {
-        let mut census = [0u64; QBINS];
+        let mut census = [0u64; QBYTES];
         census[70] = 5; // 'F' = Q37 under +33, Q6 under +64
         let v = offset_verdict(&census, None);
         assert_eq!(v.offset, 33, "default, but not claimed as certain");
@@ -617,7 +782,7 @@ mod tests {
         assert_eq!(v64.offset, 64);
         assert!(v64.certain);
         // Forcing +64 on a census that cannot be +64 is reported, not hidden.
-        let mut low = [0u64; QBINS];
+        let mut low = [0u64; QBYTES];
         low[33] = 1;
         let forced = offset_verdict(&low, Some(64));
         assert!(!forced.certain);
@@ -626,7 +791,7 @@ mod tests {
 
     #[test]
     fn malformed_quality_bytes_are_flagged() {
-        let mut census = [0u64; QBINS];
+        let mut census = [0u64; QBYTES];
         census[10] = 1;
         let v = offset_verdict(&census, None);
         assert!(v.malformed);
@@ -650,10 +815,55 @@ mod tests {
     fn per_position_quality_is_binned_by_byte() {
         let a = fixture();
         let row = a.qual_at(0);
-        assert_eq!(row[73], 1); // 'I'
-        assert_eq!(row[33], 1); // '!'
-        assert_eq!(row[53], 1); // '5'
+        assert_eq!(row[73 - 33], 1); // 'I' = 73 -> cell 40
+        assert_eq!(row[0], 1); // '!' = 33 -> cell 0
+        assert_eq!(row[53 - 33], 1); // '5' = 53 -> cell 20
         assert_eq!(a.covered_positions(), 4);
+    }
+
+    /// FC-8: the per-position plane is 128 cells, indexed by `byte - 33`, because the
+    /// only bytes a valid FASTQ can carry are 33..=126. A byte outside that range is
+    /// still in the exact byte census (which decides the offset and reports the range),
+    /// but it is not folded into a per-position row where it would silently shift the
+    /// position's mean and quantiles.
+    #[test]
+    fn per_position_quality_plane_covers_only_valid_phred_bytes() {
+        let mut a = Accum::new(8);
+        // One read per interesting byte, so every position carries the same quality and
+        // the row can be read cell by cell.
+        a.observe(b"@r", b"ACGT", &[33u8, 33, 33, 33]);
+        a.observe(b"@r", b"ACGT", &[73u8, 73, 73, 73]);
+        a.observe(b"@r", b"ACGT", &[126u8, 126, 126, 126]);
+        a.observe(b"@r", b"ACGT", &[200u8, 200, 200, 200]);
+        let row = a.qual_at(0);
+        assert_eq!(row.len(), 128, "the plane is 128 cells, not 256");
+        assert_eq!(row[0], 1, "'!' = 33 -> cell 0");
+        assert_eq!(row[73 - 33], 1, "'I' = 73 -> cell 40");
+        assert_eq!(row[126 - 33], 1, "the highest valid byte, 126, is the last used cell");
+        assert_eq!(row.iter().sum::<u64>(), 3, "byte 200 is not a per-position quality");
+        assert_eq!(a.qual_byte[200], 4, "but it is still in the exact byte census");
+        // The census, and therefore the offset verdict and the reported byte range, are
+        // untouched: a malformed file is still named as one.
+        let v = offset_verdict(&a.qual_byte, None);
+        assert!(v.certain, "byte 33 proves +33, exactly as before");
+        assert!(!v.malformed, "the malformed flag is about bytes BELOW 33");
+    }
+
+    /// FC-8, the other half: a byte above 126 is out of range for a Phred byte too, and
+    /// it is counted where the report can name it rather than dropped.
+    #[test]
+    fn quality_bytes_above_the_phred_range_are_counted_not_dropped() {
+        let mut a = Accum::new(8);
+        a.observe(b"@r", b"ACGT", &[33u8, 73, 126, 200]);
+        assert_eq!(a.qual_out_of_range, 1, "byte 200 is outside 33..=126");
+        let mut ok = Accum::new(8);
+        ok.observe(b"@r", b"ACGT", &[33u8, 73, 126, 40]);
+        assert_eq!(ok.qual_out_of_range, 0, "a valid file pays nothing and reports nothing");
+        // Both merge exactly, like every other counter here.
+        let mut m = Accum::new(8);
+        m.merge(&a);
+        m.merge(&ok);
+        assert_eq!(m.qual_out_of_range, 1);
     }
 
     #[test]
@@ -722,22 +932,313 @@ mod tests {
         assert_eq!(block["top"][0]["count"], json!(16_000));
     }
 
-    /// Merge keeps the bound: an over-cap merge drops singletons and leaves the frequent
-    /// k-mers counted exactly.
+    /// FC-1: the spectrum is exact now, and it says so. A 16 bp read carries five
+    /// 12-mer windows; every one of them is counted, `distinct` comes off the non-zero
+    /// cells, and the block no longer claims an approximation.
     #[test]
-    fn kmer_merge_respects_the_cap_and_evicts_only_singletons() {
-        let mut a = RepeatedCounter::new(100);
-        let mut b = RepeatedCounter::new(100);
-        let common = repeated::pack_kmer(b"ACGTACGTACGT").unwrap();
-        for _ in 0..50 {
-            a.insert(common);
+    fn kmer_spectrum_is_exact_and_reports_distinct() {
+        let mut a = Accum::new(32);
+        for _ in 0..20 {
+            // 16 bp, five windows, all five different. 20 reads puts the top count (20)
+            // above the report's 0.1%-of-reads / 10-count threshold.
+            a.observe(b"@r", b"ACGTACGTACGTACGA", &[b'I'; 16]);
         }
-        for i in 0..200u64 {
-            b.insert(1 << 40 | i); // 200 distinct singletons, over the cap
+        let (m, block) = crate::rich::kmer_metrics(&a);
+        assert_eq!(block["approximate"], json!(false), "the dense table is exact");
+        assert!(
+            block.get("approximation").is_none(),
+            "there is no bound left to state: {block}"
+        );
+        assert_eq!(block["distinct"], json!(5), "5 windows, all distinct");
+        assert_eq!(m["kmer_top_count"], json!(20));
+        assert_eq!(block["top"].as_array().unwrap().len(), 5);
+        let named: Vec<&str> = block["top"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kmer"].as_str().unwrap())
+            .collect();
+        assert!(named.contains(&"ACGTACGTACGT"), "{named:?}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // FC-2: the fused single pass, held to the per-function path it replaced.
+    // ---------------------------------------------------------------------------
+
+    /// Deterministic xorshift64 — no dev-dependency, and the same reads every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
         }
-        a.merge(&b);
-        assert!(a.len() <= 100, "the merged map must stay under the cap, got {}", a.len());
-        assert_eq!(a.report(10), vec![(common, 50)], "the frequent k-mer keeps its exact count");
-        assert_eq!(a.total, 250, "total is the number of inserts seen");
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// The pre-FC-2 path, kept verbatim as the reference the fused loop is held to:
+    /// an inline composition/N-run pass, then `heatmap::encode`, then `pack_kmer` per
+    /// window, then `contains_ci` per adapter prefix plus the fragment-GC loop, then
+    /// `polyx::measure_polyx`. Everything here is a separate function call over the
+    /// whole read, which is exactly what `observe` no longer does.
+    fn reference(reads: &[(Vec<u8>, Vec<u8>)], max_pos: usize) -> (Accum, Vec<(u64, u32)>) {
+        let mut a = Accum::new(max_pos);
+        a.track_profile = true;
+        let mut kmers: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        for (seq, qual) in reads {
+            let len = seq.len();
+            a.reads += 1;
+            a.bases += len as u64;
+            grow(&mut a.len_hist, len + 1);
+            a.len_hist[len] += 1;
+            let per_pos = len.min(max_pos);
+            if len > max_pos {
+                a.reads_over_max_len += 1;
+            }
+            grow(&mut a.base_pos, per_pos);
+            if a.qual_pos.len() < per_pos {
+                a.qual_pos.resize(per_pos, QUAL_ROW);
+            }
+
+            let (mut acgt, mut gc, mut has_n) = (0u64, 0u64, false);
+            let mut run_start = 0usize;
+            let mut in_run = false;
+            for (i, &raw) in seq.iter().enumerate() {
+                let code = match raw.to_ascii_uppercase() {
+                    b'A' => 0,
+                    b'C' => 1,
+                    b'G' => 2,
+                    b'T' => 3,
+                    _ => 4,
+                };
+                if code == 4 {
+                    if !in_run {
+                        in_run = true;
+                        run_start = i;
+                    }
+                    has_n = true;
+                } else {
+                    if in_run {
+                        a.record_n_run(run_start, i, len);
+                        in_run = false;
+                    }
+                    acgt += 1;
+                    if code == 1 || code == 2 {
+                        gc += 1;
+                    }
+                }
+                if i < per_pos {
+                    a.base_pos[i][code] += 1;
+                }
+            }
+            if in_run {
+                a.record_n_run(run_start, len, len);
+            }
+            if has_n {
+                a.reads_with_n += 1;
+            }
+            grow(&mut a.acgt_hist, acgt as usize + 1);
+            a.acgt_hist[acgt as usize] += 1;
+            grow(&mut a.gc_hist, gc as usize + 1);
+            a.gc_hist[gc as usize] += 1;
+
+            let mut qsum = 0u64;
+            for (i, &q) in qual.iter().enumerate() {
+                a.qual_byte[q as usize] += 1;
+                qsum += q as u64;
+                if (33..=126).contains(&q) {
+                    if i < per_pos {
+                        a.qual_pos[i][(q - 33) as usize] += 1;
+                    }
+                } else {
+                    a.qual_out_of_range += 1;
+                }
+            }
+            let raw_mean = if qual.is_empty() { 0 } else { (qsum / qual.len() as u64) as usize };
+            a.meanq_raw_hist[raw_mean.min(QBYTES - 1)] += 1;
+
+            let mut hit = false;
+            for (i, (_, pat)) in ADAPTER_PREFIXES.iter().enumerate() {
+                if contains_ci(seq, pat.as_bytes()) {
+                    a.adapter_hits[i] += 1;
+                    hit = true;
+                }
+            }
+            if !hit {
+                let start = seq
+                    .iter()
+                    .position(|&b| b.to_ascii_uppercase() != b'G')
+                    .unwrap_or(seq.len());
+                for &b in &seq[start..] {
+                    match b.to_ascii_uppercase() {
+                        b'G' | b'C' => {
+                            a.frag_gc += 1;
+                            a.frag_bases += 1;
+                        }
+                        b'A' | b'T' => a.frag_bases += 1,
+                        _ => {}
+                    }
+                }
+            }
+
+            let (lb, ll, tb, tl) = polyx::measure_polyx(seq);
+            if lb != usize::MAX {
+                grow(&mut a.polyx5[lb], ll + 1);
+                a.polyx5[lb][ll] += 1;
+            }
+            if tb != usize::MAX {
+                grow(&mut a.polyx3[tb], tl + 1);
+                a.polyx3[tb][tl] += 1;
+            }
+            const G: usize = 2;
+            if lb == G {
+                let n = ll.min(qual.len());
+                a.run_q_head.0 += qual[..n].iter().map(|&b| b as u64).sum::<u64>();
+                a.run_q_head.1 += n as u64;
+            }
+            if tb == G {
+                let start = qual.len().saturating_sub(tl);
+                a.run_q_tail.0 += qual[start..].iter().map(|&b| b as u64).sum::<u64>();
+                a.run_q_tail.1 += (qual.len() - start) as u64;
+            }
+
+            let (hx, hy) = heatmap::encode(seq);
+            a.heatmap[heatmap::index(hx, hy)] += 1;
+
+            if seq.len() >= 12 {
+                for w in seq.windows(12) {
+                    if let Some(pk) = repeated::pack_kmer(w) {
+                        *kmers.entry(pk).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut kv: Vec<(u64, u32)> = kmers.into_iter().collect();
+        kv.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        (a, kv)
+    }
+
+    /// Reads with everything the loop has to get right: both cases, N and other IUPAC
+    /// codes, empty reads, reads shorter and longer than 12 bp, and a max_pos that
+    /// truncates the per-position planes.
+    fn random_reads(seed: u64, n: usize, max_len: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        const ALPHABET: &[u8] = b"ACGTACGTacgtNNnRYry.-";
+        let mut rng = Rng(seed | 1);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = rng.below(max_len + 1);
+            let mut seq = Vec::with_capacity(len);
+            for _ in 0..len {
+                seq.push(ALPHABET[rng.below(ALPHABET.len())]);
+            }
+            // Every 7th read carries a real adapter prefix, in a random case, so both
+            // the hit path and the fragment path are exercised.
+            if rng.below(7) == 0 && seq.len() >= 13 {
+                let pat: &[u8] = ADAPTER_PREFIXES[rng.below(2)].1.as_bytes();
+                let at = rng.below(seq.len() - 12);
+                for (j, &b) in pat.iter().enumerate() {
+                    seq[at + j] = if j % 2 == 0 { b } else { b.to_ascii_lowercase() };
+                }
+            }
+            let qual: Vec<u8> = (0..len).map(|_| (33 + rng.below(94)) as u8).collect();
+            out.push((seq, qual));
+        }
+        out
+    }
+
+    /// The fused loop must be the per-function path, counter for counter. If a base is
+    /// decoded once instead of four times, the four answers must not move.
+    #[test]
+    fn the_fused_pass_is_the_per_function_path() {
+        let reads = random_reads(0x5EED_1234, 400, 40);
+        let mut fused = Accum::new(24); // shorter than the longest read: truncation too
+        fused.track_profile = true;
+        for (seq, qual) in &reads {
+            fused.observe(b"@r", seq, qual);
+        }
+        let (want, want_kmers) = reference(&reads, 24);
+
+        assert_eq!(fused.reads, want.reads);
+        assert_eq!(fused.bases, want.bases);
+        assert_eq!(fused.reads_with_n, want.reads_with_n);
+        assert_eq!(fused.reads_over_max_len, want.reads_over_max_len);
+        assert_eq!(fused.n_run_hist, want.n_run_hist, "N-run lengths");
+        assert_eq!(fused.n_run_leading, want.n_run_leading);
+        assert_eq!(fused.n_run_trailing, want.n_run_trailing);
+        assert_eq!(fused.len_hist, want.len_hist);
+        assert_eq!(fused.acgt_hist, want.acgt_hist);
+        assert_eq!(fused.gc_hist, want.gc_hist);
+        assert_eq!(fused.meanq_raw_hist, want.meanq_raw_hist);
+        assert_eq!(fused.qual_byte, want.qual_byte);
+        assert_eq!(fused.qual_out_of_range, want.qual_out_of_range);
+        assert_eq!(fused.base_pos, want.base_pos, "composition plane");
+        assert_eq!(fused.qual_pos, want.qual_pos, "quality plane");
+        assert_eq!(fused.polyx3, want.polyx3);
+        assert_eq!(fused.polyx5, want.polyx5);
+        assert_eq!(fused.run_q_head, want.run_q_head);
+        assert_eq!(fused.run_q_tail, want.run_q_tail);
+        assert_eq!(fused.heatmap, want.heatmap, "heatmap grid");
+        assert_eq!(fused.adapter_hits, want.adapter_hits, "adapter readthrough rate");
+        assert_eq!(fused.frag_gc, want.frag_gc, "fragment GC");
+        assert_eq!(fused.frag_bases, want.frag_bases);
+        assert_eq!(fused.kmer_counts.report(1), want_kmers, "12-mer spectrum");
+    }
+
+    /// FC-6: the word-at-a-time prefilter must answer exactly what the double-fold
+    /// window scan answered, including the bytes that survive `& 0xDF` together
+    /// ('@' and '`' fold to the same value but are not the same letter case).
+    #[test]
+    fn contains_ci_agrees_with_the_window_reference() {
+        fn reference(hay: &[u8], needle: &[u8]) -> bool {
+            if needle.is_empty() || hay.len() < needle.len() {
+                return false;
+            }
+            hay.windows(needle.len())
+                .any(|w| w.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase()))
+        }
+        let mut cases: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // the two real prefixes, present and absent, in every case mix
+        for pat in ["AGATCGGAAGAGC", "CTGTCTCTTATA"] {
+            cases.push((pat.as_bytes().to_vec(), pat.as_bytes().to_vec()));
+            cases.push((pat.to_ascii_lowercase().into_bytes(), pat.as_bytes().to_vec()));
+            cases.push((b"ACGTACGTACGTACGT".to_vec(), pat.as_bytes().to_vec()));
+            let mut h = vec![b'g'; 40];
+            h.extend_from_slice(pat.as_bytes());
+            cases.push((h, pat.as_bytes().to_vec()));
+        }
+        // fold collisions: '@'/'`' and '['/'{' differ by 0x20 but are not one letter
+        cases.push((b"@@@AGATCGGAAGAGC".to_vec(), b"AGATCGGAAGAGC".to_vec()));
+        cases.push((b"@@@`GATCGGAAGAGC".to_vec(), b"AGATCGGAAGAGC".to_vec()));
+        cases.push((b"[{][{][{][{][{][{][{".to_vec(), b"[{][{][{][{][{".to_vec()));
+        // needles shorter than a word and exactly a word
+        cases.push((b"aaAAaa".to_vec(), b"AAAA".to_vec()));
+        cases.push((b"xACGTACGTx".to_vec(), b"acgtacgt".to_vec()));
+        // random haystacks over a nasty alphabet, and a random needle from each
+        const HAY_ALPHABET: &[u8] = b"ACGTacgt@`[{N. nAGATCG";
+        const NEEDLE_ALPHABET: &[u8] = b"ACGTacgt@`[";
+        let mut rng = Rng(0xC0FF_EE11);
+        for _ in 0..300 {
+            let hl = rng.below(60);
+            let hay: Vec<u8> = (0..hl).map(|_| HAY_ALPHABET[rng.below(HAY_ALPHABET.len())]).collect();
+            let nl = 1 + rng.below(13);
+            let needle: Vec<u8> =
+                (0..nl).map(|_| NEEDLE_ALPHABET[rng.below(NEEDLE_ALPHABET.len())]).collect();
+            cases.push((hay, needle));
+        }
+        for (hay, needle) in &cases {
+            assert_eq!(
+                contains_ci(hay, needle),
+                reference(hay, needle),
+                "hay {hay:?} needle {needle:?}"
+            );
+        }
+        // and the semantics the fitter relies on: an empty needle never matches
+        assert!(!contains_ci(b"ACGT", b""));
+        assert!(contains_ci(b"xxagatcggaagagcxx", b"AGATCGGAAGAGC"));
     }
 }

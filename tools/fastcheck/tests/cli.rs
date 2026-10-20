@@ -398,17 +398,30 @@ fn a_projection_above_max_mem_refuses_before_reading() {
 }
 
 #[test]
-fn the_kmer_spectrum_is_labelled_approximate_because_its_counter_evicts() {
-    let d = tmpdir("kmer_approx");
-    let fq = write_fixture(&d);
+fn the_kmer_spectrum_is_exact_and_says_so() {
+    let d = tmpdir("kmer_exact");
+    // 32 bp reads: 21 windows each, so the block has something to count.
+    let fq = write_overrep(&d);
     let json = d.join("k.json");
-    run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
+    let (_, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
     let v = read_json(&json);
-    assert_eq!(v["kmer_spectrum"]["approximate"], true);
-    // The approximation and its bound must be stated, not implied.
-    let note = v["kmer_spectrum"]["approximation"].as_str().unwrap();
-    assert!(note.contains("singleton"), "{note}");
-    assert!(note.contains("evict"), "{note}");
+    let k = &v["kmer_spectrum"];
+    assert_eq!(k["approximate"], false, "the dense 4^12 table is exact");
+    assert!(
+        k.get("approximation").is_none(),
+        "there is no bound left to state, so nothing may claim one: {k}"
+    );
+    // `distinct` is counted from the non-zero cells, and the packed fixture is dominated
+    // by one 32 bp sequence appearing 4 times: its 21 windows are its own.
+    let distinct = k["distinct"].as_u64().unwrap();
+    assert!(distinct >= 21, "distinct = {distinct}, expected at least one read's windows");
+    // The block is a function of the data, not of the thread split (FC-1's bonus: the
+    // old counter evicted in read order, so -j could change the top list).
+    let json8 = d.join("k8.json");
+    run(&d, &[fq.to_str().unwrap(), "--json", json8.to_str().unwrap(), "-j", "8", "-q"]);
+    let v8 = read_json(&json8);
+    assert_eq!(v8["kmer_spectrum"], *k, "-j must not move a single k-mer count");
 }
 
 /// A fixture where one sequence appears 4 times out of 12 reads.
@@ -559,6 +572,54 @@ fn overrep_mode_table_names_the_sequences_and_second_pass_records_two_passes() {
     let seqs2 = v2["overrep"]["sequences"].as_array().unwrap();
     assert_eq!(seqs2.len(), 1);
     assert_eq!(seqs2[0]["seq"], "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA");
+}
+
+#[test]
+fn overrep_second_pass_is_thread_count_invariant() {
+    let d = tmpdir("overrep_threads");
+    // BGZF: the one input whose second pass actually builds an inflate pool, so the
+    // resolved -j reaches `overrep::second_pass` -> `reader::open` (FC-12).
+    let plain = write_overrep(&d);
+    let mut src = std::fs::File::open(&plain).unwrap();
+    let bgzf = d.join("over.fastq.gz");
+    let mut w = gzp::par::compress::ParCompressBuilder::<gzp::deflate::Bgzf>::new()
+        .num_threads(2)
+        .unwrap()
+        .from_writer(std::fs::File::create(&bgzf).unwrap());
+    std::io::copy(&mut src, &mut w).unwrap();
+    drop(w);
+
+    let mut reports = Vec::new();
+    // -j 2 and -j 8 both inflate BGZF in parallel, so the reports must be identical;
+    // -j 1 would legitimately report "bgzf-serial" (a different decompression MODE, not
+    // a different number) and is covered by the plain-file identity tests.
+    for j in ["2", "8"] {
+        let json = d.join(format!("s{j}.json"));
+        let (_, stderr, code) = run(
+            &d,
+            &[bgzf.to_str().unwrap(), "--json", json.to_str().unwrap(),
+              "--overrep-mode", "second-pass", "--overrep-min-count", "3", "-j", j, "-q"],
+        );
+        assert_eq!(code, 0, "-j {j}: {stderr}");
+        let mut v = read_json(&json);
+        assert_eq!(v["overrep"]["passes"], 2, "the second read must still be declared");
+        blank_run_variance(&mut v);
+        reports.push(v);
+    }
+    if reports[0] != reports[1] {
+        let a = reports[0].as_object().unwrap();
+        let b = reports[1].as_object().unwrap();
+        for (k, v) in a {
+            if b.get(k) != Some(v) {
+                panic!("-j changed {k}:\n 1: {v}\n 8: {}", b.get(k).unwrap());
+            }
+        }
+        panic!("-j changed the report in a way the top-level keys do not name");
+    }
+    // The pass still finds what it found with one thread.
+    let seqs = reports[0]["overrep"]["sequences"].as_array().unwrap();
+    assert_eq!(seqs.len(), 1);
+    assert_eq!(seqs[0]["count"], 4);
 }
 
 #[test]

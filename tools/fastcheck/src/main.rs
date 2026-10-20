@@ -365,6 +365,7 @@ fn main() -> Result<()> {
             if processed_reports.is_empty() { None } else { Some(&processed_total) },
             overrep,
             min_count,
+            threads,
             total.adapter_pos.as_ref().map(|ap| {
                 (ap, cli.adapter_error_rate, cli.min_adapter_overlap)
             }),

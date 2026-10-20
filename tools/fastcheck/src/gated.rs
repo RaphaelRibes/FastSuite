@@ -20,13 +20,12 @@
 //!
 //! [`observe_gated`]: Accum::observe_gated
 
-use crate::accum::{Accum, QBINS};
+use crate::accum::{contains_ci, qbin, Accum, QBYTES, QBINS};
 use crate::cli::Modules;
 use crate::heatmap;
 use crate::polyx;
-use crate::repeated;
 
-/// `[u64; 256]` has no `Default`, so rows are grown with an explicit literal
+/// `[u64; QBINS]` has no `Default`, so rows are grown with an explicit literal
 /// (the same one `accum.rs` uses).
 const QUAL_ROW: [u64; QBINS] = [0; QBINS];
 
@@ -62,15 +61,9 @@ fn record_n_run(a: &mut Accum, start: usize, end: usize, read_len: usize) {
     }
 }
 
-/// Case-insensitive substring search (copy of `accum::contains_ci`, used only by
-/// the `--profile` readthrough scan).
-fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return false;
-    }
-    hay.windows(needle.len())
-        .any(|w| w.iter().zip(needle).all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase()))
-}
+// Case-insensitive substring search: the gated twin calls `accum::contains_ci` rather
+// than carrying a copy, so the two paths cannot drift (the copy that lived here had to
+// be kept byte-identical by hand).
 
 /// What a gated pass actually measured, in units of work rather than of output.
 ///
@@ -211,9 +204,15 @@ impl Accum {
             for (i, &q) in qual.iter().enumerate() {
                 self.qual_byte[q as usize] += 1;
                 qsum += q as u64;
-                if i < per_pos {
-                    self.qual_pos[i][q as usize] += 1;
-                    w.qual_cells += 1;
+                match qbin(q) {
+                    Some(b) => {
+                        if i < per_pos {
+                            self.qual_pos[i][b] += 1;
+                            w.qual_cells += 1;
+                        }
+                    }
+                    // Not a Phred byte: in the census, never in a per-position row.
+                    None => self.qual_out_of_range += 1,
                 }
             }
             w.quality_bytes = qual.len() as u64;
@@ -222,7 +221,7 @@ impl Accum {
             } else {
                 (qsum / qual.len() as u64) as usize
             };
-            self.meanq_raw_hist[raw_mean.min(QBINS - 1)] += 1;
+            self.meanq_raw_hist[raw_mean.min(QBYTES - 1)] += 1;
         }
 
         // The --profile extras are not a module: they are the price of the profile
@@ -320,8 +319,8 @@ impl Accum {
 
         if m.kmer && seq.len() >= 12 {
             for win in seq.windows(12) {
-                if let Some(pk) = repeated::pack_kmer(win) {
-                    self.kmer_counts.insert(pk);
+                if let Some(pk) = crate::repeated::pack_kmer(win) {
+                    self.kmer_counts.add(pk as u32);
                     w.kmer_windows += 1;
                 }
             }

@@ -116,6 +116,12 @@ pub fn repeated_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
 }
 
 /// 12-mer spectrum: metrics + the top list.
+///
+/// Exact: the counter is a dense 4^12 `u16` table (32 MiB, allocated once, independent
+/// of the number of reads) with an exact overflow map for k-mers that occur more than
+/// 65 535 times. There is no cap and no eviction, so `approximate` is `false`, `distinct`
+/// is a count of non-zero cells rather than an estimate, and the block is the same
+/// whatever `-j` is.
 pub fn kmer_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
     let reads = acc.reads.max(1) as f64;
     let min_count = (reads * 0.001).max(10.0) as u32;
@@ -143,13 +149,12 @@ pub fn kmer_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
     (
         m,
         json!({
-            "approximate": true,
-            "approximation": "the 12-mer counter is bounded at 1e6 distinct keys and evicts \
-                              singletons when it overflows: a k-mer whose every occurrence \
-                              was evicted loses its count entirely, and one whose first \
-                              occurrence was evicted loses exactly 1. Counts are exact for \
-                              k-mers above the 0.1% reporting threshold; below it the number \
-                              is a lower bound.",
+            "approximate": false,
+            "exactness": "dense 4^12 = 16 777 216-cell u16 table, one allocation at scan \
+                          start, merged cell by cell; counts above 65 535 are carried exactly \
+                          in an overflow map, so only the cell WIDTH is bounded and the count \
+                          is not",
+            "distinct": acc.kmer_counts.distinct(),
             "top": list,
         }),
     )
