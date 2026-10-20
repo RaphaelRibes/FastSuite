@@ -469,8 +469,15 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
 
     let (chunk_tx, chunk_rx): (Sender<Vec<RawRecord>>, Receiver<Vec<RawRecord>>) =
         bounded(num_workers * 2);
+    // Bounded, not unbounded: the writer blocks on gzippy's 16-chunk channel
+    // whenever compression is the bottleneck (1-2 gzip threads at low `-j`), and
+    // an unbounded queue here absorbs whatever the hashers can produce while it
+    // is blocked. Measured on 5 M pairs with gzip output: `-j 1` 78.7 MB,
+    // `-j 2/4/8` ~4.0 GB, with peak tracking input size rather than threads. At
+    // 100 M pairs that is tens of GB for a queue nobody asked for. The bound
+    // applies the backpressure the pipeline already has one stage downstream.
     let (hash_tx, hash_rx): (Sender<HashedRecord<T>>, Receiver<HashedRecord<T>>) =
-        crossbeam_channel::unbounded();
+        bounded(num_workers * 256);
 
     // The reader reports, off the first record, whether the input carries
     // quality scores (FASTQ) or not (FASTA). The writer validates the
@@ -671,14 +678,17 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     let worker_threads = num_workers.saturating_sub(1).max(1);
 
     // Resume existing outputs before any thread starts, so the preload pass
-    // cannot race the unbounded worker channel.
+    // cannot race the worker channel.
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, worker_threads)?;
     resume_existing_paired_outputs(output_r1_path, output_r2_path, cfg, &mut verifier)?;
 
     let (chunk_tx, chunk_rx): (Sender<Vec<RawPair>>, Receiver<Vec<RawPair>>) =
         bounded(num_workers * 2);
+    // Bounded for the same reason as the single-end path: when gzip output is the
+    // bottleneck the writer stalls, and an unbounded queue would absorb the whole
+    // stream in memory instead of applying backpressure.
     let (hash_tx, hash_rx): (Sender<HashedPair<T>>, Receiver<HashedPair<T>>) =
-        crossbeam_channel::unbounded();
+        bounded(num_workers * 256);
 
     // Same as the single-end path: the reader reports whether R1 carries
     // quality scores, and the writer validates the format pairing before
