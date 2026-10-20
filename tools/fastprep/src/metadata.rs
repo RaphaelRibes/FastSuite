@@ -81,6 +81,7 @@ pub fn write_record(
                 DropReason::MeanQ   => 5,
                 DropReason::Adapter => 6,
                 DropReason::Duplicate => 7,
+                DropReason::Length    => 8,
             };
             w.write_all(&[status])?;
             w.write_all(&(*t5_adapter as u32).to_le_bytes())?;

@@ -25,11 +25,27 @@ pub enum MinLen {
 }
 
 impl MinLen {
-    /// Resolve against a concrete read length `l`.
+    /// Resolve against a concrete read length `l`, clamped to `l`.
+    ///
+    /// Clamped because this feeds the trim BUDGET (`l - resolve(l)`): a floor
+    /// above the read length would make the budget negative.
     pub fn resolve(self, l: usize) -> usize {
         match self {
             MinLen::Abs(n) => n.min(l),
             MinLen::Frac(f) => ((f * l as f64).floor() as usize).min(l),
+        }
+    }
+
+    /// The floor as an absolute length, NOT clamped to the read length.
+    ///
+    /// The post-trim length filter uses this one: `--min-len 100` must reject a
+    /// 40 bp read, and the clamped value (40) can never do that. Before this
+    /// existed the flag could only ever drop reads by exhausting the trim
+    /// budget, so it never filtered short input at all.
+    pub fn floor(self, l: usize) -> usize {
+        match self {
+            MinLen::Abs(n) => n,
+            MinLen::Frac(f) => (f * l as f64).floor() as usize,
         }
     }
 }
@@ -112,6 +128,10 @@ pub enum DropReason {
     /// Removed by deduplication, before any trimming ran. Carries no trim
     /// counts: the read was never scanned.
     Duplicate,
+    /// Survived trimming, but the post-trim length is below --min-len (an
+    /// absolute floor above the read length is the usual cause). Carries the
+    /// trim counts, because the trim happened.
+    Length,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1372,6 +1392,33 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
                 runs: abs_runs,
             }
         }
+    };
+
+    // --- Step 5: the post-trim length floor ---
+    // The budget in step 2 caps how much trim is ALLOWED, but it is computed
+    // from `MinLen::resolve`, which clamps to the read length — so on its own
+    // it can never reject a read that was already too short. An absolute floor
+    // (or a fraction on a short read) must actually filter, which is what the
+    // flag documents.
+    let result = match result {
+        TrimResult::Emit { t5_adapter, t3_adapter, t5_poly, t3_poly, runs } => {
+            let out_len = l.saturating_sub(
+                t5_adapter + t5_poly + t3_adapter + t3_poly,
+            );
+            if out_len < params.min_len.floor(l) {
+                TrimResult::Drop {
+                    reason: DropReason::Length,
+                    t5_adapter,
+                    t3_adapter,
+                    t5_poly,
+                    t3_poly,
+                    runs,
+                }
+            } else {
+                TrimResult::Emit { t5_adapter, t3_adapter, t5_poly, t3_poly, runs }
+            }
+        }
+        other => other,
     };
 
     TrimOutput { result, adapter }

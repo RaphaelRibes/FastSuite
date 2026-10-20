@@ -255,6 +255,7 @@ fn runtime(pe_overlap: PeOverlapMode) -> Runtime {
         json: None,
         dry_run: false,
         quiet: false,
+        allow_total_drop: false,
         adapter_source: AdapterSource::None,
         adapter_error_rate: 0.2,
         min_adapter_overlap_se: 14,

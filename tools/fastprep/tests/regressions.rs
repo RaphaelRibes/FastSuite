@@ -176,3 +176,119 @@ fn a_single_q43_base_does_not_flip_to_phred64() {
     );
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// The same defect at the OTHER end of the distribution: a Phred+33 library
+/// whose qualities are uniformly Q43 (ASCII 'L' = 76) has every sampled byte
+/// above 74, so the old "preponderance of high bytes means +64" rule fired on
+/// 100 % of the sample, shifted every quality down 31 and let the default
+/// --mean-q 25 delete the whole file — exit 0, empty output.
+///
+/// Real AVITI/Element, MGI and recalibrated data look like this, which is why
+/// the census can never be treated as evidence for +64.
+#[test]
+fn a_uniformly_high_quality_library_is_not_phred64() {
+    let d = tmpdir("phred_uniform");
+    let fq = d.join("uniform.fastq");
+    let seq = "ACTCAGTACCTGATCAGTACCTGATCAGTACCTAGCTAACTCAGTACCTGATCAGTACCTGATCA";
+    let mut body = String::new();
+    for i in 0..50 {
+        body.push_str(&format!("@r{i}\n{seq}\n+\n{}\n", "L".repeat(seq.len())));
+    }
+    std::fs::write(&fq, body).unwrap();
+
+    let out = d.join("out.fastq");
+    let (err, code) = run(&[
+        "-1",
+        fq.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--no-adapter",
+        "--no-dedup",
+    ]);
+    assert_eq!(code, 0, "run must succeed: {err}");
+    assert_eq!(
+        records(&out).len(),
+        50,
+        "an all-Q43 Phred+33 library was read as Phred+64 and emptied: {err}"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+/// An explicit --phred-offset is a decision. `--auto-phred` ships on by
+/// default and clap's `conflicts_with` only fires for an EXPLICIT
+/// `--auto-phred`, so the old code silently ignored the flag and the detection
+/// branch won.
+#[test]
+fn an_explicit_phred_offset_is_honoured() {
+    let d = tmpdir("phred_explicit");
+    let fq = d.join("hi.fastq");
+    // 'h' = 104: Q71 under +33, Q40 under +64. Either reading keeps the read;
+    // what matters is that the flag decides, not the census.
+    let seq = "ACTCAGTACCTGATCAGTACCTGATCAGTACCTAGCTAACTCAGTACCTGATCAGTACCTGATCA";
+    let mut body = String::new();
+    for i in 0..50 {
+        body.push_str(&format!("@r{i}\n{seq}\n+\n{}\n", "h".repeat(seq.len())));
+    }
+    std::fs::write(&fq, body).unwrap();
+
+    let out = d.join("out.fastq");
+    let (err, code) = run(&[
+        "-1",
+        fq.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--no-adapter",
+        "--no-dedup",
+        "--phred-offset",
+        "33",
+        "--json",
+        d.join("r.json").to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "run must succeed: {err}");
+    assert_eq!(records(&out).len(), 50, "an explicit +33 was overridden: {err}");
+    std::fs::remove_dir_all(&d).ok();
+}
+
+/// A run that keeps nothing must not exit 0. The empty output plus a success
+/// status is the one combination no downstream step can detect, and every
+/// cause of a total drop is a configuration error worth stopping for.
+#[test]
+fn a_total_drop_is_a_failure_unless_allowed() {
+    let d = tmpdir("total_drop");
+    let fq = d.join("lowq.fastq");
+    let seq = "ACTCAGTACCTGATCAGTACCTGATCAGTACCTAGCTAACTCAGTACCTGATCAGTACCTGATCA";
+    let mut body = String::new();
+    for i in 0..20 {
+        // '#' = Q2: the default --mean-q 25 removes every read.
+        body.push_str(&format!("@r{i}\n{seq}\n+\n{}\n", "#".repeat(seq.len())));
+    }
+    std::fs::write(&fq, body).unwrap();
+
+    let out = d.join("out.fastq");
+    let (err, code) = run(&[
+        "-1",
+        fq.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--no-adapter",
+        "--no-dedup",
+    ]);
+    assert_ne!(code, 0, "a total drop must not exit 0: {err}");
+    assert!(
+        err.contains("dropped all") && err.contains("--allow-total-drop"),
+        "the refusal must name the flag that accepts it: {err}"
+    );
+
+    let (err2, code2) = run(&[
+        "-1",
+        fq.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--no-adapter",
+        "--no-dedup",
+        "--allow-total-drop",
+        "--force",
+    ]);
+    assert_eq!(code2, 0, "--allow-total-drop must accept the empty run: {err2}");
+    std::fs::remove_dir_all(&d).ok();
+}

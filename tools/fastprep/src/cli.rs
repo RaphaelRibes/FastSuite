@@ -255,16 +255,19 @@ pub struct Cli {
     pub pe_overlap: PeOverlapMode,
 
     /// Minimum adapter overlap for sequence matching.
-    /// 8 (was 4): a 4-base window at 10% error tolerates 1 mismatch on 4
-    /// bases — any read ending in "AGAT" (adapter prefix) was falsely
-    /// trimmed (~10% of clean reads measured on the benchmark QC set).
+    /// 14 at the shipped `--adapter-error-rate 0.2`: a 4-base window admits a
+    /// mismatch on 4 bases, so any read ending in "AGAT" (adapter prefix) was
+    /// falsely trimmed (~10% of clean reads measured on the benchmark QC set).
     #[arg(long, default_value_t = 14, value_name = "N", help_heading = "Adapter Trimming")]
     pub min_adapter_overlap: usize,
 
 
     // -------------------------------------------------------- PolyX trimming
-    /// Minimum post-trim read length. Integer N (bases) or fraction FL
-    /// (e.g. `0.6L`). Reads below this after trimming are dropped.
+    /// Minimum post-trim read length. Integer N (bases) or fraction FL of the
+    /// ORIGINAL read length (e.g. `0.6L`). A read whose post-trim length is
+    /// below this floor is dropped; a read that would need more trim than the
+    /// floor allows is dropped rather than trimmed past it. Integer floors are
+    /// absolute: `--min-len 100` drops a 40 bp read.
     #[arg(long, value_name = "N|FL", default_value = "0.9L", help_heading = "PolyX Trimming")]
     pub min_len: MinLen,
 
@@ -362,6 +365,16 @@ pub struct Cli {
     /// Disable the mean-quality filter (the shipped default is 25).
     #[arg(long = "no-mean-q", help_heading = "Quality Filtering")]
     pub no_mean_q: bool,
+
+    /// Succeed even when the run drops every read.
+    ///
+    /// By default a run that outputs zero reads exits non-zero: an empty
+    /// output file plus exit 0 is the one combination a pipeline cannot
+    /// distinguish from success, and every cause of a total drop (a Phred
+    /// offset read the wrong way, a floor above the read length, a mean-Q gate
+    /// on a degraded library) is a configuration error worth stopping for.
+    #[arg(long = "allow-total-drop", help_heading = "Quality Filtering")]
+    pub allow_total_drop: bool,
 
     /// ASCII offset used to decode FASTQ quality scores.
     /// 33 for modern Illumina; 64 for legacy Illumina 1.3/1.5.
@@ -542,6 +555,8 @@ pub struct Runtime {
     /// Warnings and errors still print — quiet never hides a reason a run
     /// went wrong (CLI-SPEC §1 rule 5).
     pub quiet: bool,
+    /// `--allow-total-drop`: exit 0 even when no read survives.
+    pub allow_total_drop: bool,
     pub adapter_source: AdapterSource,
     /// `--pe-overlap`: the tri-state as resolved in `finalize()`. `Auto` is
     /// resolved against the adapter source there (explicit `Fixed` set ⇒
@@ -1014,11 +1029,15 @@ impl Cli {
                 gz_threads: self.gz_threads.unwrap_or((self.threads / 2).max(1)),
             },
             phred_offset,
-            phred_auto: self.auto_phred && !self.no_auto_phred,
+            // An explicit --phred-offset is a decision, and auto-detection must
+            // not silently overrule it (`conflicts_with` only fires for an
+            // explicit --auto-phred, since --auto-phred ships on by default).
+            phred_auto: self.auto_phred && !self.no_auto_phred && self.phred_offset.is_none(),
             metadata: self.metadata,
             json: self.json,
             dry_run: self.dry_run,
             quiet: self.quiet,
+            allow_total_drop: self.allow_total_drop,
             adapter_source,
             pe_overlap,
             dedup,

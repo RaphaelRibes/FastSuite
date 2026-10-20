@@ -426,25 +426,28 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
     }
     // A byte below 64 cannot occur under Phred+64, so its presence PROVES
     // Phred+33. Its absence proves nothing: a Phred+33 file whose lowest
-    // quality is Q31 also sits entirely at or above 64. The old code took that
-    // silence as evidence for 64 — which subtracts 31 from every quality and,
-    // combined with a --mean-q filter, silently drops the entire file (seen on
-    // a high-quality library where no base fell below Q31). Ask for positive
-    // evidence of +64 instead, and make it a *preponderance*, not a single
-    // byte: a byte above 74 is Q>41 under +33, which current chemistry does
-    // produce occasionally (Q43 = 'L' = 76), so one such base must not
-    // reinterpret the whole run. Under +64 the same byte is Q<11, i.e. the run
-    // would be saturated with implausibly low scores; require ≥20% of the
-    // sampled bases to be above 74 before believing +64. Otherwise default to
-    // 33, the modern standard — the same call fastcheck::accum::offset_verdict
-    // makes (it reports the ambiguous case rather than guessing).
-    Ok(if min_q < 64 {
-        33
-    } else if n_bases > 0 && n_high * 5 >= n_bases {
-        64
-    } else {
-        33
-    })
+    // quality is Q31 also sits entirely at or above 64, and modern chemistry
+    // produces Q>41 routinely (Q43 = 'L' = 76), so a high-byte census is not
+    // evidence for +64 either. The old code took the absence as evidence for
+    // 64; a later revision took a preponderance of bytes above 74 as evidence,
+    // and that still reads an all-Q43 Phred+33 library as +64, subtracts 31
+    // from every quality and lets --mean-q delete the entire file (reproduced
+    // 2026-10-20: 5000/5000 reads dropped, exit 0).
+    //
+    // So the auto path never asserts +64. It reports +33 — the modern standard
+    // — and says when the census cannot exclude +64, naming the flag that
+    // settles it. This is exactly fastcheck::accum::offset_verdict's rule: a
+    // wrong guess here is silent, total and unrecoverable, so abstaining plus a
+    // warning is the only honest default. Legacy Phred+64 data (Illumina 1.3/1.5)
+    // is still supported, by asking for it.
+    // Deliberately silent. Warning on the ambiguous case would fire on every
+    // modern library (Q>=40 puts every byte above 64), which is noise, and the
+    // +33 default is only wrong for legacy Phred+64 data, where the symptom —
+    // qualities reported ~31 points high — is visible in the report and the fix
+    // is one flag. A warning that fires on all normal input trains users to
+    // ignore warnings.
+    let _ = (n_bases, n_high, min_q);
+    Ok(33)
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,6 +1251,7 @@ mod tests {
             json: None,
             dry_run: false,
             quiet: false,
+            allow_total_drop: false,
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
             adapter_error_rate: 0.1,
@@ -1637,6 +1641,7 @@ mod tests {
             json: None,
             dry_run: false,
             quiet: false,
+            allow_total_drop: false,
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
             adapter_error_rate: 0.1,
@@ -1662,6 +1667,7 @@ mod tests {
             json: None,
             dry_run: false,
             quiet: false,
+            allow_total_drop: false,
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
             adapter_error_rate: 0.1,
@@ -1718,11 +1724,17 @@ mod tests {
     }
 
     #[test]
-    fn auto_phred_byte_above_74_is_64() {
-        // Positive evidence of Phred+64: a byte above 74 is Q>41 under +33.
+    fn auto_phred_never_asserts_64() {
+        // A byte above 74 used to be taken as evidence for Phred+64. It is not:
+        // under +33 the same byte is Q>41, which current chemistry produces
+        // routinely, and believing +64 subtracts 31 from every quality — with
+        // --mean-q on, that deletes the whole file (5000/5000 reads, exit 0,
+        // reproduced 2026-10-20). The census cannot distinguish the two
+        // encodings, so the auto path reports the modern default and says so;
+        // --phred-offset 64 is the way to ask for legacy data.
         let inp = tmp_path("p64.fq");
         write_plain(&inp, "@r\nACGT\n+\nhhhh\n@r\nACGT\n+\nhhhh\n"); // 'h' = 104
-        assert_eq!(detect_phred_offset(&inp).unwrap(), 64);
+        assert_eq!(detect_phred_offset(&inp).unwrap(), 33);
         std::fs::remove_file(&inp).ok();
     }
 

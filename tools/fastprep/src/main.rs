@@ -27,6 +27,28 @@ fn write_json(
         .with_context(|| format!("writing JSON report to {}", path.display()))
 }
 
+/// A run that keeps nothing is a configuration error, not a result.
+///
+/// Every cause of a total drop (a Phred offset read the wrong way, a floor
+/// above the read length, a mean-Q gate on a degraded library) leaves an empty
+/// output file behind, and an empty file plus exit 0 is indistinguishable from
+/// a successful run to every downstream step. Fail loudly instead; `--allow-total-drop`
+/// is the explicit opt-out for a caller that really wants the empty file.
+fn refuse_total_drop(reads_in: u64, reads_out: u64, allow: bool, mode: &str) -> Result<()> {
+    if allow || reads_in == 0 || reads_out > 0 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "fastprep: dropped all {reads_in} {mode} reads — the output file is empty. \
+         Refusing to report success on a total drop. Check the per-cause drop \
+         table above; the usual causes are --min-len above the read length, \
+         --mean-q above the library's mean quality, a Phred offset read the \
+         wrong way (pass --phred-offset 64 for legacy data), and an adapter \
+         floor that exceeds the trim budget. Pass --allow-total-drop to accept \
+         an empty output."
+    )
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let (mode, rt) = cli.finalize()?;
@@ -66,6 +88,7 @@ fn main() -> Result<()> {
                 let doc = to_report_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
                 write_json(path, &doc)?;
             }
+            refuse_total_drop(s.reads_in, s.reads_kept, rt.allow_total_drop, "single-end")?;
         }
         Mode::Paired {
             in1,
@@ -136,6 +159,7 @@ fn main() -> Result<()> {
                 let doc = to_report_paired_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
                 write_json(path, &doc)?;
             }
+            refuse_total_drop(s.r1.reads_in, s.pairs_out, rt.allow_total_drop, "paired-end")?;
         }
     }
 

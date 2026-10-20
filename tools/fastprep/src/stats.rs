@@ -126,6 +126,9 @@ pub struct Stats {
     pub reads_dropped_mean_q: u64,
     pub reads_dropped_adapter: u64,
     pub reads_dropped_duplicate: u64,
+    /// Post-trim length below `--min-len` (distinct from the trim budget: this
+    /// one fires on reads that were simply too short to begin with).
+    pub reads_dropped_length: u64,
     /// Adapter-specific stats; separate to isolate HashMap allocation.
     pub adapter: AdapterStats,
 }
@@ -148,6 +151,7 @@ impl Stats {
                     DropReason::MeanQ    => self.reads_dropped_mean_q += 1,
                     DropReason::Adapter  => self.reads_dropped_adapter += 1,
                     DropReason::Duplicate => self.reads_dropped_duplicate += 1,
+                    DropReason::Length   => self.reads_dropped_length += 1,
                 }
                 if (t5a + t3a) > 0 {
                     if let Some(idx) = adapter {
@@ -194,6 +198,7 @@ impl Stats {
             "reads_dropped_mean_q": self.reads_dropped_mean_q,
             "reads_dropped_adapter": self.reads_dropped_adapter,
             "reads_dropped_duplicate": self.reads_dropped_duplicate,
+            "reads_dropped_length": self.reads_dropped_length,
             "reads_adapter_trimmed": self.adapter.reads_trimmed,
         })
     }
@@ -307,7 +312,7 @@ pub fn report(label: &str, s: &Stats) {
         "    dropped:                 {:>12}  ({})",
         s.reads_dropped, pct(s.reads_dropped, s.reads_in)
     );
-    let causes: [(&str, u64); 7] = [
+    let causes: [(&str, u64); 8] = [
         ("polyX 5′",       s.reads_dropped_poly5),
         ("polyX 3′",       s.reads_dropped_poly3),
         ("polyX interior", s.reads_dropped_poly_int),
@@ -315,6 +320,7 @@ pub fn report(label: &str, s: &Stats) {
         ("mean quality",   s.reads_dropped_mean_q),
         ("adapter",        s.reads_dropped_adapter),
         ("duplicate",      s.reads_dropped_duplicate),
+        ("below --min-len", s.reads_dropped_length),
     ];
     let last_nonzero = causes.iter().rposition(|(_, n)| *n > 0);
     for (i, (lbl, count)) in causes.iter().enumerate() {
