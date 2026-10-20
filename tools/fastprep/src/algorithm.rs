@@ -207,13 +207,27 @@ pub struct Params {
     /// to the original read length.
     pub original_len: Option<usize>,
 
-    /// Precomputed quality-gate values: `gate_lut[q] = g(q)`.
+    /// Precomputed quality-gate values, indexed by the RAW quality byte:
+    /// `gate_lut[b] = g(b − phred_offset)`.
+    ///
     /// Built by [`Params::prepare`] (called automatically by
-    /// `Default::default()` and `cli::Cli::finalize()`). On the hot
-    /// path, `per_step_gap_and_match` reads from this table instead
-    /// of calling `powf`, eliminating the dominant micro-cost.
+    /// `Default::default()`, by `cli::Cli::finalize()` and again by the
+    /// pipeline once the Phred offset is known). On the hot path,
+    /// `per_step_gap_and_match` reads from this table instead of calling
+    /// `powf`, eliminating the dominant micro-cost.
+    ///
+    /// The offset lives *here* and not in the data: ingestion copies the
+    /// quality bytes through untouched and egress writes them back, so the
+    /// only per-byte work left is this one table (`phred_offset = 0` keeps the
+    /// identity mapping every unit test relies on).
     #[doc(hidden)]
     pub gate_lut: [f64; 256],
+
+    /// Phred offset the raw quality bytes carry (33 or 64). Only used to build
+    /// [`Params::gate_lut`] and to shift the mean-quality sum; 0 means "the
+    /// bytes are already decoded values", which is what the algorithm unit
+    /// tests assume.
+    pub phred_offset: u8,
 }
 
 impl Default for Params {
@@ -241,6 +255,7 @@ impl Default for Params {
             extra_committed: 0,
             original_len: None,
             gate_lut: [0.0; 256],
+            phred_offset: 0,
         };
         p.prepare();
         p
@@ -258,17 +273,39 @@ impl Params {
             .saturating_sub(self.extra_committed)
     }
 
-    /// Populate `gate_lut` from the current `phred_sat` and `gate_shape`.
+    /// Populate `gate_lut` from `phred_offset`, `phred_sat` and `gate_shape`.
     /// Cheap (~256 `powf` calls, ~10 µs) but should not be done per
     /// read.
     ///
     /// `Default::default()` and `cli::Cli::finalize()` call this for
-    /// you. Tests that mutate `phred_sat` or `gate_shape` after
-    /// construction must call `prepare()` again to keep the LUT in
-    /// sync; tests that mutate other fields don't need to.
+    /// you, and the pipeline calls [`Params::set_phred_offset`] once the
+    /// offset is detected (it is not known until the first chunk is read).
+    /// Tests that mutate `phred_sat` or `gate_shape` after construction must
+    /// call `prepare()` again to keep the LUT in sync; tests that mutate other
+    /// fields don't need to.
+    ///
+    /// The index is the raw byte, so the table is shifted by the offset rather
+    /// than the data being decoded. `saturating_sub` is what makes a byte below
+    /// the offset gate as Q0 — the same value the old decode-then-encode path
+    /// produced, and the reason ingest clamps such a byte up to the offset (so
+    /// egress writes back exactly what the old path wrote).
     pub fn prepare(&mut self) {
-        for q in 0u8..=255 {
-            self.gate_lut[q as usize] = quality_gate(q, self.phred_sat, self.gate_shape);
+        for b in 0u16..=255 {
+            let b = b as u8;
+            self.gate_lut[b as usize] =
+                quality_gate(b.saturating_sub(self.phred_offset), self.phred_sat, self.gate_shape);
+        }
+    }
+
+    /// Set the Phred offset of the raw quality bytes and rebuild [`Params::gate_lut`].
+    ///
+    /// The offset is only known once the first records are read (auto-detection),
+    /// so the pipeline calls this on its own copy of the params before the first
+    /// chunk. A no-op when the offset is unchanged.
+    pub fn set_phred_offset(&mut self, offset: u8) {
+        if self.phred_offset != offset {
+            self.phred_offset = offset;
+            self.prepare();
         }
     }
 }
@@ -287,6 +324,33 @@ fn quality_gate(q: u8, t: u8, x: f64) -> f64 {
     } else {
         (q as f64 / t as f64).powf(x)
     }
+}
+
+/// Sum of the decoded Phred values over a whole slice, read from the raw
+/// bytes.
+///
+/// `sum(raw) − offset·len` is exact, not an approximation: ingestion clamps
+/// every byte below the offset up to it, which is precisely the value the old
+/// decode path produced (`saturating_sub`) and the value egress wrote back. One
+/// vectorisable pass, and no per-byte subtract — the same reason the gate reads
+/// a shifted lookup table instead of decoding.
+#[inline]
+fn quality_sum_raw(quals: &[u8], phred_offset: u8) -> u64 {
+    let raw: u64 = quals.iter().map(|&q| q as u64).sum();
+    raw.saturating_sub(phred_offset as u64 * quals.len() as u64)
+}
+
+/// Shift an accumulated RAW quality sum covering `n` bases into decoded Phred
+/// units.
+///
+/// The streaming walk sums the bytes it visits (a plain add, once per base) and
+/// this one subtraction turns the total into the same number the pre-decode
+/// path produced. Doing it here rather than per byte keeps the inner loop a
+/// bare add — a per-byte `saturating_sub` there measured ~1.5 % of wall time on
+/// the 200 k-pair cell.
+#[inline]
+fn decode_quality_sum(raw_sum: u64, n: usize, phred_offset: u8) -> u64 {
+    raw_sum.saturating_sub(phred_offset as u64 * n as u64)
 }
 
 /// Per-step gap contribution + match flag, for a single pair.
@@ -310,9 +374,9 @@ fn per_step_gap_and_match(
         MatchRule::Homopolymer => b1 == b2,
         MatchRule::Anchored(mask) => mask[b2 as usize],
     };
-    // Quality bytes are raw Phred values: pipeline::ScanInput pre-decodes
-    // the FASTQ ASCII offset on ingestion. Tests construct raw values
-    // directly. So no offset subtraction here.
+    // Quality bytes are RAW: the Phred offset is folded into `gate_lut` by
+    // `Params::prepare`, and ingestion clamps bytes below the offset up to it.
+    // So no offset subtraction here — and none anywhere on the hot path.
     let w = (params.gate_lut[q1 as usize] + params.gate_lut[q2 as usize]) * 0.5;
     let gap = if matches {
         // σ = (1 − μ) + μW  ⇒  gap = μ(1 − W)
@@ -583,7 +647,9 @@ fn streaming_walk<const FORWARD: bool>(
     for i_logical in 0..l {
         let i_phys = idx_const::<FORWARD>(i_logical, l);
 
-        // Always sum quality (mean-q is over the whole read).
+        // Always sum quality (mean-q is over the whole read) as the RAW byte;
+        // the offset is subtracted once, at the end, by `decode_quality_sum`
+        // (the walk's coverage at any return point is `i_logical + 1`).
         // Safety: i_phys < l by construction (idx_const returns either
         // i_logical < l or l - 1 - i_logical, both < l). The compiler
         // should hoist the bounds check; if not, we can switch to
@@ -635,7 +701,8 @@ fn streaming_walk<const FORWARD: bool>(
             && m_curr + 1 >= params.min_run
         {
             return StreamOut {
-                quality_sum, // partial; caller still drops, doesn't use
+                // Partial coverage; the caller drops the read without using it.
+                quality_sum: decode_quality_sum(quality_sum, i_logical + 1, params.phred_offset),
                 first_trim: 0,
                 h_int: 0,
                 runs: Vec::new(),
@@ -661,7 +728,11 @@ fn streaming_walk<const FORWARD: bool>(
                 runs.push((sub_pos, sub_trim));
                 if first_trim + h_int > rem_budget {
                     return StreamOut {
-                        quality_sum,
+                        quality_sum: decode_quality_sum(
+                            quality_sum,
+                            i_logical + 1,
+                            params.phred_offset,
+                        ),
                         first_trim,
                         h_int,
                         runs,
@@ -692,7 +763,7 @@ fn streaming_walk<const FORWARD: bool>(
     }
 
     StreamOut {
-        quality_sum,
+        quality_sum: decode_quality_sum(quality_sum, l, params.phred_offset),
         first_trim,
         h_int,
         runs,
@@ -985,7 +1056,7 @@ fn polyx_trim_inner(
         // the bench never sets --mean-q, so this is usually a plain 0.
         StreamOut {
             quality_sum: if params.mean_q.is_some() {
-                quals.iter().map(|&q| q as u64).sum()
+                quality_sum_raw(quals, params.phred_offset)
             } else {
                 0
             },
@@ -998,7 +1069,7 @@ fn polyx_trim_inner(
         // Quality-only walk (no scan). Still cheap; one path with no
         // direction branch.
         StreamOut {
-            quality_sum: quals.iter().map(|&q| q as u64).sum(),
+            quality_sum: quality_sum_raw(quals, params.phred_offset),
             first_trim: 0,
             h_int: 0,
             runs: Vec::new(),
@@ -1187,13 +1258,17 @@ fn polyx_trim_inner(
 // Public trim() — adapter + polyX in one pass.
 // ---------------------------------------------------------------------------
 
-/// Output of [`trim`]: the trim decision plus the name of the matched
+/// Output of [`trim`]: the trim decision plus the identity of the matched
 /// adapter (if any), used by the pipeline to update per-adapter stats.
 #[derive(Debug)]
 pub struct TrimOutput {
     pub result: TrimResult,
-    /// Name of the adapter that was trimmed, if any.
-    pub adapter_name: Option<String>,
+    /// Index of the adapter that was trimmed, in `Params::adapter`'s set order,
+    /// or [`crate::adapter::PE_OVERLAP_ADAPTER`] for a boundary the mate pair
+    /// pinned. An index rather than a name: this value is produced for every
+    /// trimmed read and crossed two heap allocations (one here, one in the
+    /// stats hash) that bought nothing until the report is printed.
+    pub adapter: Option<u8>,
 }
 
 /// Full single-read processing: adapter detection then polyX trimming.
@@ -1214,15 +1289,16 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
     let l = bases.len();
 
     // --- Step 1: adapter detection ---
-    let (t5_adapter, t3_adapter, adapter_name) = match params.pe_adapter {
+    let (t5_adapter, t3_adapter, adapter) = match params.pe_adapter {
         // PE overlap pinned the boundary on this mate: the trim is exact, and
-        // the name records where it came from so the report can say so.
-        Some((t5, t3)) => (t5, t3, Some("pe-overlap".to_string())),
+        // the reserved index records where it came from so the report can say
+        // so.
+        Some((t5, t3)) => (t5, t3, Some(crate::adapter::PE_OVERLAP_ADAPTER)),
         None => match params.adapter.as_deref() {
             None => (0, 0, None),
             Some(set) => match crate::adapter::match_adapters(bases, set) {
                 None => (0, 0, None),
-                Some(m) => (m.t5, m.t3, Some(m.name)),
+                Some(m) => (m.t5, m.t3, Some(m.adapter)),
             },
         },
     };
@@ -1241,7 +1317,7 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
                     t3_poly: 0,
                     runs: vec![],
                 },
-                adapter_name,
+                adapter,
             };
         }
     }
@@ -1298,10 +1374,7 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
         }
     };
 
-    TrimOutput {
-        result,
-        adapter_name,
-    }
+    TrimOutput { result, adapter }
 }
 // ===========================================================================
 
@@ -1400,7 +1473,114 @@ mod tests {
         }
     }
 
+    // ------- Adapter identity is an index, not a name ----------------------
+
+    /// A trimmed read carries an adapter INDEX. Materialising the name per
+    /// read was two heap allocations (one in the worker, one in the stats
+    /// hash) per adapter-trimmed read; the name is only needed once, at report
+    /// time.
+    #[test]
+    fn trim_carries_an_adapter_index_not_a_name() {
+        let adapter = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+        let mut seq = b"ACGT".repeat(30);
+        seq.extend_from_slice(adapter);
+        let quals = vec![40u8; seq.len()];
+        let mut p = Params::default();
+        p.adapter = Some(std::sync::Arc::new(AdapterSet::new(
+            vec![crate::adapter::Adapter { name: "TruSeq/R1".into(), seq: adapter.to_vec() }],
+            0.2,
+            14,
+        )));
+        p.prepare();
+        let out = trim(&seq, &quals, &p);
+        assert_eq!(out.adapter, Some(0), "adapter index 0 in set order");
+        assert!(matches!(out.result, TrimResult::Emit { .. }));
+    }
+
+    /// The PE-overlap boundary is an adapter identity too, with the reserved
+    /// index, so the report can attribute it without a String.
+    #[test]
+    fn pe_overlap_boundary_uses_the_reserved_index() {
+        let seq = b"ACGT".repeat(38);
+        let quals = vec![40u8; seq.len()];
+        let mut p = Params::default();
+        p.pe_adapter = Some((0, 10));
+        p.prepare();
+        let out = trim(&seq, &quals, &p);
+        assert_eq!(out.adapter, Some(crate::adapter::PE_OVERLAP_ADAPTER));
+    }
+
     // ------- Scan primitive -----------------------------------------------
+
+    /// The quality LUT is indexed by the RAW byte, with the Phred offset
+    /// folded in once at build time. That is what lets ingest and egress be
+    /// plain copies instead of a decode/encode round trip per byte.
+    #[test]
+    fn gate_lut_is_indexed_by_the_raw_quality_byte() {
+        let mut p = Params::default();
+        p.phred_offset = 33;
+        p.prepare();
+        for q in 0u8..=40 {
+            let raw = q + 33;
+            assert_eq!(
+                p.gate_lut[raw as usize],
+                quality_gate(q, p.phred_sat, p.gate_shape),
+                "raw byte {raw} must gate as Q{q}"
+            );
+        }
+        // Bytes below the offset are clamped to the offset on ingest, so they
+        // must gate as Q0 — and, defensively, an unclamped 0 must too, because
+        // FASTA ingestion fills quality with zeros rather than ASCII.
+        assert_eq!(p.gate_lut[0], quality_gate(0, p.phred_sat, p.gate_shape));
+        // With no offset configured (every unit test building `Params` raw),
+        // the table is the identity mapping.
+        let mut raw = Params::default();
+        raw.prepare();
+        for q in 0u8..=255 {
+            assert_eq!(raw.gate_lut[q as usize], quality_gate(q, raw.phred_sat, raw.gate_shape));
+        }
+    }
+
+    /// The mean-quality filter must stay exact on raw bytes: `sum(raw) −
+    /// offset·len`, not `sum(raw)`. A read of Q40 bases at Phred+33 must pass a
+    /// Q39 threshold and fail a Q41 one — the failure mode of keeping ASCII is
+    /// a mean of 73, which passes both.
+    #[test]
+    fn mean_quality_is_exact_over_raw_bytes() {
+        let bases: Vec<u8> = b"ACGT".iter().cycle().take(152).copied().collect();
+        let raw_quals = vec![b'I'; 152]; // 'I' = 73 = Q40 at Phred+33
+        let run = |threshold: f64| {
+            let mut p = Params::default();
+            p.min_len = MinLen::Frac(0.5);
+            p.mean_q = Some(threshold);
+            p.phred_offset = 33;
+            p.prepare();
+            trim(&bases, &raw_quals, &p).result
+        };
+        assert!(
+            matches!(run(39.0), TrimResult::Emit { .. }),
+            "mean Q40 must pass a Q39 threshold"
+        );
+        match run(41.0) {
+            TrimResult::Drop { reason, .. } => assert_eq!(reason, DropReason::MeanQ),
+            other => panic!("mean Q40 must fail a Q41 threshold, got {other:?}"),
+        }
+    }
+
+    /// Phred+64 is the LUT shift's real test: the same *decoded* quality must
+    /// gate identically whatever offset the bytes were written with.
+    #[test]
+    fn gate_lut_shift_handles_phred64() {
+        let mut p33 = Params::default();
+        p33.phred_offset = 33;
+        p33.prepare();
+        let mut p64 = Params::default();
+        p64.phred_offset = 64;
+        p64.prepare();
+        for q in 0u8..=40 {
+            assert_eq!(p33.gate_lut[q as usize + 33], p64.gate_lut[q as usize + 64]);
+        }
+    }
 
     #[test]
     fn scan_pure_polya_boundary() {

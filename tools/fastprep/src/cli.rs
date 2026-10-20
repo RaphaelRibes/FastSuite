@@ -34,14 +34,18 @@ pub enum AdapterPreset {
 
 /// When the paired-end overlap detector may pin the adapter boundary.
 ///
-/// `auto` (the default) tracks the adapter source, because the safety guard
-/// needs a set to check the boundary against: `auto` runs only when the
-/// adapter source is EXPLICIT (`--adapter-preset` / `--adapters`), and stays
-/// off with auto-detection or `--no-adapter`. `always` is the explicit opt-in
-/// to run regardless of the source. Either way the detector refuses a
-/// boundary when no set is configured (`detect_pe_overlap_trim(.., None)` is
-/// `None`), so `always` cannot trim biology either — it only opts into running
-/// the detector.
+/// `auto` (the default) tracks *whether the user configured an adapter set*,
+/// because the safety guard needs a set to check the boundary against: `auto`
+/// runs only when the adapter source is EXPLICIT (`--adapter-preset` /
+/// `--adapters`), and stays off with auto-detection or `--no-adapter`. A
+/// detected set is not an explicit one — [`AdapterSource::Fixed`] carries the
+/// distinction in `explicit` — so detection alone cannot switch the stage on;
+/// the mode's measured value on the cohort is a null, and running it on every
+/// pair for a set the user never named was the bug this field exists to stop.
+/// `always` is the explicit opt-in to run regardless of the source. Either way
+/// the detector refuses a boundary when no set is configured
+/// (`detect_pe_overlap_trim(.., None)` is `None`), so `always` cannot trim
+/// biology either — it only opts into running the detector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum PeOverlapMode {
     /// Never run the mode (equivalent to the flag being absent).
@@ -57,14 +61,17 @@ impl PeOverlapMode {
     ///
     /// `Never` never runs; `Always` always runs (the caller has opted in);
     /// `Auto` runs only for an explicit source — the guard then has a set to
-    /// check the boundary against. This is the one place the tri-state is
-    /// resolved, so the mode's reach cannot drift from the source that
-    /// justifies it.
+    /// check the boundary against, and the user asked for that set. A
+    /// *detected* set has one too, but nobody asked to run the stage, so it
+    /// does not count: measured against the cohort the mode is a null, and its
+    /// per-pair cost (a `revcomp` allocation plus ~140 anchor probes) is not.
+    /// This is the one place the tri-state is resolved, so the mode's reach
+    /// cannot drift from the source that justifies it.
     pub fn runs_with(self, source: &AdapterSource) -> bool {
         match self {
             PeOverlapMode::Never => false,
             PeOverlapMode::Always => true,
-            PeOverlapMode::Auto => matches!(source, AdapterSource::Fixed(_)),
+            PeOverlapMode::Auto => matches!(source, AdapterSource::Fixed { explicit: true, .. }),
         }
     }
 
@@ -475,10 +482,22 @@ pub enum Mode {
 ///
 /// There is no auto-detect variant: detection resolves to a `Fixed` set in
 /// `Cli::finalize`, so by the time the pipeline runs the adapters are known.
+/// `explicit` is what distinguishes the two ways a set can come into being,
+/// because they are not interchangeable for decisions that need a *user's*
+/// configuration rather than any set at all: a preset or a FASTA is something
+/// the user asked for, a catalogue detection is the tool's own guess. Only
+/// `--adapter-preset` / `--adapters` set it to `true`.
 #[derive(Debug, Clone)]
 pub enum AdapterSource {
     /// Pre-loaded set, from a preset, a FASTA, or catalogue detection.
-    Fixed(Arc<AdapterSet>),
+    Fixed {
+        set: Arc<AdapterSet>,
+        /// `true` only when the user named the set on the command line. A
+        /// detected set is `false`, which is what keeps `--pe-overlap auto`
+        /// from running a stage the user never asked for (see
+        /// [`PeOverlapMode::runs_with`]).
+        explicit: bool,
+    },
     /// Adapter trimming disabled.
     None,
 }
@@ -525,10 +544,10 @@ pub struct Runtime {
     pub quiet: bool,
     pub adapter_source: AdapterSource,
     /// `--pe-overlap`: the tri-state as resolved in `finalize()`. `Auto` is
-    /// resolved against the adapter source here (explicit ⇒ [`PeOverlapMode::Auto`]
-    /// stays; auto-detect/`--no-adapter` ⇒ [`PeOverlapMode::Never`]), so the
-    /// pipeline reads the mode directly and the mode's reach cannot drift from
-    /// the source that justifies it.
+    /// resolved against the adapter source there (explicit `Fixed` set ⇒
+    /// [`PeOverlapMode::Auto`] stays; detected set or `--no-adapter` ⇒
+    /// [`PeOverlapMode::Never`]), so the pipeline reads the mode directly and
+    /// the mode's reach cannot drift from the source that justifies it.
     pub pe_overlap: PeOverlapMode,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
@@ -750,7 +769,9 @@ impl Cli {
             }
         }
 
-        // Build adapter source.
+        // Build adapter source. `explicit` records *which branch* produced the
+        // set: only the two the user named (preset, FASTA) are explicit, and
+        // `--pe-overlap auto` resolves against that flag alone.
         let adapter_source = if self.no_adapter {
             AdapterSource::None
         } else if let Some(preset) = self.adapter_preset {
@@ -759,18 +780,24 @@ impl Cli {
                 AdapterPreset::Nextera  => adapter::preset_nextera(),
                 AdapterPreset::SmallRna => adapter::preset_small_rna(),
             };
-            AdapterSource::Fixed(Arc::new(AdapterSet::new(
-                adapters,
-                self.adapter_error_rate,
-                self.min_adapter_overlap,
-            )))
+            AdapterSource::Fixed {
+                set: Arc::new(AdapterSet::new(
+                    adapters,
+                    self.adapter_error_rate,
+                    self.min_adapter_overlap,
+                )),
+                explicit: true,
+            }
         } else if let Some(path) = self.adapters {
             let adapters = adapter::load_fasta(&path)?;
-            AdapterSource::Fixed(Arc::new(AdapterSet::new(
-                adapters,
-                self.adapter_error_rate,
-                self.min_adapter_overlap,
-            )))
+            AdapterSource::Fixed {
+                set: Arc::new(AdapterSet::new(
+                    adapters,
+                    self.adapter_error_rate,
+                    self.min_adapter_overlap,
+                )),
+                explicit: true,
+            }
         } else {
             // Auto-detect. The terminal k-mer is a fingerprint against the
             // built-in catalogue; the catalogue supplies the full sequence
@@ -834,11 +861,15 @@ impl Cli {
                     }
                 }
 
-                AdapterSource::Fixed(Arc::new(AdapterSet::new(
-                    det.adapters,
-                    self.adapter_error_rate,
-                    self.min_adapter_overlap,
-                )))
+                AdapterSource::Fixed {
+                    set: Arc::new(AdapterSet::new(
+                        det.adapters,
+                        self.adapter_error_rate,
+                        self.min_adapter_overlap,
+                    )),
+                    // Detection is not configuration: `auto` stays off.
+                    explicit: false,
+                }
             }
         };
 
@@ -862,7 +893,7 @@ impl Cli {
             trim_5: self.trim_5,
             trim_3: self.trim_3,
             adapter: match &adapter_source {
-                AdapterSource::Fixed(arc) => Some(Arc::clone(arc)),
+                AdapterSource::Fixed { set, .. } => Some(Arc::clone(set)),
                 _ => None,
             },
             // Set per pair in `pair_chunks` when `--pe-overlap` fires; `None`
@@ -871,6 +902,9 @@ impl Cli {
             extra_committed: 0,
             original_len: None,
             gate_lut: [0.0; 256],
+            // The configured offset; `run_single`/`run_paired` re-set it from
+            // auto-detection before the first chunk and rebuild the LUT.
+            phred_offset,
         };
         base.prepare();
         // Deduplication. Resolved here so the run refuses before allocating
@@ -957,17 +991,16 @@ impl Cli {
         };
 
         // Resolve the PE-overlap tri-state against the adapter source, in the
-        // same place the source is built: the guard needs a set to check the
-        // boundary against, so `auto` runs only when the source is explicit.
-        // `always` keeps its explicit opt-in, and the detector still refuses a
-        // boundary with no set (`detect_pe_overlap_trim(.., None)` is `None`).
-        let pe_overlap = match self.pe_overlap {
-            PeOverlapMode::Never => PeOverlapMode::Never,
-            PeOverlapMode::Always => PeOverlapMode::Always,
-            PeOverlapMode::Auto => match adapter_source {
-                AdapterSource::Fixed(_) => PeOverlapMode::Auto,
-                AdapterSource::None => PeOverlapMode::Never,
-            },
+        // same place the source is built and through the one function that
+        // knows the rule: the guard needs a set to check the boundary against
+        // AND the user must have named it, so `auto` runs only for an explicit
+        // source. `always` keeps its explicit opt-in, and the detector still
+        // refuses a boundary with no set (`detect_pe_overlap_trim(.., None)` is
+        // `None`).
+        let pe_overlap = if self.pe_overlap.runs_with(&adapter_source) {
+            self.pe_overlap
+        } else {
+            PeOverlapMode::Never
         };
 
         let runtime = Runtime {
@@ -1154,15 +1187,94 @@ mod tests {
     #[test]
     fn auto_tracks_the_adapter_source() {
         // The resolution the pipeline relies on: auto + explicit ⇒ runs;
-        // auto + auto-detect or --no-adapter ⇒ off.
-        assert!(PeOverlapMode::Auto.runs_with(&AdapterSource::Fixed(Arc::new(
-            AdapterSet::new(adapter::preset_illumina(), 0.2, 14)
-        ))));
+        // auto + auto-detect or --no-adapter ⇒ off. Robustness note: an adapter
+        // set EXISTING is not the same thing as one being CONFIGURED. That is
+        // the whole point of `explicit`.
+        let set = || Arc::new(AdapterSet::new(adapter::preset_illumina(), 0.2, 14));
+        let explicit = AdapterSource::Fixed { set: set(), explicit: true };
+        let detected = AdapterSource::Fixed { set: set(), explicit: false };
+        assert!(PeOverlapMode::Auto.runs_with(&explicit));
+        assert!(
+            !PeOverlapMode::Auto.runs_with(&detected),
+            "a DETECTED set is not an explicit one: auto must stay off"
+        );
         assert!(!PeOverlapMode::Auto.runs_with(&AdapterSource::None));
-        assert!(!PeOverlapMode::Never.runs_with(&AdapterSource::Fixed(Arc::new(
-            AdapterSet::new(adapter::preset_illumina(), 0.2, 14)
-        ))));
+        assert!(!PeOverlapMode::Never.runs_with(&explicit));
+        assert!(PeOverlapMode::Always.runs_with(&detected));
         assert!(PeOverlapMode::Always.runs_with(&AdapterSource::None));
+    }
+
+    /// The resolution `finalize` performs, end to end: with no adapter flags the
+    /// source comes from auto-detection, which must leave `auto` resolved to
+    /// `Never`; `--adapter-preset` is explicit and keeps `Auto`; `always` keeps
+    /// today's reach regardless of the source.
+    #[test]
+    fn finalize_resolves_auto_against_explicit_adapters_only() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("fastprep-pe-auto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inp = dir.join("in.fq");
+        let inp2 = dir.join("in2.fq");
+        let out = dir.join("out.fq");
+        let out2 = dir.join("out2.fq");
+        // Nextera readthrough in every read, so catalogue detection fires and
+        // resolves to a Fixed set that no flag asked for.
+        let mut body = String::new();
+        for i in 0..200 {
+            body.push_str(&format!(
+                "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGTCTGTCTCTTATACACATCT\n+\n{}\n",
+                "I".repeat(51)
+            ));
+        }
+        std::fs::write(&inp, &body).unwrap();
+        std::fs::write(&inp2, &body).unwrap();
+
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = vec![
+                "fastprep".into(),
+                "-1".into(),
+                inp.to_string_lossy().into_owned(),
+                "-2".into(),
+                inp2.to_string_lossy().into_owned(),
+                "-o".into(),
+                out.to_string_lossy().into_owned(),
+                "-p".into(),
+                out2.to_string_lossy().into_owned(),
+                "--no-dedup".into(),
+                "--no-auto-phred".into(),
+                "-q".into(),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+
+        // 1. No adapter flags → detected → `auto` is off.
+        let (_, rt) = Cli::parse_from(argv(&[])).finalize().unwrap();
+        assert!(
+            matches!(rt.adapter_source, AdapterSource::Fixed { explicit: false, .. }),
+            "auto-detection must be recorded as NOT explicit"
+        );
+        assert_eq!(
+            rt.pe_overlap,
+            PeOverlapMode::Never,
+            "auto must not run on a detected adapter set"
+        );
+
+        // 2. --adapter-preset is explicit → `auto` stays on.
+        let (_, rt) = Cli::parse_from(argv(&["--adapter-preset", "illumina"]))
+            .finalize()
+            .unwrap();
+        assert!(matches!(rt.adapter_source, AdapterSource::Fixed { explicit: true, .. }));
+        assert_eq!(rt.pe_overlap, PeOverlapMode::Auto);
+
+        // 3. `always` keeps today's reach, detected set or not.
+        let (_, rt) = Cli::parse_from(argv(&["--pe-overlap", "always"]))
+            .finalize()
+            .unwrap();
+        assert_eq!(rt.pe_overlap, PeOverlapMode::Always);
+
+        std::fs::remove_file(&inp).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

@@ -48,10 +48,11 @@ pub struct AdapterSet {
     pub error_rate: f64,
     /// Minimum overlap for sequence matching.
     pub min_overlap_se: usize,
-    /// 6-mer seed index, built once at construction. `match_adapters` uses it
-    /// to skip the ~118-position full scan on reads that share no 6-mer with
-    /// any adapter (the pigeonhole argument below makes this exact, not a
-    /// heuristic).
+    /// Seed index, built once at construction. `match_adapters` uses it to
+    /// skip the ~118-position full scan on reads that share no seed with any
+    /// adapter (the pigeonhole argument above makes this exact, not a
+    /// heuristic). The seed width is derived from the error rate, so this is
+    /// not a fixed 6-mer table.
     pub seeds: Arc<SeedTable>,
 }
 
@@ -69,80 +70,172 @@ impl AdapterSet {
     }
 }
 
-/// 6-mer seed index for fast rejection of adapter-free reads.
+/// Seed index for fast rejection of adapter-free reads.
 ///
-/// Soundness: any alignment of `k` bases with ≤ `max_mm` mismatches contains
-/// an exactly-matching run of at least `k / (max_mm + 1)` bases (split the
-/// window into `max_mm + 1` chunks; one must be perfect). When that run is
-/// ≥ 6 bases it contains an adapter 6-mer that appears verbatim in the read,
-/// so a seed lookup at that position finds the alignment. The table therefore
-/// only needs to be consulted at positions where the read actually contains
-/// one of the adapter's 6-mers; everything else is provably non-matching.
+/// Soundness of the pigeonhole argument, stated exactly: an alignment of `k`
+/// bases with `mm = ceil(k·ε)` mismatches has at most `mm + 1` exactly
+/// matching runs, totalling `k − mm` bases, so the longest of them is at least
+/// `floor(k / (mm + 1))`. When that is `>= s` — the seed width — the alignment
+/// contains an adapter `s`-mer that appears verbatim in the read, so a seed
+/// lookup at that position finds the alignment and everything below `s` bases
+/// of run can only be found by the direct scan.
+///
+/// The seed width is therefore a derived quantity, not a constant: `s = 6`
+/// requires `k >= 6·(mm+1)`, which has no solution once `ε >= 1/6`, so at the
+/// shipped `--adapter-error-rate 0.2` a fixed 6-mer table declared every
+/// adapter unsound (`min_sound_k = usize::MAX`) and every read took the
+/// reference full scan — 414 exact compares at L = 151 while only 2.3 % of
+/// reads carry an adapter. Sizing `s` from the bound, per adapter, revives the
+/// filter where it was dead (81 compares on random sequence, measured) and
+/// leaves it untouched where it already worked.
 #[derive(Debug)]
 pub struct SeedTable {
-    /// `table[code]` = index into `pairs` of the first `(adapter, offset)`
-    /// for this 6-mer code; `-1` when empty. Flat and small (8 KB) so the
-    /// per-read lookup stays in L1, unlike the old `Vec<Vec<…>>` which
+    /// `table[index]` = index into `pairs` of the first `(adapter, offset)`
+    /// for this seed code; `-1` when empty. Flat and ~11 KB so the per-read
+    /// lookup stays in cache, unlike the old `Vec<Vec<…>>` which
     /// pointer-chased on every position of every read (profile: ~49% of
     /// runtime after the first seed optimisation).
-    table: [i16; 1 << 12],
-    /// Flat `(code, adapter index, offset within adapter)` list, grouped by
-    /// code so a lookup iterates a contiguous run.
+    ///
+    /// One array holds every width: each width owns a disjoint code range
+    /// ([`code_base`]), because a 4-mer code and a 5-mer code with the same
+    /// numeric value are different seeds and must not share a bucket.
+    table: [i16; TABLE_LEN],
+    /// Flat `(tagged code, adapter index, offset within adapter)` list, grouped
+    /// by code so a lookup iterates a contiguous run.
     pairs: Vec<(u16, u8, u8)>,
-    /// Smallest overlap length for which the 6-mer guarantee holds, per
-    /// adapter (`usize::MAX` = never, e.g. high error rates). Alignments
-    /// shorter than this cannot rely on seeds and fall back to a direct scan.
+    /// Smallest overlap length for which the seed guarantee holds, per
+    /// adapter (`usize::MAX` = never: the adapter is too short to host the
+    /// bound at this error rate and falls back to a direct scan).
     min_sound_k: Vec<usize>,
+    /// Seed width chosen per adapter, `0` when the adapter is not seeded.
+    width: Vec<usize>,
+    /// The distinct widths in use, ascending. The scan iterates exactly these
+    /// per position — normally one or two, because the wide adapters and a
+    /// short one need different widths at the same error rate.
+    widths: Vec<usize>,
+}
+
+/// Candidate seed widths, widest first.
+///
+/// A wider seed is exponentially more selective — a 4-mer is shared by almost
+/// every read, a 6-mer by almost none — so each adapter gets the widest width
+/// its own length and the error rate allow, and only shrinks when the
+/// arithmetic forces it. At the shipped `--adapter-error-rate 0.2` the 34-base
+/// TruSeq adapters take a 4-mer (sound from k = 20) and the 19-base Nextera
+/// adapter a 3-mer (sound from k = 9); with the old fixed 6 every one of them
+/// was unsound and took the reference full scan.
+const SEED_WIDTHS: [usize; 4] = [6, 5, 4, 3];
+
+/// Code ranges: width `s` owns `[code_base(s), code_base(s) + 4^s)`.
+const TABLE_LEN: usize = 5440;
+
+/// Base index of width `s`'s code range. Width 6 keeps the low range so the
+/// original 12-bit table layout is unchanged for existing error rates.
+#[inline]
+fn code_base(s: usize) -> usize {
+    match s {
+        6 => 0,
+        5 => 4096,
+        4 => 5120,
+        3 => 5376,
+        _ => unreachable!("seed width is one of 3..=6"),
+    }
+}
+
+#[inline]
+fn code_mask(s: usize) -> u32 {
+    (1u32 << (2 * s)) - 1
+}
+
+/// Smallest `k` at which an alignment of `k` bases with `ceil(k·ε)` mismatches
+/// is guaranteed to contain an exact run of at least `s` bases, or `usize::MAX`
+/// when no `k <= a_len` satisfies it.
+///
+/// The test is `k >= s * (mm + 1)` — the pigeonhole bound above, in integers —
+/// not `ceil(k / (mm + 1)) >= s`: the latter is optimistic by one seed width,
+/// because the mismatch-free chunk may be one of the short ones when `k` is not
+/// a multiple of `mm + 1`. Using it would make the filter unsound, which the
+/// conformance test catches as a changed trim, not as a slow path.
+fn min_sound_k_for(a_len: usize, error_rate: f64, s: usize) -> usize {
+    for k in s..=a_len {
+        let max_mm = (k as f64 * error_rate).ceil() as usize;
+        if k >= s * (max_mm + 1) {
+            return k;
+        }
+    }
+    usize::MAX
 }
 
 impl SeedTable {
     fn build(adapters: &[Adapter], error_rate: f64) -> Self {
+        // Per adapter, widest sound width. `0` (no width) means the adapter
+        // cannot host any bound at this error rate; it then takes the direct
+        // scan for every position, exactly as before.
+        let width: Vec<usize> = adapters
+            .iter()
+            .map(|a| {
+                SEED_WIDTHS
+                    .iter()
+                    .copied()
+                    .find(|&s| {
+                        a.seq.len() >= s && min_sound_k_for(a.seq.len(), error_rate, s) != usize::MAX
+                    })
+                    .unwrap_or(0)
+            })
+            .collect();
+        let mut widths: Vec<usize> = width.iter().copied().filter(|&s| s > 0).collect();
+        widths.sort_unstable();
+        widths.dedup();
+
         let mut pairs: Vec<(u16, u8, u8)> = Vec::new();
-        for (ai, a) in adapters.iter().enumerate() {
-            let seq = &a.seq;
-            if seq.len() >= 6 {
-                for off in 0..=seq.len() - 6 {
-                    let code = seed_code(&seq[off..off + 6]);
-                    pairs.push((code as u16, ai as u8, off as u8));
-                }
+        for ((ai, a), &s) in adapters.iter().enumerate().zip(width.iter()) {
+            if s == 0 {
+                continue;
+            }
+            let base = code_base(s);
+            let mask = code_mask(s);
+            for off in 0..=a.seq.len() - s {
+                let code = seed_code(&a.seq[off..off + s], mask);
+                pairs.push(((base + code as usize) as u16, ai as u8, off as u8));
             }
         }
         // Group by code so a lookup is a contiguous run. This matters: two
-        // adapters (e.g. TruSeq R1/R2) share a long prefix, so the same 6-mer
+        // adapters (e.g. TruSeq R1/R2) share a long prefix, so the same seed
         // appears in both at the same offset — without the sort, table[code]
         // would point into R1's block and the run would stop before R2's
         // entry, silently missing valid R2 alignments.
         pairs.sort_unstable_by_key(|p| p.0);
-        let mut table = [-1i16; 1 << 12];
+        let mut table = [-1i16; TABLE_LEN];
         for (i, &(code, _, _)) in pairs.iter().enumerate() {
             if i == 0 || pairs[i - 1].0 != code {
                 table[code as usize] = i as i16;
             }
         }
-        // Smallest k with k >= 6 * (max_mm + 1), max_mm = ceil(k·e).
-        let mut min_sound_k = Vec::with_capacity(adapters.len());
-        for a in adapters {
-            let mut ms = usize::MAX;
-            for k in 1..=a.seq.len() {
-                let max_mm = (k as f64 * error_rate).ceil() as usize;
-                if k >= 6 * (max_mm + 1) {
-                    ms = k;
-                    break;
+        let min_sound_k = adapters
+            .iter()
+            .zip(width.iter())
+            .map(|(a, &s)| {
+                if s == 0 {
+                    usize::MAX
+                } else {
+                    min_sound_k_for(a.seq.len(), error_rate, s)
                 }
-            }
-            min_sound_k.push(ms);
-        }
+            })
+            .collect();
         SeedTable {
             table,
             pairs,
             min_sound_k,
+            width,
+            widths,
         }
     }
 }
 
-/// 2-bit encoding of a 6-mer into a 12-bit code (A=0, C=1, G=2, T=3).
+/// 2-bit encoding of a seed into a `2 * bases.len()`-bit code (A=0, C=1, G=2,
+/// T=3), masked to the table's code space.
 #[inline]
-fn seed_code(bases: &[u8]) -> u32 {
+fn seed_code(bases: &[u8], mask: u32) -> u32 {
     let mut code: u32 = 0;
     for &b in bases {
         let c = match b {
@@ -153,7 +246,7 @@ fn seed_code(bases: &[u8]) -> u32 {
         };
         code = (code << 2) | c;
     }
-    code & 0xFFF
+    code & mask
 }
 
 /// Byte → 2-bit base code lookup (0=A, 1=C, 2=G, 3=T; anything else → 3).
@@ -172,11 +265,25 @@ static BASE2: [u8; 256] = {
     t
 };
 
+/// Index reserved for the PE-overlap pseudo-adapter in [`AdapterMatch`] and in
+/// the per-adapter counters.
+///
+/// The overlap detector pins a boundary without naming an adapter, and the
+/// report still has to attribute the trim, so it owns the top index. Real
+/// adapters are `0..adapters.len()`, which no set can push past this.
+pub const PE_OVERLAP_ADAPTER: u8 = u8::MAX;
+
 /// Result of a successful adapter match on one read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The match carries an INDEX into the configured set, not the adapter's name:
+/// a name is a heap `String`, and this value crosses a thread boundary and is
+/// then counted for every trimmed read (462 792 of them at 5 M pairs). The name
+/// is resolved once, at report time, from [`crate::algorithm::Params::adapter`]
+/// and [`PE_OVERLAP_ADAPTER`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdapterMatch {
-    /// Name of the matched adapter.
-    pub name: String,
+    /// Index into `AdapterSet::adapters`, or [`PE_OVERLAP_ADAPTER`].
+    pub adapter: u8,
     /// Bases to trim from the 5′ end of this read.
     pub t5: usize,
     /// Bases to trim from the 3′ end of this read.
@@ -404,19 +511,20 @@ pub fn load_fasta(path: &Path) -> Result<Vec<Adapter>> {
 
 /// Find the leftmost adapter match in `seq`, or `None`.
 ///
-/// The scan is seed-guided: the read is walked once, a rolling 6-mer code is
-/// looked up in the adapter seed table, and only positions where the read
-/// actually contains an adapter 6-mer are tested with the exact
+/// The scan is seed-guided: the read is walked once, a rolling `seed_len`-base
+/// code is looked up in the adapter seed table, and only positions where the
+/// read actually contains an adapter seed are tested with the exact
 /// [`mismatches_upto`] comparison. This is *exact*, not a heuristic:
 ///
-/// * any valid alignment of `k` bases with ≤ `max_mm` mismatches contains an
-///   exactly-matching run of ≥ `k / (max_mm + 1)` bases (split the window
-///   into `max_mm + 1` chunks; one must be perfect);
-/// * when that run is ≥ 6 bases (i.e. `k ≥ 6·(max_mm+1)`, exactly the
-///   `min_sound_k` bound), it contains an adapter 6-mer appearing verbatim in
+/// * any valid alignment of `k` bases with `mm = ceil(k·ε)` mismatches has at
+///   most `mm + 1` exactly-matching runs totalling `k − mm` bases, so one of
+///   them is at least `floor(k / (mm + 1))` long;
+/// * when that is `>= seed_len` (i.e. `k >= seed_len·(mm+1)`, exactly the
+///   `min_sound_k` bound) it contains an adapter seed appearing verbatim in
 ///   the read, so the seed hit at its position finds the alignment;
 /// * positions whose overlap `k` falls below `min_sound_k` (short truncated
-///   tails, or short adapters at high error rates) are scanned directly.
+///   tails, or adapters too short for the bound at this error rate) are
+///   scanned directly.
 ///
 /// "Leftmost" = smallest `p`, tie-broken by first adapter in set order, which
 /// is what the reference implementation produces (largest `t3 = l − p`).
@@ -435,42 +543,46 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
     };
 
     // ---- Seed-guided pass (sound for k >= min_sound_k) -------------------
-    // Walk the read once, rolling a 12-bit 6-mer code; every table hit yields
-    // candidate alignment starts p = q - offset for the adapter at that
-    // offset. Only positions that provably need checking are tested.
-    if l >= 6 && !set.seeds.pairs.is_empty() {
-        let mut code: u32 = 0;
+    // Walk the read once, rolling a 12-bit 6-mer code and deriving each active
+    // seed width from it by masking; every table hit yields candidate
+    // alignment starts p = q + 1 - s - offset for the adapter at that offset.
+    // Only positions that provably need checking are tested.
+    if !set.seeds.widths.is_empty() {
+        let mut code6: u32 = 0;
         for q in 0..l {
             let c = BASE2[seq[q] as usize] as u32;
-            code = ((code << 2) | c) & 0xFFF;
-            if q < 5 {
-                continue; // window not full yet
-            }
-            let start = set.seeds.table[code as usize];
-            if start < 0 {
-                continue;
-            }
-            let win_start = q - 5; // start of the 6-mer ending at q
-            for &(pc, ai, off) in &set.seeds.pairs[start as usize..] {
-                if pc != code as u16 {
-                    break; // contiguous run for this code ends
+            code6 = ((code6 << 2) | c) & 0xFFF;
+            for &s in &set.seeds.widths {
+                if q + 1 < s {
+                    continue; // window not full yet
                 }
-                let a = set.adapters[ai as usize].seq.len();
-                let ms = set.seeds.min_sound_k[ai as usize];
-                // Soundness requires k >= ms; p must be in range.
-                if win_start < off as usize {
-                    continue; // p would be negative
-                }
-                let p = win_start - off as usize;
-                let k = a.min(l - p);
-                if k < min_overlap || k < ms || p > max_p {
+                let idx = (code_base(s) + (code6 & code_mask(s)) as usize) as u16;
+                let start = set.seeds.table[idx as usize];
+                if start < 0 {
                     continue;
                 }
-                let max_mm = (k as f64 * set.error_rate).ceil() as usize;
-                if mismatches_upto(&seq[p..p + k], &set.adapters[ai as usize].seq[..k], max_mm)
-                    <= max_mm
-                {
-                    consider(p, ai as usize);
+                let win_start = q + 1 - s; // start of the seed ending at q
+                for &(pc, ai, off) in &set.seeds.pairs[start as usize..] {
+                    if pc != idx {
+                        break; // contiguous run for this code ends
+                    }
+                    let a = set.adapters[ai as usize].seq.len();
+                    let ms = set.seeds.min_sound_k[ai as usize];
+                    // Soundness requires k >= ms; p must be in range.
+                    if win_start < off as usize {
+                        continue; // p would be negative
+                    }
+                    let p = win_start - off as usize;
+                    let k = a.min(l - p);
+                    if k < min_overlap || k < ms || p > max_p {
+                        continue;
+                    }
+                    let max_mm = (k as f64 * set.error_rate).ceil() as usize;
+                    if mismatches_upto(&seq[p..p + k], &set.adapters[ai as usize].seq[..k], max_mm)
+                        <= max_mm
+                    {
+                        consider(p, ai as usize);
+                    }
                 }
             }
         }
@@ -486,9 +598,11 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
             continue;
         }
         let ms = set.seeds.min_sound_k[ai];
-        if a < ms {
-            // Adapter never seed-sound (too short, or error rate too high):
-            // scan every position, reference-style.
+        if set.seeds.width[ai] == 0 {
+            // This adapter could not host the bound at this error rate (too
+            // short, or eps too high): every position is scanned directly,
+            // reference-style. `ms` is `usize::MAX` here, so the seed pass
+            // contributed nothing for it.
             for p in 0..=max_p {
                 let k = a.min(l - p);
                 if k < min_overlap {
@@ -523,7 +637,7 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
     }
 
     best.map(|(p, ai)| AdapterMatch {
-        name: set.adapters[ai].name.clone(),
+        adapter: ai as u8,
         t5: 0,
         t3: l - p,
     })
@@ -546,6 +660,8 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
 #[inline]
 fn mismatches_upto(a: &[u8], b: &[u8], cap: usize) -> usize {
     debug_assert_eq!(a.len(), b.len());
+    #[cfg(test)]
+    MM_CALLS.with(|c| c.set(c.get() + 1));
     let mut mm = 0usize;
     for (ca, cb) in a.chunks(32).zip(b.chunks(32)) {
         for i in 0..ca.len() {
@@ -559,6 +675,24 @@ fn mismatches_upto(a: &[u8], b: &[u8], cap: usize) -> usize {
         }
     }
     mm
+}
+
+// Counts exact compares. Test builds only, so the shipped binary pays nothing
+// for the instrument — without it the prefilter's value is invisible: a dead
+// prefilter and a live one produce the same trims, just at 414 calls per read
+// instead of a few dozen.
+#[cfg(test)]
+thread_local! {
+    static MM_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the exact-compare counter, run `f`, and return how many compares it
+/// took. `mismatches_upto` is otherwise invisible to a test.
+#[cfg(test)]
+fn count_mismatch_calls<R>(f: impl FnOnce() -> R) -> u64 {
+    MM_CALLS.with(|c| c.set(0));
+    let _ = f();
+    MM_CALLS.with(|c| c.get())
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +730,7 @@ mod tests {
     fn match_adapters_reference(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
         let l = seq.len();
         let mut best: Option<(usize, AdapterMatch)> = None;
-        for adapter in &set.adapters {
+        for (idx, adapter) in set.adapters.iter().enumerate() {
             let a = adapter.seq.len();
             if a == 0 {
                 continue;
@@ -622,11 +756,14 @@ mod tests {
                 if matched {
                     let t3 = l - p;
                     if best.as_ref().map_or(true, |(prev, _)| t3 > *prev) {
-                        best = Some((t3, AdapterMatch {
-                            name: adapter.name.clone(),
-                            t5: 0,
+                        best = Some((
                             t3,
-                        }));
+                            AdapterMatch {
+                                adapter: idx as u8,
+                                t5: 0,
+                                t3,
+                            },
+                        ));
                     }
                     break;
                 }
@@ -677,7 +814,7 @@ mod tests {
                     }
                 }
             }
-            for &eps in &[0.0f64, 0.05, 0.1, 0.2, 0.3] {
+            for &eps in &[0.0f64, 0.05, 0.1, 0.15, 0.2, 0.3] {
                 for &ov in &[3usize, 6, 10, 20] {
                     let set = AdapterSet::new(
                         presets.iter().enumerate().map(|(i, s)| Adapter {
@@ -773,13 +910,13 @@ mod tests {
         let mut seq = b"ACGT".repeat(25);
         seq.extend_from_slice(&a2);
         let m = match_adapters(&seq, &set).expect("should match a2");
-        assert_eq!(m.name, "a2");
+        assert_eq!(m.adapter, 1);
         assert_eq!(m.t3, a2.len());
         // Also the reverse direction must work.
         let mut seq = b"ACGT".repeat(25);
         seq.extend_from_slice(&a1);
         let m = match_adapters(&seq, &set).expect("should match a1");
-        assert_eq!(m.name, "a1");
+        assert_eq!(m.adapter, 0);
         assert_eq!(m.t3, a1.len());
     }
 
@@ -903,6 +1040,113 @@ mod tests {
             assert!(!c[i + 1..].iter().any(|b| b.seq == a.seq), "duplicate {}", a.name);
         }
         assert!(c.len() >= 4);
+    }
+
+    /// The seed width is sized from the pigeonhole bound instead of being
+    /// fixed at 6. Which width each error rate selects, and the overlap at
+    /// which that width becomes sound, is the whole contract: a wrong
+    /// `min_sound_k` silently changes what gets trimmed.
+    ///
+    /// Derivation used (sound, and the one the code implements): an alignment
+    /// of `k` bases with `mm = ceil(k·eps)` mismatches has at most `mm + 1`
+    /// exact runs totalling `k − mm` bases, so the longest run is at least
+    /// `floor(k / (mm + 1))` and a seed of width `s` is found iff
+    /// `k >= s · (mm + 1)`. At the shipped `--adapter-error-rate 0.2` no
+    /// `k` satisfies that for `s = 6` (nor `s = 5`), which is why the old
+    /// fixed 6 made every adapter take the reference full scan.
+    #[test]
+    fn seed_width_and_sound_bound_follow_the_error_rate() {
+        let presets: Vec<Vec<u8>> = vec![
+            b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA".to_vec(), // 34
+            b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT".to_vec(), // 34
+            b"CTGTCTCTTATACACATCT".to_vec(),               // 19
+        ];
+        let set_at = |eps: f64| {
+            AdapterSet::new(
+                presets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| Adapter {
+                        name: format!("a{i}"),
+                        seq: s.clone(),
+                    })
+                    .collect(),
+                eps,
+                14,
+            )
+        };
+        // (eps, [width per adapter], [min_sound_k per adapter])
+        let expect: [(f64, [usize; 3], [usize; 3]); 6] = [
+            (0.0, [6, 6, 6], [6, 6, 6]),
+            (0.05, [6, 6, 6], [12, 12, 12]),
+            (0.1, [6, 6, 6], [18, 18, 18]),
+            // 6 needs k >= 6*(mm+1), impossible for a 34-base adapter once
+            // eps >= 1/6; 5 is sound from k = 20 and fits the 34-base presets
+            // but not the 19-base Nextera one, which drops to a 4-mer.
+            (0.15, [5, 5, 4], [20, 20, 12]),
+            // The shipped rate: no width above 4 is satisfiable at all.
+            (0.2, [4, 4, 3], [20, 20, 9]),
+            (0.3, [3, 3, 0], [30, 30, usize::MAX]),
+        ];
+        for (eps, widths, ms) in expect {
+            let set = set_at(eps);
+            assert_eq!(set.seeds.width, widths, "eps {eps}: seed widths");
+            assert_eq!(set.seeds.min_sound_k, ms, "eps {eps}: sound k");
+        }
+    }
+
+    /// The prefilter must actually be LOADED at the shipped error rate, not
+    /// merely sound on paper: a clean 151-base read used to take 414 exact
+    /// compares per read (3 presets × 138 positions). Sizing the seed from the
+    /// bound must leave only the truncated 3′ tail there.
+    #[test]
+    fn prefilter_is_live_at_the_shipped_error_rate() {
+        let presets: Vec<Vec<u8>> = vec![
+            b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA".to_vec(),
+            b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT".to_vec(),
+            b"CTGTCTCTTATACACATCT".to_vec(),
+        ];
+        let set = AdapterSet::new(
+            presets
+                .iter()
+                .enumerate()
+                .map(|(i, s)| Adapter {
+                    name: format!("a{i}"),
+                    seq: s.clone(),
+                })
+                .collect(),
+            0.2,
+            14,
+        );
+        // A 151-base random read with no adapter in it: the worst case for the
+        // scan, since every seed hit and every tail position must be checked.
+        // (A degenerate `ACGT` repeat would over-count: its 4-mers recur every
+        // four bases and hit the table far more often than real sequence.)
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let read: Vec<u8> = (0..151)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"ACGT"[(state % 4) as usize]
+            })
+            .collect();
+        let calls = count_mismatch_calls(|| {
+            let _ = match_adapters(&read, &set);
+        });
+        // Measured: 81 with per-adapter widths (4-mers for the 34-base
+        // presets, 3-mers for 19-base Nextera), 174 with one global 4-mer
+        // width, 414 with the old fixed 6-mer. It cannot go to a handful: at
+        // eps 0.2 a 4-mer is the widest SOUND seed (a 5-mer needs
+        // k >= 5*(mm+1), which has no solution above eps = 0.2), and a 4-mer
+        // occurs in a random read often enough that ~80 candidates are
+        // unavoidable. What matters is that the bound is now live instead of
+        // dead — and that every candidate is a real comparison, not a scan.
+        assert!(
+            calls < 120,
+            "prefilter is not doing its job at eps 0.2: {calls} exact compares \
+             (was 414 with the fixed 6-mer seed)"
+        );
     }
 
     #[test]

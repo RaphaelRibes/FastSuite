@@ -206,6 +206,11 @@ pub struct Verifier<T: Fingerprint> {
     since_poll: u64,
     saturated_at: Option<u64>,
     offered: u64,
+    /// Counts table probes. Test builds only, so the shipped binary pays
+    /// nothing: whether a read costs one probe or two is invisible in the
+    /// output, and only a counter can assert it.
+    #[cfg(test)]
+    probes: u64,
 }
 
 impl<T: Fingerprint> Verifier<T> {
@@ -218,29 +223,65 @@ impl<T: Fingerprint> Verifier<T> {
             since_poll: 0,
             saturated_at: None,
             offered: 0,
+            #[cfg(test)]
+            probes: 0,
         }
     }
 
     /// Offers a fingerprint. `&mut self`, so this runs on the ordered thread;
     /// computing the fingerprint itself is a pure function and belongs in the
     /// parallel stage.
+    ///
+    /// The saturation check comes **first** and the order is load-bearing: it
+    /// is the one-sidedness argument of §6.1.2 (a saturated set is a subset of
+    /// the unsaturated one at every point, so a saturated run can miss
+    /// duplicates but can never drop a read the unsaturated procedure kept).
+    /// With that out of the way the unsaturated path needs a single probe —
+    /// `insert` tells us whether the fingerprint was already there — instead of
+    /// `contains` followed by `insert`, two probes of the same open-addressed
+    /// table for every read that is not a duplicate.
     pub fn offer(&mut self, fp: T) -> Seen {
         self.offered += 1;
-        if self.seen.contains(&fp) {
-            return Seen::Duplicate;
-        }
         if self.saturated() {
-            return Seen::NewUnrecorded;
+            #[cfg(test)]
+            {
+                self.probes += 1;
+            }
+            return if self.seen.contains(&fp) {
+                Seen::Duplicate
+            } else {
+                Seen::NewUnrecorded
+            };
         }
-        self.since_poll += 1;
-        if self.since_poll >= POLL_INTERVAL {
+        // The poll keeps the original order (probe, then poll, then insert) and
+        // runs once per POLL_INTERVAL insertions. It has to: the poll can change
+        // THIS fingerprint's answer, and a duplicate landing on the polling read
+        // must stay a duplicate. Duplicates do not advance the counter, so
+        // `since_poll + 1` is the value the poll would see.
+        if self.since_poll + 1 >= POLL_INTERVAL {
+            #[cfg(test)]
+            {
+                self.probes += 2;
+            }
+            if self.seen.contains(&fp) {
+                return Seen::Duplicate;
+            }
             self.since_poll = 0;
             if self.over_ceiling() {
                 self.saturated_at = Some(self.offered);
                 return Seen::NewUnrecorded;
             }
+            self.seen.insert(fp);
+            return Seen::New;
         }
-        self.seen.insert(fp);
+        #[cfg(test)]
+        {
+            self.probes += 1;
+        }
+        if !self.seen.insert(fp) {
+            return Seen::Duplicate;
+        }
+        self.since_poll += 1;
         Seen::New
     }
 
@@ -421,6 +462,50 @@ mod tests {
         assert_eq!(v.offer(u64::of(b"TGCA")), Seen::NewUnrecorded);
         assert_eq!(v.offer(u64::of(b"TGCA")), Seen::NewUnrecorded);
         assert_eq!(v.len(), 1);
+    }
+
+    /// One probe per read on the unsaturated path: `insert` reports whether the
+    /// fingerprint was already there, which is `contains` + `insert` collapsed.
+    /// At 5 M pairs the table is ~72 MB, so the second probe was a DRAM round
+    /// trip per read on the ordered thread.
+    #[test]
+    fn unsaturated_path_probes_the_set_once() {
+        let mut v = Verifier::<u64>::with_capacity(16, None);
+        assert_eq!(v.offer(u64::of(b"ACGT")), Seen::New);
+        assert_eq!(v.probes, 1, "a new read must take one probe, not contains+insert");
+        assert_eq!(v.offer(u64::of(b"ACGT")), Seen::Duplicate);
+        assert_eq!(v.probes, 2, "a duplicate must also take one probe");
+        // Saturated: `contains` only, and nothing is recorded.
+        v.saturated_at = Some(2);
+        assert_eq!(v.offer(u64::of(b"TGCA")), Seen::NewUnrecorded);
+        assert_eq!(v.probes, 3);
+        assert_eq!(v.len(), 1);
+    }
+
+    /// The saturation poll keeps the old two-probe order, and it must: the poll
+    /// can change THIS fingerprint's answer (a new one is reported
+    /// `NewUnrecorded` instead of `New`), while a duplicate that lands on the
+    /// polling read is still a duplicate and must not advance the counter.
+    #[test]
+    fn saturation_fires_on_the_polling_read_and_keeps_its_exact_answer() {
+        // ceiling 0: every poll finds the process over the limit.
+        let mut v = Verifier::<u64>::with_capacity(64, Some(0));
+        for i in 0..POLL_INTERVAL - 1 {
+            assert_eq!(v.offer(i as u64), Seen::New, "insert {i}");
+        }
+        assert!(!v.saturated());
+        // A duplicate on the polling read: reported as a duplicate, and the
+        // poll does not fire (the old order probed before polling).
+        assert_eq!(v.offer(0), Seen::Duplicate);
+        assert!(!v.saturated(), "a duplicate must not trigger the poll");
+        assert_eq!(v.len(), POLL_INTERVAL as usize - 1);
+        // The next NEW read is the polling one: it saturates and is not
+        // recorded (so a second copy of it passes).
+        assert_eq!(v.offer(u64::MAX), Seen::NewUnrecorded);
+        assert!(v.saturated());
+        assert_eq!(v.len(), POLL_INTERVAL as usize - 1);
+        assert_eq!(v.offer(u64::MAX), Seen::NewUnrecorded);
+        assert_eq!(v.offer(0), Seen::Duplicate);
     }
 
     /// The one-sidedness of §6.1.2, tested directly rather than assumed: the

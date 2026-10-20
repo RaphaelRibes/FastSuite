@@ -21,21 +21,87 @@ pub const REPORT_SCHEMA: &str = "fastsuite.report.v1";
 // Per-adapter stats (counts by adapter name).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct AdapterStats {
-    /// reads → adapter name → count of reads where that adapter was trimmed.
-    pub by_name: HashMap<String, u64>,
+    /// Trimmed-read count per adapter index, indexed exactly like the
+    /// configured set (`crate::adapter::PE_OVERLAP_ADAPTER` for the PE-overlap
+    /// boundary). A flat array, not a hash of names: this is written once per
+    /// trimmed read on the ordered thread, and hashing a `String` there was
+    /// pure cost — the name is only needed when the report is printed.
+    pub counts: [u64; 256],
+    /// Names by adapter index, filled ONCE per run by [`AdapterStats::set_names`].
+    /// Index `255` is `"pe-overlap"`.
+    pub names: Vec<String>,
     pub reads_trimmed: u64,
     pub bases_trimmed_5: u64,
     pub bases_trimmed_3: u64,
 }
 
+impl Default for AdapterStats {
+    fn default() -> Self {
+        Self {
+            counts: [0; 256],
+            names: Vec::new(),
+            reads_trimmed: 0,
+            bases_trimmed_5: 0,
+            bases_trimmed_3: 0,
+        }
+    }
+}
+
 impl AdapterStats {
-    pub fn record(&mut self, name: &str, t5: usize, t3: usize) {
-        *self.by_name.entry(name.to_string()).or_insert(0) += 1;
+    /// Install the adapter names for the run. Called once from the pipeline,
+    /// with the configured set's names in set order and the reserved
+    /// `"pe-overlap"` slot filled in.
+    pub fn set_names(&mut self, mut names: Vec<String>) {
+        let reserved = crate::adapter::PE_OVERLAP_ADAPTER as usize;
+        if names.len() <= reserved {
+            names.resize_with(reserved + 1, String::new);
+        }
+        names[reserved] = "pe-overlap".to_string();
+        self.names = names;
+    }
+
+    /// Count one trimmed read against adapter `idx`.
+    pub fn record(&mut self, idx: u8, t5: usize, t3: usize) {
+        self.counts[idx as usize] += 1;
         self.reads_trimmed += 1;
         self.bases_trimmed_5 += t5 as u64;
         self.bases_trimmed_3 += t3 as u64;
+    }
+
+    /// Name for an adapter index; empty when the index was never named (only
+    /// possible in tests that record without calling `set_names`).
+    pub fn name(&self, idx: usize) -> &str {
+        self.names.get(idx).map(String::as_str).unwrap_or("")
+    }
+
+    /// The legacy `by_name` map, built at report time: index → count for every
+    /// adapter that actually trimmed a read.
+    pub fn by_name(&self) -> HashMap<String, u64> {
+        let mut m = HashMap::new();
+        for (idx, &n) in self.counts.iter().enumerate() {
+            if n > 0 {
+                m.insert(self.name(idx).to_string(), n);
+            }
+        }
+        m
+    }
+}
+
+/// Serialised exactly as the old `{by_name, reads_trimmed, bases_trimmed_5,
+/// bases_trimmed_3}` object, so the `--json` adapter block does not move. Keys
+/// come out sorted because `serde_json::to_value` builds a `BTreeMap` by
+/// default, which is also what the old `HashMap` field produced.
+impl serde::Serialize for AdapterStats {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("AdapterStats", 4)?;
+        st.serialize_field("by_name", &self.by_name())?;
+        st.serialize_field("reads_trimmed", &self.reads_trimmed)?;
+        st.serialize_field("bases_trimmed_5", &self.bases_trimmed_5)?;
+        st.serialize_field("bases_trimmed_3", &self.bases_trimmed_3)?;
+        st.end()
     }
 }
 
@@ -65,7 +131,7 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub fn record(&mut self, original_len: usize, res: &TrimResult, adapter_name: Option<&str>) {
+    pub fn record(&mut self, original_len: usize, res: &TrimResult, adapter: Option<u8>) {
         self.reads_in += 1;
         self.bases_in += original_len as u64;
         match res {
@@ -84,8 +150,8 @@ impl Stats {
                     DropReason::Duplicate => self.reads_dropped_duplicate += 1,
                 }
                 if (t5a + t3a) > 0 {
-                    if let Some(name) = adapter_name {
-                        self.adapter.record(name, t5a, t3a);
+                    if let Some(idx) = adapter {
+                        self.adapter.record(idx, t5a, t3a);
                     }
                 }
             }
@@ -97,8 +163,8 @@ impl Stats {
                 let h_int: usize = runs.iter().map(|(_, l)| l).sum();
                 self.bases_interior_mass += h_int as u64;
                 if (t5a + t3a) > 0 {
-                    if let Some(name) = adapter_name {
-                        self.adapter.record(name, t5a, t3a);
+                    if let Some(idx) = adapter {
+                        self.adapter.record(idx, t5a, t3a);
                     }
                 }
             }
@@ -263,7 +329,8 @@ pub fn report(label: &str, s: &Stats) {
         eprintln!("      bases trimmed (5′):    {:>12}", s.adapter.bases_trimmed_5);
         eprintln!("      bases trimmed (3′):    {:>12}", s.adapter.bases_trimmed_3);
         // Per-adapter breakdown.
-        let mut by_name: Vec<(&String, &u64)> = s.adapter.by_name.iter().collect();
+        let by_name_map = s.adapter.by_name();
+        let mut by_name: Vec<(&String, &u64)> = by_name_map.iter().collect();
         by_name.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let last = by_name.len().saturating_sub(1);
         for (i, (name, count)) in by_name.iter().enumerate() {
@@ -333,14 +400,51 @@ mod tests {
     #[test]
     fn record_adapter_trim_updates_adapter_stats() {
         let mut s = Stats::default();
+        s.adapter.set_names(vec!["TruSeq/R1".to_string()]);
         s.record(
             150,
             &TrimResult::Emit { t5_adapter: 5, t3_adapter: 10, t5_poly: 0, t3_poly: 0, runs: vec![] },
-            Some("TruSeq/R1"),
+            Some(0),
         );
         assert_eq!(s.adapter.reads_trimmed, 1);
         assert_eq!(s.adapter.bases_trimmed_5, 5);
         assert_eq!(s.adapter.bases_trimmed_3, 10);
-        assert_eq!(*s.adapter.by_name.get("TruSeq/R1").unwrap(), 1);
+        assert_eq!(*s.adapter.by_name().get("TruSeq/R1").unwrap(), 1);
+    }
+
+    /// Counts are by index and names are materialised only at report time —
+    /// and the serialised `--json` block keeps the shape and the values it
+    /// always had, including the reserved `pe-overlap` slot.
+    #[test]
+    fn adapter_names_are_materialised_at_report_time() {
+        let mut s = Stats::default();
+        s.adapter.set_names(vec!["TruSeq/R1".to_string(), "Nextera".to_string()]);
+        let emit = |t5: usize, t3: usize| TrimResult::Emit {
+            t5_adapter: t5,
+            t3_adapter: t3,
+            t5_poly: 0,
+            t3_poly: 0,
+            runs: vec![],
+        };
+        s.record(150, &emit(5, 10), Some(0));
+        s.record(150, &emit(2, 0), Some(1));
+        // A boundary the mate pair pinned, and an untrimmed read.
+        s.record(150, &emit(0, 7), Some(crate::adapter::PE_OVERLAP_ADAPTER));
+        s.record(150, &emit(0, 0), Some(0));
+
+        assert_eq!(s.adapter.reads_trimmed, 3);
+        assert_eq!(s.adapter.bases_trimmed_5, 7);
+        assert_eq!(s.adapter.bases_trimmed_3, 17);
+        assert_eq!(s.adapter.counts[0], 1);
+        assert_eq!(s.adapter.counts[1], 1);
+        assert_eq!(s.adapter.counts[crate::adapter::PE_OVERLAP_ADAPTER as usize], 1);
+
+        let v = serde_json::to_value(&s.adapter).unwrap();
+        assert_eq!(v["by_name"]["TruSeq/R1"], 1);
+        assert_eq!(v["by_name"]["Nextera"], 1);
+        assert_eq!(v["by_name"]["pe-overlap"], 1);
+        assert_eq!(v["reads_trimmed"], 3);
+        assert_eq!(v["bases_trimmed_5"], 7);
+        assert_eq!(v["bases_trimmed_3"], 17);
     }
 }

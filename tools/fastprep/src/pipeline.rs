@@ -31,7 +31,7 @@ use crate::algorithm::{trim, DropReason, Params, TrimOutput, TrimResult};
 use crate::cli::{PeOverlapMode, Runtime};
 use crate::dedup::{AnchorSpec, Fingerprint, Seen, Verifier};
 use crate::io::{
-    open_input, open_output, open_output_as, write_fasta, write_fastq, OutputWriter, RecordFormat,
+    open_input, open_output, open_output_as, Out, OutputWriter, RecordFormat,
 };
 use crate::metadata::{self, Mate};
 use crate::stats::Stats;
@@ -53,7 +53,39 @@ struct ChunkBuf {
     qual: Vec<u8>,
 }
 
+// Counts freshly allocated chunk arenas. Test builds only: recycling is
+// invisible in the output, so only a counter can show it happens. Thread-local
+// because the pipeline allocates on its own (ordered) thread, and a global
+// would be polluted by the other tests running in parallel with this one.
+#[cfg(test)]
+thread_local! {
+    static ARENAS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Take a recycled arena, or allocate one.
+///
+/// Spelled as a `match` rather than `unwrap_or_default()` on purpose: `Default`
+/// would bypass the test-only `ARENAS` counter that the recycling test asserts
+/// on.
+#[inline]
+fn pop_or_new(free: &mut Vec<ChunkBuf>) -> ChunkBuf {
+    match free.pop() {
+        Some(buf) => buf,
+        None => ChunkBuf::new(),
+    }
+}
+
 impl ChunkBuf {
+    /// A fresh arena. Only the free-list miss path should reach this: a chunk
+    /// at 1024 reads and 151 bp is ~464 KB per mate, so allocating one per
+    /// chunk (and freeing the previous one only after reserving the next) was
+    /// ~4.5 GB of large-object churn in a 5 M-pair run.
+    fn new() -> Self {
+        #[cfg(test)]
+        ARENAS.with(|c| c.set(c.get() + 1));
+        Self::default()
+    }
+
     fn reserve(&mut self, reads: usize, avg_len: usize) {
         let cap = reads * avg_len;
         self.id.reserve(cap / 4);
@@ -87,14 +119,28 @@ impl ScanInput {
         buf.seq.extend_from_slice(rec.seq().as_ref());
         let (qual, format) = match rec.qual() {
             Some(q) => {
-                // Decode ASCII Phred. saturating_sub handles corrupted
-                // bytes below the offset (would otherwise underflow).
+                // Quality stays in its INPUT encoding: it is copied through,
+                // used through a LUT shifted by `phred_offset`, and written
+                // back verbatim. The one transformation kept is the clamp —
+                // a byte below the offset used to decode to 0 and re-encode to
+                // `offset`, so it is stored as `offset` here and the output
+                // bytes are identical to the decode/encode path's.
+                //
+                // `max` rather than a branch: the whole slice is a memcpy plus
+                // one SIMD max, where decoding was a subtract per byte and
+                // egress an add per byte (two full passes over 151 bytes).
                 let q_start = buf.qual.len();
-                buf.qual
-                    .extend(q.iter().map(|&b| b.saturating_sub(phred_offset)));
+                if phred_offset == 0 {
+                    buf.qual.extend_from_slice(q);
+                } else {
+                    buf.qual.extend(q.iter().map(|&b| b.max(phred_offset)));
+                }
                 (q_start..buf.qual.len(), RecordFormat::Fastq)
             }
             None => {
+                // FASTA carries no qualities. Zeros (not ASCII) because
+                // `gate_lut[0]` is Q0 either way, and the mean-q filter is
+                // skipped for FASTA records (`fasta_params`).
                 let q_start = buf.qual.len();
                 buf.qual.resize(q_start + buf.seq.len() - seq_start, 0u8);
                 (q_start..buf.qual.len(), RecordFormat::Fasta)
@@ -115,7 +161,7 @@ struct Processed {
 }
 
 impl Processed {
-    fn emit_to(&self, buf: &ChunkBuf, w: &mut OutputWriter, phred_offset: u8) -> Result<()> {
+    fn emit_to(&self, buf: &ChunkBuf, w: &mut Out) -> Result<()> {
         match &self.output.result {
             TrimResult::Drop { .. } => Ok(()),
             TrimResult::Emit { .. } => {
@@ -130,19 +176,14 @@ impl Processed {
                     seq.len()
                 );
                 let seq = &seq[t_5..seq.len() - t_3];
+                let id = &buf.id[self.input.id.clone()];
                 match self.input.format {
                     RecordFormat::Fastq => {
                         let qual = &buf.qual[self.input.qual.clone()];
                         let raw_qual = &qual[t_5..qual.len() - t_3];
-                        write_fastq(
-                            w,
-                            &buf.id[self.input.id.clone()],
-                            seq,
-                            raw_qual,
-                            phred_offset,
-                        )
+                        w.fastq(id, seq, raw_qual)
                     }
-                    RecordFormat::Fasta => write_fasta(w, &buf.id[self.input.id.clone()], seq),
+                    RecordFormat::Fasta => w.fasta(id, seq),
                 }
             }
         }
@@ -186,6 +227,20 @@ fn fasta_params(params: &Params) -> Option<Params> {
         mean_q: None,
         ..params.clone()
     })
+}
+
+/// The configured adapter names in set order, for the report.
+///
+/// Called once per run. Per-read work carries an adapter *index*
+/// (`TrimOutput::adapter`), so these strings are materialised only when the
+/// report is printed — `Stats` used to allocate one per adapter-trimmed read,
+/// twice.
+fn adapter_names(params: &Params) -> Vec<String> {
+    params
+        .adapter
+        .as_ref()
+        .map(|set| set.adapters.iter().map(|a| a.name.clone()).collect())
+        .unwrap_or_default()
 }
 
 fn params_for<'a>(params: &'a Params, fasta: &'a Option<Params>, fmt: RecordFormat) -> &'a Params {
@@ -415,7 +470,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
     let mut writer = if rt.dry_run {
         None
     } else {
-        Some(open_output_as(&tmp_out, out1, rt.compression)?)
+        Some(Out::new(open_output_as(&tmp_out, out1, rt.compression)?))
     };
 
     let tmp_meta_path = rt.metadata.as_deref().map(part_path);
@@ -430,9 +485,15 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
     };
 
     let mut stats = Stats::default();
+    // Names are resolved once for the run; per-read work carries an index.
+    stats.adapter.set_names(adapter_names(params));
     let parallel = rt.threads > 1;
 
-    let params = params.clone();
+    // Quality is never decoded: the offset is folded into the gate LUT and the
+    // mean-q sum, so the params carry it. Set before the first chunk.
+    let mut params = params.clone();
+    params.set_phred_offset(phred_offset);
+    let params = params;
 
     // The anchor window is resolved once for the run from the expected read
     // length; deriving it per read would make it vary with the polyG tail,
@@ -464,7 +525,11 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
     let mut progress_shown = false;
 
     let io_result = (|| -> Result<()> {
-        let mut buf = ChunkBuf::default();
+        // Recycled arenas: the buffer a chunk was computed in comes back on
+        // `res_rx` and is reused for the next chunk instead of being freed
+        // after the next one was allocated.
+        let mut free: Vec<ChunkBuf> = Vec::new();
+        let mut buf = ChunkBuf::new();
         buf.reserve(rt.chunk, 151);
         let mut chunk = Vec::with_capacity(rt.chunk);
         fill_chunk(&mut *reader, &mut buf, &mut chunk, rt.chunk, phred_offset)?;
@@ -472,7 +537,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
         while !chunk.is_empty() {
             raw_tx.send((buf, chunk)).ok();
 
-            let mut next_buf = ChunkBuf::default();
+            let mut next_buf = pop_or_new(&mut free);
             next_buf.reserve(rt.chunk, 151);
             let mut next = Vec::with_capacity(rt.chunk);
             fill_chunk(
@@ -483,21 +548,26 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 phred_offset,
             )?;
 
-            let (res_buf, results) = res_rx.recv().context("compute thread died")?;
+            let (mut res_buf, results) = res_rx.recv().context("compute thread died")?;
             for p in &results {
                 // Deduplication runs on the ordered thread, so the decision
                 // sequence is the input order regardless of thread count.
                 let seq = &res_buf.seq[p.input.seq.clone()];
                 let dup = dedup.as_mut().is_some_and(|d| d.is_duplicate(seq, None));
-                let result = if dup {
-                    duplicate_result()
+                // Borrowed, never cloned: `TrimResult::Emit` carries a heap
+                // `Vec` of interior runs and this is the per-record path on the
+                // ordered thread. `duplicate_result()` allocates nothing.
+                let dup_result;
+                let result: &TrimResult = if dup {
+                    dup_result = duplicate_result();
+                    &dup_result
                 } else {
-                    p.output.result.clone()
+                    &p.output.result
                 };
-                stats.record(seq.len(), &result, p.output.adapter_name.as_deref());
+                stats.record(seq.len(), result, p.output.adapter);
                 if !dup {
                     if let Some(w) = writer.as_mut() {
-                        p.emit_to(&res_buf, w, phred_offset)?;
+                        p.emit_to(&res_buf, w)?;
                     }
                 }
                 if let Some(mw) = meta.as_mut() {
@@ -505,7 +575,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                         &mut **mw,
                         &res_buf.id[p.input.id.clone()],
                         Mate::R1,
-                        &result,
+                        result,
                         seq.len(),
                     )
                     .context("writing metadata record")?;
@@ -516,6 +586,10 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 eprint!("\r  {} reads processed", stats.reads_in);
                 progress_shown = true;
             }
+            // The arena just written from goes back on the free list, cleared,
+            // so the next chunk reuses its capacity instead of re-mapping.
+            res_buf.clear();
+            free.push(res_buf);
             buf = next_buf;
             chunk = next;
         }
@@ -531,11 +605,11 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
             stats.record(
                 seq.len(),
                 &p.output.result,
-                p.output.adapter_name.as_deref(),
+                p.output.adapter,
             );
             if io_result.is_ok() {
                 if let Some(w) = writer.as_mut() {
-                    let _ = p.emit_to(&res_buf, w, phred_offset);
+                    let _ = p.emit_to(&res_buf, w);
                 }
             }
         }
@@ -643,12 +717,12 @@ pub fn run_paired(
     let mut w1 = if rt.dry_run {
         None
     } else {
-        Some(open_output_as(&tmp_w1, out1, rt.compression)?)
+        Some(Out::new(open_output_as(&tmp_w1, out1, rt.compression)?))
     };
     let mut w2 = if rt.dry_run {
         None
     } else {
-        Some(open_output_as(&tmp_w2, out2, rt.compression)?)
+        Some(Out::new(open_output_as(&tmp_w2, out2, rt.compression)?))
     };
 
     let tmp_ws1 = singletons1.map(part_path);
@@ -661,7 +735,7 @@ pub fn run_paired(
         tmp_ws1
             .as_deref()
             .zip(singletons1)
-            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
+            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression).map(Out::new))
             .transpose()?
     };
     let mut ws2 = if rt.dry_run {
@@ -670,7 +744,7 @@ pub fn run_paired(
         tmp_ws2
             .as_deref()
             .zip(singletons2)
-            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression))
+            .map(|(tp, fp)| open_output_as(tp, fp, rt.compression).map(Out::new))
             .transpose()?
     };
 
@@ -700,8 +774,16 @@ pub fn run_paired(
     };
 
     let parallel = rt.threads > 1;
-    let params_r1 = params_r1.clone();
-    let params_r2 = params_r2.clone();
+    // Names are resolved once for the run; per-read work carries an index.
+    let names = adapter_names(&params_r1);
+    stats.r1.adapter.set_names(names.clone());
+    stats.r2.adapter.set_names(names);
+    // Quality is never decoded: the offset is folded into the gate LUT and the
+    // mean-q sum, so both mates' params carry it before the first chunk.
+    let mut params_r1 = params_r1.clone();
+    params_r1.set_phred_offset(phred_offset);
+    let mut params_r2 = params_r2.clone();
+    params_r2.set_phred_offset(phred_offset);
 
     // PE overlap: resolved once per chunk, per pair, inside the work closure.
     // The mode resolved to `Never` (the default with auto-detection or
@@ -761,9 +843,11 @@ pub fn run_paired(
     let mut progress_shown = false;
 
     let io_result = (|| -> Result<()> {
-        let mut buf1 = ChunkBuf::default();
+        // One free list serves both mates: an arena is an arena.
+        let mut free: Vec<ChunkBuf> = Vec::new();
+        let mut buf1 = ChunkBuf::new();
         buf1.reserve(rt.chunk, 151);
-        let mut buf2 = ChunkBuf::default();
+        let mut buf2 = ChunkBuf::new();
         buf2.reserve(rt.chunk, 151);
         let mut chunk1 = Vec::with_capacity(rt.chunk);
         let mut chunk2 = Vec::with_capacity(rt.chunk);
@@ -781,9 +865,9 @@ pub fn run_paired(
         while !chunk1.is_empty() {
             raw_tx.send(((buf1, chunk1), (buf2, chunk2))).ok();
 
-            let mut next_buf1 = ChunkBuf::default();
+            let mut next_buf1 = pop_or_new(&mut free);
             next_buf1.reserve(rt.chunk, 151);
-            let mut next_buf2 = ChunkBuf::default();
+            let mut next_buf2 = pop_or_new(&mut free);
             next_buf2.reserve(rt.chunk, 151);
             let mut next1 = Vec::with_capacity(rt.chunk);
             let mut next2 = Vec::with_capacity(rt.chunk);
@@ -798,7 +882,7 @@ pub fn run_paired(
                 );
             }
 
-            let ((res_b1, res_b2), pairs) = res_rx.recv().context("compute thread died")?;
+            let ((mut res_b1, mut res_b2), pairs) = res_rx.recv().context("compute thread died")?;
             write_pairs(
                 &res_b1,
                 &res_b2,
@@ -809,7 +893,6 @@ pub fn run_paired(
                 ws1.as_mut(),
                 ws2.as_mut(),
                 meta.as_mut(),
-                phred_offset,
                 &warn_r1_once,
                 &warn_r2_once,
                 dedup.as_mut(),
@@ -823,6 +906,10 @@ pub fn run_paired(
                 );
                 progress_shown = true;
             }
+            res_b1.clear();
+            free.push(res_b1);
+            res_b2.clear();
+            free.push(res_b2);
             buf1 = next_buf1;
             buf2 = next_buf2;
             chunk1 = next1;
@@ -843,7 +930,6 @@ pub fn run_paired(
             ws1.as_mut(),
             ws2.as_mut(),
             meta.as_mut(),
-            phred_offset,
             &warn_r1_once,
             &warn_r2_once,
             dedup.as_mut(),
@@ -917,12 +1003,11 @@ fn write_pairs(
     buf2: &ChunkBuf,
     pairs: Vec<ProcessedPair>,
     stats: &mut PairedStats,
-    w1: &mut Option<OutputWriter>,
-    w2: &mut Option<OutputWriter>,
-    mut ws1: Option<&mut OutputWriter>,
-    mut ws2: Option<&mut OutputWriter>,
+    w1: &mut Option<Out>,
+    w2: &mut Option<Out>,
+    mut ws1: Option<&mut Out>,
+    mut ws2: Option<&mut Out>,
     mut meta: Option<&mut OutputWriter>,
-    phred_offset: u8,
     warn_r1_once: &AtomicBool,
     warn_r2_once: &AtomicBool,
     dedup: Option<&mut Dedup>,
@@ -937,23 +1022,31 @@ fn write_pairs(
         let dup = dedup
             .as_deref_mut()
             .is_some_and(|d| d.is_duplicate(s1, Some(s2)));
-        let (res1, res2) = if dup {
-            (duplicate_result(), duplicate_result())
+        // Borrowed, never cloned: `TrimResult::Emit` carries a heap `Vec` of
+        // interior runs, and this runs per record on the ordered thread. The
+        // duplicate case needs a zeroed result, which allocates nothing
+        // (`runs: vec![]`).
+        let dup1;
+        let dup2;
+        let (res1, res2): (&TrimResult, &TrimResult) = if dup {
+            dup1 = duplicate_result();
+            dup2 = duplicate_result();
+            (&dup1, &dup2)
         } else {
-            (pp.p1.output.result.clone(), pp.p2.output.result.clone())
+            (&pp.p1.output.result, &pp.p2.output.result)
         };
         stats
             .r1
-            .record(s1.len(), &res1, pp.p1.output.adapter_name.as_deref());
+            .record(s1.len(), res1, pp.p1.output.adapter);
         stats
             .r2
-            .record(s2.len(), &res2, pp.p2.output.adapter_name.as_deref());
+            .record(s2.len(), res2, pp.p2.output.adapter);
         if let Some(mw) = meta.as_deref_mut() {
             metadata::write_record(
                 &mut **mw,
                 &buf1.id[pp.p1.input.id.clone()],
                 Mate::R1,
-                &res1,
+                res1,
                 s1.len(),
             )
             .context("writing metadata record (R1)")?;
@@ -961,16 +1054,16 @@ fn write_pairs(
                 &mut **mw,
                 &buf2.id[pp.p2.input.id.clone()],
                 Mate::R2,
-                &res2,
+                res2,
                 s2.len(),
             )
             .context("writing metadata record (R2)")?;
         }
-        match outcome(&res1, &res2) {
+        match outcome(res1, res2) {
             PairOutcome::BothKept => {
                 if let (Some(w1), Some(w2)) = (w1.as_mut(), w2.as_mut()) {
-                    pp.p1.emit_to(buf1, w1, phred_offset)?;
-                    pp.p2.emit_to(buf2, w2, phred_offset)?;
+                    pp.p1.emit_to(buf1, w1)?;
+                    pp.p2.emit_to(buf2, w2)?;
                 }
                 stats.pairs_out += 1;
             }
@@ -979,7 +1072,7 @@ fn write_pairs(
             }
             PairOutcome::R1KeptR2Dropped => {
                 if let Some(w) = ws1.as_deref_mut() {
-                    pp.p1.emit_to(buf1, w, phred_offset)?;
+                    pp.p1.emit_to(buf1, w)?;
                     stats.singletons_r1 += 1;
                 } else {
                     stats.discarded_singletons_r1 += 1;
@@ -994,7 +1087,7 @@ fn write_pairs(
             }
             PairOutcome::R1DroppedR2Kept => {
                 if let Some(w) = ws2.as_deref_mut() {
-                    pp.p2.emit_to(buf2, w, phred_offset)?;
+                    pp.p2.emit_to(buf2, w)?;
                     stats.singletons_r2 += 1;
                 } else {
                     stats.discarded_singletons_r2 += 1;
@@ -1166,6 +1259,136 @@ mod tests {
 
     fn default_params() -> Params {
         Params::default()
+    }
+
+    // ------- Chunk arenas are recycled ------------------------------------
+
+    /// A fresh `ChunkBuf` per chunk was ~464 KB alloc + first-touch per mate per
+    /// chunk (928 KB paired), and the old one was only freed *after* the new
+    /// one was reserved. Recycling needs a handful for a whole run. The counter
+    /// is a thread-local so parallel tests cannot pollute it.
+    #[test]
+    fn chunk_arenas_are_recycled_not_reallocated() {
+        let inp = tmp_path("arena.fq");
+        let out = tmp_path("arena-out.fq");
+        let mut body = String::new();
+        for i in 0..200 {
+            body.push_str(&format!(
+                "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+            ));
+        }
+        write_plain(&inp, &body);
+        let rt = Runtime { chunk: 8, ..default_rt() };
+        ARENAS.with(|c| c.set(0));
+        run_single(&inp, &out, &default_params(), &rt).unwrap();
+        let n = ARENAS.with(|c| c.get());
+        // 25 chunks; recycling needs one in flight, one being filled, one in
+        // the result channel.
+        assert!(n <= 3, "{n} chunk arenas allocated for 25 chunks (expected ≤ 3)");
+        std::fs::remove_file(&inp).ok();
+        std::fs::remove_file(&out).ok();
+    }
+
+    #[test]
+    fn paired_chunk_arenas_are_recycled_too() {
+        let in1 = tmp_path("arena-r1.fq");
+        let in2 = tmp_path("arena-r2.fq");
+        let out1 = tmp_path("arena-o1.fq");
+        let out2 = tmp_path("arena-o2.fq");
+        let mut body = String::new();
+        for i in 0..200 {
+            body.push_str(&format!(
+                "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+            ));
+        }
+        write_plain(&in1, &body);
+        write_plain(&in2, &body);
+        let p = default_params();
+        let rt = Runtime { chunk: 8, ..default_rt() };
+        ARENAS.with(|c| c.set(0));
+        run_paired(&in1, &in2, &out1, &out2, None, None, &p, &p, &rt).unwrap();
+        let n = ARENAS.with(|c| c.get());
+        // Two mates per chunk → two arenas in flight is still a handful.
+        assert!(n <= 6, "{n} chunk arenas allocated for 25 paired chunks (expected ≤ 6)");
+        for f in [&in1, &in2, &out1, &out2] {
+            std::fs::remove_file(f).ok();
+        }
+    }
+
+    /// `--interior` still works after the per-record `TrimResult` clone was
+    /// removed: the runs are read through the borrowed result on the ordered
+    /// thread, and the interior mass reaches the counters.
+    #[test]
+    fn interior_runs_reach_the_counters_without_cloning() {
+        let inp = tmp_path("interior.fq");
+        let out = tmp_path("interior-out.fq");
+        // 16 random | polyA(12) interior | 16 more, ending in T so no 3' run.
+        let seq = format!("ACGTACGTACGTACGT{}{}", "A".repeat(12), "CGTACGTACGTACGT");
+        write_plain(
+            &inp,
+            &format!("@r\n{}\n+\n{}\n", seq, "I".repeat(seq.len())),
+        );
+        let mut p = default_params();
+        p.scan_interior = true;
+        let rt = default_rt();
+        let stats = run_single(&inp, &out, &p, &rt).unwrap();
+        assert_eq!(stats.reads_kept, 1);
+        assert!(
+            stats.bases_interior_mass >= 11,
+            "interior mass {} — the runs were lost with the clone",
+            stats.bases_interior_mass
+        );
+        std::fs::remove_file(&inp).ok();
+        std::fs::remove_file(&out).ok();
+    }
+
+    // ------- Ingest keeps quality raw ------------------------------------
+
+    /// Quality is not decoded on ingest: the chunk arena holds the input bytes
+    /// (clamped up to the offset), the gate LUT is indexed by them, and egress
+    /// writes them back. This is the property that makes the whole round trip
+    /// disappear; without it the arena holds decoded values and egress has to
+    /// re-encode.
+    #[test]
+    fn ingest_keeps_raw_quality_bytes_and_clamps_below_the_offset() {
+        let fq = b"@r\nACGT\n+\n I#I\n".to_vec(); // quals: ' ', 'I', '#', 'I'
+        let mut parser = needletail::parse_fastx_reader(std::io::Cursor::new(fq)).unwrap();
+        let rec = parser.next().unwrap().unwrap();
+        let mut buf = ChunkBuf::default();
+        let si = ScanInput::push_needletail(&mut buf, &rec, 33).unwrap();
+        assert_eq!(
+            &buf.qual[si.qual.clone()],
+            b"!I#I",
+            "ingest must store the input bytes, clamped up to the offset"
+        );
+        // And a second record appends rather than overwriting.
+        let si2 = ScanInput::push_needletail(&mut buf, &rec, 33).unwrap();
+        assert_eq!(&buf.qual[si2.qual.clone()], b"!I#I");
+        assert_eq!(si2.qual.start, 4);
+    }
+
+    /// End to end: a FASTQ round trip must return the quality bytes it was
+    /// given, including a sub-offset byte, which is clamped exactly as the old
+    /// decode/encode path clamped it.
+    #[test]
+    fn quality_round_trips_through_the_pipeline() {
+        let inp = tmp_path("q-rt.fq");
+        let out = tmp_path("q-rt-out.fq");
+        write_plain(
+            &inp,
+            "@r1\nACGTACGTACGTACGTACGTACGT\n+\n I#I5?+ABCDEFGHIJKLMNOPQ\n",
+        );
+        let mut rt = default_rt();
+        rt.phred_offset = 33;
+        let stats = run_single(&inp, &out, &default_params(), &rt).unwrap();
+        assert_eq!(stats.reads_kept, 1);
+        let body = read_plain(&out);
+        assert!(
+            body.contains("\n!I#I5?+ABCDEFGHIJKLMNOPQ\n"),
+            "quality bytes changed: {body:?}"
+        );
+        std::fs::remove_file(&inp).ok();
+        std::fs::remove_file(&out).ok();
     }
 
     // ------- Single-end plain --------------------------------------------

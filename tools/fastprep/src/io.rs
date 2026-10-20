@@ -180,49 +180,86 @@ pub fn open_input(path: &Path, gz_threads: usize) -> Result<InputReader> {
     }
 }
 
-/// Write one FASTQ record. Includes `@` / `+` sigils and terminating
-/// newlines. `raw_qual` contains raw Phred values (not ASCII-encoded);
-/// `phred_offset` is added to each byte inline via a 512-byte stack
-/// buffer, avoiding a per-read heap allocation.
-pub fn write_fastq(
-    w: &mut OutputWriter,
-    id: &[u8],
-    seq: &[u8],
-    raw_qual: &[u8],
-    phred_offset: u8,
-) -> Result<()> {
-    debug_assert_eq!(seq.len(), raw_qual.len());
-    let id_trimmed = strip_sigil(id, b'@');
-    w.write_all(b"@")?;
-    w.write_all(id_trimmed)?;
-    w.write_all(b"\n")?;
-    w.write_all(seq)?;
-    w.write_all(b"\n+\n")?;
-    let mut buf = [0u8; 512];
-    let mut rest = raw_qual;
-    while !rest.is_empty() {
-        let n = rest.len().min(buf.len());
-        for (dst, &q) in buf[..n].iter_mut().zip(rest.iter()) {
-            *dst = q.saturating_add(phred_offset);
-        }
-        w.write_all(&buf[..n])?;
-        rest = &rest[n..];
-    }
-    w.write_all(b"\n")?;
-    Ok(())
+/// Flush threshold for the record staging buffer. A record is appended in
+/// memory and handed to the compressor in one call once the buffer passes
+/// this size, instead of six short calls per record.
+pub const STAGE_FLUSH: usize = 256 << 10;
+
+/// Record writer with a staging buffer.
+///
+/// Every FASTQ/FASTA output is one of these. The point is the syscall-free
+/// append path: six `write_all` calls per record became one per ~256 KiB, and
+/// each `ParCompress::write` (which memcpys into a `BytesMut` and re-checks the
+/// 65 280-byte BGZF block boundary) now runs once per buffer rather than once
+/// per record plus its quality slice. It also hands the compressor whole
+/// blocks, which is what it wants.
+///
+/// Quality bytes are written exactly as ingested: the Phred offset is folded
+/// into the quality-gate LUT and the mean sum, never into the data (see
+/// `algorithm::Params::prepare`), so this is a pure append and the output
+/// bytes are the input bytes.
+pub struct Out {
+    w: OutputWriter,
+    stage: Vec<u8>,
 }
 
-/// Write one FASTA record. Includes `>` sigil and terminating newline.
-/// Single-line FASTA (no 60/80-char wrapping) — this matches needletail's
-/// output convention and is what every downstream tool accepts.
-pub fn write_fasta(w: &mut OutputWriter, id: &[u8], seq: &[u8]) -> Result<()> {
-    let id_trimmed = strip_sigil(id, b'>');
-    w.write_all(b">")?;
-    w.write_all(id_trimmed)?;
-    w.write_all(b"\n")?;
-    w.write_all(seq)?;
-    w.write_all(b"\n")?;
-    Ok(())
+impl Out {
+    pub fn new(w: OutputWriter) -> Self {
+        // Slack for the record that crosses the threshold, so a spill never
+        // has to grow the buffer.
+        Self {
+            w,
+            stage: Vec::with_capacity(STAGE_FLUSH + (8 << 10)),
+        }
+    }
+
+    /// Append one FASTQ record: `@id\nseq\n+\nqual\n`.
+    pub fn fastq(&mut self, id: &[u8], seq: &[u8], qual: &[u8]) -> Result<()> {
+        debug_assert_eq!(seq.len(), qual.len());
+        self.stage.push(b'@');
+        self.stage.extend_from_slice(strip_sigil(id, b'@'));
+        self.stage.push(b'\n');
+        self.stage.extend_from_slice(seq);
+        self.stage.extend_from_slice(b"\n+\n");
+        self.stage.extend_from_slice(qual);
+        self.stage.push(b'\n');
+        if self.stage.len() >= STAGE_FLUSH {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// Append one FASTA record: `>id\nseq\n`. Single-line FASTA (no 60/80-char
+    /// wrapping) — this matches needletail's output convention and is what
+    /// every downstream tool accepts.
+    pub fn fasta(&mut self, id: &[u8], seq: &[u8]) -> Result<()> {
+        self.stage.push(b'>');
+        self.stage.extend_from_slice(strip_sigil(id, b'>'));
+        self.stage.push(b'\n');
+        self.stage.extend_from_slice(seq);
+        self.stage.push(b'\n');
+        if self.stage.len() >= STAGE_FLUSH {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// Hand the staged bytes to the compressor.
+    fn spill(&mut self) -> Result<()> {
+        if !self.stage.is_empty() {
+            self.w.write_all(&self.stage)?;
+            self.stage.clear();
+        }
+        Ok(())
+    }
+
+    /// Push everything staged, then flush the compressor. Must run before the
+    /// atomic rename that commits the file.
+    pub fn flush(&mut self) -> Result<()> {
+        self.spill()?;
+        self.w.flush()?;
+        Ok(())
+    }
 }
 
 fn strip_sigil<'a>(s: &'a [u8], sigil: u8) -> &'a [u8] {
@@ -263,10 +300,9 @@ mod tests {
     fn write_fastq_plain_roundtrip() {
         let p = tmp_path("plain.fq");
         {
-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
-            // phred_offset=0: raw bytes passed through unchanged (already ASCII).
-            write_fastq(&mut w, b"read1", b"ACGT", b"IIII", 0).unwrap();
-            write_fastq(&mut w, b"@read2", b"NN", b"##", 0).unwrap();
+            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
+            w.fastq(b"read1", b"ACGT", b"IIII").unwrap();
+            w.fastq(b"@read2", b"NN", b"##").unwrap();
             w.flush().unwrap();
         }
         let mut data = String::new();
@@ -275,19 +311,86 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
+    /// Quality bytes are written verbatim: the Phred offset lives in the
+    /// quality-gate LUT and the mean sum, never in the data, so egress is an
+    /// append and not a per-byte re-encode.
     #[test]
-    fn write_fastq_phred_offset_encoding() {
-        // Raw Phred 40 + offset 33 = ASCII 73 = 'I'.
-        let p = tmp_path("phred.fq");
+    fn write_fastq_quality_bytes_are_verbatim() {
+        let p = tmp_path("rawq.fq");
         {
-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
-            write_fastq(&mut w, b"r1", b"ACGT", &[40u8; 4], 33).unwrap();
+            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
+            w.fastq(b"r1", b"ACGT", b"IIII").unwrap();
+            // A byte below any sane offset must round-trip untouched: the
+            // clamp happens once, on ingest, where the LUT is indexed.
+            w.fastq(b"r2", b"ACGT", b"!I#\x7f").unwrap();
             w.flush().unwrap();
         }
-        let mut data = String::new();
-        File::open(&p).unwrap().read_to_string(&mut data).unwrap();
-        assert_eq!(data, "@r1\nACGT\n+\nIIII\n");
+        let mut data = Vec::new();
+        File::open(&p).unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\n!I#\x7f\n");
         std::fs::remove_file(&p).ok();
+    }
+
+    /// A `Write` that records every call, to prove the record path batches.
+    #[derive(Clone, Default)]
+    struct Counting(std::sync::Arc<std::sync::Mutex<(Vec<u8>, usize)>>);
+
+    impl Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut g = self.0.lock().unwrap();
+            g.0.extend_from_slice(buf);
+            g.1 += 1;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Six `write_all`s per record became one per staging flush. 20 000
+    /// records are ~2.2 MB, so a 256 KiB stage must need a handful of calls —
+    /// the old code emitted 120 000.
+    #[test]
+    fn fastq_records_are_staged_not_written_one_call_per_field() {
+        let sink = Counting::default();
+        let mut w = Out::new(Box::new(sink.clone()));
+        let seq = vec![b'A'; 50];
+        let qual = vec![b'I'; 50];
+        for i in 0..20_000 {
+            w.fastq(format!("r{i}").as_bytes(), &seq, &qual).unwrap();
+        }
+        w.flush().unwrap();
+        let (bytes, calls) = { sink.0.lock().unwrap().clone() };
+        let expected_flushes = bytes.len() / STAGE_FLUSH + 1;
+        assert!(
+            calls <= expected_flushes + 1,
+            "{calls} write calls for {} bytes; staging should need ~{expected_flushes}",
+            bytes.len()
+        );
+        let mut expect = Vec::new();
+        for i in 0..20_000 {
+            expect.extend_from_slice(format!("@r{i}\n").as_bytes());
+            expect.extend_from_slice(&seq);
+            expect.extend_from_slice(b"\n+\n");
+            expect.extend_from_slice(&qual);
+            expect.push(b'\n');
+        }
+        assert_eq!(bytes, expect, "staged bytes differ from the record stream");
+    }
+
+    #[test]
+    fn fasta_records_are_staged() {
+        let sink = Counting::default();
+        let mut w = Out::new(Box::new(sink.clone()));
+        let seq = vec![b'A'; 100];
+        for i in 0..10_000 {
+            w.fasta(format!("c{i}").as_bytes(), &seq).unwrap();
+        }
+        w.flush().unwrap();
+        let (bytes, calls) = { sink.0.lock().unwrap().clone() };
+        assert!(calls <= bytes.len() / STAGE_FLUSH + 2, "{calls} write calls");
+        assert!(bytes.starts_with(b">c0\nAAAA"), "content corrupted");
+        assert!(bytes.ends_with(b"\n"));
     }
 
     /// Exercises the parallel path specifically: with more than one worker
@@ -302,11 +405,11 @@ mod tests {
             gz_threads: 4,
         };
         let seq = vec![b'A'; 200];
-        let qual = vec![40u8; 200];
+        let qual = vec![b'I'; 200];
         {
-            let mut w = open_output(&p, levels).unwrap();
+            let mut w = Out::new(open_output(&p, levels).unwrap());
             for i in 0..20_000 {
-                write_fastq(&mut w, format!("read{i}").as_bytes(), &seq, &qual, 33).unwrap();
+                w.fastq(format!("read{i}").as_bytes(), &seq, &qual).unwrap();
             }
             w.flush().unwrap();
         }
@@ -333,11 +436,11 @@ mod tests {
             gz_threads: 4,
         };
         let seq = vec![b'A'; 150];
-        let qual = vec![40u8; 150];
+        let qual = vec![b'I'; 150];
         {
-            let mut w = open_output(&p, levels).unwrap();
+            let mut w = Out::new(open_output(&p, levels).unwrap());
             for i in 0..50_000 {
-                write_fastq(&mut w, format!("read{i}").as_bytes(), &seq, &qual, 33).unwrap();
+                w.fastq(format!("read{i}").as_bytes(), &seq, &qual).unwrap();
             }
             w.flush().unwrap();
         }
@@ -397,8 +500,8 @@ mod tests {
     fn write_fastq_gz_roundtrip() {
         let p = tmp_path("rt.fq.gz");
         {
-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
-            write_fastq(&mut w, b"read1", b"ACGT", b"IIII", 0).unwrap();
+            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
+            w.fastq(b"read1", b"ACGT", b"IIII").unwrap();
             w.flush().unwrap();
         }
         let f = File::open(&p).unwrap();
@@ -413,8 +516,8 @@ mod tests {
     fn write_fastq_zst_roundtrip() {
         let p = tmp_path("rt.fq.zst");
         {
-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
-            write_fastq(&mut w, b"read1", b"ACGT", b"IIII", 0).unwrap();
+            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
+            w.fastq(b"read1", b"ACGT", b"IIII").unwrap();
             w.flush().unwrap();
         }
         let f = File::open(&p).unwrap();
@@ -429,9 +532,9 @@ mod tests {
     fn write_fasta_plain() {
         let p = tmp_path("plain.fa");
         {
-            let mut w = open_output(&p, CompressionLevels::default()).unwrap();
-            write_fasta(&mut w, b">contig1", b"ACGT").unwrap();
-            write_fasta(&mut w, b"contig2", b"NN").unwrap();
+            let mut w = Out::new(open_output(&p, CompressionLevels::default()).unwrap());
+            w.fasta(b">contig1", b"ACGT").unwrap();
+            w.fasta(b">contig2", b"NN").unwrap();
             w.flush().unwrap();
         }
         let mut data = String::new();
