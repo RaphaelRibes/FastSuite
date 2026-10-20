@@ -449,11 +449,23 @@ impl Profile {
             ),
         };
 
-        let mode = match raw.adapter.mode.as_deref() {
+        let mut mode = match raw.adapter.mode.as_deref() {
             None | Some("readthrough") => AdapterMode::Readthrough,
             Some("none") => AdapterMode::None,
             Some(other) => bail!("unknown adapter mode {other:?}"),
         };
+        // An empty adapter sequence cannot be read through: cycling a zero-length
+        // string would panic on the modulo. The CLI path already forces `None`
+        // for `--adapter-seq ""`; the profile path must do the same.
+        let adapter_seq = raw.adapter.seq.into_bytes();
+        if adapter_seq.is_empty() {
+            mode = AdapterMode::None;
+        }
+        // The profile's GC is the authority for random DNA (the CLI default is
+        // only the fallback), so an out-of-range value must not run clean.
+        if !(0.0..=1.0).contains(&raw.gc) {
+            bail!("profile gc {} must be in [0,1]", raw.gc);
+        }
 
         let insert = match &raw.insert {
             Some(m) => Some(Cdf::from_map(m)?),
@@ -558,7 +570,7 @@ impl Profile {
                     .round().clamp(0.0, 41.0) as u8,
             ],
             adapter: Adapter {
-                seq: raw.adapter.seq.into_bytes(),
+                seq: adapter_seq,
                 mode,
             },
             n_run,

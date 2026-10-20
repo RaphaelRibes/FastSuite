@@ -22,6 +22,45 @@ fn sample_name_walks_up_past_generic_dirs() {
     assert_eq!(sample_from_path(Path::new("runs/demo/E94/fastprep.json")), "E94");
     // A non-generic stem wins over the parent directory.
     assert_eq!(sample_from_path(Path::new("runs/demo/stats.json")), "demo");
+    // Every tool's own report stem is generic: a QC-only chain writes
+    // <sample>/fastcheck.json, so the directory carries the identity.
+    assert_eq!(sample_from_path(Path::new("runs/demo/E94/fastcheck.json")), "E94");
+}
+
+#[test]
+fn html_and_md_escape_the_sample_name() {
+    // A sample directory may legally be named `a<b&c|d`; unescaped it closed the
+    // HTML tag and broke the table. TSV stays raw — it is not markup.
+    let reports = vec![ToolReport {
+        sample: "a<b&c|d".into(),
+        tool: "fastcheck".into(),
+        version: Some("0.1.0".into()),
+        source: PathBuf::from("/tmp/a<b&c|d/fastcheck.json"),
+        metrics: BTreeMap::from([("reads".to_string(), 2.0)]),
+        notes: vec![],
+        from_v1: true,
+    }];
+
+    let html = fasthelper::report::render_html("T", &reports);
+    assert!(
+        html.contains("<th>a&lt;b&amp;c|d</th>"),
+        "the sample column must be escaped: {html}"
+    );
+    assert!(!html.contains("<b&c|d"), "raw markup leaked into the HTML: {html}");
+
+    let md = fasthelper::report::matrix_md(&reports);
+    assert!(
+        md.contains(" a&lt;b&amp;c|d |"),
+        "the markdown header must be escaped: {md}"
+    );
+
+    let mut tsv = Vec::new();
+    fasthelper::report::write_matrix_tsv(&mut tsv, &fasthelper::report::build_matrix(&reports))
+        .unwrap();
+    assert!(
+        String::from_utf8(tsv).unwrap().contains("a<b&c|d\t"),
+        "TSV is not markup and must stay raw"
+    );
 }
 
 #[test]

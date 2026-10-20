@@ -50,7 +50,11 @@ fn main() {
         }
         let parent = p.parent().filter(|d| !d.as_os_str().is_empty());
         if let Some(dir) = parent {
-            if !dir.exists() {
+            // A report inside the output directory is fine even when that
+            // directory does not exist yet: this run creates it, then the
+            // report's parent (review 2026-10-21, item 5 — `-o fresh --json
+            // fresh/r.json` used to fail here, before create_dir_all ran).
+            if !dir.exists() && !dir.starts_with(&args.output_dir) {
                 eprintln!(
                     "Error: --json directory {} does not exist",
                     dir.display()
@@ -62,10 +66,12 @@ fn main() {
 
     // ── Output targets ────────────────────────────────────────────────────
     let output_dir = args.output_dir;
-    // Grid JSON destination: --json redirects it (and adds the v1 wrapper
-    // next to it); otherwise the historical <output-dir>/heatmap.json.
-    let with_wrapper = args.json.is_some();
-    let json_path = args.json.clone().unwrap_or_else(|| output_dir.join("heatmap.json"));
+    // The grid JSON always lands in the output dir under its historical name:
+    // `--json` names the *report*, not the grid (README, CLI-SPEC §1), so -o
+    // never loses heatmap.json (review 2026-10-21, item 1).
+    let grid_path = output_dir.join(format::GRID_JSON_NAME);
+    // `--json PATH` is the fastsuite.report.v1 destination — nothing else.
+    let report_path = args.json.clone();
 
     // Each --corners spec produces a dedicated output file. Parsed up here,
     // before the clobber guard, because that file is one of the outputs the
@@ -86,12 +92,15 @@ fn main() {
 
     // ── Clobber guard ─────────────────────────────────────────────────────
     // Every file this run would write, built from the same inputs the writers
-    // use — the data/preview streams, PNG and HTML always; the SVG on --svg;
-    // one file per --corners box; and the grid JSON (with its v1 wrapper) when
-    // it lands inside the output dir. Checked before the first `File::create`,
-    // so a refused run leaves the directory untouched.
-    if !args.force && output_dir.exists() {
+    // use — the grid JSON, the data/preview streams, PNG and HTML always; the
+    // SVG on --svg; one file per --corners box; and the `--json` report
+    // wherever it points, inside the output dir or not (review 2026-10-21,
+    // item 6: a report outside -o used to be invisible here). Checked before
+    // the first `File::create`, so a refused run leaves the directory
+    // untouched.
+    if !args.force {
         let mut targets = vec![
+            grid_path.clone(),
             output_dir.join("heatmap.data"),
             output_dir.join("heatmap.preview"),
             output_dir.join("heatmap.png"),
@@ -105,17 +114,13 @@ fn main() {
                 .iter()
                 .map(|&bounds| output_dir.join(corners_filename(bounds))),
         );
-        if json_path.starts_with(&output_dir) {
-            targets.push(json_path.clone());
-            if with_wrapper {
-                targets.push(report::wrapper_path(&json_path));
-            }
+        if let Some(p) = &report_path {
+            targets.push(p.clone());
         }
         if let Some(p) = targets.iter().find(|p| p.exists()) {
             eprintln!(
-                "Error: {} already exists in {}. Pass --force to overwrite.",
-                p.file_name().unwrap().to_string_lossy(),
-                output_dir.display()
+                "Error: {} already exists. Pass --force to overwrite.",
+                p.display()
             );
             std::process::exit(1);
         }
@@ -124,6 +129,18 @@ fn main() {
         eprintln!("Cannot create output dir {}: {e}", output_dir.display());
         std::process::exit(1);
     });
+    // A report parent inside the output dir may be a nested directory this run
+    // creates (`-o out --json out/qc/r.json`).
+    if let Some(dir) = report_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty() && !d.exists())
+    {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| {
+            eprintln!("Cannot create --json directory {}: {e}", dir.display());
+            std::process::exit(1);
+        });
+    }
 
     // ── Temp directory ────────────────────────────────────────────────────
     let temp_dir: PathBuf = args.temp_dir.unwrap_or_else(|| {
@@ -316,8 +333,7 @@ fn main() {
         preview_n: args.preview_reads,
         data_mode: args.data_mode,
         output_dir: &output_dir,
-        json_path: &json_path,
-        with_wrapper,
+        report_path: report_path.as_deref(),
         elapsed_s: started.elapsed().as_secs_f64(),
         quiet: args.quiet,
     };

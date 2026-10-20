@@ -55,12 +55,11 @@ fn run(tag: &str, fq: &str, extra: &[&str]) -> Run {
         String::from_utf8_lossy(&o.stdout),
         String::from_utf8_lossy(&o.stderr)
     );
-    // The v1 wrapper lands next to the redirected grid as <stem>.report.json.
-    let report = extra.windows(2).find(|w| w[0] == "--json").map(|w| {
-        let p = PathBuf::from(w[1]);
-        let stem = p.file_stem().unwrap().to_string_lossy().to_string();
-        p.with_file_name(format!("{stem}.report.json"))
-    });
+    // `--json PATH` is the v1 report itself (the grid stays in -o).
+    let report = extra
+        .windows(2)
+        .find(|w| w[0] == "--json")
+        .map(|w| PathBuf::from(w[1]));
     Run {
         out,
         report,

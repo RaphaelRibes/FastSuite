@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::report::{collect, ToolReport};
+use crate::report::{collect, esc, ToolReport};
 
 /// Merge every metric across a report set into one map (last value wins on a
 /// key collision, which is fine for a single-tool comparison).
@@ -20,10 +20,6 @@ fn merge_metrics(reports: &[ToolReport]) -> BTreeMap<String, f64> {
         }
     }
     m
-}
-
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 /// Write `compare.tsv` and `compare.html` to `outdir`.

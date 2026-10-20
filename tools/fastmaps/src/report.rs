@@ -36,8 +36,14 @@ pub fn corner_metrics(size: u32, grids: &[(&str, &[u64], u64)]) -> BTreeMap<Stri
                     continue;
                 }
                 total += n;
-                let (low_x, high_x) = (x <= c, x >= size as usize - 1 - c);
-                let (low_y, high_y) = (y <= c, y >= size as usize - 1 - c);
+                // High corner bound: `size - 1 - c`, saturating because a grid
+                // no wider than the window (`size <= 1 + c`, i.e. reads of a
+                // couple of bases) would otherwise wrap in release and panic in
+                // debug — a 1 bp all-T read reported polyA instead of polyT
+                // (review 2026-10-21, item 2).
+                let high = (size as usize).saturating_sub(1 + c);
+                let (low_x, high_x) = (x <= c, x >= high);
+                let (low_y, high_y) = (y <= c, y >= high);
                 if low_x && low_y { poly_a += n; }
                 if high_x && high_y { poly_t += n; }
                 if low_x && high_y { poly_g += n; }
@@ -81,16 +87,17 @@ pub fn corner_window(size: u32) -> u32 {
 
 /// Write the `fastsuite.report.v1` wrapper (docs/REPORT-SCHEMA.md) to `path`.
 ///
-/// fastmaps' grid JSON (`heatmap.json`) keeps its own shape; this wrapper is
-/// the machine-readable layer, carrying the corner metrics the tool now owns
-/// (they used to be derived by fasthelper from the grid). The grid file's
-/// location is recorded under `grid` so a consumer can find both.
+/// This *is* the `--json PATH` file; the grid JSON keeps its own shape and its
+/// own home, `<output-dir>/heatmap.json`. `grid_name` is that file's name, so
+/// the `grid` block names a file the consumer can actually find (it used to
+/// hard-code `heatmap.json` while `--json` was redirecting the grid).
 pub fn write_report_v1(
     path: &std::path::Path,
     command: &str,
     elapsed_s: f64,
     files: &[String],
     metrics: &BTreeMap<String, f64>,
+    grid_name: &str,
 ) -> std::io::Result<()> {
     use crate::encode::json_escape;
 
@@ -116,12 +123,13 @@ pub fn write_report_v1(
             "  \"inputs\": {{\"files\": [{files}]}},\n",
             "  \"elapsed_s\": {},\n",
             "  \"metrics\": {{\n{metrics}\n  }},\n",
-            "  \"grid\": {{\"format\": \"heatmap.json\", \"see\": \"docs/PLAN-QC.md\"}}\n",
+            "  \"grid\": {{\"format\": {}, \"see\": \"docs/PLAN-QC.md\"}}\n",
             "}}\n"
         ),
         env!("CARGO_PKG_VERSION"),
         json_escape(command),
         fmt_f64(elapsed_s),
+        grid = json_escape(grid_name),
         files = files_json,
         metrics = metrics_json,
     );
@@ -130,19 +138,6 @@ pub fn write_report_v1(
     use std::io::Write;
     f.write_all(doc.as_bytes())?;
     f.flush()
-}
-
-/// Path of the wrapper that accompanies a grid JSON: `<stem>.report.json`,
-/// next to it.
-///
-/// One definition because the clobber guard in `main` has to predict exactly
-/// the path the writer will create.
-pub fn wrapper_path(json_path: &std::path::Path) -> std::path::PathBuf {
-    let stem = json_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "heatmap".into());
-    json_path.with_file_name(format!("{stem}.report.json"))
 }
 
 /// Compact float rendering: integers print without a `.0`, everything else
@@ -256,6 +251,7 @@ mod tests {
             0.42,
             &["a_R1.fq.gz".into(), "a_R2.fastq.gz".into()],
             &metrics,
+            "heatmap.json",
         )
         .unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -283,6 +279,23 @@ mod tests {
         assert!(text.contains("\"total_reads\": 4"), "{text}");
         assert!(!text.contains("\"total_reads\": 4.0"), "{text}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `grid` block names the grid file the writer was handed, not a
+    /// hard-coded `heatmap.json`.
+    #[test]
+    fn report_names_the_grid_file_it_is_given() {
+        let dir = std::env::temp_dir().join(format!("maps_grid_name_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.json");
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert("total_reads".into(), 1.0);
+        super::write_report_v1(&path, "fastmaps a.fq", 0.0, &["a.fq".into()], &metrics, "corner.json")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["grid"]["format"], "corner.json", "{v}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

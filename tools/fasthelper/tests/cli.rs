@@ -1461,3 +1461,400 @@ fn concatenate_says_when_it_is_handed_an_aggregate() {
         "a refused concatenate must write nothing"
     );
 }
+
+// --------------------------------------------- 2026-10-21 review round ---- //
+
+/// A two-read FASTQ, long enough for fastmaps to build a grid from.
+fn write_two_read_fastq(path: &Path) {
+    std::fs::write(
+        path,
+        "@r1\nACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIII\n@r2\nTTTTAAAACCCCGGGG\n+\nIIIIIIIIIIIIIIII\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn two_sample_qc_report_keeps_each_sample_name() {
+    // The generic-stem list had no `fastcheck` entry, so
+    // `<outdir>/<sample>/fastcheck.json` resolved its sample to the stem
+    // "fastcheck": two samples gave two identical rows in report.tsv and two
+    // columns headed "fastcheck" in report.md/html. The run knows which sample
+    // each report belongs to and must prefer that over path re-derivation.
+    require_tool("fastcheck");
+    let d = tmpdir("qc_two_samples");
+    let out = d.join("out");
+    let alpha = d.join("alpha_R1.fastq");
+    let beta = d.join("beta_R1.fastq");
+    write_two_read_fastq(&alpha);
+    write_two_read_fastq(&beta);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"qc\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [[samples]]\nname = \"alpha\"\nr1 = \"{}\"\n\n\
+             [[samples]]\nname = \"beta\"\nr1 = \"{}\"\n",
+            out.display(),
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "-P", "2",
+        "--tools-dir", tools_dir().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "a two-sample QC chain must run: {stderr}");
+
+    let tsv = std::fs::read_to_string(out.join("report.tsv")).unwrap();
+    let rows: Vec<&str> = tsv.lines().skip(1).collect();
+    assert_eq!(rows.len(), 2, "one row per sample: {tsv}");
+    assert!(rows.iter().any(|r| r.starts_with("alpha\t")), "alpha lost its identity: {tsv}");
+    assert!(rows.iter().any(|r| r.starts_with("beta\t")), "beta lost its identity: {tsv}");
+    assert!(
+        !rows.iter().any(|r| r.starts_with("fastcheck\t")),
+        "the sample fell back to the generic report stem: {tsv}"
+    );
+
+    let html = std::fs::read_to_string(out.join("report.html")).unwrap();
+    assert!(
+        html.contains("<th>alpha</th>") && html.contains("<th>beta</th>"),
+        "both samples must head their own column: {html}"
+    );
+    let md = std::fs::read_to_string(out.join("report.md")).unwrap();
+    assert!(md.contains(" alpha |") && md.contains(" beta |"), "{md}");
+}
+
+#[test]
+fn full_chain_with_a_fastsim_step_runs_twice_and_aggregates_every_step() {
+    // fastsim as a chain step: it used to generate into the [simulate] control's
+    // own prefix (clobber guard, exit 1) and, with no sim block, its outputs were
+    // discarded (out1 empty) so the next step silently reprocessed the original
+    // reads. Its artefacts now live in a step-private directory and become the
+    // next step's input.
+    for tool in ["fastsim", "fastdedup", "fastprep", "fastmaps", "fastcheck"] {
+        require_tool(tool);
+    }
+    let profile = tools_dir().join("fastsim/profiles/test_small.json");
+    assert!(profile.is_file(), "the shipped test profile must exist: {}", profile.display());
+    let d = tmpdir("fastsim_chain");
+    let out = d.join("out");
+    let cfg = d.join("fastsuite.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"simchain\"\noutdir = \"{}\"\nthreads = 2\ngz_level = 1\n\
+             steps = [\"fastsim\", \"fastdedup\", \"fastprep\", \"fastmaps\", \"fastcheck\"]\n\n\
+             [simulate]\nenabled = true\nname = \"sim_E\"\npairs = 200\nprofile = \"{}\"\nseed = 42\n",
+            out.display(),
+            profile.display()
+        ),
+    )
+    .unwrap();
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+    let tools = ["fastsim", "fastdedup", "fastprep", "fastmaps", "fastcheck"];
+
+    let (_, e1, c1) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c1, 0, "the chain with a fastsim step must run: {e1}");
+
+    // Every step's report reached the aggregate, one row each.
+    let tsv = std::fs::read_to_string(out.join("report.tsv")).unwrap();
+    let rows: Vec<&str> = tsv.lines().skip(1).collect();
+    assert_eq!(rows.len(), tools.len(), "one row per step: {tsv}");
+    for tool in tools {
+        assert!(
+            rows.iter().any(|r| *r == format!("sim_E\t{tool}") || r.starts_with(&format!("sim_E\t{tool}\t"))),
+            "the {tool} step's report is missing from the aggregate: {tsv}"
+        );
+    }
+    // The step generated into its own directory and the next step consumed it.
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let cmds = man["commands"].as_array().unwrap();
+    assert_eq!(cmds.len(), tools.len(), "one manifest entry per step: {man}");
+    for c in cmds {
+        assert_eq!(c["exit"], 0, "every step must have run clean: {c}");
+    }
+    let dedup = cmds.iter().find(|c| c["tool"] == "fastdedup").unwrap();
+    let argv: Vec<String> = serde_json::from_value(dedup["argv"].clone()).unwrap();
+    let private_r1 = out.join("sim_E/fastsim/sim_R1.fastq.gz").display().to_string();
+    assert!(
+        argv.contains(&private_r1),
+        "fastdedup must read the FASTQ the fastsim step generated ({private_r1}): {argv:?}"
+    );
+
+    // A second run into the same outdir, no --force: no clobber guard may trip.
+    let (_, e2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_eq!(c2, 0, "the chain must be re-runnable into the same outdir: {e2}");
+    let json2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+    assert_eq!(
+        json2["reports"].as_array().unwrap().len(),
+        tools.len(),
+        "the rerun must aggregate every step: {json2}"
+    );
+
+    let (_, e3, c3) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td, "--force"]);
+    assert_eq!(c3, 0, "--force must rerun the whole chain: {e3}");
+    let tsv3 = std::fs::read_to_string(out.join("report.tsv")).unwrap();
+    assert_eq!(
+        tsv3.lines().skip(1).count(),
+        tools.len(),
+        "the forced rerun must still aggregate one row per step: {tsv3}"
+    );
+}
+
+/// A stand-in tool that exits 0 without writing anything: the shape that used
+/// to leave a header-only report and exit 0.
+const FAKE_SILENT_CHECK: &str = "#!/bin/sh\nexit 0\n";
+
+#[test]
+fn a_step_that_writes_no_json_fails_the_run() {
+    let d = tmpdir("silent_step");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    write_exe(&tools.join("fastcheck"), FAKE_SILENT_CHECK);
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"silent\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap(),
+    ]);
+    assert_ne!(
+        code, 0,
+        "a step that exited 0 without writing its --json must fail the run: {stderr}"
+    );
+    assert!(
+        stderr.contains("fastcheck"),
+        "the failure must name the step's tool: {stderr}"
+    );
+    assert!(
+        stderr.contains("fastcheck.json"),
+        "the failure must name the output that is missing: {stderr}"
+    );
+}
+
+#[test]
+fn fastcheck_assumptions_reach_the_aggregate() {
+    // D-6: fastcheck states its assumptions as data. The aggregate dropped
+    // every v1 top-level block, so the --no-quality caveat never reached a
+    // published table.
+    require_tool("fastcheck");
+    let d = tmpdir("assumptions");
+    let out = d.join("out");
+    let fq = d.join("S1_R1.fastq");
+    write_two_read_fastq(&fq);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"assumptions\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [steps.fastcheck]\nargs = [\"--no-quality\"]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools_dir().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+    let row = json["reports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["tool"] == "fastcheck")
+        .expect("the fastcheck report must be aggregated");
+    let notes = row["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or_default().contains("no quality-derived metric is reported")),
+        "the --no-quality assumption must be carried, not stripped: {row}"
+    );
+    let html = std::fs::read_to_string(out.join("report.html")).unwrap();
+    assert!(
+        html.contains("no quality-derived metric is reported"),
+        "the caveat must be visible in the human-readable aggregate: {html}"
+    );
+}
+
+#[test]
+fn fastmaps_length_scalars_reach_the_aggregate() {
+    // The corner fractions are length-biased, and fastmaps publishes the three
+    // numbers that make the bias visible (min/max read length, corner window).
+    // The grid reader dropped them, so the caveat was unpublishable downstream.
+    require_tool("fastmaps");
+    let d = tmpdir("maps_scalars");
+    let out = d.join("out");
+    let fq = d.join("S1_R1.fastq");
+    write_two_read_fastq(&fq);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"maps\"\noutdir = \"{}\"\nsteps = [\"fastmaps\"]\nthreads = 1\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools_dir().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let tsv = std::fs::read_to_string(out.join("report.tsv")).unwrap();
+    let mut lines = tsv.lines();
+    let header: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    let row: Vec<&str> = lines.next().expect("one row").split('\t').collect();
+    for key in ["min_seq_len", "max_seq_len", "corner_window"] {
+        let i = header
+            .iter()
+            .position(|h| *h == key)
+            .unwrap_or_else(|| panic!("{key} must be a column of the aggregate: {tsv}"));
+        assert!(!row[i].is_empty(), "{key} must carry a value: {tsv}");
+    }
+    // 16 bp reads -> grid 17 -> corner window max(17/50, 2) = 2.
+    let cell = |key: &str| {
+        let i = header.iter().position(|h| *h == key).unwrap();
+        row[i]
+    };
+    assert_eq!(cell("min_seq_len"), "16", "{tsv}");
+    assert_eq!(cell("max_seq_len"), "16", "{tsv}");
+    assert_eq!(cell("corner_window"), "2", "{tsv}");
+}
+
+#[test]
+fn from_an_unknown_step_fails_before_any_work() {
+    // --from nosuchstep silently resumed everything and exited 0.
+    require_tool("fastcheck");
+    let d = tmpdir("from_unknown");
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"f\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--from", "nosuchstep",
+        "--tools-dir", tools_dir().to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "an unknown --from step must fail the run: {stderr}");
+    assert!(stderr.contains("nosuchstep"), "the refusal must name the step: {stderr}");
+    assert!(
+        !out.join("S1").exists(),
+        "no sample may be started before --from is validated: {} exists",
+        out.join("S1").display()
+    );
+    assert!(!out.join("report.tsv").exists(), "a rejected run must not write a report");
+}
+
+#[test]
+fn check_refuses_a_sample_named_like_the_simulated_control() {
+    // The control is appended to the sample list under [simulate] name, but the
+    // duplicate check ran before that append: a [[samples]] entry called sim_E
+    // put two workers on one directory and the control's report overwrote it.
+    let d = tmpdir("dup_sim");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"dup\"\nsteps = [\"fastdedup\"]\n\n\
+             [simulate]\nenabled = true\nname = \"sim_E\"\npairs = 10\n\n\
+             [[samples]]\nname = \"sim_E\"\nr1 = \"{}\"\n",
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, check_err, check_code) = run(&["check", "-c", cfg.to_str().unwrap()]);
+    assert_ne!(check_code, 0, "check must refuse it: {check_err}");
+    assert!(
+        check_err.contains("duplicate sample name") && check_err.contains("sim_E"),
+        "the refusal must name the collision: {check_err}"
+    );
+
+    let (_, run_err, run_code) = run(&["run", "-c", cfg.to_str().unwrap()]);
+    assert_ne!(run_code, 0, "run must refuse it too: {run_err}");
+    assert!(
+        run_err.contains("duplicate sample name") && run_err.contains("sim_E"),
+        "run must agree with check: {run_err}"
+    );
+}
+
+#[test]
+fn threads_zero_is_forwarded_to_every_tool() {
+    // -j 0 means "all cores" to every tool, but the per-sample split turned it
+    // into -j 1 before the children saw it (while the manifest recorded 0), and
+    // fastcheck/fastmaps/fastsim never received -j at all.
+    for tool in ["fastsim", "fastdedup", "fastprep", "fastmaps", "fastcheck"] {
+        require_tool(tool);
+    }
+    let profile = tools_dir().join("fastsim/profiles/test_small.json");
+    let d = tmpdir("threads_zero");
+    let out = d.join("out");
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"j0\"\noutdir = \"{}\"\nthreads = 4\ngz_level = 1\n\
+             steps = [\"fastsim\", \"fastdedup\", \"fastprep\", \"fastmaps\", \"fastcheck\"]\n\n\
+             [simulate]\nenabled = true\nname = \"sim_E\"\npairs = 50\nprofile = \"{}\"\nseed = 42\n",
+            out.display(),
+            profile.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "-j", "0",
+        "--tools-dir", tools_dir().to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "-j 0 must be accepted and the chain must run: {stderr}");
+
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(man["threads"], 0, "the manifest must record what was asked for: {man}");
+    let cmds = man["commands"].as_array().unwrap();
+    assert_eq!(cmds.len(), 5, "{man}");
+    for c in cmds {
+        let argv: Vec<String> = serde_json::from_value(c["argv"].clone()).unwrap();
+        let j = argv.iter().position(|a| a == "-j");
+        assert_eq!(
+            j.map(|i| argv.get(i + 1).map(String::as_str)),
+            Some(Some("0")),
+            "{} must receive -j 0, not a rewritten 1: {argv:?}",
+            c["tool"]
+        );
+    }
+}

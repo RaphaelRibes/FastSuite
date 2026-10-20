@@ -72,9 +72,10 @@ pub struct Cli {
     #[arg(long)]
     pub insert_min: Option<u32>,
 
-    /// GC fraction for random DNA (default 0.49).
-    #[arg(long, default_value_t = 0.49)]
-    pub gc: f64,
+    /// GC fraction for random DNA (default: the profile's measured `gc`,
+    /// falling back to 0.49). An explicit --gc overrides the profile.
+    #[arg(long)]
+    pub gc: Option<f64>,
 
     /// Sample inserts from a reference FASTA instead of random DNA.
     #[arg(long)]
@@ -173,7 +174,7 @@ pub struct Config {
     pub insert_mean: f64,
     pub insert_sd: f64,
     pub insert_min: Option<u32>,
-    pub gc: f64,
+    pub gc: Option<f64>,
     pub reference: Option<String>,
     pub adapter_seq: Option<String>,
     pub gzip: bool,
@@ -239,8 +240,10 @@ impl Config {
         if self.insert_sd <= 0.0 {
             bail!("--insert-sd must be > 0");
         }
-        if !(0.0..=1.0).contains(&self.gc) {
-            bail!("--gc must be in [0,1]");
+        if let Some(gc) = self.gc {
+            if !(0.0..=1.0).contains(&gc) {
+                bail!("--gc must be in [0,1]");
+            }
         }
         if !(0.0..=1.0).contains(&self.dup_rate) {
             bail!("--dup-rate must be in [0,1]");

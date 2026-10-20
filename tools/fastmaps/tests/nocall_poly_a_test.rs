@@ -48,7 +48,7 @@ fn all_n_read_is_not_poly_a() {
         String::from_utf8_lossy(&o.stderr)
     );
 
-    let text = std::fs::read_to_string(dir.join("r.report.json")).unwrap();
+    let text = std::fs::read_to_string(&json).unwrap();
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     let m = &v["metrics"];
 

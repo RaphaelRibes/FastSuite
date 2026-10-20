@@ -121,7 +121,10 @@ struct StepOutcome {
 /// the residual-adapter guard.
 struct SampleOutcome {
     entries: Vec<(usize, serde_json::Value)>,
-    reports: Vec<PathBuf>,
+    /// (sample it belongs to, report path). The sample name travels with the
+    /// path because the path cannot be trusted to carry it: every tool's report
+    /// file is named after the tool, not the sample.
+    reports: Vec<(String, PathBuf)>,
     failed: Vec<String>,
     adapter_trips: Vec<String>,
 }
@@ -148,7 +151,7 @@ fn run_sample(
     from: Option<&str>,
 ) -> Result<SampleOutcome> {
     let mut entries: Vec<(usize, serde_json::Value)> = Vec::new();
-    let mut reports: Vec<PathBuf> = Vec::new();
+    let mut reports: Vec<(String, PathBuf)> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut adapter_trips: Vec<String> = Vec::new();
 
@@ -196,6 +199,9 @@ fn run_sample(
             failed.push(format!("{}/{}", sample.name, tool));
             break;
         };
+        // Where a fastsim step generates. A step-private prefix, never the
+        // [simulate] control's own <outdir>/<simulate.name>/sim.
+        let step_prefix = work.join("fastsim").join("sim");
         let (out1, out2, json_path, maps_dir) = match tool.as_str() {
             "fastdedup" => (
                 work.join(format!("{}_dedup_R1.fastq.gz", sample.name)),
@@ -223,16 +229,28 @@ fn run_sample(
                 work.join("fastcheck.json"),
                 work.join("maps"), // unused; the aggregator reads the JSON
             ),
+            // A generator step writes a fresh pair of FASTQs, so they are this
+            // step's outputs (and the next step's inputs). They live in a
+            // step-private directory: the [simulate] control already owns
+            // <outdir>/<simulate.name>/sim, and a step told to generate into
+            // that same prefix tripped fastsim's clobber guard on every run.
             "fastsim" => (
-                PathBuf::new(), // simulate-only: the generated FASTQs are inputs
-                None,
-                work.join("fastsim.json"),
-                work.join("maps"), // unused
+                work.join("fastsim").join(sim_file("R1")),
+                Some(work.join("fastsim").join(sim_file("R2"))),
+                work.join("fastsim").join("fastsim.json"),
+                work.join("fastsim"), // unused
             ),
             // Unreachable: run() validates the step list against KNOWN_STEPS
             // before any sample starts, so this only keeps the match total.
             _ => continue,
         };
+        // fastsim does not create its own output directory (it only writes the
+        // three artefacts), so the runner must — but never on a dry run.
+        if tool == "fastsim" && !dry_run {
+            if let Some(dir) = out1.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
         let argv = argv_for(
             tool,
             &cur1,

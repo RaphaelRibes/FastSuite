@@ -62,6 +62,9 @@ pub struct PooledPair {
     /// Finished R1 and R2 (sequence + quality): the exact bytes to re-emit.
     pub r1: crate::quality::MateRead,
     pub r2: Option<crate::quality::MateRead>,
+    /// `N` bases the no-adapter filler put in each mate (not a no-call).
+    pub pad_n1: u32,
+    pub pad_n2: u32,
 }
 
 /// A constructed read: sequence + the boundaries needed by the quality
@@ -587,6 +590,8 @@ mod tests {
             artefact: a,
             r1: m1,
             r2: None,
+            pad_n1: 0,
+            pad_n2: 0,
         };
 
         // An empty pool samples nothing.

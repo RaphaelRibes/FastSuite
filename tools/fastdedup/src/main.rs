@@ -13,7 +13,7 @@ use crate::processor::{
 };
 use crate::utils::{
     birthday_problem_square_approximation, count_sequences, estimate_sequence_capacity,
-    get_hash_method,
+    get_hash_method, path_identity,
 };
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -175,6 +175,22 @@ fn dispatch_paired_threaded(
     }
 }
 
+/// Refuses two CLI roles that resolve to the same file.
+///
+/// `-` is not a path, so a stream side is always accepted here (the stream
+/// conflicts are refused separately). Everything else is resolved through the
+/// filesystem with [`path_identity`] before the comparison: comparing the
+/// strings let `-o ./c.fq -p c.fq` through.
+fn refuse_same_file(a: &str, a_role: &str, b: &str, b_role: &str, why: &str) -> Result<()> {
+    if crate::stream::is_stream(a) || crate::stream::is_stream(b) {
+        return Ok(());
+    }
+    if path_identity(a) == path_identity(b) {
+        bail!("{a_role} ({a}) and {b_role} ({b}) name the same file: {why}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -223,12 +239,62 @@ fn main() -> Result<()> {
     }
     // Two independent writers on one path interleave R1 and R2 into a file that
     // is neither valid FASTQ nor FASTA, and exit 0. Refuse before any write.
+    // The comparison resolves both paths: `-o ./coll2.fq -p coll2.fq` is one
+    // file in two spellings and used to slip past a string comparison.
     if let (Some(out1), Some(out2)) = (args.output.as_deref(), args.output_r2.as_deref()) {
-        if out1 == out2 {
-            bail!(
-                "--out1 (-o) and --out2 (-p) name the same file ({}): two writers would interleave R1 and R2 into one file that is neither valid FASTQ nor FASTA. Give each mate its own path.",
-                out1
-            );
+        refuse_same_file(
+            out1,
+            "--out1 (-o)",
+            out2,
+            "--out2 (-p)",
+            "two writers would interleave R1 and R2 into one file that is neither \
+             valid FASTQ nor FASTA. Give each mate its own path.",
+        )?;
+    }
+    // The report is written last, so `--json j.fq -o j.fq` used to replace a
+    // finished FASTQ with JSON and exit 0.
+    if let Some(json) = args.json.as_deref() {
+        for (role, out) in [
+            ("--out1 (-o)", args.output.as_deref()),
+            ("--out2 (-p)", args.output_r2.as_deref()),
+        ] {
+            if let Some(out) = out {
+                refuse_same_file(
+                    json,
+                    "--json",
+                    out,
+                    role,
+                    "the report would overwrite the sequences (or the reverse). \
+                     Give the report its own path.",
+                )?;
+            }
+        }
+    }
+    // Reading and writing one file cannot produce correct output: `--force`
+    // truncates it before the first read (`-1 f.fq -o f.fq --force` left a
+    // 0-byte input), and a resume appends to the file it is reading.
+    // `--dry-run` writes nothing, so an output naming an input is harmless.
+    if !args.dry_run {
+        for (in_role, in_path) in [
+            ("--input (-1)", Some(args.input.as_str())),
+            ("--input-r2 (-2)", args.input_r2.as_deref()),
+        ] {
+            let Some(in_path) = in_path else { continue };
+            for (out_role, out) in [
+                ("--out1 (-o)", args.output.as_deref()),
+                ("--out2 (-p)", args.output_r2.as_deref()),
+            ] {
+                if let Some(out) = out {
+                    refuse_same_file(
+                        in_path,
+                        in_role,
+                        out,
+                        out_role,
+                        "reading and writing one file truncates or appends to the \
+                         input. Give the output its own path.",
+                    )?;
+                }
+            }
         }
     }
     if out1_stream && args.json.as_deref() == Some("-") {
@@ -314,6 +380,23 @@ fn main() -> Result<()> {
         );
     }
 
+    let resolved_threads = crate::parallel::resolve_thread_count(args.threads);
+
+    // `--out-compression` is the stream counterpart of the `.gz` extension: a
+    // named path used to ignore it and write plain records in silence.
+    if args.out_compression == OutCompression::Gz {
+        let named_output = [args.output.as_deref(), args.output_r2.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|path| !crate::stream::is_stream(path));
+        if named_output {
+            eprintln!(
+                "Warning: --out-compression only applies to stream output (-o -/-p -); \
+                 a named path infers compression from its extension (.gz). Writing plain records."
+            );
+        }
+    }
+
     let cfg = DedupConfig {
         force: args.force,
         verbose: args.verbose,
@@ -322,7 +405,10 @@ fn main() -> Result<()> {
         estimated_capacity: total_capacity,
         read_length: args.read_length,
         abundance_sep: args.abundance_sep.clone(),
-        threads: args.threads,
+        // `-j 0` means "auto": resolve it once here so the engine, the summary
+        // and the report all announce the pool that actually runs (they used to
+        // report the request, so `-j 0` printed "0 threads").
+        threads: resolved_threads,
         temp_dir: args.temp_dir.clone(),
         out_format: match args.out_format {
             OutFormat::Fastq => OutputFormat::Fastq,
@@ -429,7 +515,7 @@ fn main() -> Result<()> {
         // so the summary goes to stderr and never pollutes the pipe.
         let summary = format!(
             "fastdedup: {} reads in, {} out, {} duplicates ({:.2}%), {} threads, {:.2?}",
-            processed, reads_out, duplicates, dup_pct, args.threads, elapsed
+            processed, reads_out, duplicates, dup_pct, resolved_threads, elapsed
         );
         if out1_stream || args.json.as_deref() == Some("-") {
             eprintln!("{summary}");
@@ -445,31 +531,52 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = &args.json {
+        // Units. `processed`/`reads_out`/`duplicates` above count records: one
+        // read in single-end mode, but one PAIR in paired mode. The report's
+        // read metrics are reads, so paired mode doubles them — 4 pairs is
+        // 8 reads, not 4 — and also publishes the pair counts it used to
+        // report under a read name. Keys are added, never renamed: fasthelper
+        // aggregates `reads_in`/`reads_out`/`reads_duplicate`.
+        let paired = args.input_r2.is_some();
+        let pairs = paired.then_some((processed, reads_out));
+        let (report_reads_in, report_reads_out, report_reads_duplicate) = if paired {
+            (processed * 2, reads_out * 2, duplicates * 2)
+        } else {
+            (processed, reads_out, duplicates)
+        };
+
+        let mut metrics = serde_json::json!({
+            "reads_in": report_reads_in,
+            "reads_out": report_reads_out,
+            "reads_duplicate": report_reads_duplicate,
+            "duplicate_rate": dup_pct / 100.0,
+            "hash_bits": selected_hash_type.to_num(),
+            "hash_capacity_estimate": total_capacity,
+            "collision_estimate": collisions_pct / 100.0,
+            "threads": resolved_threads,
+            "gz_level": args.compression,
+            "abundance": args.abundance
+        });
+        if let Some((pairs_in, pairs_out)) = pairs {
+            metrics["pairs_in"] = pairs_in.into();
+            metrics["pairs_out"] = pairs_out.into();
+        }
+
         let report = serde_json::json!({
             "schema": "fastsuite.report.v1",
             "tool": "fastdedup",
             "tool_version": env!("CARGO_PKG_VERSION"),
             "command": std::env::args().collect::<Vec<_>>().join(" "),
-            "mode": if args.input_r2.is_some() { "paired" } else { "single" },
+            "mode": if paired { "paired" } else { "single" },
             "dry_run": args.dry_run,
             "inputs": { "r1": args.input, "r2": args.input_r2 },
             "outputs": {
+                // --dry-run writes neither mate: report both as absent.
                 "r1": if args.dry_run { serde_json::Value::Null } else { serde_json::Value::String(output.clone()) },
-                "r2": args.output_r2
+                "r2": if args.dry_run { serde_json::Value::Null } else { serde_json::json!(args.output_r2) }
             },
             "elapsed_s": elapsed.as_secs_f64(),
-            "metrics": {
-                "reads_in": processed,
-                "reads_out": reads_out,
-                "reads_duplicate": duplicates,
-                "duplicate_rate": dup_pct / 100.0,
-                "hash_bits": selected_hash_type.to_num(),
-                "hash_capacity_estimate": total_capacity,
-                "collision_estimate": collisions_pct / 100.0,
-                "threads": args.threads,
-                "gz_level": args.compression,
-                "abundance": args.abundance
-            }
+            "metrics": metrics
         });
         let body = serde_json::to_string_pretty(&report)? + "\n";
         if crate::stream::is_stream(path) {

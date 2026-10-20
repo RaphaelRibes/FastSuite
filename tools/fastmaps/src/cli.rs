@@ -93,7 +93,14 @@ pub fn parse_data_mode(s: &str) -> Result<DataMode, String> {
 /// into a grid. Outputs heatmap.json / .data / .preview (for the marimo
 /// notebook), heatmap.png, and heatmap_3d.html.
 #[derive(Parser, Debug)]
-#[command(name = "fastmaps", version)]
+#[command(
+    name = "fastmaps",
+    version,
+    after_help = "PLANE LIMIT: the grid is O(max read length^2) — three u64 grids plus their \n\
+JSON rendering. A run is refused before anything is written when the plane would \n\
+exceed 256 MiB at 64 B/cell (2048x2048 cells, i.e. reads up to 2047 bp). \n\
+--buffer-mb bounds the read-index buffer, not the plane: trim reads upstream to go longer."
+)]
 pub struct Args {
     /// Input FASTQ files (plain or .gz).
     #[arg(required = true, value_name = "FILE")]
@@ -177,10 +184,9 @@ pub struct Args {
     pub r2_pattern: Vec<String>,
 
     /// Write the machine-readable FastSuite report (fastsuite.report.v1) to
-    /// PATH, alongside the grid JSON. The grid JSON keeps its default
-    /// location `<output-dir>/heatmap.json`; this flag only redirects it
-    /// and additionally writes the v1 wrapper. `-` is not accepted:
-    /// fastmaps is file-only (D-4).
+    /// PATH. This is the report only: the heatmap grid JSON is never
+    /// redirected and always lands at `<output-dir>/heatmap.json`, so `-o`
+    /// keeps its grid. `-` is not accepted: fastmaps is file-only (D-4).
     #[arg(long, value_name = "PATH")]
     pub json: Option<std::path::PathBuf>,
 
@@ -363,5 +369,28 @@ mod tests {
         assert!(parse_data_mode("mostly").is_err());
         assert!(parse_data_mode("").is_err());
         assert!(Args::try_parse_from(["fastmaps", "a.fq", "--data-mode", "nope"]).is_err());
+    }
+
+    /// The plane ceiling is published in `--help`, and the numbers there are
+    /// the ones the check enforces (review 2026-10-21, item 4).
+    #[test]
+    fn plane_cap_is_documented_in_help() {
+        use clap::CommandFactory;
+        let help = Args::command().render_help().to_string();
+        let max_len = crate::format::MAX_PLANE_SIDE - 1;
+        let cap_mib = crate::format::MAX_PLANE_BYTES / (1024 * 1024);
+        assert!(
+            help.contains(&max_len.to_string()),
+            "--help must name the {max_len} bp read-length limit:\n{help}"
+        );
+        assert!(
+            help.contains(&cap_mib.to_string()),
+            "--help must name the {cap_mib} MiB plane cap:\n{help}"
+        );
+        assert!(help.contains("plane"), "--help must say what is bounded:\n{help}");
+        assert!(
+            help.contains("--buffer-mb"),
+            "--help must say that --buffer-mb does not bound it:\n{help}"
+        );
     }
 }

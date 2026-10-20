@@ -1,7 +1,7 @@
 use crate::hasher::HashType;
 use anyhow::{Context, Result, bail};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Maximum number of entries to pre-allocate in the hash set.
 /// Prevents multi-GB allocations from inaccurate file-size estimates.
@@ -69,6 +69,35 @@ pub fn estimate_sequence_capacity<P: AsRef<Path>>(path: P, read_length: usize) -
     let divisor = compute_bytes_per_read(read_length, is_gz);
 
     Ok((file_size_bytes / divisor).clamp(1, MAX_PREALLOC_ENTRIES))
+}
+
+/// Resolves a CLI path to a filesystem identity, for "is this the same file?".
+///
+/// Comparing the strings is not comparing the files: `-o ./coll2.fq -p
+/// coll2.fq` are two spellings of one path, so a string check let two writers
+/// interleave into it, `--json j.fq -o j.fq` overwrote a FASTQ with JSON, and
+/// `-1 f.fq -o f.fq --force` truncated its own input. Canonicalizing resolves
+/// `.`/`..`, symlinks and absolute-vs-relative spellings.
+///
+/// A path that does not exist yet cannot be canonicalized; resolve its parent
+/// directory instead and keep the file name, which covers the usual "output
+/// does not exist yet" case. Anything we cannot resolve at all is compared as
+/// written — a best effort, never a silent skip.
+pub fn path_identity(path: &str) -> PathBuf {
+    let raw = Path::new(path);
+    if let Ok(resolved) = fs::canonicalize(raw) {
+        return resolved;
+    }
+    let parent = match raw.parent() {
+        // `Path::new("out.fq").parent()` is `Some("")`, which is not a directory.
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+        None => return raw.to_path_buf(),
+    };
+    match (fs::canonicalize(parent), raw.file_name()) {
+        (Ok(dir), Some(name)) => dir.join(name),
+        _ => raw.to_path_buf(),
+    }
 }
 
 /// Performs a fast first-pass count of sequences in a FASTX file.
@@ -255,6 +284,32 @@ mod tests {
     fn test_bytes_per_read_zero_length_no_panic() {
         assert!(compute_bytes_per_read(0, false) >= 1);
         assert!(compute_bytes_per_read(0, true) >= 1);
+    }
+
+    // --- path_identity ---
+
+    #[test]
+    fn test_path_identity_ignores_spelling() {
+        let dir = std::env::temp_dir().join(format!("fastdedup_identity_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("out.fq");
+        fs::write(&file, b"@r\nA\n+\nI\n").unwrap();
+
+        let plain = file.to_string_lossy().to_string();
+        let dotted = dir.join(".").join("out.fq").to_string_lossy().to_string();
+        assert_eq!(path_identity(&plain), path_identity(&dotted));
+
+        // Un fichier qui n'existe pas encore : l'identité passe par le parent.
+        let missing = dir.join("nouveau.fq").to_string_lossy().to_string();
+        let missing_dotted = dir
+            .join(".")
+            .join("nouveau.fq")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(path_identity(&missing), path_identity(&missing_dotted));
+        assert_ne!(path_identity(&plain), path_identity(&missing));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // --- base_read_id ---

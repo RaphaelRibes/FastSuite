@@ -89,6 +89,16 @@ fn num(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+/// Escape the three characters that turn a sample name into markup.
+///
+/// Shared by every writer that renders text (this module's HTML/markdown and
+/// `compare`'s HTML): a sample directory may legally be called `a<b&c`, and
+/// unescaped it closed the tag it was written into. TSV stays raw — it is not
+/// markup.
+pub fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 fn get_num(o: &serde_json::Value, key: &str) -> f64 {
     o.get(key).and_then(num).unwrap_or(0.0)
 }
@@ -103,10 +113,14 @@ fn get_num(o: &serde_json::Value, key: &str) -> f64 {
 /// gated on the remainder being generic, so a library genuinely called
 /// `align.report` keeps its own name.
 pub fn sample_from_path(path: &Path) -> String {
+    // Every tool's own report file name, plus the report-shaped names a
+    // consumer is likely to meet. fastcheck was missing from this list, so
+    // `<sample>/fastcheck.json` resolved its sample to the stem "fastcheck":
+    // two samples produced two identical rows.
     const GENERIC: &[&str] = &[
         "report", "reports", "stats", "json", "out", "output", "heatmap", "fastprep",
-        "fastdedup", "fastmaps", "fastsim", "fasthelper", "dedup", "prep", "maps", "result",
-        "results", "summary", "manifest", "positions", "position", "pos", "matrix",
+        "fastdedup", "fastmaps", "fastcheck", "fastsim", "fasthelper", "dedup", "prep", "maps",
+        "result", "results", "summary", "manifest", "positions", "position", "pos", "matrix",
     ];
     let stem = path
         .file_stem()
@@ -299,6 +313,13 @@ struct GridDoc {
     size: Option<i64>,
     total_reads: Option<f64>,
     version: Option<f64>,
+    /// The read-length span the corner window was derived from (grid v2+).
+    /// Carried into the metrics: a consumer can only see that the corner
+    /// fractions are length-biased (`max - min > corner_window`) if these
+    /// travel with them.
+    min_seq_len: Option<f64>,
+    max_seq_len: Option<f64>,
+    corner_window: Option<f64>,
     /// windows in metric order: all, r1, r2
     windows: [Option<WindowSums>; 3],
     /// `counts` numbers buffered because `size` had not been seen yet — JSON
@@ -313,6 +334,9 @@ impl Default for GridDoc {
             size: None,
             total_reads: None,
             version: None,
+            min_seq_len: None,
+            max_seq_len: None,
+            corner_window: None,
             windows: [None, None, None],
             deferred: [None, None, None],
             has_counts: false,
@@ -367,6 +391,9 @@ impl<'de> Visitor<'de> for GridDocVisitor {
                 "size" => doc.size = Some(map.next_value::<f64>()? as i64),
                 "total_reads" => doc.total_reads = Some(map.next_value::<f64>()?),
                 "version" => doc.version = Some(map.next_value::<f64>()?),
+                "min_seq_len" => doc.min_seq_len = Some(map.next_value::<f64>()?),
+                "max_seq_len" => doc.max_seq_len = Some(map.next_value::<f64>()?),
+                "corner_window" => doc.corner_window = Some(map.next_value::<f64>()?),
                 "counts" => {
                     doc.has_counts = true;
                     read_window(&mut map, &mut doc, 0, true)?;
@@ -395,6 +422,17 @@ impl GridDoc {
         let mut metrics = BTreeMap::new();
         metrics.insert("total_reads".into(), self.total_reads.unwrap_or(0.0));
         metrics.insert("grid_size".into(), size as f64);
+        // Only when the grid states them (v2+): an older grid has no length
+        // span, and a missing metric must stay missing rather than read as 0.
+        for (key, value) in [
+            ("min_seq_len", self.min_seq_len),
+            ("max_seq_len", self.max_seq_len),
+            ("corner_window", self.corner_window),
+        ] {
+            if let Some(v) = value {
+                metrics.insert(key.into(), v);
+            }
+        }
         for (idx, label) in ["all", "r1", "r2"].into_iter().enumerate() {
             let Some(w) = self.windows[idx] else { continue };
             if !w.complete() || w.total == 0.0 {
@@ -515,6 +553,31 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
         if let Some(e) = v.get("elapsed_s").and_then(num) {
             metrics.insert("elapsed_s".into(), e);
         }
+        // D-6: a v1 report states the assumptions its numbers rest on
+        // (`assumptions: [{what, value, basis, consequence}]`). They used to be
+        // dropped with every other top-level block, so a --no-quality caveat
+        // never reached the aggregate. A note is the carrier: the aggregate's
+        // json and html both render notes, and `metrics` must stay numeric.
+        let notes = v
+            .get("assumptions")
+            .and_then(|a| a.as_array())
+            .map(|assumptions| {
+                assumptions
+                    .iter()
+                    .map(|a| {
+                        let what = a.get("what").and_then(|w| w.as_str()).unwrap_or("assumption");
+                        let mut note = format!("assumption [{what}]");
+                        if let Some(c) = a.get("consequence").and_then(|c| c.as_str()) {
+                            note.push_str(&format!(": {c}"));
+                        }
+                        if let Some(b) = a.get("basis").and_then(|b| b.as_str()) {
+                            note.push_str(&format!(" (basis: {b})"));
+                        }
+                        note
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
         return Ok(Some(ToolReport {
             sample,
             tool,
@@ -524,7 +587,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
                 .map(str::to_string),
             source: path.to_path_buf(),
             metrics,
-            notes: Vec::new(),
+            notes,
             from_v1: true,
         }));
     }
@@ -540,6 +603,11 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
         let mut metrics = BTreeMap::new();
         metrics.insert("total_reads".into(), get_num(&v, "total_reads"));
         metrics.insert("grid_size".into(), size as f64);
+        for key in ["min_seq_len", "max_seq_len", "corner_window"] {
+            if let Some(n) = v.get(key).and_then(num) {
+                metrics.insert(key.into(), n);
+            }
+        }
         let c = (size / 50).max(2); // corner window: 2% of the read length
         for (label, obj) in windows {
             let counts = match obj.get("counts") {
@@ -730,6 +798,30 @@ fn walk_json(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     }
 }
 
+/// Normalise a set of report files and keep one measurement per (sample, tool).
+///
+/// A `fastsuite.report.v1` wrapper wins over the raw file it was derived from
+/// (fastmaps' grid beside its `<stem>.report.json`), so nothing double-counts.
+fn assemble(files: Vec<(PathBuf, Option<String>)>) -> Vec<ToolReport> {
+    let mut reports = Vec::new();
+    for (f, sample) in files.iter() {
+        match adapt_file(f, sample.as_deref()) {
+            Ok(Some(r)) => reports.push(r),
+            Ok(None) => {}
+            Err(e) => eprintln!("fasthelper: skipping {}: {e}", f.display()),
+        }
+    }
+    let v1: BTreeSet<(String, String)> = reports
+        .iter()
+        .filter(|r| r.from_v1)
+        .map(|r| (r.sample.clone(), r.tool.clone()))
+        .collect();
+    if !v1.is_empty() {
+        reports.retain(|r| r.from_v1 || !v1.contains(&(r.sample.clone(), r.tool.clone())));
+    }
+    reports
+}
+
 /// Collect and normalise every report reachable from the given inputs.
 pub fn collect(inputs: &[PathBuf], sample: Option<&str>) -> Result<Vec<ToolReport>> {
     let mut files = Vec::new();
@@ -745,28 +837,29 @@ pub fn collect(inputs: &[PathBuf], sample: Option<&str>) -> Result<Vec<ToolRepor
     files.sort();
     files.dedup();
 
-    let mut reports = Vec::new();
-    for f in files.iter() {
-        let hint = if files.len() == 1 { sample } else { None };
-        match adapt_file(f, hint) {
-            Ok(Some(r)) => reports.push(r),
-            Ok(None) => {}
-            Err(e) => eprintln!("fasthelper: skipping {}: {e}", f.display()),
-        }
-    }
-    // One measurement, one row: a `fastsuite.report.v1` wrapper and the raw
-    // file it was derived from (fastmaps' grid beside its `<stem>.report.json`)
-    // describe the same (sample, tool). Keep the v1 report — it is the tool's
-    // own statement — and drop the derivation, so nothing double-counts.
-    let v1: BTreeSet<(String, String)> = reports
+    let hint = if files.len() == 1 { sample } else { None };
+    Ok(assemble(
+        files
+            .into_iter()
+            .map(|f| (f, hint.map(str::to_string)))
+            .collect(),
+    ))
+}
+
+/// Collect reports whose sample name the caller already knows.
+///
+/// `run` knows which sample produced each report path, and re-deriving it from
+/// the path loses that identity whenever the file stem is generic
+/// (`<sample>/fastcheck.json`): two samples then collapse onto one name.
+pub fn collect_named(files: &[(String, PathBuf)]) -> Result<Vec<ToolReport>> {
+    let mut keyed: Vec<(PathBuf, Option<String>)> = files
         .iter()
-        .filter(|r| r.from_v1)
-        .map(|r| (r.sample.clone(), r.tool.clone()))
+        .filter(|(_, p)| p.is_file())
+        .map(|(sample, path)| (path.clone(), Some(sample.clone())))
         .collect();
-    if !v1.is_empty() {
-        reports.retain(|r| r.from_v1 || !v1.contains(&(r.sample.clone(), r.tool.clone())));
-    }
-    Ok(reports)
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.dedup_by(|a, b| a.0 == b.0);
+    Ok(assemble(keyed))
 }
 
 /// Wide metric matrix: one row per (sample, tool), union of metric columns.
@@ -844,7 +937,7 @@ pub fn matrix_md(reports: &[ToolReport]) -> String {
         }
         s.push_str(&format!("## {tool}\n\n| metric |"));
         for r in reports {
-            s.push_str(&format!(" {} |", r.sample));
+            s.push_str(&format!(" {} |", esc(&r.sample)));
         }
         s.push_str("\n|---|");
         for _ in reports {
@@ -891,6 +984,9 @@ fn bar(value: f64, max: f64, colour: &str) -> String {
 /// Self-contained HTML report: no scripts, no external assets.
 pub fn render_html(title: &str, reports: &[ToolReport]) -> String {
     let by_tool = group_by_tool(reports);
+    // The title is caller-supplied text (a run name), the sample names come
+    // from the filesystem: both can carry markup characters.
+    let title = esc(title);
     let mut out = String::new();
     out.push_str(&format!(
         "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
@@ -938,7 +1034,7 @@ code{{background:#f2f3f5;padding:0 .25rem;border-radius:3px}}\
         }
         out.push_str("<table><tr><th>metric</th>");
         for r in reps {
-            out.push_str(&format!("<th>{}</th>", r.sample));
+            out.push_str(&format!("<th>{}</th>", esc(&r.sample)));
         }
         out.push_str("</tr>");
         for c in &columns {
@@ -969,7 +1065,9 @@ code{{background:#f2f3f5;padding:0 .25rem;border-radius:3px}}\
             for n in &r.notes {
                 out.push_str(&format!(
                     "<div class='note'>{} — {}: {}</div>",
-                    r.sample, r.tool, n
+                    esc(&r.sample),
+                    esc(&r.tool),
+                    esc(n)
                 ));
             }
         }

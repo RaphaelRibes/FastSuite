@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use needletail::parse_fastx_file;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Shared configuration for a deduplication run.
 pub(crate) struct DedupConfig {
@@ -45,6 +45,30 @@ struct OwnedRecord {
     id: Vec<u8>,
     seq: Vec<u8>,
     qual: Option<Vec<u8>>,
+}
+
+/// An abundance temp file that is removed when it goes out of scope.
+///
+/// The temp file is created before pass 1 and deleted after pass 2, so every
+/// early return in between — a refused format conversion, a desynchronized
+/// pair, an I/O error — used to leave `fastdedup_abundance_<pid>.fastq` in
+/// `--temp-dir`. Dropping the guard removes it on those paths too.
+struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    fn create(path: PathBuf) -> Result<(Self, fs::File)> {
+        let file =
+            fs::File::create(&path).with_context(|| format!("Failed to create temp: {path:?}"))?;
+        Ok((Self { path }, file))
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 // ==========================================
@@ -461,8 +485,9 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
         // --- PASS 1: count abundances + write unique records to temp file ---
         let temp_path = std::path::Path::new(temp_dir)
             .join(format!("fastdedup_abundance_{}.fastq", std::process::id()));
-        let temp_file = fs::File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp: {temp_path:?}"))?;
+        // Held for its Drop: the guard deletes the temp file on every exit path,
+        // refusals included.
+        let (_temp_guard, temp_file) = TempFile::create(temp_path.clone())?;
         let mut temp_writer = BufWriter::with_capacity(256 * 1024, temp_file);
 
         {
@@ -567,7 +592,6 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
             .flush()
             .context("Failed to flush output buffer")?;
 
-        let _ = fs::remove_file(&temp_path);
         let duplicates = total_reads - tracker.len();
         Ok((total_reads, duplicates))
 
@@ -694,8 +718,8 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
         // --- PASS 1: count abundances + write unique pairs to temp file ---
         let temp_path = std::path::Path::new(temp_dir)
             .join(format!("fastdedup_abundance_{}.fastq", std::process::id()));
-        let temp_file = fs::File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp: {temp_path:?}"))?;
+        // Paired twin: the same guard removes the temp file on every exit path.
+        let (_temp_guard, temp_file) = TempFile::create(temp_path.clone())?;
         let mut temp_writer = BufWriter::with_capacity(256 * 1024, temp_file);
 
         {
@@ -852,7 +876,6 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
             .flush()
             .context("Failed to flush R2 output buffer")?;
 
-        let _ = fs::remove_file(&temp_path);
         let duplicates = total_reads - tracker.len();
         Ok((total_reads, duplicates))
 

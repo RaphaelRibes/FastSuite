@@ -38,19 +38,19 @@ fn tmpdir(tag: &str) -> PathBuf {
     d
 }
 
-/// Run the binary on `body` with the grid redirected to `<dir>/grid.json`, so
-/// the v1 wrapper is written too. Returns the run's dir and stderr.
+/// Run the binary on `body`, with `--json report.json` so the v1 report is
+/// written too. Returns the run's dir and stderr.
 fn run(tag: &str, body: &str) -> (PathBuf, String) {
     let dir = tmpdir(tag);
     let fq = dir.join("reads_R1.fastq");
     std::fs::write(&fq, body).unwrap();
     let out = dir.join("out");
-    let grid = dir.join("grid.json");
+    let report = dir.join("report.json");
     let o = Command::new(bin())
         .arg("-o")
         .arg(&out)
         .arg("--json")
-        .arg(&grid)
+        .arg(&report)
         .arg(&fq)
         .output()
         .unwrap();
@@ -79,7 +79,7 @@ fn uniform_lengths_publish_lengths_and_do_not_warn() {
         "a uniform-length run must not warn; stderr:\n{stderr}"
     );
 
-    let m = parse(&dir.join("grid.report.json"));
+    let m = parse(&dir.join("report.json"));
     let m = &m["metrics"];
     assert_eq!(m["min_seq_len"].as_f64().unwrap(), 150.0, "{m}");
     assert_eq!(m["max_seq_len"].as_f64().unwrap(), 150.0, "{m}");
@@ -92,7 +92,7 @@ fn uniform_lengths_publish_lengths_and_do_not_warn() {
         m["polyT_frac"]
     );
 
-    let g = parse(&dir.join("grid.json"));
+    let g = parse(&dir.join("out").join("heatmap.json"));
     assert_eq!(g["min_seq_len"], 150, "grid JSON carries min_seq_len: {g}");
     assert_eq!(g["max_seq_len"], 150, "grid JSON carries max_seq_len: {g}");
     assert_eq!(g["corner_window"], 3, "grid JSON carries corner_window: {g}");
@@ -119,7 +119,7 @@ fn mixed_lengths_warn_and_publish_the_spread() {
         "the warning must state the spread against the window; stderr:\n{stderr}"
     );
 
-    let m = parse(&dir.join("grid.report.json"));
+    let m = parse(&dir.join("report.json"));
     let m = &m["metrics"];
     assert_eq!(m["min_seq_len"].as_f64().unwrap(), 150.0, "{m}");
     assert_eq!(m["max_seq_len"].as_f64().unwrap(), 200.0, "{m}");
@@ -141,7 +141,7 @@ fn mixed_lengths_warn_and_publish_the_spread() {
         m["polyA_frac"]
     );
 
-    let g = parse(&dir.join("grid.json"));
+    let g = parse(&dir.join("out").join("heatmap.json"));
     assert_eq!(g["min_seq_len"], 150, "grid JSON carries min_seq_len: {g}");
     assert_eq!(g["max_seq_len"], 200, "grid JSON carries max_seq_len: {g}");
     assert_eq!(g["corner_window"], 4, "grid JSON carries corner_window: {g}");

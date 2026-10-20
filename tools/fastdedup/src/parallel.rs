@@ -4,13 +4,14 @@ use std::io::Read;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use needletail::parser::LineEnding;
-use needletail::{parse_fastx_file, parse_fastx_reader};
+use needletail::parse_fastx_reader;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::hasher::SequenceHasher;
 use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
 use crate::writer::{
-    ByteCounter, OutputFormat, StreamCompression, prepare_writer, write_fasta_record,
+    ByteCounter, OutputFormat, StreamCompression, open_preload_reader, preload_is_empty,
+    prepare_writer, write_fasta_record,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -347,7 +348,14 @@ fn resume_existing_output<T: SequenceHasher>(
         println!("Preloading sequences from existing output...");
     }
 
-    let mut reader = parse_fastx_file(path).context("Error opening preload file")?;
+    // A 0- or 1-byte output holds no record — every interrupted run leaves one,
+    // since the file is created before the first write. Nothing to preload; cut
+    // it to 0 so the append starts on a record boundary.
+    if preload_is_empty(bound)? {
+        return truncate_to_valid_len(bound, 0, "file", cfg.verbose);
+    }
+
+    let mut reader = open_preload_reader(path, "preload")?;
     let mut valid_bytes = ByteCounter(0);
     let mut preloads = 0;
 
@@ -399,8 +407,15 @@ fn resume_existing_paired_outputs<T: SequenceHasher>(
         println!("Preloading and synchronizing pairs from existing outputs...");
     }
 
-    let mut reader_r1 = parse_fastx_file(path_r1).context("Error opening R1 preload file")?;
-    let mut reader_r2 = parse_fastx_file(path_r2).context("Error opening R2 preload file")?;
+    // Same as the single-end path: nothing to preload from an empty mate, and
+    // both are cut to 0 so the pairs re-synchronize from the first record.
+    if preload_is_empty(bound_r1)? || preload_is_empty(bound_r2)? {
+        truncate_to_valid_len(bound_r1, 0, "R1", cfg.verbose)?;
+        return truncate_to_valid_len(bound_r2, 0, "R2", cfg.verbose);
+    }
+
+    let mut reader_r1 = open_preload_reader(path_r1, "R1 preload")?;
+    let mut reader_r2 = open_preload_reader(path_r2, "R2 preload")?;
 
     let mut valid_bytes_r1 = ByteCounter(0);
     let mut valid_bytes_r2 = ByteCounter(0);
@@ -815,7 +830,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         cfg.out_compression,
         cfg.force,
     )?;
-    let (writer_r2, _output_format_r2, gzip_handle2) = create_output_writer(
+    let (writer_r2, output_format_r2, gzip_handle2) = create_output_writer(
         output_r2_path,
         cfg.compression_level,
         gzip_threads,
@@ -823,6 +838,13 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         cfg.out_compression,
         cfg.force,
     )?;
+
+    // R2's own verdict, not R1's: `-o c.fq -p d.fa` wrote R1's FASTQ into the
+    // `.fa` file (and the reverse) and exited 0, while `-j 1` refused. Same
+    // message as the serial path (processor.rs, paired writer preparation).
+    if output_format != output_format_r2 {
+        bail!("Output files R1 and R2 must have the same format (FASTA or FASTQ)");
+    }
 
     let buf_size = compute_write_buffer_size(cfg.read_length);
     let mut buf_r1 = BufWriter::with_capacity(buf_size, writer_r1);
@@ -909,7 +931,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
 // HELPERS
 // ==========================================
 
-fn resolve_thread_count(requested: usize) -> usize {
+pub(crate) fn resolve_thread_count(requested: usize) -> usize {
     if requested == 0 {
         std::thread::available_parallelism()
             .map(|n| n.get())

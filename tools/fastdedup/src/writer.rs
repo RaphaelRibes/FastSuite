@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use needletail::parse_fastx_file;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -113,6 +113,30 @@ pub fn prepare_writer(
     Ok((writer, format))
 }
 
+/// True when an existing output is too short to hold a FASTX record.
+///
+/// The output file is created before the first record is written, so a run that
+/// crashes — or that is refused after `File::create` — leaves a 0-byte file
+/// behind. That is the common resume artifact, and there is nothing in it to
+/// preload. Two bytes is needletail's minimum: it sniffs the first two.
+pub(crate) fn preload_is_empty(path: &Path) -> Result<bool> {
+    Ok(fs::metadata(path)?.len() < 2)
+}
+
+/// Opens an existing output for the resume preload pass.
+///
+/// `what` names the file in the message ("preload" for a single output, "R1
+/// preload" for a mate). A file that is not FASTX at all gets a message naming
+/// the fix instead of needletail's bare parse error.
+pub(crate) fn open_preload_reader(
+    path: &str,
+    what: &str,
+) -> Result<Box<dyn needletail::FastxReader>> {
+    parse_fastx_file(path).with_context(|| {
+        format!("Error opening {what} file {path}: not a FASTX file; use --force to overwrite it")
+    })
+}
+
 /// Preloads existing hashes into memory from an existing output file (Single-End).
 pub fn preload_existing_hashes<T: SequenceHasher>(
     path: &str,
@@ -123,11 +147,18 @@ pub fn preload_existing_hashes<T: SequenceHasher>(
         return Ok((0, 0));
     }
 
+    // A 0- or 1-byte output holds no record: preload nothing and let the caller
+    // truncate it (it does when `valid_bytes < current_size`), so the append
+    // starts on a record boundary.
+    if preload_is_empty(Path::new(path))? {
+        return Ok((0, 0));
+    }
+
     if verbose {
         println!("Preloading sequences from existing output...");
     }
 
-    let mut reader = parse_fastx_file(path).context("Error opening preload file")?;
+    let mut reader = open_preload_reader(path, "preload")?;
     let mut count = 0;
     let mut valid_bytes = ByteCounter(0);
 
@@ -168,12 +199,18 @@ pub fn preload_existing_paired_hashes<T: SequenceHasher>(
         return Ok((0, 0, 0));
     }
 
+    // Either mate being empty means no pair can be preloaded: return nothing,
+    // and the caller truncates both to 0 — the same state as a fresh run.
+    if preload_is_empty(path_r1_ref)? || preload_is_empty(path_r2_ref)? {
+        return Ok((0, 0, 0));
+    }
+
     if verbose {
         println!("Preloading and synchronizing pairs from existing outputs...");
     }
 
-    let mut reader_r1 = parse_fastx_file(path_r1).context("Error opening R1 preload file")?;
-    let mut reader_r2 = parse_fastx_file(path_r2).context("Error opening R2 preload file")?;
+    let mut reader_r1 = open_preload_reader(path_r1, "R1 preload")?;
+    let mut reader_r2 = open_preload_reader(path_r2, "R2 preload")?;
 
     let mut count = 0;
     let mut valid_bytes_r1 = ByteCounter(0);

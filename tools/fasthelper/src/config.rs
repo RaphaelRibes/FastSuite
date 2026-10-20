@@ -165,6 +165,10 @@ impl Config {
         // The work dir and the resume key derive from the sample name alone
         // (runner.rs), so two entries with one name would have two workers
         // create, unlink and write the same paths. Refuse it at minute zero.
+        // The simulated control is appended to this list under simulate.name,
+        // so its name has to be in the same set: a [[samples]] entry called
+        // sim_E put two workers on one directory and the control's report
+        // overwrote the sample's.
         let mut seen = std::collections::BTreeSet::new();
         for s in &cfg.samples {
             if !seen.insert(s.name.as_str()) {
@@ -175,6 +179,14 @@ impl Config {
                     s.name
                 );
             }
+        }
+        if cfg.simulate.enabled && !seen.insert(cfg.simulate.name.as_str()) {
+            anyhow::bail!(
+                "config {}: duplicate sample name '{}' — [simulate] name collides with a \
+                 [[samples]] entry, and it names the simulated control's output directory",
+                path.display(),
+                cfg.simulate.name
+            );
         }
         Ok(cfg)
     }

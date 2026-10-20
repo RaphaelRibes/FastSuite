@@ -73,6 +73,39 @@ pub const BASE_CODE: [u8; 256] = {
 /// The 12-mer rolling register's mask: 12 bases x 2 bits.
 const KMER_MASK: u32 = (1 << (2 * repeated::KMER_K)) - 1;
 
+/// The 12-mer rolling 2-bit register, shared by the fused path (`Accum::observe`)
+/// and the gated path (`Accum::observe_gated`).
+///
+/// Both paths push every base code through this one definition of the window rule,
+/// so `windows(12)` + `pack_kmer` (the pre-fusion loop the gated twin kept, which
+/// decoded each base ~11 times) can never disagree with the fused register about
+/// what a counted window is: 12 consecutive A/C/G/T codes, and any other code
+/// (N, IUPAC) resets the run.
+#[derive(Default)]
+pub struct KmerRoll {
+    win: u32,
+    valid: u32,
+}
+
+impl KmerRoll {
+    /// Push one base code. Returns the packed k-mer when the last 12 codes are all
+    /// A/C/G/T, i.e. exactly when `pack_kmer` would have accepted that window.
+    #[inline]
+    pub fn push(&mut self, code: u8) -> Option<u32> {
+        self.win = ((self.win << 2) | code as u32) & KMER_MASK;
+        if code == 4 {
+            self.valid = 0;
+        } else {
+            self.valid = (self.valid + 1).min(repeated::KMER_K as u32);
+        }
+        if self.valid == repeated::KMER_K as u32 {
+            Some(self.win)
+        } else {
+            None
+        }
+    }
+}
+
 fn grow<T: Clone + Default>(v: &mut Vec<T>, n: usize) {
     if v.len() < n {
         v.resize(n, T::default());
@@ -159,6 +192,15 @@ pub struct Accum {
     /// Exact 12-mer counter: a dense 4^12 `u16` table plus an exact width-overflow map
     /// (`crate::repeated::KmerTable`). No cap, no eviction, no approximation.
     pub kmer_counts: KmerTable,
+    /// Windows actually counted into `kmer_counts`: one per 12 consecutive A/C/G/T
+    /// bases. This is the denominator a k-mer share must divide by — a read of `L`
+    /// bases carries `L - 11` windows, not one, so dividing a count by the read count
+    /// is unbounded (a 12-mer repeating inside every read reaches `L - 11` per read).
+    pub kmer_windows: u64,
+    /// Bases of each code over EVERY base read, including those past `--max-read-len`
+    /// (which the per-position `base_pos` rows do not reach). This is what makes the
+    /// reported composition sum to `bases` rather than to the covered window only.
+    pub base_totals: [u64; NT],
     /// 2-bit packed sequence table, filled only in `--overrep-mode table` (the memory is
     /// real: ~46 B per unique 150 bp read, admission-checked in main.rs).
     pub overrep_table: crate::overrep::SequenceTable,
@@ -285,6 +327,8 @@ impl Accum {
             heatmap: vec![0; heatmap::SIZE * heatmap::SIZE],
             seq_counts: crate::fingerprint::FingerprintTable::with_capacity(1024),
             kmer_counts: KmerTable::new(),
+            kmer_windows: 0,
+            base_totals: [0; NT],
             overrep_table: crate::overrep::SequenceTable::default(),
             track_overrep_table: false,
             adapter_pos: None,
@@ -356,25 +400,20 @@ impl Accum {
         // Heatmap counters: x = #(T+C), y = #(T+G), capped at the grid edge at the end
         // (`heatmap::encode`'s own rule, so both paths agree on a saturating read).
         let (mut hx, mut hy) = (0u64, 0u64);
-        // Rolling 12-mer: 24 bits of 2-bit codes, and how many consecutive valid bases
-        // it holds. Any other code (N, IUPAC) resets the run, which is exactly
-        // `pack_kmer`'s "contains a non-ACGT base" rule.
-        let mut win: u32 = 0;
-        let mut valid: u32 = 0;
+        // Rolling 12-mer register (shared with the gated path). Any other code (N,
+        // IUPAC) resets the run, which is exactly `pack_kmer`'s rule.
+        let mut roll = KmerRoll::default();
         // First non-G base: the fragment start the profile fitter measures from.
         let mut first_non_g: Option<usize> = None;
         for (i, &raw) in seq.iter().enumerate() {
             let code = BASE_CODE[raw as usize];
-            win = ((win << 2) | code as u32) & KMER_MASK;
             if code == 4 {
-                valid = 0;
                 if !in_run {
                     in_run = true;
                     run_start = i;
                 }
                 has_n = true;
             } else {
-                valid = (valid + 1).min(repeated::KMER_K as u32);
                 if in_run {
                     self.record_n_run(run_start, i, len);
                     in_run = false;
@@ -396,14 +435,16 @@ impl Accum {
                     _ => {}
                 }
             }
+            self.base_totals[code as usize] += 1;
             if first_non_g.is_none() && code != 2 {
                 first_non_g = Some(i);
             }
             if i < per_pos {
                 self.base_pos[i][code as usize] += 1;
             }
-            if valid == repeated::KMER_K as u32 {
-                self.kmer_counts.add(win);
+            if let Some(k) = roll.push(code) {
+                self.kmer_counts.add(k);
+                self.kmer_windows += 1;
             }
         }
         if in_run {
@@ -553,6 +594,7 @@ impl Accum {
         // Without this the merged accumulator carries an empty spectrum and every report
         // says kmer_top_count 0 however over-represented the k-mers are.
         self.kmer_counts.merge(&o.kmer_counts);
+        self.kmer_windows += o.kmer_windows;
         match (self.adapter_pos.as_mut(), o.adapter_pos.as_ref()) {
             (Some(a), Some(b)) => a.merge(b),
             // The run total starts without the optional counter: the first file that
@@ -580,6 +622,9 @@ impl Accum {
             self.qual_byte[i] += o.qual_byte[i];
         }
         self.qual_out_of_range += o.qual_out_of_range;
+        for (d, s) in self.base_totals.iter_mut().zip(o.base_totals.iter()) {
+            *d += s;
+        }
         grow(&mut self.base_pos, o.base_pos.len());
         for (i, row) in o.base_pos.iter().enumerate() {
             for (d, s) in self.base_pos[i].iter_mut().zip(row.iter()) {

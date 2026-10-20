@@ -2527,3 +2527,397 @@ fn test_sorties_r1_et_r2_sur_le_meme_fichier_refusees() {
         );
     }
 }
+
+// ================================================================
+// REVUE DU 2026-10-21 — IDENTITÉ DE CHEMIN, FORMATS, REPRISE, RAPPORT
+// ================================================================
+
+/// Lit un rapport `fastsuite.report.v1` produit par `--json`.
+fn lire_rapport(chemin: &std::path::Path) -> serde_json::Value {
+    let texte = fs::read_to_string(chemin).unwrap();
+    serde_json::from_str(&texte)
+        .unwrap_or_else(|e| panic!("rapport JSON illisible ({e}) : {texte}"))
+}
+
+/// Extrait « N threads » de la ligne de résumé humaine.
+fn threads_du_resume(sortie: &str) -> Option<u64> {
+    let idx = sortie.find(" threads,")?;
+    sortie[..idx].rsplit(", ").next()?.trim().parse().ok()
+}
+
+/// 1a. `-o ./coll2.fq -p coll2.fq` nomme un seul fichier. La comparaison était
+/// faite sur la chaîne : les deux écrivains entrelaçaient R1 et R2 dans un
+/// fichier ni FASTQ ni FASTA, avec un code de sortie 0. L'identité doit être
+/// résolue par le système de fichiers.
+#[test]
+fn test_chemins_relatifs_equivalents_refuses() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    generer_fastq_paire(&temp_dir, "R1.fastq", "R2.fastq", 4, 0);
+
+    cmd()
+        .current_dir(temp_dir.path())
+        .arg("-1")
+        .arg("R1.fastq")
+        .arg("-2")
+        .arg("R2.fastq")
+        .arg("-o")
+        .arg("./coll2.fq")
+        .arg("-p")
+        .arg("coll2.fq")
+        .arg("--force")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("same file")
+                .and(predicate::str::contains("-o"))
+                .and(predicate::str::contains("-p")),
+        );
+
+    assert!(
+        !temp_dir.child("coll2.fq").exists(),
+        "le refus doit précéder toute écriture : aucun fichier entrelacé ne doit être créé"
+    );
+}
+
+/// 1b. `--json j.fq -o j.fq` : le rapport JSON écrasait la sortie FASTQ.
+#[test]
+fn test_json_et_sortie_meme_fichier_refuses() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 5, 0);
+    let sortie = temp_dir.child("j.fq");
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("--json")
+        .arg(sortie.path())
+        .arg("--force")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("same file").and(predicate::str::contains("--json")));
+
+    assert!(
+        !sortie.exists(),
+        "le refus doit précéder toute écriture : ni FASTQ ni JSON ne doit être écrit"
+    );
+}
+
+/// 1c. `-1 f1.fq -o f1.fq --force` tronquait l'entrée à 0 octet (et un
+/// préchargement sans --force relisait l'entrée comme sa propre sortie).
+#[test]
+fn test_entree_et_sortie_meme_fichier_refusees() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "f1.fq", 5, 0);
+    let avant = fs::read(entree.path()).unwrap();
+
+    for force in [false, true] {
+        let mut c = cmd();
+        c.arg("-1").arg(entree.path()).arg("-o").arg(entree.path());
+        if force {
+            c.arg("--force");
+        }
+        c.assert()
+            .failure()
+            .stderr(predicate::str::contains("same file"));
+    }
+
+    assert_eq!(
+        fs::read(entree.path()).unwrap(),
+        avant,
+        "le fichier d'entrée doit rester intact"
+    );
+}
+
+/// 2. `-j 4 -o c.fq -p d.fa` écrivait le format de R1 dans le fichier R2
+/// (FASTQ dans un `.fa`, FASTA dans un `.fq`) avec un code de sortie 0, alors
+/// que `-j 1` refuse déjà « must have the same format ».
+#[test]
+fn test_paire_parallele_formats_incoherents_refuses() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1, r2) = generer_fastq_paire(&temp_dir, "R1.fastq", "R2.fastq", 4, 0);
+
+    // (sortie R1, sortie R2) : FASTQ puis FASTA, et l'inverse.
+    for (nom_r1, nom_r2) in [("c.fq", "d.fa"), ("f.fa", "f2.fq")] {
+        let sortie_r1 = temp_dir.child(nom_r1);
+        let sortie_r2 = temp_dir.child(nom_r2);
+        cmd()
+            .arg("-1")
+            .arg(r1.path())
+            .arg("-2")
+            .arg(r2.path())
+            .arg("-j")
+            .arg("4")
+            .arg("-o")
+            .arg(sortie_r1.path())
+            .arg("-p")
+            .arg(sortie_r2.path())
+            .arg("--force")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("must have the same format"));
+
+        for sortie in [&sortie_r1, &sortie_r2] {
+            let contenu = fs::read_to_string(sortie.path()).unwrap_or_default();
+            assert!(
+                contenu.is_empty(),
+                "le refus doit précéder toute écriture, {} contient {contenu:?}",
+                sortie.path().display()
+            );
+        }
+    }
+}
+
+/// 3. Une sortie de 0 octet est l'artefact de crash le plus courant (et celui
+/// qu'un run refusé laisse derrière lui). Le README promet une reprise
+/// « tronquer au dernier enregistrement valide » : elle doit fonctionner.
+#[test]
+fn test_reprise_sortie_zero_octet() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "tiny.fastq", 5, 0);
+
+    for threads in ["1", "4"] {
+        let sortie = temp_dir.child(format!("z0_j{threads}.fq"));
+        sortie.touch().unwrap();
+
+        cmd()
+            .arg("-1")
+            .arg(entree.path())
+            .arg("-o")
+            .arg(sortie.path())
+            .arg("-j")
+            .arg(threads)
+            .assert()
+            .success();
+
+        assert_eq!(
+            compter_sequences_fastq(&fs::read_to_string(sortie.path()).unwrap()),
+            5,
+            "une sortie vide doit être reprise et remplie (-j {threads})"
+        );
+    }
+}
+
+/// 3bis. Un fichier existant qui n'est pas du FASTX doit dire quoi faire,
+/// au lieu du seul « Is the file empty? » de needletail.
+#[test]
+fn test_reprise_sortie_non_fastx_message_clair() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 5, 0);
+    let sortie = temp_dir.child("ordures.fq");
+    sortie.write_str("ceci n'est pas un FASTX\n").unwrap();
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("not a FASTX file")
+                .and(predicate::str::contains("--force")),
+        );
+}
+
+/// 4. 4 paires = 8 lectures, pas 4. `pairs_in`/`pairs_out` sont ajoutés à côté
+/// des clés existantes (que fasthelper agrège) ; `reads_in` compte les lectures.
+#[test]
+fn test_paire_metriques_lectures_et_paires() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1, r2) = generer_fastq_paire(&temp_dir, "R1.fastq", "R2.fastq", 4, 0);
+    let sortie_r1 = temp_dir.child("m1.fq");
+    let sortie_r2 = temp_dir.child("m2.fq");
+    let rapport = temp_dir.child("m.json");
+
+    cmd()
+        .arg("-1")
+        .arg(r1.path())
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg(sortie_r1.path())
+        .arg("-p")
+        .arg(sortie_r2.path())
+        .arg("--json")
+        .arg(rapport.path())
+        .arg("--force")
+        .arg("-q")
+        .assert()
+        .success();
+
+    let v = lire_rapport(rapport.path());
+    let m = &v["metrics"];
+    let pairs_in = m["pairs_in"].as_u64().expect("pairs_in doit être émis");
+    let pairs_out = m["pairs_out"].as_u64().expect("pairs_out doit être émis");
+    let reads_in = m["reads_in"].as_u64().unwrap();
+    let reads_out = m["reads_out"].as_u64().unwrap();
+
+    assert_eq!(pairs_in, 4, "4 paires en entrée");
+    assert_eq!(pairs_out, 4, "4 paires en sortie");
+    assert_eq!(
+        reads_in,
+        2 * pairs_in,
+        "reads_in doit compter les lectures (deux brins par paire)"
+    );
+    assert_eq!(reads_out, 2 * pairs_out);
+
+    // wc : 4 enregistrements dans chaque brin = 8 lectures.
+    let wc = compter_sequences_fastq(&fs::read_to_string(sortie_r1.path()).unwrap())
+        + compter_sequences_fastq(&fs::read_to_string(sortie_r2.path()).unwrap());
+    assert_eq!(wc, reads_in as usize, "reads_in doit correspondre à wc");
+}
+
+/// 5. Un run refusé ne doit pas laisser `fastdedup_abundance_<pid>.fastq` :
+/// ici le refus tombe à la passe 2 (FASTA → FASTQ), après l'écriture du temporaire.
+#[test]
+fn test_abundance_temp_supprime_apres_refus() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fasta(&temp_dir, "entree.fa", 5, 0);
+    let dossier_temp = temp_dir.child("tmp_se");
+    dossier_temp.create_dir_all().unwrap();
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(temp_dir.child("abondance.fq").path())
+        .arg("--abundance")
+        .arg("--temp-dir")
+        .arg(dossier_temp.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "FASTA → FASTQ conversion not supported",
+        ));
+
+    assert_eq!(
+        fs::read_dir(dossier_temp.path()).unwrap().count(),
+        0,
+        "aucun temporaire d'abondance ne doit survivre à un refus (single-end)"
+    );
+
+    // Jumeau paired-end : mêmes pass 1/2, mêmes fuites.
+    let (r1, r2) = generer_fasta_paire(&temp_dir, "P1.fasta", "P2.fasta", 5, 0);
+    let dossier_temp_pe = temp_dir.child("tmp_pe");
+    dossier_temp_pe.create_dir_all().unwrap();
+
+    cmd()
+        .arg("-1")
+        .arg(r1.path())
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg(temp_dir.child("pe1.fq").path())
+        .arg("-p")
+        .arg(temp_dir.child("pe2.fq").path())
+        .arg("--abundance")
+        .arg("--temp-dir")
+        .arg(dossier_temp_pe.path())
+        .assert()
+        .failure();
+
+    assert_eq!(
+        fs::read_dir(dossier_temp_pe.path()).unwrap().count(),
+        0,
+        "aucun temporaire d'abondance ne doit survivre à un refus (paired-end)"
+    );
+}
+
+/// 6. `-j 0` demandait « auto » mais rapportait 0 thread alors que le pool en
+/// résolvait plusieurs. Le rapport et le résumé doivent annoncer le compte résolu.
+#[test]
+fn test_j0_rapporte_les_threads_resolus() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 5, 0);
+    let sortie = temp_dir.child("sortie.fq");
+    let rapport = temp_dir.child("j0.json");
+
+    let assert = cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("-j")
+        .arg("0")
+        .arg("--json")
+        .arg(rapport.path())
+        .arg("--force")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let annonce = threads_du_resume(&stdout).expect("le résumé doit annoncer un nombre de threads");
+    let rapporte = lire_rapport(rapport.path())["metrics"]["threads"]
+        .as_u64()
+        .expect("metrics.threads doit être un entier");
+
+    assert!(rapporte >= 1, "-j 0 ne peut pas résoudre 0 thread");
+    assert_eq!(
+        rapporte, annonce,
+        "le rapport et le résumé doivent annoncer le même compte résolu"
+    );
+}
+
+/// 7a. `--out-compression gz` sur un chemin nommé écrivait du FASTQ brut en
+/// silence : l'option ne s'applique qu'au flux (`-o -`). Elle doit avertir.
+#[test]
+fn test_out_compression_sur_chemin_nomme_avertit() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let entree = generer_fastq(&temp_dir, "entree.fastq", 5, 0);
+    let sortie = temp_dir.child("nomme.fq");
+
+    cmd()
+        .arg("-1")
+        .arg(entree.path())
+        .arg("-o")
+        .arg(sortie.path())
+        .arg("--out-compression")
+        .arg("gz")
+        .arg("--force")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--out-compression"));
+
+    // Toujours du FASTQ brut (l'avertissement documente le comportement).
+    let contenu = fs::read_to_string(sortie.path()).unwrap();
+    assert!(contenu.starts_with('@'), "sortie nommée non compressée");
+}
+
+/// 7b. `--dry-run` n'écrit aucun fichier : le rapport ne doit annoncer ni R1
+/// ni R2, au lieu de `outputs.r1: null` + `outputs.r2: <chemin>`.
+#[test]
+fn test_dry_run_rapport_sorties_nulles() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let (r1, r2) = generer_fastq_paire(&temp_dir, "R1.fastq", "R2.fastq", 4, 0);
+    let rapport = temp_dir.child("dry.json");
+
+    cmd()
+        .arg("-1")
+        .arg(r1.path())
+        .arg("-2")
+        .arg(r2.path())
+        .arg("-o")
+        .arg(temp_dir.child("x1.fq").path())
+        .arg("-p")
+        .arg(temp_dir.child("x2.fq").path())
+        .arg("--dry-run")
+        .arg("--json")
+        .arg(rapport.path())
+        .assert()
+        .success();
+
+    let v = lire_rapport(rapport.path());
+    assert!(v["dry_run"].as_bool().unwrap());
+    assert!(
+        v["outputs"]["r1"].is_null(),
+        "--dry-run n'écrit pas R1 : outputs.r1 doit être null, obtenu {}",
+        v["outputs"]["r1"]
+    );
+    assert!(
+        v["outputs"]["r2"].is_null(),
+        "--dry-run n'écrit pas R2 : outputs.r2 doit être null, obtenu {}",
+        v["outputs"]["r2"]
+    );
+}

@@ -19,11 +19,36 @@ pub struct FormatOpts<'a> {
     pub preview_n: usize,
     pub data_mode: DataMode,
     pub output_dir: &'a Path,
-    pub json_path: &'a Path,
-    pub with_wrapper: bool,
+    /// `--json PATH`: where the `fastsuite.report.v1` document goes. The grid
+    /// JSON is *not* redirected — it always lands at
+    /// `<output_dir>/heatmap.json` (review 2026-10-21, item 1).
+    pub report_path: Option<&'a Path>,
     pub elapsed_s: f64,
     pub quiet: bool,
 }
+
+/// Name of the grid JSON inside the output directory. One definition: the
+/// writer, the report's `grid` block and the clobber guard all use it.
+pub const GRID_JSON_NAME: &str = "heatmap.json";
+
+/// Bytes charged per plane cell when deciding whether a run is allowed.
+///
+/// The end-of-run plane is three dense `u64` grids of `size²` cells (24 B/cell)
+/// plus their JSON rendering and the `Vec<String>` join temporaries. Measured:
+/// 61 B/cell at a 4 001×4 001 grid (976 MB). 64 B/cell rounds that up, so the
+/// cap below bounds peak RSS rather than only the arrays.
+pub const PLANE_BYTES_PER_CELL: usize = 64;
+
+/// Ceiling on the output plane, published in `--help`.
+///
+/// 256 MiB at 64 B/cell ⇒ `MAX_PLANE_SIDE² = 2048²` cells ⇒ reads of at most
+/// `MAX_PLANE_SIDE - 1 = 2047` bp. `--buffer-mb` sizes the read-index buffer
+/// and cannot bound the plane, so without a ceiling a 65 kb read asks for
+/// ~100 GB and the process is OOM-killed with no message.
+pub const MAX_PLANE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Largest accepted `size` (= longest read + 1).
+pub const MAX_PLANE_SIDE: usize = 2048;
 
 // ── Row encoding ─────────────────────────────────────────────────────────────
 
@@ -87,7 +112,9 @@ pub fn encode_data_row(indices: Vec<(u16, u16, u32)>) -> Vec<u8> {
 /// ```
 /// `qual_len == seq_len` (not stored separately).
 /// Reads per (pixel, kind) are kept as the first `preview_n` by
-/// `(file_id, read_num)`, so R1 and R2 each get their own quota.
+/// `(file_id, read_num)`, so R1 and R2 each get their own quota. The worker
+/// keeps the first `preview_n` of *each file*, so this rule sees the same
+/// candidates at any `-j`.
 pub fn encode_preview_row(
     previews: Vec<PreviewRead>,
     preview_n: usize,
@@ -162,31 +189,47 @@ pub fn write_preview_entry(w: &mut impl Write, p: &PreviewRead) -> std::io::Resu
 }
 
 /// Decode a whole preview temp row (written by `write_preview_entry`).
-pub fn decode_preview_row(raw: &[u8], y: u16) -> Vec<PreviewRead> {
-    fn u16_at(raw: &[u8], pos: &mut usize) -> u16 {
-        let v = u16::from_le_bytes(raw[*pos..*pos + 2].try_into().unwrap());
-        *pos += 2;
-        v
+///
+/// Every field is bounds-checked: a truncated or corrupt row is an error, not
+/// a slice panic. The qual string carries no length of its own — the format
+/// relies on `seq.len() == qual.len()`, which `process_fastq` enforces for
+/// every record it reads (review 2026-10-21, item 3).
+pub fn decode_preview_row(raw: &[u8], y: u16) -> std::io::Result<Vec<PreviewRead>> {
+    fn corrupt(why: String) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, why)
     }
-    fn u32_at(raw: &[u8], pos: &mut usize) -> u32 {
-        let v = u32::from_le_bytes(raw[*pos..*pos + 4].try_into().unwrap());
-        *pos += 4;
-        v
+    /// Take the next `n` bytes, or fail without moving `pos`.
+    fn take<'a>(raw: &'a [u8], pos: &mut usize, n: usize) -> std::io::Result<&'a [u8]> {
+        let end = pos
+            .checked_add(n)
+            .ok_or_else(|| corrupt(format!("field length {n} overflows at offset {pos}")))?;
+        if end > raw.len() {
+            return Err(corrupt(format!(
+                "preview row truncated: {n} B needed at offset {pos}, row is {} B",
+                raw.len()
+            )));
+        }
+        let out = &raw[*pos..end];
+        *pos = end;
+        Ok(out)
+    }
+    fn u16_at(raw: &[u8], pos: &mut usize) -> std::io::Result<u16> {
+        Ok(u16::from_le_bytes(take(raw, pos, 2)?.try_into().unwrap()))
+    }
+    fn u32_at(raw: &[u8], pos: &mut usize) -> std::io::Result<u32> {
+        Ok(u32::from_le_bytes(take(raw, pos, 4)?.try_into().unwrap()))
     }
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < raw.len() {
-        let x = u16_at(raw, &mut pos);
-        let file_id = u16_at(raw, &mut pos);
-        let read_num = u32_at(raw, &mut pos);
-        let hlen = u32_at(raw, &mut pos) as usize;
-        let header = String::from_utf8_lossy(&raw[pos..pos + hlen]).into_owned();
-        pos += hlen;
-        let slen = u32_at(raw, &mut pos) as usize;
-        let seq = String::from_utf8_lossy(&raw[pos..pos + slen]).into_owned();
-        pos += slen;
-        let qual = String::from_utf8_lossy(&raw[pos..pos + slen]).into_owned();
-        pos += slen;
+        let x = u16_at(raw, &mut pos)?;
+        let file_id = u16_at(raw, &mut pos)?;
+        let read_num = u32_at(raw, &mut pos)?;
+        let hlen = u32_at(raw, &mut pos)? as usize;
+        let header = String::from_utf8_lossy(take(raw, &mut pos, hlen)?).into_owned();
+        let slen = u32_at(raw, &mut pos)? as usize;
+        let seq = String::from_utf8_lossy(take(raw, &mut pos, slen)?).into_owned();
+        let qual = String::from_utf8_lossy(take(raw, &mut pos, slen)?).into_owned();
         out.push(PreviewRead {
             x,
             y,
@@ -197,7 +240,7 @@ pub fn decode_preview_row(raw: &[u8], y: u16) -> Vec<PreviewRead> {
             qual,
         });
     }
-    out
+    Ok(out)
 }
 
 // ── Output ───────────────────────────────────────────────────────────────────
@@ -219,13 +262,35 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
         preview_n,
         data_mode,
         output_dir,
-        json_path,
-        with_wrapper,
+        report_path,
         elapsed_s,
         quiet,
     } = *opts;
 
     let size = (state.max_seq_len + 1) as usize;
+    // The plane is O(max_read_len²): three dense u64 grids of `size²` cells
+    // plus their JSON rendering. `--buffer-mb` sizes the read-index buffer and
+    // cannot bound it, so the plane gets its own published ceiling and a
+    // refusal that names both (review 2026-10-21, item 4). 4 000 bp used to
+    // peak at 976 MB and 8 000 bp at 3 788 MB, identically at --buffer-mb 1 and
+    // 8; the u16 guard admitted ~65 kb reads (~100 GB).
+    let cells = size.saturating_mul(size);
+    let plane_bytes = cells.saturating_mul(PLANE_BYTES_PER_CELL);
+    if plane_bytes > MAX_PLANE_BYTES {
+        eprintln!(
+            "Error: max read length {} bp needs a {size}x{size} plane ({cells} cells x \
+             {PLANE_BYTES_PER_CELL} B/cell = {} MiB), over the {} MiB plane cap. The plane \
+             grows as O(max read length^2); --buffer-mb bounds the read-index buffer only and \
+             cannot bound it. The cap allows reads up to {} bp: trim reads to <= {} bp upstream \
+             and re-run.",
+            state.max_seq_len,
+            plane_bytes / (1024 * 1024),
+            MAX_PLANE_BYTES / (1024 * 1024),
+            MAX_PLANE_SIDE - 1,
+            MAX_PLANE_SIDE - 1,
+        );
+        std::process::exit(1);
+    }
     if size > u16::MAX as usize {
         eprintln!("Error: max read length {} exceeds u16::MAX", state.max_seq_len);
         std::process::exit(1);
@@ -255,6 +320,12 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
     let mut preview_written: u64 = 0;
     data_offsets.push(0);
     preview_offsets.push(0);
+
+    // The grid JSON keeps its own home: `--json` names the *report*, not the
+    // grid (review 2026-10-21, item 1). One name for the writer, the report's
+    // `grid` block and the clobber guard.
+    let grid_path = output_dir.join(GRID_JSON_NAME);
+    let grid_name = GRID_JSON_NAME;
 
     let mut data_file    = BufWriter::new(File::create(output_dir.join("heatmap.data"))?);
     let mut preview_file = BufWriter::new(File::create(output_dir.join("heatmap.preview"))?);
@@ -297,7 +368,7 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             if path.exists() {
                 let raw = std::fs::read(&path)?;
                 std::fs::remove_file(&path)?;
-                decode_preview_row(&raw, y)
+                decode_preview_row(&raw, y)?
             } else {
                 Vec::new()
             }
@@ -426,33 +497,38 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
         poff      = preview_offsets.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(","),
     );
 
-    let mut jf = BufWriter::new(File::create(json_path)?);
+    let mut jf = BufWriter::new(File::create(grid_path)?);
     jf.write_all(json.as_bytes())?;
     jf.flush()?;
 
-    // The v1 wrapper lands next to the grid JSON as <stem>.report.json —
-    // only when --json redirected the grid (the historical
-    // <output-dir>/heatmap.json default keeps its bare, wrapper-free shape).
-    let mut wrapper_suffix = String::new();
-    if with_wrapper {
-        let wrapper = crate::report::wrapper_path(json_path);
+    // `--json PATH` writes the v1 report at PATH. The grid JSON is never
+    // redirected: it is `<output-dir>/heatmap.json`, so `-o` always has it
+    // (review 2026-10-21, item 1). The report's `grid` block names that file.
+    let mut report_suffix = String::new();
+    if let Some(report_path) = report_path {
         crate::report::write_report_v1(
-            &wrapper,
+            report_path,
             &std::env::args().collect::<Vec<_>>().join(" "),
             elapsed_s,
             files,
             &metrics,
+            grid_name,
         )?;
-        wrapper_suffix = format!(" + {}", wrapper.file_name().unwrap().to_string_lossy());
+        report_suffix = format!(
+            " + {} (fastsuite.report.v1)",
+            report_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| report_path.display().to_string())
+        );
     }
 
     if !quiet {
         println!(
             "Saved heatmap.data ({data_written} B), \
              heatmap.preview ({preview_written} B), \
-             heatmap.json (size={size}, {} reads){}",
+             heatmap.json (size={size}, {} reads){report_suffix}",
             state.total_reads,
-            wrapper_suffix,
         );
     }
     Ok(())
@@ -552,7 +628,7 @@ mod tests {
         p.qual = "IIIIIIIIII".into();
         let mut buf = Vec::new();
         write_preview_entry(&mut buf, &p).unwrap();
-        let back = decode_preview_row(&buf, 9);
+        let back = decode_preview_row(&buf, 9).unwrap();
         assert_eq!(back.len(), 1);
         let q = &back[0];
         assert_eq!(
@@ -578,12 +654,43 @@ mod tests {
         for p in &reads {
             write_preview_entry(&mut buf, p).unwrap();
         }
-        assert!(decode_preview_row(&[], 3).is_empty());
-        let back = decode_preview_row(&buf, 3);
+        assert!(decode_preview_row(&[], 3).unwrap().is_empty());
+        let back = decode_preview_row(&buf, 3).unwrap();
         assert_eq!(back.len(), reads.len());
         for (a, b) in back.iter().zip(&reads) {
             assert_eq!((a.x, a.file_id, a.read_num, &a.seq, &a.qual),
                        (b.x, b.file_id, b.read_num, &b.seq, &b.qual));
         }
+    }
+
+    /// A truncated row is an error, never a slice panic — every cut point of a
+    /// valid entry, which is the shape of the short-qual record that used to
+    /// abort the process with exit 101 (review 2026-10-21, item 3).
+    #[test]
+    fn preview_row_truncated_is_an_error_not_a_panic() {
+        let mut p = make_preview(0, 1);
+        p.seq = "ACGTACGT".into();
+        p.qual = "IIIIIIII".into();
+        let mut buf = Vec::new();
+        write_preview_entry(&mut buf, &p).unwrap();
+        for cut in 1..buf.len() {
+            assert!(
+                decode_preview_row(&buf[..cut], 0).is_err(),
+                "a row cut at {cut} of {} B must be reported, not decoded",
+                buf.len()
+            );
+        }
+        assert_eq!(decode_preview_row(&buf, 0).unwrap().len(), 1);
+    }
+
+    /// The plane constants are one equation: the accepted side is exactly the
+    /// largest square the byte cap allows.
+    #[test]
+    fn plane_constants_agree() {
+        assert_eq!(
+            MAX_PLANE_SIDE * MAX_PLANE_SIDE * PLANE_BYTES_PER_CELL,
+            MAX_PLANE_BYTES
+        );
+        assert_eq!(MAX_PLANE_SIDE, 2048);
     }
 }

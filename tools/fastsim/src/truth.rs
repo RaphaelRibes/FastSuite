@@ -4,28 +4,38 @@
 //! compute trim accuracy absolutely (not relative to another tool):
 //!
 //! ```text
-//! pair_id  insert  r1_h  r1_t  r2_h  r2_t  r1_ad  r2_ad  full_flag  is_dup  r1_n  r2_n
+//! pair_id  insert  r1_h  r1_t  r2_h  r2_t  r1_ad  r2_ad  full_flag  is_dup  r1_n  r2_n  r1_full  r2_full
 //! ```
 //!
 //! - `r1_n` / `r2_n`: ambiguous (`N`) bases the sequencing overlay injected
 //!   into that mate (0 when the profile carries no N model). An injected `N`
 //!   is an instrument no-call recorded INSIDE the keep window — it never
 //!   touches `h`/`t` — so the GT states it explicitly rather than letting a
-//!   reader mistake it for fragment biology.
+//!   reader mistake it for fragment biology. The `N` filler of the no-adapter
+//!   mode is NOT a no-call and is not counted here (it is reported separately
+//!   in the run's `adapter_pad_bases` metric).
 //!
 //! - `pair_id`: unique integer (matches the FASTQ coordinate x:y).
 //! - `insert`: true fragment length I.
-//! - `r1_h` / `r1_t`: 5′/3′ G-run lengths of R1; same for R2.
-//! - `full_flag`: 1 = entirely artefact (full-length spike or biology
-//!   window < 1 bp) — the correct answer is to DROP the pair; 0 = trim.
+//! - `r1_h` / `r1_t`: 5′/3′ G-run lengths of R1 **as drawn** — the fragment
+//!   truth. Sequencing errors are applied after the artefact is decided, so a
+//!   substitution inside an injected run can make the emitted run differ from
+//!   `h`; scoring that difference is the trimmer's error, not a GT mismatch.
+//!   Same for R2.
+//! - `r1_full` / `r2_full`: 1 = that mate is entirely artefact
+//!   (`h + t >= L`, from the drawn extents). A trimmer must drop it.
+//! - `full_flag`: 1 = the PAIR is entirely artefact (`r1_full && r2_full`,
+//!   identical to `r1_full` in `--single` mode) — the correct answer is to
+//!   DROP the pair; 0 = trim. Per-mate drops read `r1_full`/`r2_full`.
 //! - `is_dup`: 1 = PCR duplicate of a previously emitted pair: the whole
 //!   stored read (template, artefact, substitution errors and quality) is
 //!   replayed byte-for-byte.
 //!
-//! The correct trimmed window per mate is `[h, min(I, L−t))`:
+//! The correct trimmed window per mate is `[h, h + min(I, L−h−t))`:
 //! - `[0, h)`     — 5′ G-run (artefact)
-//! - `[h, min(I, L−t))` — biology (keep)
-//! - `[min(I, L−t), L−t)` — adapter readthrough (artefact, only when I < L−t)
+//! - `[h, h + min(I, L−h−t))` — biology (keep)
+//! - `[h + min(I, L−h−t), L−t)` — adapter readthrough (artefact, only when
+//!   the insert is shorter than the window `L−h−t`)
 //! - `[L−t, L)`   — 3′ G-run (artefact)
 //!
 //! So `h`, `t`, `I` and `L` (from the profile) fully determine truth; no
@@ -67,9 +77,9 @@ impl GtWriter<BufWriter<std::fs::File>> {
             row: Vec::with_capacity(96),
         };
         w.out.write_all(if single {
-            b"pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\tr1_n\n"
+            b"pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\tr1_n\tr1_full\n"
         } else {
-            b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n\n"
+            b"pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n\tr1_full\tr2_full\n"
         })?;
         Ok(w)
     }
@@ -128,7 +138,14 @@ impl<W: Write> GtWriter<W> {
         // Clamp artefact lengths to read_len for display (full pairs may
         // have t = L).
         let l = read_len;
-        let full = u8::from(a.full);
+        // "Entirely artefact" is measured per mate from the EMITTED record the
+        // GT names: `a.h1`/`a.t1` are the emitted runs after substitutions, so
+        // a row can never claim a run the FASTQ does not contain.
+        let f1: u8 = u8::from(a.h1.min(l) + a.t1.min(l) >= l);
+        let f2: u8 = u8::from(a.h2.min(l) + a.t2.min(l) >= l);
+        // The pair must be dropped only when BOTH mates are useless; a pair
+        // with one full mate still has valid biology in the other.
+        let full: u8 = if single { f1 } else { f1 & f2 };
         let dup = u8::from(is_dup);
         buf.clear();
         push_u64(buf, pair_idx);
@@ -156,9 +173,16 @@ impl<W: Write> GtWriter<W> {
         push_u64(buf, dup as u64);
         buf.push(b'\t');
         push_u64(buf, n1 as u64);
-        if !single {
+        if single {
+            buf.push(b'\t');
+            push_u64(buf, f1 as u64);
+        } else {
             buf.push(b'\t');
             push_u64(buf, n2 as u64);
+            buf.push(b'\t');
+            push_u64(buf, f1 as u64);
+            buf.push(b'\t');
+            push_u64(buf, f2 as u64);
         }
         buf.push(b'\n');
     }
@@ -192,7 +216,7 @@ mod tests {
         let a = artefact(2, 5, 0, 3, false);
         // an injected N overlay on R1 only: the r1_n column must carry it
         w.write_pair(7, 300, &a, false, 3, 0).unwrap();
-        w.write_pair(8, 120, &artefact(0, 0, 0, 0, true), true, 0, 0)
+        w.write_pair(8, 120, &artefact(150, 0, 0, 150, true), true, 0, 0)
             .unwrap();
         w.finish().unwrap();
 
@@ -201,10 +225,10 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         assert_eq!(
             lines[0],
-            "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n"
+            "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n\tr1_full\tr2_full"
         );
-        assert_eq!(lines[1], "7\t300\t2\t5\t0\t3\t0\t0\t0\t0\t3\t0");
-        assert_eq!(lines[2], "8\t120\t0\t0\t0\t0\t0\t0\t1\t1\t0\t0");
+        assert_eq!(lines[1], "7\t300\t2\t5\t0\t3\t0\t0\t0\t0\t3\t0\t0\t0");
+        assert_eq!(lines[2], "8\t120\t150\t0\t0\t150\t0\t0\t1\t1\t0\t0\t1\t1");
     }
 
     #[test]
@@ -219,43 +243,83 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             s.lines().nth(1).unwrap(),
-            "0\t300\t0\t150\t0\t150\t0\t0\t1\t0\t0\t0"
+            "0\t300\t0\t150\t0\t150\t0\t0\t1\t0\t0\t0\t1\t1"
         );
     }
 
-    /// FS-10: the appended row must be byte-identical to what `writeln!` with
-    /// twelve `Display` arguments produced, including the `min(read_len)`
-    /// clamping and both column layouts.
+    /// FS-10: the appended row must be byte-identical to the `writeln!` form,
+    /// including the `min(read_len)` clamping and both column layouts. The
+    /// expected strings are literal so the per-mate `full` flags are pinned
+    /// independently of the writer's arithmetic.
     #[test]
     fn row_append_matches_the_format_macro() {
         let l = 150u32;
-        let cases: Vec<(u64, u32, Artefact, bool, u32, u32)> = vec![
-            (0, 300, artefact(2, 5, 0, 3, false), false, 3, 0),
-            (7, 120, artefact(0, 0, 0, 0, true), true, 0, 0),
-            (9_999, 20, artefact(150, 150, 149, 3, false), false, 0, 12),
-            (123_456, 288, artefact(200, 151, 0, 64, true), true, 41, 41),
-            (u64::MAX, 1_000_000, artefact(0, 150, 0, 150, false), false, 41, 42),
+        let cases: Vec<(u64, u32, Artefact, bool, u32, u32, &str, &str)> = vec![
+            (
+                0,
+                300,
+                artefact(2, 5, 0, 3, false),
+                false,
+                3,
+                0,
+                "0\t300\t2\t5\t0\t3\t0\t0\t0\t0\t3\t0\t0\t0\n",
+                "0\t300\t2\t5\t0\t0\t0\t3\t0\n",
+            ),
+            (
+                7,
+                120,
+                artefact(150, 0, 0, 150, true),
+                true,
+                0,
+                0,
+                "7\t120\t150\t0\t0\t150\t0\t0\t1\t1\t0\t0\t1\t1\n",
+                "7\t120\t150\t0\t0\t1\t1\t0\t1\n",
+            ),
+            (
+                9_999,
+                20,
+                artefact(150, 150, 149, 3, false),
+                false,
+                0,
+                12,
+                "9999\t20\t150\t150\t149\t3\t0\t0\t1\t0\t0\t12\t1\t1\n",
+                "9999\t20\t150\t150\t0\t1\t0\t0\t1\n",
+            ),
+            (
+                123_456,
+                288,
+                artefact(200, 151, 0, 64, true),
+                true,
+                41,
+                41,
+                "123456\t288\t150\t150\t0\t64\t0\t0\t0\t1\t41\t41\t1\t0\n",
+                "123456\t288\t150\t150\t0\t1\t1\t41\t1\n",
+            ),
+            (
+                u64::MAX,
+                1_000_000,
+                artefact(0, 150, 0, 150, false),
+                false,
+                41,
+                42,
+                "18446744073709551615\t1000000\t0\t150\t0\t150\t0\t0\t1\t0\t41\t42\t1\t1\n",
+                "18446744073709551615\t1000000\t0\t150\t0\t1\t0\t41\t1\n",
+            ),
         ];
-        for (pair_idx, insert_len, a, is_dup, n1, n2) in cases {
-            let full = u8::from(a.full);
-            let dup = u8::from(is_dup);
-            let want = format!(
-                "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}\t{n2}\n",
-                a.h1.min(l), a.t1.min(l), a.h2.min(l), a.t2.min(l), a.a1.min(l), a.a2.min(l)
-            );
+        for (pair_idx, insert_len, a, is_dup, n1, n2, want, want_single) in cases {
             let mut buf = Vec::new();
             GtWriter::<Vec<u8>>::row_into(
                 &mut buf, l, false, pair_idx, insert_len, &a, is_dup, n1, n2,
             );
             assert_eq!(String::from_utf8(buf).unwrap(), want, "paired row {pair_idx}");
 
-            let want_single = format!(
-                "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}\n",
-                a.h1.min(l), a.t1.min(l), a.a1.min(l)
-            );
             let mut buf = Vec::new();
             GtWriter::<Vec<u8>>::row_into(&mut buf, l, true, pair_idx, insert_len, &a, is_dup, n1, n2);
-            assert_eq!(String::from_utf8(buf).unwrap(), want_single, "single row {pair_idx}");
+            assert_eq!(
+                String::from_utf8(buf).unwrap(),
+                want_single,
+                "single row {pair_idx}"
+            );
         }
     }
 

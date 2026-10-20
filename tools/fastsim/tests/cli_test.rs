@@ -90,7 +90,7 @@ fn smoke_run_produces_three_files() {
     let gt_text = std::fs::read_to_string(&gt).unwrap();
     assert_eq!(gt_text.lines().count(), 1001);
     let header = gt_text.lines().next().unwrap();
-    assert_eq!(header, "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n");
+    assert_eq!(header, "pair_id\tinsert\tr1_h\tr1_t\tr2_h\tr2_t\tr1_adapter\tr2_adapter\tfull_flag\tis_dup\tr1_n\tr2_n\tr1_full\tr2_full");
 
     // Cleanup.
         std::fs::remove_dir_all(&dir).unwrap();
@@ -121,10 +121,10 @@ fn smoke_run_produces_three_files() {
         assert_eq!(lines.len(), 501);
         assert_eq!(
             lines[0],
-            "pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\tr1_n"
+            "pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\tr1_n\tr1_full"
         );
-        // every row has 8 fields
-        assert!(lines[1..].iter().all(|l| l.split('\t').count() == 8));
+        // every row has 9 fields
+        assert!(lines[1..].iter().all(|l| l.split('\t').count() == 9));
 
         // Adapter readthrough is labelled: some rows carry a nonzero r1_adapter
         // (the test profile has readthrough mode and short inserts).
@@ -556,4 +556,234 @@ fn zero_dup_pool_is_a_clean_cli_error() {
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("--dup-pool must be >= 1"), "stderr: {err}");
     assert!(!err.contains("panicked"), "stderr: {err}");
+}
+
+/// Profile with a configurable `gc` (no insert CDF, adapter off, no artefacts).
+fn gc_profile(dir: &Path, gc: f64) -> std::path::PathBuf {
+    let q = vec!["30"; 150].join(",");
+    let json = format!(
+        r#"{{
+        "read_len": 150, "gc": {gc}, "geometry": "tail3p_both",
+        "head": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+        "tail": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+        "joint_tail": {{"0,0": 100}},
+        "tail_q_collapse": {{"R1": 0.0, "R2": 0.0}},
+        "pos_q": {{"R1": [{q}], "R2": [{q}]}},
+        "read_meanq": {{"R1": {{"30": 100}}, "R2": {{"30": 100}}}},
+        "full_length_rate": 0.0,
+        "full_length_q": {{"R1": 20, "R2": 20}},
+        "adapter": {{"seq": "CTGTCTCTTATACACATCT", "mode": "none"}}
+    }}"#,
+        gc = gc,
+        q = q
+    );
+    let p = dir.join(format!("gc_{}.json", (gc * 1000.0) as u32));
+    std::fs::write(&p, json).unwrap();
+    p
+}
+
+/// Emitted GC of a plain FASTQ's R1 records.
+fn emitted_gc(path: &Path) -> f64 {
+    let s = std::fs::read_to_string(path).unwrap();
+    let mut gc = 0usize;
+    let mut total = 0usize;
+    for (i, line) in s.lines().enumerate() {
+        if i % 4 != 1 {
+            continue;
+        }
+        for b in line.bytes() {
+            total += 1;
+            if b == b'G' || b == b'C' {
+                gc += 1;
+            }
+        }
+    }
+    gc as f64 / total as f64
+}
+
+/// A profile's `gc` is the authority; `--gc` only overrides it. Before this
+/// pin, both were silently replaced by the flag's 0.49 default (a gc=0.30
+/// profile emitted 0.4992, so the `gc` field was inert).
+#[test]
+fn profile_gc_drives_the_generator_and_the_flag_overrides_it() {
+    let dir = std::env::temp_dir().join(format!("fastsim_gc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = gc_profile(&dir, 0.30);
+
+    let run = |out: &Path, extra: &[&str]| {
+        let o = Command::new(bin())
+            .args([
+                "--pairs",
+                "2000",
+                "--profile",
+                profile.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--seed",
+                "5",
+                "--no-gzip",
+                "--no-adapter",
+                "--drop-rate",
+                "0",
+                "--quiet",
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "fastsim {extra:?} failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+
+    let from_profile = dir.join("p");
+    run(&from_profile, &[]);
+    let observed = emitted_gc(&std::path::PathBuf::from(format!(
+        "{}_R1.fastq",
+        from_profile.display()
+    )));
+    assert!(
+        (observed - 0.30).abs() < 0.02,
+        "profile gc=0.30 emitted {observed}"
+    );
+
+    // The flag still wins when given.
+    let from_flag = dir.join("f");
+    run(&from_flag, &["--gc", "0.60"]);
+    let observed = emitted_gc(&std::path::PathBuf::from(format!(
+        "{}_R1.fastq",
+        from_flag.display()
+    )));
+    assert!(
+        (observed - 0.60).abs() < 0.02,
+        "--gc 0.60 emitted {observed}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A profile with an empty adapter sequence must be a clean refusal or a
+/// no-adapter run, never a modulo-by-zero panic (exit 101).
+#[test]
+fn empty_profile_adapter_sequence_does_not_panic() {
+    let dir = std::env::temp_dir().join(format!("fastsim_epad_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let q = vec!["30"; 150].join(",");
+    let json = format!(
+        r#"{{
+        "read_len": 150, "gc": 0.5, "geometry": "tail3p_both",
+        "head": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+        "tail": {{"R1": {{"0": 100}}, "R2": {{"0": 100}}}},
+        "joint_tail": {{"0,0": 100}},
+        "tail_q_collapse": {{"R1": 0.0, "R2": 0.0}},
+        "pos_q": {{"R1": [{q}], "R2": [{q}]}},
+        "read_meanq": {{"R1": {{"30": 100}}, "R2": {{"30": 100}}}},
+        "full_length_rate": 0.0,
+        "full_length_q": {{"R1": 20, "R2": 20}},
+        "adapter": {{"seq": "", "mode": "readthrough"}}
+    }}"#,
+        q = q
+    );
+    let profile = dir.join("empty_adapter.json");
+    std::fs::write(&profile, json).unwrap();
+    // --insert-mean 60 forces readthrough: the window is longer than the insert.
+    let o = Command::new(bin())
+        .args([
+            "--pairs",
+            "200",
+            "--insert-mean",
+            "60",
+            "--insert-sd",
+            "10",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--out",
+            dir.join("e").to_str().unwrap(),
+            "--no-gzip",
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(o.status.code(), Some(101), "must not be a panic");
+    assert!(o.status.success(), "empty adapter should mean 'no adapter'");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `is_dup=1` must always name a payload that exists earlier in the same file:
+/// with an empty duplicate pool the pair is NOT a duplicate.
+#[test]
+fn duplicate_flag_always_has_an_earlier_copy() {
+    let dir = std::env::temp_dir().join(format!("fastsim_dupflag_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_test_profile(&dir);
+    let out = dir.join("d");
+    let o = Command::new(bin())
+        .args([
+            "--pairs",
+            "40",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--seed",
+            "3",
+            "--dup-rate",
+            "1.0",
+            "--no-gzip",
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let r1 = std::fs::read_to_string(dir.join("d_R1.fastq")).unwrap();
+    let seqs: Vec<&str> = r1.lines().skip(1).step_by(4).collect();
+    let gt = std::fs::read_to_string(dir.join("d.gt.tsv")).unwrap();
+    for (i, line) in gt.lines().skip(1).enumerate() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f[9] == "1" {
+            assert!(
+                seqs[..i].contains(&seqs[i]),
+                "pair {i} is flagged duplicate with no earlier byte-identical record"
+            );
+        }
+    }
+    // Pair 0 can never be a duplicate (nothing precedes it).
+    assert_eq!(gt.lines().nth(1).unwrap().split('\t').nth(9).unwrap(), "0");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `--single` writes no R2, so the report must not name one and must count one
+/// read per pair (it used to claim 2*pairs and a nonexistent R2 path).
+#[test]
+fn single_mode_report_matches_the_files() {
+    let dir = std::env::temp_dir().join(format!("fastsim_serep_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_test_profile(&dir);
+    let out = dir.join("s");
+    let o = Command::new(bin())
+        .args([
+            "--pairs",
+            "100",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--single",
+            "--no-gzip",
+            "--json",
+            dir.join("r.json").to_str().unwrap(),
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let rep: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("r.json")).unwrap()).unwrap();
+    assert!(rep["outputs"]["r2"].is_null(), "single mode names an R2: {rep}");
+    assert_eq!(rep["metrics"]["reads_in"], 100, "reads_in must be one read per pair");
+    assert!(!dir.join("s_R2.fastq").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

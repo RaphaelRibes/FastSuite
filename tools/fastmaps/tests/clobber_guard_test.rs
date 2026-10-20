@@ -91,13 +91,16 @@ fn guard_covers_svg_preview_and_corners() {
 }
 
 #[test]
-fn guard_covers_the_json_target_and_its_wrapper() {
+fn guard_covers_the_json_target_and_the_grid() {
     let json_args = |out: &Path| {
         vec![
             "--json".into(),
-            out.join("grid.json").to_string_lossy().into_owned(),
+            out.join("r.json").to_string_lossy().into_owned(),
         ]
     };
-    assert_guarded("json", "grid.json", &json_args);
-    assert_guarded("wrapper", "grid.report.json", &json_args);
+    // The report is one of the files this run writes, wherever it points.
+    assert_guarded("report", "r.json", &json_args);
+    // The grid is no longer redirectable, so it is guarded in every run —
+    // including the ones that also pass --json.
+    assert_guarded("grid_with_json", "heatmap.json", &json_args);
 }

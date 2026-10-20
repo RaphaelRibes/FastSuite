@@ -318,9 +318,15 @@ impl Accum {
         }
 
         if m.kmer && seq.len() >= 12 {
-            for win in seq.windows(12) {
-                if let Some(pk) = crate::repeated::pack_kmer(win) {
-                    self.kmer_counts.add(pk as u32);
+            // The SAME rolling register the fused path uses (accum::KmerRoll). The
+            // pre-fusion loop that used to live here (`seq.windows(12)` +
+            // `pack_kmer`) decoded each base 11 more times, which made `--only kmer`
+            // 2.6x slower than running every module at once.
+            let mut roll = crate::accum::KmerRoll::default();
+            for &raw in seq {
+                if let Some(k) = roll.push(crate::accum::BASE_CODE[raw as usize]) {
+                    self.kmer_counts.add(k);
+                    self.kmer_windows += 1;
                     w.kmer_windows += 1;
                 }
             }

@@ -32,7 +32,12 @@ const PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/mandrill_E3
 /// `--seed 42 --pairs 1000`, gzip level 6 (the default).
 const GOLDEN_GZ_R1: &str = "693b6616dab8736f842abb2a4863bdf8a9bfdc6bd921eccc799f90e41d88bd13";
 const GOLDEN_GZ_R2: &str = "af6247b21a3003257c016e3b14452176e9d8395a9e157c5d6dbe78b683c0af49";
-const GOLDEN_GT: &str = "a2d8e7a7600c533e078b4fe6801800c23901b9c9ef357023fb1b8a2998958282";
+/// The GT pin was deliberately re-based once, in the 2026-10-21 GT-contract
+/// fix: the row gained per-mate `r1_full`/`r2_full` columns and `full_flag`
+/// became "BOTH mates are artefact" (it used to be "either"). The FASTQ pins
+/// did NOT move, which is the point of pinning them separately: the payload
+/// is unchanged, only the labels changed.
+const GOLDEN_GT: &str = "56da7e652c0f66b06bab65a7455a97e8b17dbf1c2cf18471aa2c6052cec423bc";
 /// The same stream with the compression removed (what any level must inflate
 /// back to).
 const GOLDEN_PLAIN_R1: &str = "43738c1a013cd9bf40561b9fc7618c90a909799d81ce312fe271f8e855e3f225";

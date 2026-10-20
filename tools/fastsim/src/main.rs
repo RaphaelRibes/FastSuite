@@ -15,7 +15,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use fastsim::artefact::{build_read, decide, PooledPair};
+use fastsim::artefact::{build_read, decide, PooledPair, Read};
 use fastsim::biology::{insert_from_reference, random_dna_bias, read_fasta, History};
 use fastsim::fastq::FastqWriter;
 use fastsim::profile::{AdapterMode, Mate, Profile};
@@ -33,6 +33,13 @@ fn main() -> Result<()> {
 /// from the emitted bytes so the GT records exactly what a scorer will see.
 fn n_bases(mr: &MateRead) -> u32 {
     mr.seq.iter().filter(|&&b| b == b'N').count() as u32
+}
+
+/// `N` bases the no-adapter length filler put in a constructed read. They are
+/// a padding artefact, not an instrument no-call, so the GT's `rN` columns
+/// exclude them (the run's `adapter_pad_bases` metric reports them instead).
+fn pad_n(read: &Read) -> u32 {
+    read.seq.iter().filter(|&&b| b == b'N').count() as u32
 }
 
 /// Add one mate's emitted qualities to the running `mean_q` tally (FS-11).
@@ -99,6 +106,10 @@ fn run(cfg: &cli::Config) -> Result<()> {
             profile.read_len
         );
     }
+    // The profile's measured GC is the authority for random DNA; --gc exists
+    // only to override it. It used to be a hard 0.49 default that silently
+    // discarded a measured value (a gc=0.30 profile emitted 0.499).
+    let gc = cfg.gc.unwrap_or(profile.gc);
 
     // Reference contigs (optional).
     let contigs = match &cfg.reference {
@@ -156,6 +167,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
     let mut n_drop = 0u64;
     let mut n_ambig = 0u64; // ambiguous (N) bases emitted across both mates
     let mut n_ambig_reads = 0u64; // mates carrying at least one N
+    let mut pad_total = 0u64; // N filler the no-adapter mode emitted
     let mut q_sum = 0u64; // sum of emitted Phred values (mean_q)
     let mut q_n = 0u64; // emitted bases
     for pair_idx in 0..cfg.pairs {
@@ -170,7 +182,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
         //     readthrough fills the rest) — we are simulating sequencer
         //     output, not the fragment.
         let dup_rate = profile.dup_rate.unwrap_or(cfg.dup_rate);
-        let is_dup = dup_rate > 0.0 && rng.gen::<f64>() < dup_rate;
+        let mut is_dup = dup_rate > 0.0 && rng.gen::<f64>() < dup_rate;
         let is_drop = !is_dup && cfg.drop_rate > 0.0 && rng.gen::<f64>() < cfg.drop_rate;
 
         // A duplicate REPLAYS a stored pair verbatim: same bases, same artefact,
@@ -190,14 +202,29 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 if let Some(m2) = src.r2.as_ref() {
                     tally_q(m2, &mut q_sum, &mut q_n);
                 }
-                let (d1, d2) = (n_bases(&src.r1), src.r2.as_ref().map_or(0, n_bases));
+                // The GT names the fragment truth: h/t are the DRAWN artefact
+                // extents (a substitution inside a run is a trimmer-relevant
+                // observation, not a different truth), and the N columns carry
+                // the no-call overlay only (the no-adapter pad is counted
+                // separately).
+                let d1 = n_bases(&src.r1).saturating_sub(src.pad_n1);
+                let d2 = src
+                    .r2
+                    .as_ref()
+                    .map_or(0, |m| n_bases(m))
+                    .saturating_sub(src.pad_n2);
+                pad_total += (src.pad_n1 + src.pad_n2) as u64;
                 n_ambig += (d1 + d2) as u64;
                 n_ambig_reads += (d1 > 0) as u64 + (d2 > 0) as u64;
                 gt.write_pair(pair_idx, src.insert_len, &a, true, d1, d2)?;
                 n_dup += 1;
                 continue;
             }
-            // Pool not primed yet (first pairs): fall through and emit fresh.
+            // Pool not primed yet (first pairs): no earlier copy exists, so
+            // this pair is NOT a duplicate. Flagging it would claim a
+            // duplicate with nothing to copy, which no scorer can reconcile
+            // with the FASTQ.
+            is_dup = false;
         }
 
         let (insert, insert_len): (Vec<u8>, u32) = if is_drop {
@@ -206,7 +233,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             let l = rng.gen_range(1..=cfg.drop_min_len.saturating_sub(1).max(1));
             let i = match &contigs {
                 Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
-                None => random_dna_bias(l as usize, cfg.gc, Some(&profile.head_bias), Some(&profile.tail_bias), &mut rng),
+                None => random_dna_bias(l as usize, gc, Some(&profile.head_bias), Some(&profile.tail_bias), &mut rng),
             };
             (i, l)
         } else {
@@ -218,7 +245,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             );
             let i = match &contigs {
                 Some(cs) => insert_from_reference(cs, l, &mut rng)?.1,
-                None => random_dna_bias(l as usize, cfg.gc, Some(&profile.head_bias), Some(&profile.tail_bias), &mut rng),
+                None => random_dna_bias(l as usize, gc, Some(&profile.head_bias), Some(&profile.tail_bias), &mut rng),
             };
             (i, l)
         };
@@ -274,7 +301,13 @@ fn run(cfg: &cli::Config) -> Result<()> {
         if let Some(m2) = m2.as_ref() {
             tally_q(m2, &mut q_sum, &mut q_n);
         }
-        let (n1, n2) = (n_bases(&m1), m2.as_ref().map_or(0, n_bases));
+        // The GT names the fragment truth: no-call overlay only in the N
+        // columns, h/t as drawn (a substitution inside an injected run is a
+        // trimmer-relevant observation, not a different truth).
+        let (pad1, pad2) = (pad_n(&r1), r2.as_ref().map_or(0, pad_n));
+        pad_total += (pad1 + pad2) as u64;
+        let n1 = n_bases(&m1).saturating_sub(pad1);
+        let n2 = m2.as_ref().map_or(0, |m| n_bases(m)).saturating_sub(pad2);
         n_ambig += (n1 + n2) as u64;
         n_ambig_reads += (n1 > 0) as u64 + (n2 > 0) as u64;
         gt.write_pair(pair_idx, insert_len, &a, is_dup, n1, n2)?;
@@ -290,6 +323,8 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 artefact: a,
                 r1: m1,
                 r2: m2,
+                pad_n1: pad1,
+                pad_n2: pad2,
             });
         }
     }
@@ -321,6 +356,9 @@ fn run(cfg: &cli::Config) -> Result<()> {
     // 0 unless --stats asked for the counter: the wrapper is a no-op otherwise.
     let rng_draws = rng.draws();
 
+    // Mates actually emitted: a --single run writes one read per pair, so every
+    // rate in the summary and the report divides by this, not by 2*pairs.
+    let mates = cfg.pairs * if cfg.single { 1 } else { 2 };
     if !cfg.quiet {
         eprintln!(
             "fastsim: {} pairs, read_len {}, full-artefact {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%), ambiguous {} reads ({:.4}%) / {} N bases",
@@ -335,7 +373,7 @@ fn run(cfg: &cli::Config) -> Result<()> {
             n_drop,
             n_drop as f64 / cfg.pairs as f64 * 100.0,
             n_ambig_reads,
-            n_ambig_reads as f64 / (cfg.pairs as f64 * 2.0) * 100.0,
+            n_ambig_reads as f64 / mates as f64 * 100.0,
             n_ambig,
         );
     }
@@ -358,7 +396,17 @@ fn run(cfg: &cli::Config) -> Result<()> {
             "inputs": { "profile": cfg.profile },
             "outputs": {
                 "r1": format!("{}_R1.fastq{}", cfg.out, if cfg.gzip { ".gz" } else { "" }),
-                "r2": format!("{}_R2.fastq{}", cfg.out, if cfg.gzip { ".gz" } else { "" }),
+                // --single writes no R2: naming a file the run never created
+                // made the report disagree with the filesystem.
+                "r2": if cfg.single {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(format!(
+                        "{}_R2.fastq{}",
+                        cfg.out,
+                        if cfg.gzip { ".gz" } else { "" }
+                    ))
+                },
                 "gt": format!("{}.gt.tsv", cfg.out),
             },
             "elapsed_s": t0.elapsed().as_secs_f64(),
@@ -372,9 +420,10 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 "substitutions": substitutions,
                 "mean_q": mean_q,
                 "rng_draws": rng_draws,
-                "reads_in": 2 * cfg.pairs,
+                "reads_in": mates,
                 "pairs_simulated": cfg.pairs,
                 "read_len": profile.read_len,
+                "gc": gc,
                 "seed": cfg.seed,
                 "full_artefact_pairs": n_full,
                 "adapter_readthrough_pairs": n_adapter,
@@ -385,8 +434,11 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 "duplicate_rate_observed": n_dup as f64 / cfg.pairs as f64,
                 "must_drop_rate": n_drop as f64 / cfg.pairs as f64,
                 "ambiguous_bases": n_ambig,
+                // N filler from the no-adapter mode: not a no-call, so the GT's
+                // rN columns exclude it and it is published here instead.
+                "adapter_pad_bases": pad_total,
                 "reads_with_ambiguous": n_ambig_reads,
-                "reads_with_ambiguous_rate": n_ambig_reads as f64 / (cfg.pairs as f64 * 2.0)
+                "reads_with_ambiguous_rate": n_ambig_reads as f64 / mates as f64
             }
         });
         std::fs::write(path, serde_json::to_string_pretty(&report)? + "\n")

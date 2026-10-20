@@ -130,9 +130,14 @@ pub struct CornerExtractor {
 pub struct WorkerLocal {
     pub indices: Vec<(u16, u16, u16, u32)>,
     pub previews: Vec<PreviewRead>,
-    /// Per-pixel-per-kind preview cap — persists across spills.
-    /// Keyed by ((x, y), kind) so each kind gets its own preview_n quota.
-    pub preview_count: HashMap<((u16, u16), FileKind), u8>,
+    /// Per-`(pixel, kind, file)` preview cap — persists across spills.
+    /// Keyed by file as well as pixel and kind so the quota is the *first*
+    /// `preview_n` of every file, not of whichever file a worker happened to
+    /// meet first: the encode-time rule picks the first `preview_n` by
+    /// `(file_id, read_num)`, and a quota that merged files gave that rule a
+    /// different candidate set at `-j 1` than at `-j 3` (review 2026-10-21,
+    /// item 7). RAM stays bounded by the preview flush threshold.
+    pub preview_count: HashMap<((u16, u16), FileKind, u16), u8>,
     /// Per-`((x, y), file_id)` count of index records kept, for
     /// `DataMode::Capped` (FM-1). Persists across spills so the cap is a cap on
     /// the whole run, not per chunk. Empty in `Exact`/`Off` mode.
@@ -324,6 +329,25 @@ pub fn process_fastq(
             break;
         }
 
+        // A FASTQ record's qual string is exactly as long as its seq string.
+        // The preview wire format stores one length for both, so a record that
+        // breaks the invariant used to abort in the *decoder* (slice panic,
+        // exit 101) — or, with no previews kept, not at all. Validate here,
+        // where the file and the read number are still known (review
+        // 2026-10-21, item 3).
+        if seq.len() != qual.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "read {}: {} seq bases but {} quality bytes — a FASTQ record's \
+                     seq and qual must be the same length",
+                    read_num as u64 + 1,
+                    seq.len(),
+                    qual.len()
+                ),
+            ));
+        }
+
         let (cx, cy, n_acgt) = encode_read(&seq);
         let (sum_q, sum_len) = quality_sums(&qual);
 
@@ -374,11 +398,11 @@ pub fn process_fastq(
         // Index entry for heatmap.data (unless --data-mode says otherwise).
         state.push_index(xy, file_id, read_num, cfg.data_mode);
 
-        // Preview accumulation (cap per (pixel, kind), so R1/R2 each get
-        // their own preview_n quota — otherwise alphabetical file_id order
-        // could starve R2 entirely).
+        // Preview accumulation (cap per (pixel, kind, file), so R1/R2 each get
+        // their own preview_n quota and so does each file — the encode-time
+        // rule then sees every file's prefix, whatever -j is).
         if cfg.preview_n > 0 {
-            let pc = state.preview_count.entry((xy, kind)).or_insert(0);
+            let pc = state.preview_count.entry((xy, kind, file_id)).or_insert(0);
             if (*pc as usize) < cfg.preview_n {
                 *pc += 1;
                 let cost = header.len() + seq.len() + qual.len() + 64;
