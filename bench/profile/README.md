@@ -10,8 +10,12 @@ their own papers.
 **Reference machine: the desktop** (`cachyos-x8664`, 16 threads, 46 GB RAM, NVMe,
 build `ea4a744`). Benchmarks belong there. The laptop campaign (`cachyoss117`, AMD
 Ryzen 7 7730U, 16 threads, 15 GB) is kept as `*_laptop.csv` for the cross-machine
-comparison: the desktop is 1.1x faster on simulation, 1.4x on dedup, 1.6x on
-trimming, 1.2x on mapping and **2.9x on `fastcheck`** at 5 M pairs.
+comparison: the desktop is 1.1x faster on simulation, 1.3x on dedup, 1.5x on
+trimming, 1.1x on mapping and **2.4x on `fastcheck`** at 5 M pairs.
+
+`pipeline_5m_laptop.csv` is post-queue-fix (the dedup stage reads 28.4 s, not the
+32.1 s of the pre-fix run); `pipeline_1m_laptop.csv` predates the fix and is kept only
+for the historical 1 M comparison.
 
 ## What was measured
 
