@@ -251,6 +251,10 @@ fn run_sample(
                 std::fs::create_dir_all(dir)?;
             }
         }
+        // Step-private prefix for a fastsim step: the [simulate] control owns
+        // <outdir>/<name>/sim, and a step told to write there tripped the
+        // clobber guard on every run.
+        let sim_prefix = work.join("fastsim").join("sim");
         let argv = argv_for(
             tool,
             &cur1,
@@ -267,7 +271,7 @@ fn run_sample(
             } else {
                 None
             },
-            &outdir.join(&cfg.simulate.name).join("sim"),
+            &sim_prefix,
             config_dir,
             force,
         );
@@ -280,7 +284,19 @@ fn run_sample(
             "fastdedup" | "fastprep" => std::iter::once(out1.clone())
                 .chain(out2.clone())
                 .collect(),
-            // fastmaps/fastcheck/fastsim write only their JSON report.
+            // A generator step's FASTQs ARE its outputs: they are the next
+            // step's input, and a resume that skipped the step while they were
+            // gone (intermediate cleanup removes them) left the next tool with
+            // a missing file. The GT is its third artefact.
+            "fastsim" => {
+                let mut v = vec![out1.clone(), json_path.clone()];
+                if let Some(o2) = &out2 {
+                    v.push(o2.clone());
+                }
+                v.push(PathBuf::from(format!("{}.gt.tsv", sim_prefix.display())));
+                v
+            }
+            // fastmaps/fastcheck write only their JSON report.
             _ => vec![json_path.clone()],
         };
         // Re-running into the same outdir: every tool refuses to clobber an
@@ -353,7 +369,7 @@ fn run_sample(
                             "outputs": inputs_json(&prev.outputs),
                         }),
                     ));
-                    reports.push(json_path.clone());
+                    reports.push((sample.name.clone(), json_path.clone()));
                     // The chain continues from this step's output: the file
                     // the resumed step produced (same argv, same inputs) is
                     // still there — we only get here when it is.
@@ -389,6 +405,21 @@ fn run_sample(
             outcome.elapsed,
             outcome.log.display()
         );
+        // A step that exits 0 without writing the report it was told to write
+        // (--json) is a failure: otherwise the run reports success with a
+        // header-only table and no measurement behind it.
+        if !dry_run && outcome.exit == 0 {
+            if let Some(missing) = expect_outputs.iter().find(|p| !p.is_file()) {
+                eprintln!(
+                    "fasthelper: {} for {} exited 0 but did not write {} — treating the step as failed",
+                    tool,
+                    sample.name,
+                    missing.display()
+                );
+                failed.push(format!("{}/{}", sample.name, tool));
+                break;
+            }
+        }
         // What this step actually left on disk, recorded so the next run can
         // tell a completed step from a partial output of a failed one.
         let out_sig = output_signatures(&expect_outputs);
@@ -407,7 +438,7 @@ fn run_sample(
                 "outputs": inputs_json(&out_sig),
             }),
         ));
-        reports.push(json_path.clone());
+        reports.push((sample.name.clone(), json_path.clone()));
         if outcome.exit != 0 {
             eprintln!(
                 "fasthelper: {} failed for {} (exit {}) — see {}",
@@ -483,6 +514,24 @@ fn run_sample(
         failed,
         adapter_trips,
     })
+}
+
+/// A fastsim step's output file name under its step-private prefix.
+/// `-j 0` means "all cores" for the tools that document it, but fastprep
+/// requires an explicit count (`--threads must be >= 1`). Resolve the sentinel
+/// for the tools that refuse it instead of rewriting it for everyone.
+fn threads_for(tool: &str, requested: usize) -> usize {
+    if requested == 0 && tool == "fastprep" {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    } else {
+        requested
+    }
+}
+
+fn sim_file(mate: &str) -> String {
+    format!("sim_{mate}.fastq.gz")
 }
 
 fn run_step(
@@ -717,7 +766,7 @@ fn argv_for(
             a.push("--json".into());
             a.push(s(json));
             a.push("-j".into());
-            a.push(threads.to_string());
+            a.push(threads_for(tool, threads).to_string());
             a.push("--gz-level".into());
             a.push(gz.to_string());
         }
@@ -737,13 +786,15 @@ fn argv_for(
             a.push("--json".into());
             a.push(s(json));
             a.push("-j".into());
-            a.push(threads.to_string());
+            a.push(threads_for(tool, threads).to_string());
             a.push("--gz-level".into());
             a.push(gz.to_string());
         }
         "fastmaps" => {
             a.push("-o".into());
             a.push(s(maps_dir));
+            a.push("-j".into());
+            a.push(threads_for(tool, threads).to_string());
             a.push(s(in1));
             if let Some(r2) = in2 {
                 a.push(s(r2));
@@ -759,6 +810,8 @@ fn argv_for(
             }
             a.push("--json".into());
             a.push(s(json));
+            a.push("-j".into());
+            a.push(threads_for(tool, threads).to_string());
         }
         "fastsim" => {
             // simulate-only: the generated FASTQs are inputs, not outputs.
@@ -777,6 +830,8 @@ fn argv_for(
                     a.push("--seed".into());
                     a.push(seed.to_string());
                 }
+                a.push("-j".into());
+                a.push(threads_for(tool, threads).to_string());
                 a.extend(sim.args.iter().cloned());
             }
         }
@@ -812,6 +867,17 @@ pub fn run(args: &RunArgs) -> Result<()> {
             bail!(
                 "unknown step '{step}' — supported: {}",
                 KNOWN_STEPS.join(", ")
+            );
+        }
+    }
+    // --from names a step of THIS run. A typo used to fall through as "no
+    // --from", so the run resumed everything and exited 0 while the user
+    // believed a step had been re-executed.
+    if let Some(from) = &args.from {
+        if !cfg.run.steps.iter().any(|s| s == from) {
+            bail!(
+                "--from '{from}' is not a step of this run — steps: {}",
+                cfg.run.steps.join(", ")
             );
         }
     }
@@ -879,7 +945,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
 
     // Optional synthetic control: generate a known-truth sample and push it
     // through the same chain.
-    let mut sim_report: Option<PathBuf> = None;
+    let mut sim_report: Option<(String, PathBuf)> = None;
     if cfg.simulate.enabled {
         let bin = ts
             .sim
@@ -945,7 +1011,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 bail!("fastsim failed (see {})", log.display());
             }
         }
-        sim_report = Some(sim_json);
+        sim_report = Some((cfg.simulate.name.clone(), sim_json));
         samples.push(crate::config::Sample {
             name: cfg.simulate.name.clone(),
             r1: PathBuf::from(format!("{}_R1.fastq.gz", s(&prefix))),
@@ -962,7 +1028,13 @@ pub fn run(args: &RunArgs) -> Result<()> {
     // stays strict; only samples are concurrent. The merged manifest is
     // sorted by (sample index, step index) so it is byte-identical to the
     // sequential run's.
-    let per_sample_threads = (cfg.run.threads / args.jobs.max(1)).max(1);
+    let per_sample_threads = if cfg.run.threads == 0 {
+        // 0 is the "all cores" sentinel every tool understands; dividing it
+        // would silently turn it into 1.
+        0
+    } else {
+        (cfg.run.threads / args.jobs.max(1)).max(1)
+    };
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
         samples.iter().enumerate().collect::<Vec<_>>(),
     ));
@@ -970,7 +1042,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
         std::sync::Mutex::new(Vec::new());
     let failures: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let guard_trips: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let report_paths: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let report_paths: std::sync::Mutex<Vec<(String, PathBuf)>> = std::sync::Mutex::new(Vec::new());
 
     std::thread::scope(|scope| {
         for _ in 0..args.jobs.max(1) {
@@ -1089,11 +1161,16 @@ pub fn run(args: &RunArgs) -> Result<()> {
     // left behind, so a table could carry a measurement of a step that did not
     // run.
     let mut report_files = report_paths.into_inner().unwrap();
-    report_files.extend(sim_report);
-    report_files.sort();
-    report_files.dedup();
-    report_files.retain(|p| p.is_file());
-    let reports = report::collect(&report_files, None)?;
+    // When fastsim runs as a step it already reports that simulation; adding
+    // the control's report too would publish the same sample twice.
+    if !cfg.run.steps.iter().any(|s| s == "fastsim") {
+        report_files.extend(sim_report);
+    }
+    // Sort/dedupe on the path: the sample label must survive, and a step can
+    // legitimately be reached twice (a resumed step records its report again).
+    report_files.sort_by(|a, b| a.1.cmp(&b.1));
+    report_files.dedup_by(|a, b| a.1 == b.1);
+    let reports = report::collect_named(&report_files)?;
     let formats: Vec<String> = vec!["json".into(), "tsv".into(), "md".into(), "html".into()];
     let title = format!("FastSuite report — {}", cfg.run.name);
     let written = report::write_reports(&title, &reports, &outdir, &formats, None)?;
