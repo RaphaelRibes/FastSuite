@@ -1423,3 +1423,41 @@ fn dry_run_leaves_the_real_manifest_alone() {
         "--dry-run must not rewrite the previous run's manifest"
     );
 }
+
+#[test]
+fn concatenate_says_when_it_is_handed_an_aggregate() {
+    // `collect` recognises per-tool reports only, so an aggregate used to fail
+    // with "no recognisable reports found" — which denies that the file is a
+    // report at all. It is one, of a different kind, and the message must say
+    // so and name the input that can be merged.
+    let d = tmpdir("concat_aggregate");
+    let agg = d.join("report.json");
+    std::fs::write(
+        &agg,
+        r#"{"generator":"fasthelper","generator_version":"0.1.0","reports":[]}"#,
+    )
+    .unwrap();
+    let out = d.join("out");
+
+    let (stdout, stderr, code) = run(&[
+        "concatenate",
+        agg.to_str().unwrap(),
+        "--outdir",
+        out.to_str().unwrap(),
+        "--format",
+        "tsv",
+    ]);
+    assert_ne!(code, 0, "an aggregate cannot be concatenated: {stdout}{stderr}");
+    assert!(
+        stderr.contains("aggregate"),
+        "the refusal must identify the input as an aggregate, not as unrecognisable: {stderr}"
+    );
+    assert!(
+        stderr.contains("report.json"),
+        "it must name the offending file: {stderr}"
+    );
+    assert!(
+        !out.join("report.tsv").exists(),
+        "a refused concatenate must write nothing"
+    );
+}

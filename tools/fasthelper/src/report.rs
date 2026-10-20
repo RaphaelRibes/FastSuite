@@ -1179,9 +1179,41 @@ pub fn evaluate_thresholds(reports: &[ToolReport], thresholds: &[Threshold]) -> 
     out
 }
 
+/// True when `path` is the aggregate `run` writes: `generator` names
+/// fasthelper and the payload is a `reports` array of per-tool entries.
+///
+/// `collect` only recognises per-tool reports, so feeding it an aggregate used
+/// to produce "no recognisable reports found" — a message that denies the file
+/// is a report at all, when it is one, of a different kind.
+fn is_aggregate(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    v["generator"] == "fasthelper" && v["reports"].is_array()
+}
+
 pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
     let reports = collect(&a.inputs, a.sample.as_deref())?;
     if reports.is_empty() {
+        let aggregates: Vec<String> = a
+            .inputs
+            .iter()
+            .filter(|p| p.is_file() && is_aggregate(p))
+            .map(|p| p.display().to_string())
+            .collect();
+        if !aggregates.is_empty() {
+            anyhow::bail!(
+                "{} is a fasthelper aggregate (\"generator\": \"fasthelper\", a \"reports\" array), \
+                 not a per-tool report: concatenate merges per-tool reports such as \
+                 <sample>/fastprep.json. To combine aggregates, pass the report paths each one \
+                 lists in its manifest (or run the tools into a single --outdir and let `run` \
+                 aggregate them).",
+                aggregates.join(", ")
+            );
+        }
         anyhow::bail!(
             "no recognisable reports found in {}",
             a.inputs

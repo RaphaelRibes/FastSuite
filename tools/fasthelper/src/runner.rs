@@ -275,8 +275,19 @@ fn run_sample(
             stale.push(json_path.clone());
         }
         if tool == "fastmaps" {
-            for f in ["heatmap.json", "heatmap.png", "heatmap.data", "heatmap_3d.html"] {
-                stale.push(maps_dir.join(f));
+            // The maps dir is this step's own output directory, so everything in
+            // it is stale by construction. An explicit filename list is what
+            // broke the second run of the documented chain: fastmaps grew a
+            // clobber guard for heatmap.preview (and --svg, --corners, the v1
+            // wrapper), the list did not, so the guard found a file the cleanup
+            // had left behind and refused with exit 1.
+            if let Ok(dir) = std::fs::read_dir(maps_dir) {
+                for entry in dir.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        stale.push(p);
+                    }
+                }
             }
         }
         // Resume: skip this step only when a previous manifest recorded a
