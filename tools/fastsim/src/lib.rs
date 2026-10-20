@@ -7,7 +7,9 @@
 pub mod artefact;
 pub mod biology;
 pub mod fastq;
+pub mod fmtint;
 pub mod profile;
 pub mod quality;
 pub mod randutil;
+pub mod stats;
 pub mod truth;

@@ -5,8 +5,8 @@
 //! fastsim --pairs N --profile profiles/mandril_E.json -o prefix \
 //!   [--seed S] [--read-len 150] [--insert-mean 300 --insert-sd 50] \
 //!   [--gc 0.49] [--reference ref.fa] [--adapter-seq SEQ] [--no-adapter] \
-//!   [--no-gzip] [--insert-min M] [--dup-rate 0.02] \
-//!   [--drop-rate 0.05 --drop-min-len 100] [--json report.json]
+//!   [--no-gzip] [--gz-level 6] [--insert-min M] [--dup-rate 0.02] \
+//!   [--drop-rate 0.05 --drop-min-len 100] [--json report.json] [--stats]
 //! ```
 //!
 //! `-o/--out` is the canonical output flag (a prefix for a simulator, not a
@@ -92,6 +92,32 @@ pub struct Cli {
     #[arg(long)]
     pub no_gzip: bool,
 
+    /// DEFLATE level for the gzip outputs, 1..=9 (default 6: today's bytes).
+    ///
+    /// The level changes ONLY the encoding — the decompressed FASTQ is
+    /// identical at every level. Deflate is ~75% of fastsim's wall time at
+    /// level 6, and this tool's own backend (flate2/miniz_oxide) writes
+    /// 38.75 MB per 200 000 pairs at level 6 and 52.63 MB at level 1 (+35.8%);
+    /// the review's system-`gzip` proxy measured +17.9%, so size a campaign
+    /// with the larger figure. End to end: 200 000 pairs go from ~14.8 s to
+    /// ~2.3 s at level 1 (~6x), ~12 MB/s of packed input at 6 versus ~200 at 1.
+    /// 4 is the balanced choice; 6 stays the default so existing campaigns
+    /// keep their exact bytes.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        default_value_t = fastsim::fastq::DEFAULT_GZ_LEVEL,
+        value_parser = clap::value_parser!(u32)
+            .range(fastsim::fastq::MIN_GZ_LEVEL as i64..=fastsim::fastq::MAX_GZ_LEVEL as i64)
+    )]
+    pub gz_level: u32,
+
+    /// Report instrument counters in the --json report: RNG words drawn,
+    /// substitutions, mean Q and gzip bytes (FS-11). Counting is a no-op when
+    /// this is absent, and it never changes the emitted bytes.
+    #[arg(long)]
+    pub stats: bool,
+
     /// PCR duplicate fraction (default 0.02; mandril measures 1-4%). Only the
     /// fallback: a profile carrying a measured dup_rate overrides it. A
     /// duplicate replays a previously emitted pair byte-for-byte.
@@ -151,6 +177,8 @@ pub struct Config {
     pub reference: Option<String>,
     pub adapter_seq: Option<String>,
     pub gzip: bool,
+    pub gz_level: u32,
+    pub stats: bool,
     pub dup_rate: f64,
     pub dup_pool: u32,
     pub drop_rate: f64,
@@ -181,6 +209,8 @@ impl From<Cli> for Config {
                 cli.adapter_seq
             },
             gzip: !cli.no_gzip,
+            gz_level: cli.gz_level,
+            stats: cli.stats,
             dup_rate: cli.dup_rate,
             dup_pool: cli.dup_pool,
             drop_rate: cli.drop_rate,
@@ -220,6 +250,16 @@ impl Config {
         }
         if self.drop_min_len == 0 {
             bail!("--drop-min-len must be >= 1");
+        }
+        // clap rejects an out-of-range --gz-level; this catches a Config built
+        // programmatically (the tests do) so the encoder can never be handed a
+        // level the DEFLATE backend would clamp silently.
+        if !(fastsim::fastq::MIN_GZ_LEVEL..=fastsim::fastq::MAX_GZ_LEVEL).contains(&self.gz_level) {
+            bail!(
+                "--gz-level must be in {}..={}",
+                fastsim::fastq::MIN_GZ_LEVEL,
+                fastsim::fastq::MAX_GZ_LEVEL
+            );
         }
         if let (Some(m), Some(l)) = (self.insert_min, self.read_len) {
             if m > l {

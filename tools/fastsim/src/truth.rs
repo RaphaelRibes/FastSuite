@@ -37,11 +37,15 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::artefact::Artefact;
+use crate::fmtint::push_u64;
 
 pub struct GtWriter<W: Write> {
     out: W,
     read_len: u32,
     single: bool,
+    /// Reused row buffer: one `write_all` per pair, no `fmt::Display` dispatch
+    /// for the twelve integer fields (FS-10).
+    row: Vec<u8>,
 }
 
 impl GtWriter<BufWriter<std::fs::File>> {
@@ -60,6 +64,7 @@ impl GtWriter<BufWriter<std::fs::File>> {
             out: BufWriter::new(f),
             read_len,
             single,
+            row: Vec::with_capacity(96),
         };
         w.out.write_all(if single {
             b"pair_id\tinsert\tr1_h\tr1_t\tr1_adapter\tfull_flag\tis_dup\tr1_n\n"
@@ -86,32 +91,76 @@ impl<W: Write> GtWriter<W> {
         n1: u32,
         n2: u32,
     ) -> Result<()> {
+        Self::row_into(
+            &mut self.row,
+            self.read_len,
+            self.single,
+            pair_idx,
+            insert_len,
+            a,
+            is_dup,
+            n1,
+            n2,
+        );
+        self.out.write_all(&self.row)?;
+        Ok(())
+    }
+
+    /// Append one GT row (with its trailing newline) into `buf`.
+    ///
+    /// The twelve fields are integers, so they are appended directly —
+    /// `writeln!` routed each one through `fmt::Display`, which is ~14
+    /// formatter dispatches per pair for 6.1 MB per 200 000-pair unit of
+    /// output. The bytes are identical to the `writeln!` form: same order,
+    /// same tabs, same clamping to `read_len`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn row_into(
+        buf: &mut Vec<u8>,
+        read_len: u32,
+        single: bool,
+        pair_idx: u64,
+        insert_len: u32,
+        a: &Artefact,
+        is_dup: bool,
+        n1: u32,
+        n2: u32,
+    ) {
         // Clamp artefact lengths to read_len for display (full pairs may
         // have t = L).
-        let l = self.read_len;
+        let l = read_len;
         let full = u8::from(a.full);
         let dup = u8::from(is_dup);
-        if self.single {
-                    writeln!(
-                        self.out,
-                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}",
-                        a.h1.min(l),
-                        a.t1.min(l),
-                        a.a1.min(l)
-                    )?;
-                } else {
-                    writeln!(
-                        self.out,
-                        "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}\t{n2}",
-                        a.h1.min(l),
-                        a.t1.min(l),
-                        a.h2.min(l),
-                        a.t2.min(l),
-                        a.a1.min(l),
-                        a.a2.min(l)
-                    )?;
-                }
-        Ok(())
+        buf.clear();
+        push_u64(buf, pair_idx);
+        buf.push(b'\t');
+        push_u64(buf, insert_len as u64);
+        buf.push(b'\t');
+        push_u64(buf, a.h1.min(l) as u64);
+        buf.push(b'\t');
+        push_u64(buf, a.t1.min(l) as u64);
+        buf.push(b'\t');
+        if single {
+            push_u64(buf, a.a1.min(l) as u64);
+        } else {
+            push_u64(buf, a.h2.min(l) as u64);
+            buf.push(b'\t');
+            push_u64(buf, a.t2.min(l) as u64);
+            buf.push(b'\t');
+            push_u64(buf, a.a1.min(l) as u64);
+            buf.push(b'\t');
+            push_u64(buf, a.a2.min(l) as u64);
+        }
+        buf.push(b'\t');
+        push_u64(buf, full as u64);
+        buf.push(b'\t');
+        push_u64(buf, dup as u64);
+        buf.push(b'\t');
+        push_u64(buf, n1 as u64);
+        if !single {
+            buf.push(b'\t');
+            push_u64(buf, n2 as u64);
+        }
+        buf.push(b'\n');
     }
 
     pub fn finish(mut self) -> Result<()> {
@@ -172,6 +221,42 @@ mod tests {
             s.lines().nth(1).unwrap(),
             "0\t300\t0\t150\t0\t150\t0\t0\t1\t0\t0\t0"
         );
+    }
+
+    /// FS-10: the appended row must be byte-identical to what `writeln!` with
+    /// twelve `Display` arguments produced, including the `min(read_len)`
+    /// clamping and both column layouts.
+    #[test]
+    fn row_append_matches_the_format_macro() {
+        let l = 150u32;
+        let cases: Vec<(u64, u32, Artefact, bool, u32, u32)> = vec![
+            (0, 300, artefact(2, 5, 0, 3, false), false, 3, 0),
+            (7, 120, artefact(0, 0, 0, 0, true), true, 0, 0),
+            (9_999, 20, artefact(150, 150, 149, 3, false), false, 0, 12),
+            (123_456, 288, artefact(200, 151, 0, 64, true), true, 41, 41),
+            (u64::MAX, 1_000_000, artefact(0, 150, 0, 150, false), false, 41, 42),
+        ];
+        for (pair_idx, insert_len, a, is_dup, n1, n2) in cases {
+            let full = u8::from(a.full);
+            let dup = u8::from(is_dup);
+            let want = format!(
+                "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}\t{n2}\n",
+                a.h1.min(l), a.t1.min(l), a.h2.min(l), a.t2.min(l), a.a1.min(l), a.a2.min(l)
+            );
+            let mut buf = Vec::new();
+            GtWriter::<Vec<u8>>::row_into(
+                &mut buf, l, false, pair_idx, insert_len, &a, is_dup, n1, n2,
+            );
+            assert_eq!(String::from_utf8(buf).unwrap(), want, "paired row {pair_idx}");
+
+            let want_single = format!(
+                "{pair_idx}\t{insert_len}\t{}\t{}\t{}\t{full}\t{dup}\t{n1}\n",
+                a.h1.min(l), a.t1.min(l), a.a1.min(l)
+            );
+            let mut buf = Vec::new();
+            GtWriter::<Vec<u8>>::row_into(&mut buf, l, true, pair_idx, insert_len, &a, is_dup, n1, n2);
+            assert_eq!(String::from_utf8(buf).unwrap(), want_single, "single row {pair_idx}");
+        }
     }
 
     #[test]

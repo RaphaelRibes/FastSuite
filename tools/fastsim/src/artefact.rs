@@ -40,6 +40,14 @@ pub struct Artefact {
 /// exact sequence fingerprint requires in order to count it, and what a real
 /// optical duplicate is (same tile, same cycle: shared artefact, shared errors).
 ///
+/// The entry deliberately carries NO insert bytes. It used to store a copy of
+/// the insert `Vec` that the replay path never read (`main` needs `artefact`,
+/// `r1`, `r2` and `insert_len` only), and the pool is the run's entire memory
+/// footprint: at the default `--dup-pool 131072` that dead field was ~39 MB of
+/// a ~139 MB peak RSS. Removing it costs nothing and takes peak RSS to
+/// ~100 MB. Regenerating the source pair instead of caching its bytes (the
+/// rest of FS-3) needs per-pair seeding and is a separate change.
+///
 /// Before this existed a duplicate re-sequenced the stored insert with a freshly
 /// drawn artefact and freshly drawn substitution errors, so a copy differed from
 /// its original on ~56.5% of reads (per-base error 0.0055 over 150 bp leaves a
@@ -48,7 +56,6 @@ pub struct Artefact {
 /// (measured: pool 1024 -> 0.322, pool 1e6 -> 0.346).
 #[derive(Debug, Clone)]
 pub struct PooledPair {
-    pub insert: Vec<u8>,
     pub insert_len: u32,
     /// The artefact the original drew, carried across so the copy's runs match.
     pub artefact: Artefact,
@@ -576,7 +583,6 @@ mod tests {
         let read = build_read(&p, &insert, 120, Mate::R1, &a, &mut rng);
         let m1 = qualify(&p, Mate::R1, &read, &mut rng);
         let pushed = PooledPair {
-            insert: insert.clone(),
             insert_len: 120,
             artefact: a,
             r1: m1,
@@ -593,7 +599,6 @@ mod tests {
 
         // The sampled pair IS the pushed pair, byte for byte: nothing is
         // regenerated on replay.
-        assert_eq!(sampled.insert, pushed.insert);
         assert_eq!(sampled.insert_len, pushed.insert_len);
         assert_eq!(sampled.r1.seq, pushed.r1.seq, "replayed sequence must be the stored bytes");
         assert_eq!(sampled.r1.qual, pushed.r1.qual, "replayed quality must be the stored bytes");

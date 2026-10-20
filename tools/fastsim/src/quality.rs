@@ -19,14 +19,124 @@
 //! Full-length (entirely artefact) reads use a flat `full_length_q`, no
 //! position curve.
 
+use std::sync::OnceLock;
+
 use rand::Rng;
+use rand_distr::{Distribution, Normal};
 
 use crate::artefact::Read;
 use crate::profile::{Mate, Profile};
-use crate::randutil::{sample_cdf, sample_gauss};
+use crate::randutil::sample_cdf;
 
 const MAX_Q: u8 = 41;
 const MAX_Q_F: f64 = MAX_Q as f64;
+
+/// `p_err[q] = 10^(−q/10)`, the substitution probability of a Phred score.
+///
+/// Built once: `apply_errors` raised `10f64.powf` per base — 300 `powf` calls
+/// per pair for a 42-entry table (FS-4). The values are the *same* floats the
+/// `powf` produced (same expression, computed once), so the draw comparison
+/// `u < p` cannot move.
+fn p_err_table() -> &'static [f64; 42] {
+    static TABLE: OnceLock<[f64; 42]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [0f64; 42];
+        for (q, v) in t.iter_mut().enumerate() {
+            *v = 10f64.powf(-(q as f64) / 10.0);
+        }
+        t
+    })
+}
+
+/// Substitution probability for one Phred score, read out of `t`; falls back to
+/// `powf` only for a score the table does not cover (impossible from `qualify`,
+/// whose values are clamped to [`MAX_Q`], but `10^(−q/10)` is total).
+#[inline]
+fn p_err_in(t: &[f64; 42], q: u8) -> f64 {
+    if (q as usize) < t.len() {
+        t[q as usize]
+    } else {
+        10f64.powf(-(q as f64) / 10.0)
+    }
+}
+
+/// [`p_err_in`] against the shared table — the entry point the tests compare
+/// with `powf`.
+#[allow(dead_code)] // test-facing; the hot loop indexes the table directly
+fn p_err(q: u8) -> f64 {
+    p_err_in(p_err_table(), q)
+}
+
+// ---------------------------------------------------------------------------
+// Memoised per-base constants (FS-4)
+// ---------------------------------------------------------------------------
+
+/// Slots in the cap-loss memo. A qualifying read's pre-noise quality takes at
+/// most `read_len + 2` distinct values (one per position plus the flat
+/// head/tail means), and the per-read offset is drawn from a handful of bins,
+/// so a few hundred distinct floats cover a whole run: 256 slots hold every
+/// one of them with no thrashing.
+const CAP_SLOTS: usize = 256;
+
+/// Reusable memo for the per-base deterministic terms of `qualify`.
+///
+/// `cap_loss(q, sd)` costs one `exp` plus one `erf`, and `sd` is constant per
+/// profile, so the same `q` always yields the same float. Keying on the exact
+/// bit pattern of `q` (not on a rounded or bucketed value) makes the cache
+/// *bit-identical* to recomputation: a hit returns the value computed from the
+/// identical input, and a miss recomputes it.
+///
+/// This is the same set of values a `(profile, mate, offset, head, tail)` table
+/// would enumerate, without that key's coverage risk: if a read produces a
+/// `q` the cache has never seen, it is simply computed once and stored.
+///
+/// Own one per run (`main`), or let [`qualify`] create a throwaway one per read.
+pub struct QCache {
+    keys: [u64; CAP_SLOTS],
+    sds: [u64; CAP_SLOTS],
+    vals: [f64; CAP_SLOTS],
+    substitutions: u64,
+}
+
+impl QCache {
+    pub fn new() -> Self {
+        QCache {
+            // u64::MAX is a NaN bit pattern, so it can never equal a real q.
+            keys: [u64::MAX; CAP_SLOTS],
+            sds: [0; CAP_SLOTS],
+            vals: [0.0; CAP_SLOTS],
+            substitutions: 0,
+        }
+    }
+
+    /// Substitution errors emitted through this cache (the `--json`
+    /// `substitutions` counter, FS-11).
+    pub fn substitutions(&self) -> u64 {
+        self.substitutions
+    }
+}
+
+impl Default for QCache {
+    fn default() -> Self {
+        QCache::new()
+    }
+}
+
+/// `cap_loss(q, sd)`, memoised on the exact bits of `q` and `sd`.
+#[inline]
+fn cap_loss_cached(cache: &mut QCache, q: f64, sd: f64) -> f64 {
+    let key = q.to_bits();
+    let sd_key = sd.to_bits();
+    let idx = (key as usize ^ (key >> 29) as usize) & (CAP_SLOTS - 1);
+    if cache.keys[idx] == key && cache.sds[idx] == sd_key {
+        return cache.vals[idx];
+    }
+    let v = cap_loss(q, sd);
+    cache.keys[idx] = key;
+    cache.sds[idx] = sd_key;
+    cache.vals[idx] = v;
+    v
+}
 
 /// Expected Phred lost to the hard cap at 41 when emitting q + z (z ~ N(0,sd)).
 /// E[(q + z - 41)+] = sd·(φ(a) − a·Φ(−a)), a = (41−q)/sd.
@@ -60,7 +170,30 @@ pub struct MateRead {
 }
 
 /// Assign quality + errors to one read.
+///
+/// Convenience wrapper for callers that do not keep a [`QCache`] (tests, one-off
+/// reads): it allocates a throwaway one, which is correct but recomputes the
+/// memoised constants on every call. A simulation run should own a cache and
+/// call [`qualify_cached`].
 pub fn qualify<R: Rng + ?Sized>(p: &Profile, mate: Mate, read: &Read, rng: &mut R) -> MateRead {
+    let mut cache = QCache::new();
+    qualify_cached(p, &mut cache, mate, read, rng)
+}
+
+/// Assign quality + errors to one read, reusing `cache` for the per-base
+/// deterministic terms (FS-4).
+///
+/// The floats are the ones the per-base transcendental calls produced: the
+/// memo keys on exact bit patterns, the Gaussian is the same
+/// `N(0, sd)` distribution, and the draws happen in the same order, so this is
+/// byte-identical to the pre-cache implementation.
+pub fn qualify_cached<R: Rng + ?Sized>(
+    p: &Profile,
+    cache: &mut QCache,
+    mate: Mate,
+    read: &Read,
+    rng: &mut R,
+) -> MateRead {
     let l = read.seq.len();
     let mut qual = vec![0u8; l];
 
@@ -68,7 +201,8 @@ pub fn qualify<R: Rng + ?Sized>(p: &Profile, mate: Mate, read: &Read, rng: &mut 
         // Entirely artefact: flat quality, errors at that quality.
         let q = p.full_length_q[Profile::mate_idx(mate)];
         qual.iter_mut().for_each(|v| *v = q);
-        let seq = apply_errors(&read.seq, &qual, rng);
+        let (seq, subs) = apply_errors_counted(&read.seq, &qual, rng);
+        cache.substitutions += subs;
         return MateRead { seq, qual };
     }
 
@@ -96,6 +230,14 @@ pub fn qualify<R: Rng + ?Sized>(p: &Profile, mate: Mate, read: &Read, rng: &mut 
     let pos_q = p.pos_q(mate);
     let h = read.h as usize;
     let tail_start = l - read.t as usize;
+    let sd = p.qual_noise;
+    // The distribution is fixed for the whole read (mean 0, sd = qual_noise),
+    // so build it once instead of constructing one per base.
+    let normal = if sd > 0.0 {
+        Some(Normal::new(0.0, sd).expect("valid gaussian params"))
+    } else {
+        None
+    };
     for i in 0..l {
         let q = if i < h {
             // first head base is normal; deeper ones collapse
@@ -114,17 +256,17 @@ pub fn qualify<R: Rng + ?Sized>(p: &Profile, mate: Mate, read: &Read, rng: &mut 
         // E[round(q+z)] == q, BUT the hard cap at 41 truncates the noise for
         // high-quality bases (E[min(41, q+z)] < q). Compensate: emit q + the
         // expected cap loss, so E[round(clamp(q+loss+z, 41))] == q.
-        let sd = p.qual_noise;
         let mut v = q;
-        if sd > 0.0 {
-            let z = sample_gauss(0.0, sd, -20.0, 20.0, rng);
-            v += cap_loss(q, sd) + z;
+        if let Some(n) = &normal {
+            let z = n.sample(rng).clamp(-20.0, 20.0);
+            v += cap_loss_cached(cache, q, sd) + z;
         }
         qual[i] = v.round().clamp(0.0, MAX_Q_F) as u8;
     }
 
     // 5. Substitutions.
-    let mut seq = apply_errors(&read.seq, &qual, rng);
+    let (mut seq, subs) = apply_errors_counted(&read.seq, &qual, rng);
+    cache.substitutions += subs;
     // 6. Ambiguous bases: the instrument's no-call / padding overlay.
     inject_ambiguous(p, read, &mut seq, rng);
     MateRead { seq, qual }
@@ -179,24 +321,42 @@ fn inject_ambiguous<R: Rng + ?Sized>(p: &Profile, read: &Read, seq: &mut [u8], r
 
 /// Apply per-base substitution errors at probability 10^(−q/10).
 /// N bases are left untouched (no base to substitute to — keep N).
+///
+/// The probability comes from the 42-entry table (FS-4) — the same float a
+/// per-base `powf` produced — and every emitted error is tallied for the
+/// `--json` `substitutions` counter (FS-11). The draw order is unchanged:
+/// Q0 draws no uniform (it always substitutes), every other base draws one
+/// before deciding.
+#[allow(dead_code)] // convenience for tests; the run path uses the counted form
 fn apply_errors<R: Rng + ?Sized>(seq: &[u8], qual: &[u8], rng: &mut R) -> Vec<u8> {
+    apply_errors_counted(seq, qual, rng).0
+}
+
+/// [`apply_errors`], also returning the number of bases it substituted — the
+/// per-run `substitutions` counter (FS-11).
+fn apply_errors_counted<R: Rng + ?Sized>(seq: &[u8], qual: &[u8], rng: &mut R) -> (Vec<u8>, u64) {
     let mut out = seq.to_vec();
+    let mut subs = 0u64;
+    // One table fetch for the whole read: 300 lookups, one initialization check.
+    let tbl = p_err_table();
     for i in 0..seq.len() {
         let q = qual[i];
         if q == 0 {
             // Q0: error probability 1 — always substitute.
             if seq[i] != b'N' {
                 out[i] = substitute(seq[i], rng);
+                subs += 1;
             }
             continue;
         }
-        let p = 10f64.powf(-(q as f64) / 10.0);
+        let p = p_err_in(tbl, q);
         let u: f64 = rng.gen();
         if u < p && seq[i] != b'N' {
             out[i] = substitute(seq[i], rng);
+            subs += 1;
         }
     }
-    out
+    (out, subs)
 }
 
 /// Substitute to a random one of the three other bases.
@@ -571,6 +731,122 @@ mod tests {
         };
         let mr = qualify(&p, Mate::R1, &r, &mut rng);
         assert!(mr.qual.iter().all(|&q| q == 20));
+    }
+
+    /// A profile with real per-base noise and a sloping position curve, so the
+    /// cached path actually meets many distinct `q` values and a non-zero
+    /// `cap_loss`.
+    fn noisy_profile(sd: f64) -> Profile {
+        let q = (0..150)
+            .map(|i| format!("{:.3}", 30.0 + (i % 9) as f64 * 0.37))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+            "read_len": 150, "gc": 0.5, "geometry": "tail3p_both",
+            "qual_noise": {sd},
+            "head": {{"R1": {{"0": 80, "3": 20}}, "R2": {{"0": 100}}}},
+            "tail": {{"R1": {{"0": 60, "5": 30, "12": 10}}, "R2": {{"0": 60, "5": 30, "12": 10}}}},
+            "joint_tail": {{"0,0": 60, "5,5": 30, "12,12": 10}},
+            "tail_q_collapse": {{"R1": 10.0, "R2": 2.0}},
+            "pos_q": {{"R1": [{q}], "R2": [{q}]}},
+            "pos_q_uncond": {{"R1": [{q}], "R2": [{q}]}},
+            "run_q_mean": {{
+                "R1": {{"head": 24.0, "tail": 18.0}},
+                "R2": {{"head": 28.0, "tail": 22.0}}
+            }},
+            "read_meanq": {{"R1": {{"30": 40, "36": 40, "40": 20}}, "R2": {{"30": 50, "38": 50}}}},
+            "full_length_rate": 0.0,
+            "full_length_q": {{"R1": 20, "R2": 20}},
+            "adapter": {{"seq": "CTGTCTCTTATACACATCT", "mode": "none"}}
+        }}"#,
+            sd = sd,
+            q = q
+        );
+        Profile::from_raw(serde_json::from_str::<RawProfile>(&json).unwrap()).unwrap()
+    }
+
+    /// FS-4: the `powf` table must be the transcendental it replaces, bit for
+    /// bit — a 1-ulp change could flip a `u < p` comparison.
+    #[test]
+    fn p_err_table_matches_powf_bit_for_bit() {
+        for q in 0u8..=41 {
+            let want = 10f64.powf(-(q as f64) / 10.0);
+            assert_eq!(p_err(q).to_bits(), want.to_bits(), "q {q}");
+        }
+    }
+
+    /// FS-4: the cap-loss memo returns the recomputed value exactly, for the
+    /// q values a read actually produces and for the sd of a real profile.
+    #[test]
+    fn cap_loss_memo_matches_recomputation() {
+        let mut cache = QCache::new();
+        for sd in [0.9f64, 1.7, 3.3] {
+            for q in [
+                0.0, 3.5, 20.25, 30.0, 38.689, 41.0, 41.5, 43.75, 46.9, -2.5,
+            ] {
+                let got = cap_loss_cached(&mut cache, q, sd);
+                let want = cap_loss(q, sd);
+                assert_eq!(got.to_bits(), want.to_bits(), "q {q} sd {sd}");
+                // A hit (the same q/sd again) must return the same bits.
+                assert_eq!(
+                    cap_loss_cached(&mut cache, q, sd).to_bits(),
+                    want.to_bits(),
+                    "cached q {q}"
+                );
+            }
+        }
+    }
+
+    /// FS-4 acceptance: a warm cache over 1000 pairs must reproduce the
+    /// recomputed values exactly — same sequence, same qualities, same length.
+    /// A cache that keyed on a rounded q, or that missed a term of the vector,
+    /// would move one of the two.
+    #[test]
+    fn cached_qualify_matches_recomputation_over_1000_pairs() {
+        let p = noisy_profile(1.7);
+        let mut warm = QCache::new();
+        let mut rng_a = ChaCha8Rng::seed_from_u64(4242);
+        let mut rng_b = ChaCha8Rng::seed_from_u64(4242);
+        let mut distinct_q = std::collections::BTreeSet::new();
+        for i in 0..1000u32 {
+            let h = i % 4;
+            let t = i % 13;
+            let r = Read {
+                seq: (0..150).map(|j| b"ACGT"[(i as usize + j) % 4]).collect(),
+                h,
+                t,
+                bio_len: 150 - h - t,
+                adapter_len: 0,
+                full: false,
+            };
+            // Warm: one cache for the whole run. Cold: `qualify` builds a
+            // throwaway cache per read, so every constant is recomputed.
+            let warm_mr = qualify_cached(&p, &mut warm, Mate::R1, &r, &mut rng_a);
+            let cold_mr = qualify(&p, Mate::R1, &r, &mut rng_b);
+            assert_eq!(warm_mr.seq, cold_mr.seq, "pair {i} sequence");
+            assert_eq!(warm_mr.qual, cold_mr.qual, "pair {i} quality");
+            distinct_q.extend(cold_mr.qual.iter().copied());
+        }
+        // The corpus really did exercise a wide range of qualities, so the
+        // equality above is not a degenerate all-equal case.
+        assert!(distinct_q.len() > 20, "only {} distinct Q", distinct_q.len());
+        assert_eq!(distinct_q.iter().max().unwrap(), &41, "cap reached");
+        assert!(warm.substitutions() > 0, "no substitution seen in 300k bases");
+    }
+
+    /// FS-4: the substitution probability moved to a table, so its draw
+    /// behaviour must not: Q30 over 1e6 bases still gives ~0.1 %.
+    #[test]
+    fn substitution_rate_matches_q30_via_the_table() {
+        let seq = vec![b'A'; 1_000_000];
+        let qual = vec![30u8; 1_000_000];
+        let mut rng = rng();
+        let (out, subs) = apply_errors_counted(&seq, &qual, &mut rng);
+        let mismatches = out.iter().zip(seq.iter()).filter(|(a, b)| a != b).count() as u64;
+        assert_eq!(subs, mismatches, "the counter must match the emitted errors");
+        let rate = subs as f64 / seq.len() as f64;
+        assert!((rate - 0.001).abs() < 0.0002, "substitution rate {rate}");
     }
 
     #[test]

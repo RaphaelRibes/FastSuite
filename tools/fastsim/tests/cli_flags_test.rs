@@ -142,4 +142,139 @@ fn version_and_help_exit_zero() {
         assert!(s.contains("--pairs") && s.contains("--force") && s.contains("--quiet"),
                 "help missing a canonical flag: {s}");
     }
+    // The compression level is a first-class flag, not a hidden constant.
+    let help = Command::new(bin()).arg("--help").output().unwrap();
+    let s = String::from_utf8_lossy(&help.stdout);
+    assert!(s.contains("--gz-level"), "help must document --gz-level: {s}");
+}
+
+/// FS-1: `--gz-level` defaults to 6 (today's bytes), is threaded to both FASTQ
+/// writers, and is recorded in the `--json` report.
+#[test]
+fn gz_level_defaults_to_six_and_is_reported() {
+    let dir = std::env::temp_dir().join(format!("fastsim_gzlvl_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_test_profile(&dir);
+
+    let run = |out: &Path, extra: &[&str]| -> serde_json::Value {
+        let rep = dir.join(format!("{}.json", out.display()));
+        let mut args = vec![
+            "--pairs".to_string(),
+            "200".to_string(),
+            "--profile".to_string(),
+            profile.to_str().unwrap().to_string(),
+            "--out".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--json".to_string(),
+            rep.to_str().unwrap().to_string(),
+            "--force".to_string(),
+            "--quiet".to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let res = Command::new(bin()).args(&args).output().unwrap();
+        assert!(res.status.success(), "run {extra:?}: {}", String::from_utf8_lossy(&res.stderr));
+        serde_json::from_slice(&std::fs::read(&rep).unwrap()).unwrap()
+    };
+
+    let dflt = run(&dir.join("dflt"), &[]);
+    assert_eq!(dflt["metrics"]["gz_level"], 6, "default level must be 6");
+
+    let one = run(&dir.join("one"), &["--gz-level", "1"]);
+    assert_eq!(one["metrics"]["gz_level"], 1, "--gz-level must reach the report");
+
+    // The smaller level is the larger file: the documented trade is real.
+    let size = |prefix: &Path| {
+        std::fs::metadata(format!("{}_R1.fastq.gz", prefix.display()))
+            .unwrap()
+            .len()
+    };
+    assert!(
+        size(&dir.join("one")) > size(&dir.join("dflt")),
+        "level 1 must trade size for speed"
+    );
+
+    let plain = run(&dir.join("plain"), &["--no-gzip"]);
+    assert_eq!(plain["metrics"]["gz_bytes"], 0, "no gzip -> no gzip bytes");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// FS-1: a level outside 1..=9 is refused at parse time, not silently clamped.
+#[test]
+fn gz_level_out_of_range_is_rejected() {
+    let dir = std::env::temp_dir().join(format!("fastsim_gzlvl_bad_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_test_profile(&dir);
+    for bad in ["0", "10"] {
+        let out = dir.join(format!("bad{bad}"));
+        let res = Command::new(bin())
+            .args([
+                "--pairs", "10", "--profile", profile.to_str().unwrap(),
+                "--out", out.to_str().unwrap(), "--gz-level", bad,
+            ])
+            .output()
+            .unwrap();
+        assert!(!res.status.success(), "--gz-level {bad} must be rejected");
+        let err = String::from_utf8_lossy(&res.stderr);
+        assert!(err.contains("gz-level"), "error must name the flag: {err}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// FS-11: the instrument counters (gz_bytes, substitutions, mean_q, rng_draws)
+/// are reported, and enabling the draw counter must not move a single byte.
+#[test]
+fn instrument_counters_are_reported_and_stream_neutral() {
+    let dir = std::env::temp_dir().join(format!("fastsim_stats_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_test_profile(&dir);
+
+    let run = |out: &Path, extra: &[&str]| -> serde_json::Value {
+        let rep = dir.join(format!("{}.json", out.display()));
+        let mut args = vec![
+            "--pairs".to_string(), "300".to_string(),
+            "--profile".to_string(), profile.to_str().unwrap().to_string(),
+            "--out".to_string(), out.to_str().unwrap().to_string(),
+            "--json".to_string(), rep.to_str().unwrap().to_string(),
+            "--force".to_string(), "--quiet".to_string(),
+            "--no-gzip".to_string(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let res = Command::new(bin()).args(&args).output().unwrap();
+        assert!(res.status.success(), "run {extra:?}: {}", String::from_utf8_lossy(&res.stderr));
+        serde_json::from_slice(&std::fs::read(&rep).unwrap()).unwrap()
+    };
+
+    let quiet = run(&dir.join("quiet"), &[]);
+    let counted = run(&dir.join("counted"), &["--stats"]);
+
+    // Counting draws must not consume randomness: the GT is byte-identical.
+    let gt = |out: &Path| std::fs::read(format!("{}.gt.tsv", out.display())).unwrap();
+    assert_eq!(gt(&dir.join("quiet")), gt(&dir.join("counted")), "--stats moved the stream");
+
+    assert_eq!(quiet["metrics"]["rng_draws"], 0, "draw counting is off by default");
+    assert!(
+        counted["metrics"]["rng_draws"].as_u64().unwrap() > 0,
+        "--stats must count draws"
+    );
+    // ~300 bases/pair x 300 pairs: substitutions are rare but mean_q is not.
+    let mq = counted["metrics"]["mean_q"].as_f64().unwrap();
+    assert!(mq > 0.0 && mq <= 41.0, "mean_q {mq} out of range");
+    assert!(counted["metrics"].get("substitutions").is_some());
+
+    // mean_q must be the mean of the quality bytes actually emitted.
+    let r1 = std::fs::read_to_string(format!("{}_R1.fastq", dir.join("counted").display())).unwrap();
+    let quals: Vec<u8> = r1
+        .lines()
+        .skip(3)
+        .step_by(4)
+        .flat_map(|line| line.bytes())
+        .collect();
+    let mean = quals.iter().map(|&b| (b - 33) as f64).sum::<f64>() / quals.len() as f64;
+    assert!(
+        (mean - mq).abs() < 0.05,
+        "reported mean_q {mq} vs emitted {mean} (R1 only, so a close match)"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
 }

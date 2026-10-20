@@ -19,7 +19,8 @@ use fastsim::artefact::{build_read, decide, PooledPair};
 use fastsim::biology::{insert_from_reference, random_dna_bias, read_fasta, History};
 use fastsim::fastq::FastqWriter;
 use fastsim::profile::{AdapterMode, Mate, Profile};
-use fastsim::quality::{qualify, MateRead};
+use fastsim::quality::{qualify_cached, MateRead, QCache};
+use fastsim::stats::TrackedRng;
 use fastsim::truth::GtWriter;
 
 fn main() -> Result<()> {
@@ -32,6 +33,16 @@ fn main() -> Result<()> {
 /// from the emitted bytes so the GT records exactly what a scorer will see.
 fn n_bases(mr: &MateRead) -> u32 {
     mr.seq.iter().filter(|&&b| b == b'N').count() as u32
+}
+
+/// Add one mate's emitted qualities to the running `mean_q` tally (FS-11).
+///
+/// Counted from the emitted Phred values (not from the profile), so the report
+/// states what a consumer of the FASTQ actually sees.
+#[inline]
+fn tally_q(mr: &MateRead, sum: &mut u64, n: &mut u64) {
+    *sum += mr.qual.iter().map(|&q| q as u64).sum::<u64>();
+    *n += mr.qual.len() as u64;
 }
 
 fn run(cfg: &cli::Config) -> Result<()> {
@@ -109,15 +120,17 @@ fn run(cfg: &cli::Config) -> Result<()> {
     };
     let gt_path = format!("{}.gt.tsv", cfg.out);
 
+    // The compression level is a run parameter, threaded to BOTH writers so a
+    // pair is never split across two levels.
     let mut w1 = if cfg.gzip {
-        FastqWriter::open_gz(Path::new(&r1_path))?
+        FastqWriter::open_gz(Path::new(&r1_path), cfg.gz_level)?
     } else {
         FastqWriter::open_plain(Path::new(&r1_path))?
     };
     let mut w2 = if cfg.single {
         None
     } else if cfg.gzip {
-        Some(FastqWriter::open_gz(Path::new(&r2_path))?)
+        Some(FastqWriter::open_gz(Path::new(&r2_path), cfg.gz_level)?)
     } else {
         Some(FastqWriter::open_plain(Path::new(&r2_path))?)
     };
@@ -127,7 +140,11 @@ fn run(cfg: &cli::Config) -> Result<()> {
         GtWriter::open(Path::new(&gt_path), profile.read_len)?
     };
 
-    let mut rng = ChaCha8Rng::seed_from_u64(cfg.seed);
+    // The draw counter is a pass-through: same stream, counted or not, and the
+    // increment is behind an always-false branch unless --stats asked for it.
+    let mut rng = TrackedRng::new(ChaCha8Rng::seed_from_u64(cfg.seed), cfg.stats);
+    // One memo of the per-base deterministic quality terms for the whole run.
+    let mut qcache = QCache::new();
 
     // Duplicate pool: recently emitted pairs. A duplicate replays a stored
     // pair byte-for-byte — same template, artefact, errors and quality.
@@ -139,6 +156,8 @@ fn run(cfg: &cli::Config) -> Result<()> {
     let mut n_drop = 0u64;
     let mut n_ambig = 0u64; // ambiguous (N) bases emitted across both mates
     let mut n_ambig_reads = 0u64; // mates carrying at least one N
+    let mut q_sum = 0u64; // sum of emitted Phred values (mean_q)
+    let mut q_n = 0u64; // emitted bases
     for pair_idx in 0..cfg.pairs {
         // 1. Insert. Two orthogonal forced classes, then the ordinary draw:
         //   - PCR duplicate: re-sequence a stored fragment (only fresh
@@ -163,9 +182,13 @@ fn run(cfg: &cli::Config) -> Result<()> {
         if is_dup {
             if let Some(src) = hist.sample(&mut rng) {
                 let a = src.artefact;
-                w1.write_record(&w1.header(pair_idx, 1), &src.r1)?;
+                w1.write_mate(pair_idx, 1, &src.r1)?;
                 if let (Some(w2), Some(m2)) = (w2.as_mut(), src.r2.as_ref()) {
-                    w2.write_record(&w2.header(pair_idx, 2), m2)?;
+                    w2.write_mate(pair_idx, 2, m2)?;
+                }
+                tally_q(&src.r1, &mut q_sum, &mut q_n);
+                if let Some(m2) = src.r2.as_ref() {
+                    tally_q(m2, &mut q_sum, &mut q_n);
                 }
                 let (d1, d2) = (n_bases(&src.r1), src.r2.as_ref().map_or(0, n_bases));
                 n_ambig += (d1 + d2) as u64;
@@ -235,14 +258,21 @@ fn run(cfg: &cli::Config) -> Result<()> {
             n_adapter += 1;
         }
 
-        // 4. Quality + errors.
-        let m1 = qualify(&profile, Mate::R1, &r1, &mut rng);
-        let m2 = r2.as_ref().map(|r| qualify(&profile, Mate::R2, r, &mut rng));
+        // 4. Quality + errors (the per-base deterministic terms come from the
+        //    run's QCache; the draws are unchanged).
+        let m1 = qualify_cached(&profile, &mut qcache, Mate::R1, &r1, &mut rng);
+        let m2 = r2
+            .as_ref()
+            .map(|r| qualify_cached(&profile, &mut qcache, Mate::R2, r, &mut rng));
 
-        // 5. Write.
-        w1.write_record(&w1.header(pair_idx, 1), &m1)?;
+        // 5. Write (header formatted into the writer's own buffer).
+        w1.write_mate(pair_idx, 1, &m1)?;
         if let (Some(w2), Some(m2)) = (w2.as_mut(), m2.as_ref()) {
-            w2.write_record(&w2.header(pair_idx, 2), m2)?;
+            w2.write_mate(pair_idx, 2, m2)?;
+        }
+        tally_q(&m1, &mut q_sum, &mut q_n);
+        if let Some(m2) = m2.as_ref() {
+            tally_q(m2, &mut q_sum, &mut q_n);
         }
         let (n1, n2) = (n_bases(&m1), m2.as_ref().map_or(0, n_bases));
         n_ambig += (n1 + n2) as u64;
@@ -252,8 +282,10 @@ fn run(cfg: &cli::Config) -> Result<()> {
         // The forced-drop class is excluded: it is a contaminant model, not a
         // library member, and must not seed the duplicate pool.
         if !is_drop {
+            // No insert bytes: the replay path only needs the finished mates
+            // and `insert_len`, and the pool is the run's whole memory
+            // footprint (FS-3).
             hist.push(PooledPair {
-                insert: insert.clone(),
                 insert_len,
                 artefact: a,
                 r1: m1,
@@ -267,6 +299,27 @@ fn run(cfg: &cli::Config) -> Result<()> {
         w2.finish().context("finish R2")?;
     }
     gt.finish().context("finish GT")?;
+
+    // Instrument counters (FS-11). `gz_bytes` is read back from the finished
+    // files, so the report states what the run actually wrote (both mates; a
+    // --single run has only R1).
+    let gz_bytes = if cfg.gzip {
+        [&r1_path, &r2_path]
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum::<u64>()
+    } else {
+        0
+    };
+    let mean_q = if q_n > 0 {
+        q_sum as f64 / q_n as f64
+    } else {
+        0.0
+    };
+    let substitutions = qcache.substitutions();
+    // 0 unless --stats asked for the counter: the wrapper is a no-op otherwise.
+    let rng_draws = rng.draws();
 
     if !cfg.quiet {
         eprintln!(
@@ -310,6 +363,15 @@ fn run(cfg: &cli::Config) -> Result<()> {
             },
             "elapsed_s": t0.elapsed().as_secs_f64(),
             "metrics": {
+                // FS-1: the DEFLATE level is a run parameter, so it is recorded
+                // next to the outputs it shaped. Level changes the encoding
+                // only: the decompressed FASTQ is identical at every level.
+                "gz_level": cfg.gz_level,
+                "gz_bytes": gz_bytes,
+                // FS-11 instrument counters.
+                "substitutions": substitutions,
+                "mean_q": mean_q,
+                "rng_draws": rng_draws,
                 "reads_in": 2 * cfg.pairs,
                 "pairs_simulated": cfg.pairs,
                 "read_len": profile.read_len,

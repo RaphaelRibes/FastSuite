@@ -95,6 +95,13 @@ pub struct Profile {
     pub pos_q: [Vec<f64>; 2],
     /// flat mean Phred INSIDE 3' tail runs, per mate (measured run_q_mean.tail)
     pub tail_q_mean: [f64; 2],
+    /// E[q_base] per mate: the mean of `read_meanq`, precomputed at load.
+    ///
+    /// `qualify` needs it once per read to centre the per-read offset, and it
+    /// is a pure function of the profile — recomputing the CDF sum per read
+    /// was ~40 bins of work for a constant (FS-4). The value is byte-identical
+    /// to the per-read recomputation: same loop, same order, stored once.
+    pub read_meanq_mean: [f64; 2],
     /// flat mean Phred INSIDE 5' head runs EXCLUDING the first base, per mate
     /// (deep head mean, `deep_head_q` in the profile; falls back to
     /// run_q_mean.head). The first head base is normal quality (a 1bp head is
@@ -520,6 +527,12 @@ impl Profile {
             None => Vec::new(),
         };
 
+        let read_meanq = [
+            Cdf::from_map(&raw.read_meanq.R1)?,
+            Cdf::from_map(if raw.read_meanq.R2.is_empty() { &raw.read_meanq.R1 } else { &raw.read_meanq.R2 })?,
+        ];
+        let read_meanq_mean = [cdf_mean(&read_meanq[0]), cdf_mean(&read_meanq[1])];
+
         Ok(Profile {
             read_len: raw.read_len,
             gc: raw.gc,
@@ -537,10 +550,8 @@ impl Profile {
             pos_q,
             tail_q_mean,
             head_q_mean,
-            read_meanq: [
-                Cdf::from_map(&raw.read_meanq.R1)?,
-                Cdf::from_map(if raw.read_meanq.R2.is_empty() { &raw.read_meanq.R1 } else { &raw.read_meanq.R2 })?,
-            ],
+            read_meanq,
+            read_meanq_mean,
             full_length_q: [
                 raw.full_length_q.R1.round().clamp(0.0, 41.0) as u8,
                 if raw.full_length_q.R2 > 0.0 { raw.full_length_q.R2 } else { raw.full_length_q.R1 }
@@ -591,16 +602,23 @@ impl Profile {
     /// mean(pos_q_uncond): the profiler floors per-read means into histogram
     /// bins (e.g. R1: 37.36 vs 37.85 — a 0.49 floor bias), so centering on
     /// pos_q_uncond would bias every read low.
+    ///
+    /// Precomputed at load (see the field): this used to walk the CDF for
+    /// every read.
     pub fn read_meanq_mean(&self, mate: Mate) -> f64 {
-        let cdf = &self.read_meanq[Self::mate_idx(mate)];
-        let mut prev = 0.0;
-        let mut mean = 0.0;
-        for (len, cum) in &cdf.bins {
-            mean += *len as f64 * (cum - prev);
-            prev = *cum;
-        }
-        mean
+        self.read_meanq_mean[Self::mate_idx(mate)]
     }
+}
+
+/// E[Q] of a CDF stored as `(value, cumulative fraction)` bins.
+fn cdf_mean(cdf: &Cdf) -> f64 {
+    let mut prev = 0.0;
+    let mut mean = 0.0;
+    for (len, cum) in &cdf.bins {
+        mean += *len as f64 * (cum - prev);
+        prev = *cum;
+    }
+    mean
 }
 
 // ---------------------------------------------------------------------------

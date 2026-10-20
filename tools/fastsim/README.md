@@ -93,16 +93,44 @@ fastsim --pairs 20_000_000 --profile profiles/mandril_E.json \
 | `--adapter-seq SEQ` | profile | override adapter sequence |
 | `--no-adapter` | — | disable adapter readthrough |
 | `--no-gzip` | — | write uncompressed FASTQ |
+| `--gz-level L` | 6 | DEFLATE level for the gzip outputs, 1..=9 (see below) |
 | `--dup-rate R` | 0.02 | PCR duplicate fraction (mandril measures 1–4%) |
 | `--dup-pool N` | 131072 | ring-buffer capacity for the duplicate pool |
 | `--drop-rate R` | 0.05 | fraction of pairs whose fragment is too short to survive trimming (must-drop class) |
 | `--drop-min-len L` | 100 | insert ceiling for the forced-drop class (bench `min_length`) |
+| `--stats` | — | add the instrument counters (RNG words drawn, substitutions, mean Q, gzip bytes) to `--json` |
+
+### `--gz-level`: the compression trade
+
+The level changes only the DEFLATE encoding — the decompressed FASTQ is
+identical at every level, so changing it cannot invalidate a campaign. Deflate
+is the bulk of fastsim's wall time at level 6, and FASTQ quality strings are
+near-incompressible noise, so the search mostly fails. Measured on this tool's
+own output, 200 000 pairs, `taskset -c 0` — in-process backend first, then the
+review's system-`gzip` CLI sweep on the same output:
+
+| level | backend | input rate | size (both mates) | |
+|---|---|---|---|---|
+| 1 | flate2/miniz_oxide | ~200 MB/s | 52.63 MB (37.2 % of plain) | fastest, **+35.8 % size** |
+| 6 | flate2/miniz_oxide | ~11 MB/s | 38.75 MB (27.4 %) | **default** — 0.1.0's bytes |
+| 1 | system `gzip` proxy | 109 MB/s | 23.04 MB/mate (32.6 %) | the review's sweep |
+| 4 | system `gzip` proxy | 59.7 MB/s | 20.87 MB/mate (29.5 %) | balanced |
+| 6 | system `gzip` proxy | 9.2 MB/s | 19.54 MB/mate (27.7 %) | 0.1.0's level |
+
+The two backends disagree and the difference matters: miniz's fast mode packs
+worse than C zlib's, so **size a campaign with the +35.8 % figure**, not the
+proxy's +17.9 %. End to end, 200 000 pairs go from ~14.8 s to ~2.3 s at level 1
+(~6x), with the generator's ~1.8 s as the floor.
+
+The default stays 6 so existing corpora keep their exact `.gz`; `--gz-level 1`
+is the end-to-end win, `--gz-level 4` the balanced choice. `--json` records the
+level it used (`metrics.gz_level`) next to the files it shaped.
 
 ## Build & test
 
 ```bash
 pixi install -e build
-pixi run -e build test      # 49 tests (43 unit + 6 integration)
+pixi run -e build test      # 89 tests (65 unit + 24 integration)
 pixi run -e build build     # release binary at target/release/fastsim
 ```
 
