@@ -442,13 +442,14 @@ un thread et LF à quatre.
 
 #v(0.3em)
 #block(fill: luma(243), inset: 8pt, radius: 3pt, width: 100%)[
-  *Comment lire les chiffres de cette section.* Ils sont mesurés, mais pas par la campagne de
-  bureau. Celle-ci a bien tourné — quatre-vingt-quinze cellules, deux binaires, trois tailles,
-  jusqu'à huit cœurs — et son agrégat n'a jamais été écrit : les trois cellules `fastsim` à 5 M
-  lectures sont sorties en erreur et Snakemake a interrompu le graphe avant la règle d'agrégation.
-  Les chiffres ci-dessous viennent donc de l'implémenteur, sur le portable, sous `taskset -c 0`,
-  machine chargée, avec le même jeu de données des deux côtés. Ce sont des rapports avant/après
-  comparables entre eux, pas des valeurs absolues comparables aux tableaux des articles.
+  *Comment lire les chiffres de cette section.* La première campagne de bureau est jetée, et pas
+  pour une raison de temps : elle tournait avec huit cellules en parallèle alors que chaque cellule
+  est épinglée, si bien que les cellules `-j 1` se disputaient le cœur 0. Le résidu est visible dans
+  la colonne de contrôle : `cpu/mur` entre 0,13 et 2,96. Une seconde campagne, ciblée sur quinze
+  cellules et strictement sérielle, donne `cpu/mur` entre 0,98 et 1,00 sur chaque ligne, et c'est
+  elle qui fournit le tableau de bureau ci-dessous. Les chiffres du portable, pris par les
+  implémenteurs, restent dans le premier tableau parce qu'ils couvrent des tailles que la campagne
+  ciblée n'a pas mesurées.
 ]
 
 == Ce que chaque outil a gagné
@@ -471,6 +472,37 @@ de 125 Mo alors que le travail par lecture baisse d'un facteur quatre. `fastprep
 d'adaptateur de 414 à 81 comparaisons exactes par lecture de 151 bases, sans changer un octet de
 sortie. `fasthelper` supprime 5 997 des 6 000 `fork` de `--version` d'un `--dry-run` à 2 000 échantillons et 3 étapes, ce qui
 transforme 21,4 s de `--dry-run` en 0,16 s.
+
+== La même comparaison, sur le poste de bureau
+
+Une campagne ciblée, strictement sérielle, une seule taille, un seul cœur, deux binaires. La
+colonne de contrôle est la preuve que l'épinglage a tenu : `cpu/mur` vaut 0,98 à 1,00 partout, ce
+qui ne laisse aucune place à un enfant échappé ni à un autre calcul sur le même cœur.
+
+#table(
+  columns: (auto, auto, auto, auto, auto),
+  table.header([*Outil*], [*Avant, s*], [*Après, s*], [*Rapport*], [*RSS avant / après, Mo*]),
+  [fastcheck], [22,10], [4,89], [4,52×], [413 / 273],
+  [fastmaps], [3,72], [1,99], [1,87×], [18 / 14],
+  [fastprep], [16,35], [14,21], [1,15×], [49 / 49],
+  [fastsim, niveau 6], [68,38], [59,51], [1,15×], [139 / 100],
+  [fastsim, niveau 1], [68,38], [10,52], [6,50×], [139 / 100],
+  [fastdedup], [18,28], [18,02], [1,01×], [23 / 25],
+  [fasthelper, 2000 éch.], [2,98], [3,98], [0,75×], [42 / 16],
+)
+
+Deux lignes de ce tableau vont dans le sens inverse du premier, et elles sont instructives.
+`fasthelper` ralentit de 2,98 à 3,98 s à 2 000 échantillons alors que son pic mémoire tombe de 42 à
+16 Mo : l'écriture en flux échange du temps contre de la mémoire, et sur un petit arbre l'échange
+n'est pas rentable — le gain de temps n'apparaît qu'à 10 000 échantillons, où il est net. `fastdedup`
+ne bouge pas (1,01×), ce qui est exactement ce que ses changements promettaient : ils portent sur le
+parallélisme, le flux et la parité de fin de ligne, pas sur le chemin mono-thread par défaut. Un
+dossier qui n'aurait rapporté que les quatre premières lignes aurait eu l'air meilleur et aurait
+caché la seule régression de la série.
+
+Sur l'unique cellule où les deux campagnes se recoupent — `fastsim` au niveau par défaut — les deux
+donnent 1,15×, ce qui est le meilleur argument disponible pour que la mesure du portable n'ait pas
+été un artefact de charge.
 
 == Les deux défauts de sortie sont corrigés
 
@@ -531,12 +563,12 @@ mécanisme dans le tableau de mesures ne sort pas.
 // ---------------------------------------------------------------------------
 = Ce que je n'ai pas fait
 
-- *La campagne de bureau n'a pas produit de tableau.* Quatre-vingt-quinze cellules ont été mesurées
-  et sont sur le disque du poste, mais l'agrégat n'a jamais été écrit : trois cellules `fastsim` à
-  5 M lectures sont sorties en erreur (cause non établie : ni disque, ni mémoire, ni délai interne à
-  `measure.py`) et Snakemake a interrompu le graphe avant la règle d'agrégation. Les chiffres de la
-  section précédente viennent de l'implémenteur, pas de ce graphe. Le déblocage est une reprise de
-  trois cellules, pas une re-mesure.
+- *La matrice complète de bureau n'a pas été menée à terme.* La première tentative mesurait huit
+  cellules à la fois sur des cœurs qu'elles se partageaient, donc ses lignes sont jetées ; une
+  campagne sérielle complète a été lancée puis remplacée par une campagne ciblée de quinze cellules,
+  qui est celle du tableau ci-dessus. Les tailles intermédiaires et les exécutions à deux et quatre
+  cœurs du poste de bureau restent donc à mesurer, et pour elles il faut compter une heure de calcul
+  sériel, pas trois.
 - *Aucun comparateur n'a été re-mesuré.* FastQC, Falco et cutadapt ne sont pas installés sur le poste
   de bureau ; `fastp` l'est et figure au harnais, mais ses cellules ont échoué à l'agrégation comme
   les autres. Les tableaux comparatifs des articles restent donc ceux des CSV committés, et la

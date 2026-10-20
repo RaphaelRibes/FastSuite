@@ -77,8 +77,13 @@ def tool_argv(args):
         return [args.bin, "-i", r1, "-I", r2,
                 "-o", os.path.join(out, "fastp_R1.fastq.gz"),
                 "-O", os.path.join(out, "fastp_R2.fastq.gz"),
-                "-w", t, "-z", "6", "-j", os.path.join(out, "fastp.json"),
-                "--dont_overwrite"]
+                "-w", t, "-z", "6",
+                # fastp writes its HTML report next to the CWD unless told
+                # otherwise, so consecutive cells collided on fastp.html and
+                # --dont_overwrite turned that into exit 255. Both reports go to
+                # the cell's own directory.
+                "-j", os.path.join(out, "fastp.json"),
+                "-h", os.path.join(out, "fastp.html")]
     if args.tool == "fasthelper":
         # Aggregation over a pre-built report tree; `reads` carries the sample
         # count, which is the axis that matters for this tool.

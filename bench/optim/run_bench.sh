@@ -17,7 +17,7 @@ if [ ${#TARGETS[@]} -eq 0 ]; then
 fi
 
 exec snakemake \
-  --cores 4 \
+  --cores "${BENCH_CORES:-8}" \
   --rerun-triggers=mtime \
   --configfile config.yaml \
   --keep-going \
