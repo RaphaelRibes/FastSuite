@@ -26,6 +26,9 @@ heatmap.png
 heatmap.svg
 heatmap_3d.html
 
+# built papers (generated from paper.typ, never committed)
+tools/*/paper/*.pdf
+
 # misc
 *.bak
 *.orig
