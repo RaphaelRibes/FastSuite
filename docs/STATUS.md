@@ -320,6 +320,13 @@ still be re-derived before the sweep numbers are quoted again.
 
 New and open after the review round:
 
+* **fastmaps' corner fractions cannot see a 3' tail.** `polyG_frac` counts reads
+  that are *nearly all G* (the corner window is `max(size/50, 2)` at a grid sized
+  for the longest read), so a tail is a displacement, never a corner. Measured on
+  a 400-read R2 fixture: 200 reads with the last 20 bases G on a random body
+  contribute 0, while 200 entirely-G reads give `r2_polyG_frac` 0.5. A NovaSeq
+  polyG signature needs a positional metric (3'-end base composition), which does
+  not exist yet; the paper states the limit, the tool does not warn about it.
 * **fastsim ignores `profile.gc`** (`main.rs:221` uses `--gc`): a profile with
   `gc=0.30` emits GC 0.4881. Measured, open.
 * **fastprep's `--adapter-error-rate` rounds the mismatch tolerance UP**
