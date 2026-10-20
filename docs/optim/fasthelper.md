@@ -3,6 +3,29 @@
 Scope: `tools/fasthelper/src` (3 420 lines, all 11 files read) and the pre-built
 `target/release/fasthelper` run against scratch trees. Nothing here is implemented.
 
+## Status of this round
+
+Implemented and committed in `1479cb9` (7 of 10 propositions). The tests are the gate: the crate's suite is green, and every change that can alter output was checked byte-for-byte against the pre-change binary except where the entry says otherwise.
+
+### Implemented
+
+- **FH-1** --- `.report` suffix stripped before the stem test; v1 reports win on (sample, tool) -- the phantom `heatmap.report` sample is gone
+- **FH-2** --- duplicate `[[samples]]` names now fail `check -c` (they used to exit 0 and share one work dir)
+- **FH-3** --- `report.json` streams a borrowed view through `to_writer_pretty`, byte order preserved
+- **FH-5** --- fastmaps grid streamed through a `Visitor` (1.76 ms -> 0.06 ms per grid)
+- **FH-6** --- `--all-metrics` streams to a `BufWriter`
+- **FH-8** --- `build_matrix` borrows, `--stdout` builds once
+- **FH-9** --- `--version` resolved once per run (was once per sample per step)
+
+### Deferred, with the reason
+
+- **FH-4** --- the work-dir resume key is already a hash
+- **FH-7** --- the HTML template is a few hundred KB
+- **FH-10** --- parallel aggregation would break the deterministic row order that the tests assert
+
+---
+
+
 Tags: `[M]` measured, artifact named · `[E]` estimated from a named mechanism · `[V]` verified in
 this review by running the built binary.
 

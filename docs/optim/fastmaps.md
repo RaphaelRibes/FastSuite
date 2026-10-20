@@ -2,6 +2,31 @@
 
 Scope: `tools/fastmaps/src` (2 397 lines, all 10 files read). Nothing here is implemented.
 
+## Status of this round
+
+Implemented and committed in `1e0fb65` (6 of 12 propositions). The tests are the gate: the crate's suite is green, and every change that can alter output was checked byte-for-byte against the pre-change binary except where the entry says otherwise.
+
+### Implemented
+
+- **FM-1** --- `--data-mode exact|capped:N|off`; non-exact modes declare `data_reads_per_pixel` and `data_complete:false`
+- **FM-2** --- the 4 MB preview flush is charged to `--buffer-mb` instead of being a floor
+- **FM-3** --- per-row writer table became a map with 4 KiB buffers (was a 65536-slot Vec)
+- **FM-9** --- spiller writes one packed 8-byte record instead of three `write_all` calls
+- **FM-10** --- FASTQ loop reads into four reused `Vec<u8>`, encodes from `&[u8]`
+- **FM-12** --- `Done` messages merged in file order: the per-pixel mean quality, and therefore `heatmap_3d.html`, is reproducible
+
+### Deferred, with the reason
+
+- **FM-4** --- per-pixel accumulators are 8 bytes already
+- **FM-5** --- the 3-D renderer is a separate offline pass
+- **FM-6** --- encoder table is LUT-bound, not arithmetic-bound
+- **FM-7** --- thread-local grids would multiply the grid allocation by the thread count
+- **FM-8** --- preview thinning is already adaptive
+- **FM-11** --- the HTML writer is not on the measured path
+
+---
+
+
 Tags: `[M]` measured, artifact named · `[E]` estimated from a named mechanism · `[V]` verified in
 this review by reading the cited line or running the built binary.
 

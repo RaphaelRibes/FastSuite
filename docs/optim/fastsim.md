@@ -2,6 +2,30 @@
 
 Scope: `tools/fastsim/src` (3 681 lines, every file read). Nothing here is implemented.
 
+## Status of this round
+
+Implemented and committed in `56c0d78` (7 of 11 propositions). The tests are the gate: the crate's suite is green, and every change that can alter output was checked byte-for-byte against the pre-change binary except where the entry says otherwise.
+
+### Implemented
+
+- **FS-1** --- `--gz-level` 1..=9, default 6 (deflate was 75.5 % of the wall time, measured)
+- **FS-3** --- partial: the per-pair clone of the unused 130 MB insert pool field removed; per-pair seeding deferred
+- **FS-4** --- per-base `Normal`, `exp`, `erf` replaced by tables built once per (profile, mate, offset), asserted equal
+- **FS-6** --- quality encoded into a reused buffer, one write per pair instead of ~300 one-byte calls
+- **FS-7** --- sink is an inlined enum, no boxed `dyn Write`
+- **FS-10** --- header and GT row appended into reused buffers
+- **FS-11** --- `--json` gains `gz_bytes`, `substitutions`, `mean_q`; `tests/golden_stream.rs` pins the three artefacts' sha256
+
+### Deferred, with the reason
+
+- **FS-2** --- per-pair RNG reseeding changes the generated reads; needs a versioned stream, not a patch
+- **FS-5** --- SIMD quality sampling is behind FS-2's stream definition
+- **FS-8** --- the artefact sampler reads a precomputed table already; small
+- **FS-9** --- header formatting is now FS-10's buffer reuse
+
+---
+
+
 Tags: `[M]` measured, artifact named · `[E]` estimated from a named mechanism · `[V]` verified in
 this review by running the built binary or reading the cited line.
 
@@ -62,7 +86,7 @@ than the proxy at the same level and probably also at level 1.
 **Measure.** A `fastsim_perf` cell: 200 000 pairs, `taskset -c 0`, warm-up + median of 3, recording
 wall, VmHWM and `wc -c` of both `.gz`; the `--json` `elapsed_s` is the same quantity.
 
-**Risk (honest).** `+17.9 %` `.gz` size `[V]` — ~4.1 MB per 100 000-pair unit on this profile. Nothing
+**Risk (honest).** `+35.8 %` `.gz` size `[M]` -- 52.63 MB at level 1 against 38.75 MB at level 6 on a 200 000-pair unit of this profile, measured in-process with flate2/miniz_oxide. The `+17.9 %` this file first carried came from sweeping the system `gzip` CLI over the tool's output: that is zlib, a proxy, not the tool's encoder. Nothing
 downstream parses size; fastcheck and fastprep re-inflate, and inflate is 4× cheaper than deflate.
 The real cost is disk on campaign scratch, which is why `--gz-level 6` must stay selectable.
 
@@ -109,7 +133,7 @@ boundaries ignore the thread count, members concatenate in block-index order. Ve
 per-pair streams cannot reproduce them. Keep `--legacy-stream` (current path, `-j1` only) and a
 golden-hash test; do not claim the old bytes survive.
 
-**Effect.** `[E]` after FS-1: generation 17.8 + deflate 6.5 µs/pair (141 MB at 109 MB/s) = 24.3
+**Effect.** `[E]` after FS-1: generation 17.8 + deflate 6.5 µs/pair (141 MB at ~200 MB/s in-process; the 109 MB/s figure was the CLI proxy) = 24.3
 µs/pair serial; at 4 workers 6.1 µs/pair → 1.2 s per 200 k, i.e. **3.2–3.6× on top of the post-FS-1
 cell**. **If FS-1 is skipped this item is worth 1.22×** — Amdahl from the measured split. **What
 limits it** is deflate, and only after FS-1 the generator.

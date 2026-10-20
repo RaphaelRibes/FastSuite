@@ -3,6 +3,30 @@
 Scope: `tools/fastdedup/src` (3 376 lines, all files read) + the three integration suites.
 Nothing here is implemented: this is a proposition file, not a change log.
 
+## Status of this round
+
+Implemented and committed in `2dfaff2` (5 of 11 propositions). The tests are the gate: the crate's suite is green, and every change that can alter output was checked byte-for-byte against the pre-change binary except where the entry says otherwise.
+
+### Implemented
+
+- **FD-2** --- parallel gzip (gzippy) on the `-o -` stream path
+- **FD-3** --- `worker_threads = num_workers.saturating_sub(1).max(1)` budgets the pool (was 1 + j + j + 1 threads)
+- **FD-7** --- `BufWriter::with_capacity(1 MiB)` before the gzip encoder on the file path
+- **FD-8** --- `ChanWriter` moves whole chunks instead of two copies
+- **FD-9** --- `RawRecord.crlf` + `ending()`: serial and parallel output now agree on CRLF input
+
+### Deferred, with the reason
+
+- **FD-1** --- stop offloading the hash (it is < 1 % of a pair) and parallelise the serialisation instead: the ordered writer is the design constraint, a restructure not a patch
+- **FD-4** --- SIMD hash is pointless until FD-1 moves the work
+- **FD-5** --- lock-free set only matters once several threads insert
+- **FD-6** --- read-side zero-copy is small against the 21 MB/s ceiling
+- **FD-10** --- `--json` streaming is a documentation-size change
+- **FD-11** --- mmap output conflicts with the ordered-writer design
+
+---
+
+
 Tags used throughout:
 `[M]` measured, artifact named · `[E]` estimated from a named mechanism · `[V]` verified in this
 review by executing the built binary or reading the cited line.

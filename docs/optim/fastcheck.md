@@ -2,6 +2,32 @@
 
 Scope: `tools/fastcheck/src` (8 321 lines, all files read). Nothing here is implemented.
 
+## Status of this round
+
+Implemented and committed in `bb5de00` (6 of 13 propositions). The tests are the gate: the crate's suite is green, and every change that can alter output was checked byte-for-byte against the pre-change binary except where the entry says otherwise.
+
+### Implemented
+
+- **FC-1** --- dense exact 4^12 u16 table (32 MiB) with u16 overflow map; `approximate: false`, `distinct` reported
+- **FC-2** --- composition, heatmap, rolling 12-mer and profile work fused into one pass with a 256-entry decode LUT
+- **FC-6** --- `contains_ci` word-at-a-time prefilter, pattern verified only at candidates
+- **FC-8** --- `qual_pos` `[u64;128]` indexed by byte-33, out-of-range bytes into the malformed census
+- **FC-9** --- `--tiles` hoists the row resize, no per-read Vec
+- **FC-12** --- second pass uses the resolved thread count, not 1
+
+### Deferred, with the reason
+
+- **FC-3** --- needs a per-position histogram redesign that the report schema does not carry; deferred
+- **FC-4** --- fused BGZF decode is inside the pool, not the single-file path; deferred to the pool rewrite
+- **FC-5** --- SIMD 12-mer rolling needs a nightly-stable std::simd; the LUT pass met the target first
+- **FC-7** --- `serde_json` streaming of the report is a documentation-only change at this size; deferred
+- **FC-10** --- the over-represented writer rewrite is orthogonal to the measured bottleneck
+- **FC-11** --- `--tiles` parallelism needs an ordered reduce; deferred
+- **FC-13** --- bundle-size work outside the measured loop
+
+---
+
+
 Tags: `[M]` measured, artifact named · `[E]` estimated from a named mechanism · `[V]` verified in
 this review by reading the cited line or executing the built binary.
 

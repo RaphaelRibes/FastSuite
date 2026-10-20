@@ -4,6 +4,33 @@ Scope: `tools/fastprep/src` (9 792 lines; `algorithm.rs`, `adapter.rs`, `pipelin
 `cli.rs`, `dedup.rs`, `pe_overlap.rs`, `memory.rs`, `stats.rs`, `main.rs` all read) plus the
 committed bench artifacts. Nothing here is implemented.
 
+## Status of this round
+
+Implemented and committed in `154a39f` (8 of 14 propositions). The tests are the gate: the crate's suite is green, and every change that can alter output was checked byte-for-byte against the pre-change binary except where the entry says otherwise.
+
+### Implemented
+
+- **FP-2** --- `--pe-overlap auto` no longer runs on `AdapterSource::Fixed` (added `explicit`)
+- **FP-3** --- prefilter seed width derived from the error bound (per-adapter widths: 4-mer from k=20 for TruSeq, 3-mer from k=9 for Nextera; 414 -> 81 exact compares per 151 bp read); conformance gate green for eps 0..0.3 across widths 6/5/4/3. Note: the commit message of `154a39f` repeats the unsound bound this file used to state; the code and this entry carry the corrected one.
+- **FP-4** --- staged writes, one flush per 256 KiB instead of six `write_all` per record
+- **FP-5** --- quality stays ASCII end to end, gate LUT indexed by raw byte, `offset*len` subtracted once
+- **FP-6** --- dedup set probed once per read when not saturated
+- **FP-7** --- chunk arenas recycled
+- **FP-8** --- adapter carried as an index, no two heap Strings per match
+- **FP-14** --- `TrimResult` no longer cloned on the ordered thread
+
+### Deferred, with the reason
+
+- **FP-1** --- the three-stage pipeline resting on two threads is a redesign of the ordered writer; the measured single-core gain came from FP-3/FP-4 instead
+- **FP-9** --- PXMT metadata write is outside the default path
+- **FP-10** --- `--dry-run` cost only matters on tiny inputs
+- **FP-11** --- SIMD quality scan needs the nightly-stable intrinsics
+- **FP-12** --- hash-set sharding conflicts with the ordered writer
+- **FP-13** --- report size is bounded by read count, not the bottleneck
+
+---
+
+
 Tags: `[M]` measured, artifact named · `[E]` estimated from a named mechanism · `[V]` verified in
 this review by reading the cited line or executing the built binary.
 
@@ -143,9 +170,7 @@ The condition `k ≥ 6·(ceil(k·ε)+1)` requires `ε < 1/6`; at the shipped `--
 and ~11 KB compared per read**, while only 2.3 % of reads ever match an adapter
 (`fastprep_5000k.json`: 231 389 / 5 000 000 `[M]`).
 
-**Change.** Size the seed to the bound instead of fixing it at 6: a 5-mer seed needs an exact run
-≥ 5, which holds from k = 25 at ε = 0.2, so the unsound band shrinks to 11 positions per adapter
-instead of 138.
+**Change.** Size the seed to the bound instead of fixing it at 6. The sound condition is the pigeonhole one, `k >= s(m+1)` for `s` seed bases and `m` tolerated mismatches; the arithmetic this file first carried, `k >= 6*(ceil(k*eps)+1)`, assumed the mismatch-free block has nominal length and is therefore unsound -- the block can be short. At eps = 0.2 that gives per-adapter widths rather than one width: 4 seed bases sounding from k = 20 for the 34 bp TruSeq adapters, 3 from k = 9 for the 19 bp Nextera adapter, in one 5440-entry table. The unsound band is the truncated 3' tail, and the conformance test, not this paragraph, is what settles it.
 
 ```
 SeedTable::build(adapters, eps, seed_len)   // smallest seed_len with finite ms

@@ -81,10 +81,11 @@ enfin réduire les constantes.
 
 #v(0.4em)
 #block(fill: luma(243), inset: 8pt, radius: 3pt, width: 100%)[
-  *Ce que ce dossier n'est pas.* Aucun chiffre de gain n'est présenté comme mesuré. Seize valeurs
-  sont mesurées et nommées avec leur artefact, quatre sont vérifiées ici en exécutant le binaire,
-  tout le reste est estimé avec le mécanisme qui le produit. Les propositions ne sont pas
-  implémentées : le dépôt est inchangé, seuls six fichiers `docs/optim/*.md` ont été écrits.
+  *Ce que ce dossier était, et ce qu'il est devenu.* Il a été écrit en lecture seule : aucun code
+  touché, aucune mesure de campagne, les chiffres de gain estimés avec leur mécanisme. Trente-neuf
+  des soixante et onze propositions ont depuis été implémentées, et la section « Ce qui a été
+  implémenté » rapporte ce que la mesure en dit — y compris deux chiffres de ce dossier que la mise
+  en œuvre a démentis.
 ]
 
 // ---------------------------------------------------------------------------
@@ -431,10 +432,85 @@ temps, c'est la mémoire, et deux défauts de sortie se cachent dans le même ch
 )
 
 // ---------------------------------------------------------------------------
+= Ce qui a été implémenté, et ce que la mesure en dit
+
+Trente-neuf des soixante et onze propositions ont été implémentées en une journée, en six commits
+séparés, un par outil. La suite passe de 577 à 658 tests, tous verts, sans qu'aucun test existant ne
+soit modifié : les nouveaux tests sont des tests de non-régression écrits avant le changement, et
+l'un d'eux reproduit une divergence de sortie que personne n'avait vue — `fastdedup` écrivait CRLF à
+un thread et LF à quatre.
+
+#v(0.3em)
+#block(fill: luma(243), inset: 8pt, radius: 3pt, width: 100%)[
+  *Comment lire les chiffres de cette section.* Ils sont mesurés, mais pas par la campagne de
+  bureau. Celle-ci a bien tourné — quatre-vingt-quinze cellules, deux binaires, trois tailles,
+  jusqu'à huit cœurs — et son agrégat n'a jamais été écrit : les trois cellules `fastsim` à 5 M
+  lectures sont sorties en erreur et Snakemake a interrompu le graphe avant la règle d'agrégation.
+  Les chiffres ci-dessous viennent donc de l'implémenteur, sur le portable, sous `taskset -c 0`,
+  machine chargée, avec le même jeu de données des deux côtés. Ce sont des rapports avant/après
+  comparables entre eux, pas des valeurs absolues comparables aux tableaux des articles.
+]
+
+== Ce que chaque outil a gagné
+
+#table(
+  columns: (auto, auto, 1fr, 1fr),
+  table.header([*Outil*], [*Fait*], [*Changement principal*], [*Mesure avant → après*]),
+  [fastcheck], [6/13], [table de 12-mers dense et exacte (32 Mio) au lieu d'une table de hachage bornée ; une passe par lecture au lieu de quatre], [1 M lectures, `-j 1` : 36,45 → 8,34 s (4,37×) ; RSS 327 → 202 Mo],
+  [fastprep], [8/15], [largeur de graine du préfiltre dérivée de la borne d'erreur ; étage PE nul désarmé ; écritures groupées], [200 k paires, `-j 1` : 1,198 → 0,837 s (1,43×) ; adaptateurs explicites : 2,915 → 1,478 s (1,97×)],
+  [fastsim], [7/11], [`--gz-level` (le niveau 6 n'était réglable nulle part) ; écritures groupées ; tables de transcendantes], [200 k paires : gz6 13,96 → 12,14 s ; `--no-gzip` 3,53 → 1,81 s ; niveau 1 = 2,24 s ; RSS 139 → 100 Mo],
+  [fastmaps], [6/12], [`--data-mode` rend l'index par lecture optionnel ; budget de prévisualisation réel ; ordre de fusion déterministe], [5 M lectures, `-j 1` : 5,16 → 3,54 s (−31 %) ; 512 Mo : 73,4 → 63,3 Mo ; `off` : 17,0 Mo],
+  [fasthelper], [7/10], [`report.json` en flux ; grille fastmaps en `Visitor` ; `--version` résolu une fois], [10 k échantillons, json : 273,3 → 68,4 Mo et 0,82 → 0,51 s ; `--dry-run` 2000×3 : 21,4 → 0,16 s],
+  [fastdedup], [5/11], [gzip parallèle sur le flux, threads budgétés, parité CRLF], [non mesuré dans ce lot],
+)
+
+Trois de ces gains méritent d'être lus comme des suppressions de travail, pas comme des réglages.
+`fastcheck` passe de quatre passes sur chaque lecture à une seule, et sa table de 12-mers de trois
+tables de hachage saturées (environ 40 Mo chacune) à trois tableaux fixes de 32 Mio : le RSS baisse
+de 125 Mo alors que le travail par lecture baisse d'un facteur quatre. `fastprep` ramène le préfiltre
+d'adaptateur de 414 à 81 comparaisons exactes par lecture de 151 bases, sans changer un octet de
+sortie. `fasthelper` supprime 5 997 des 6 000 `fork` de `--version` d'un `--dry-run` à 2 000 échantillons et 3 étapes, ce qui
+transforme 21,4 s de `--dry-run` en 0,16 s.
+
+== Les deux défauts de sortie sont corrigés
+
+`fasthelper concatenate` ne compte plus d'échantillon fantôme quand un échantillon porte la sortie
+`fastmaps --json` : le suffixe `.report` est retiré avant le test de nom générique, et deux rapports
+pour le même couple (échantillon, outil) sont départagés en faveur du rapport v1. La même arborescence
+qui annonçait « 4 rapports de 3 échantillons » annonce « 2 rapports de 2 échantillons ». `check -c`
+refuse désormais deux `[[samples]]` de même nom, qui écrivaient auparavant dans le même répertoire de
+travail.
+
+Deux comportements changent en conséquence, et ils sont documentés comme tels : sans option
+d'adaptateur, l'attribution par adaptateur du rapport `fastprep` se déplace (le détecteur ne tourne
+plus), les totaux de lectures et de bases, eux, ne bougent pas ; et dans `fastmaps`, une erreur
+d'entrée/sortie en milieu de fichier termine maintenant en erreur au lieu de produire silencieusement
+une heatmap partielle — c'était une sortie plausible et fausse.
+
+== Deux chiffres de ce dossier étaient faux
+
+*Le coût du niveau 1 de fastsim n'est pas de 17,9 %.* Ce chiffre venait d'un balayage du binaire
+`gzip` du système, c'est-à-dire de zlib, sur la sortie de l'outil : un substitut, pas l'encodeur du
+binaire. Mesuré dans le processus, avec `flate2`/`miniz_oxide`, le niveau 1 écrit 52,63 Mo là où le
+niveau 6 écrit 38,75 Mo, soit *+35,8 %*, et il tourne à environ 200 Mo/s et non 109. La conclusion
+tient — le niveau 6 codé en dur domine le temps d'exécution — mais le chiffre à retenir pour
+dimensionner une campagne est +35,8 %, et la leçon méthodologique est que « mesurer la sortie avec
+l'outil du système » ne mesure pas l'outil.
+
+*La borne du préfiltre d'adaptateur n'est pas celle que j'avais écrite.* La condition
+$k >= 6 (ceil(k epsilon) + 1)$ suppose que le bloc sans erreur a la longueur nominale ; il peut être
+plus court, et la borne correcte est $k >= s (m+1)$ pour $s$ bases de graine et $m$ erreurs
+tolérées. Le code livré en tire des largeurs par adaptateur — une graine de 4 bases à partir de
+$k = 20$ pour les adaptateurs TruSeq de 34 bases, de 3 bases à partir de $k = 9$ pour le Nextera de
+19 — au lieu du 5-mer à $k = 25$ que je proposais, que le test de conformité aurait rejeté. La
+proposition était juste dans son diagnostic, fausse dans son arithmétique.
+
+// ---------------------------------------------------------------------------
 = Feuille de route
 
-Quatre vagues, ordonnées par rapport effet sur risque. La première ne touche presque pas au code et
-corrige des sorties.
+Quatre vagues, ordonnées par rapport effet sur risque. Les trois premières sont faites, sauf les
+propositions marquées comme différées dans les six fichiers d'outil ; la quatrième reste ouverte, et
+c'est celle qui demande un nouveau test de parité plutôt qu'un diff.
 
 #table(
   columns: (auto, 1fr, auto),
@@ -455,22 +531,23 @@ mécanisme dans le tableau de mesures ne sort pas.
 // ---------------------------------------------------------------------------
 = Ce que je n'ai pas fait
 
-- *Aucun code modifié.* Les six fichiers de propositions sont les seuls ajouts, et ils sont hors
-  index Git. Rien n'a été committé, donc rien n'a été synchronisé vers le poste de bureau : la règle
-  de synchronisation ne s'applique qu'aux changements de code.
-- *Aucune mesure de banc de la suite.* Les seules mesures faites ici sont des sondes locales, sur un
-  portable à 15 W partagé, et elles sont étiquetées comme telles. Les chiffres de comparaison
-  viennent des CSV committés, et les ratios de débit sont explicitement des estimations.
-- *Le profil n'a pas été instrumenté.* Aucun `perf` n'a été lancé : les attributions de coût sont
-  soit lues dans le code avec leur arithmétique, soit mesurées par différence de cellules, comme le
-  partage deflate de fastsim. Un profil par outil, sur le poste de bureau, reste la première étape
-  de la vague 2.
-- *La campagne Phase D n'a pas été rejouée.* Les propositions qui touchent au taux de duplication ou
-  au `g_frac` ne prétendent pas corriger ces écarts, qui sont des écarts de modèle et non de code.
-
-#v(0.6em)
-#block(fill: luma(243), inset: 8pt, radius: 3pt, width: 100%)[
-  *Ordre de lecture conseillé* : ce rapport, puis `docs/optim/fastprep.md` section 0 pour le détail
-  arithmétique du banc, puis le fichier de l'outil à attaquer. Chaque proposition y porte son
-  mécanisme, sa mesure et son risque, dans le même format.
-]
+- *La campagne de bureau n'a pas produit de tableau.* Quatre-vingt-quinze cellules ont été mesurées
+  et sont sur le disque du poste, mais l'agrégat n'a jamais été écrit : trois cellules `fastsim` à
+  5 M lectures sont sorties en erreur (cause non établie : ni disque, ni mémoire, ni délai interne à
+  `measure.py`) et Snakemake a interrompu le graphe avant la règle d'agrégation. Les chiffres de la
+  section précédente viennent de l'implémenteur, pas de ce graphe. Le déblocage est une reprise de
+  trois cellules, pas une re-mesure.
+- *Aucun comparateur n'a été re-mesuré.* FastQC, Falco et cutadapt ne sont pas installés sur le poste
+  de bureau ; `fastp` l'est et figure au harnais, mais ses cellules ont échoué à l'agrégation comme
+  les autres. Les tableaux comparatifs des articles restent donc ceux des CSV committés, et la
+  nouvelle section de chaque article est explicitement un avant/après du même outil, non sécable
+  dans un tableau de comparateurs.
+- *Aucun profil `perf` n'a été pris.* Les attributions de coût restent lues dans le code avec leur
+  arithmétique, ou mesurées par différence de cellules. Ce qui n'a pas empêché de trouver les bons
+  leviers, mais une des propositions différées (FD-1, déplacer le travail hors du thread ordonné)
+  demande un profil avant d'être tentée.
+- *La restructuration n'a pas été faite.* FD-1, FP-1, FS-2 et FC-3/4/5 sont les propositions qui
+  changent le partage du travail ou le flux d'octets, donc qui exigent un test de parité
+  supplémentaire. Elles restent ouvertes, avec leur mécanisme écrit.
+- *La campagne Phase D n'a pas été rejouée.* Les écarts de taux de duplication et de `g_frac` sont
+  des écarts de modèle, pas de code, et aucune des propositions implémentées ne prétend les corriger.
