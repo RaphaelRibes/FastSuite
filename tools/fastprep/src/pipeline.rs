@@ -285,8 +285,6 @@ const METADATA_COMPRESSION: crate::io::CompressionLevels = crate::io::Compressio
     gz_threads: 1,
 };
 
-/// Derive a `.part` write-side path for `p`. On success the caller renames
-/// this path to `p`; on error the guard removes it.
 /// Fingerprint set, monomorphised over the two widths.
 ///
 /// The fingerprint is computed here on the ordered thread rather than in the
@@ -349,6 +347,8 @@ fn duplicate_result() -> TrimResult {
     }
 }
 
+/// Derive a `.part` write-side path for `p`. On success the caller renames
+/// this path to `p`; on error the guard removes it.
 fn part_path(p: &Path) -> std::path::PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".part");
@@ -388,13 +388,76 @@ impl Drop for TmpFile {
 // Phred offset auto-detection.
 // ---------------------------------------------------------------------------
 
-/// Peek at the first `n_reads` records (up to 1000) of a FASTQ file and
-/// infer the Phred offset from the raw quality bytes.
+/// What the quality-byte census concluded.
+///
+/// The census cannot *classify* a modern file: Phred+33 qualities at Q≥40 use
+/// every byte from `'@'` up, exactly like Phred+64 at Q≥0. It can only prove
+/// +33 (one byte below `'@'`) or abstain. The count is kept because D-6 says
+/// every assumption names its evidence, and the old code parsed 1000 records
+/// and then threw the counters away.
+#[derive(Debug, Clone)]
+pub struct PhredCensus {
+    pub offset: u8,
+    pub records: usize,
+    pub bases: usize,
+    /// Lowest quality byte seen; `None` when the input carries no qualities.
+    pub min_q: Option<u8>,
+    /// Bytes above `'J'` (74) — reported as evidence, never as proof.
+    pub high: usize,
+    /// A byte below `'@'` (64) cannot occur under Phred+64, so +33 is proven.
+    pub proven: bool,
+}
+
+impl PhredCensus {
+    /// The D-6 assumption record for the offset this census settled on.
+    pub fn assumption(&self) -> crate::stats::Assumption {
+        let basis;
+        let consequence;
+        if let Some(min_q) = self.min_q {
+            if self.proven {
+                basis = format!(
+                    "census of {} records ({} quality bytes): lowest byte {} < 64, \
+                     which cannot occur under Phred+64, so +33 is proven",
+                    self.records, self.bases, min_q
+                );
+                consequence = "none; the byte range proves the offset".to_string();
+            } else {
+                basis = format!(
+                    "census of {} records ({} quality bytes): lowest byte {} >= 64 and {} \
+                     bytes above 74; a high-byte census cannot distinguish +33 from +64, \
+                     so +33 is assumed",
+                    self.records, self.bases, min_q, self.high
+                );
+                consequence = "if the input is legacy Phred+64 (Illumina 1.3/1.5), every \
+                               quality is read 31 points high and --mean-q can drop the \
+                               whole file; pass --phred-offset 64"
+                    .to_string();
+            }
+        } else {
+            basis = format!(
+                "no quality bytes in the first {} records (FASTA or empty input); \
+                 +33 is the FASTQ default",
+                self.records
+            );
+            consequence = "none; no qualities are decoded".to_string();
+        }
+        crate::stats::Assumption {
+            what: "phred_offset",
+            value: serde_json::json!(self.offset),
+            basis,
+            consequence,
+        }
+    }
+}
+
+/// Peek at the first 1000 records of a FASTQ file and infer what the Phred
+/// offset can be proven to be.
 ///
 /// Heuristic: any byte `< '@'` (64) cannot appear in Phred+64 (which
-/// starts at `'@'`) → must be Phred+33. If all observed bytes are ≥ 64,
-/// fall back to Phred+64. FASTA files (no quality) default to 33.
-pub fn detect_phred_offset(path: &Path) -> Result<u8> {
+/// starts at `'@'`) → Phred+33 is proven. If all observed bytes are ≥ 64,
+/// nothing is proven; the offset stays at the modern default of 33 and the
+/// assumption record says so. FASTA files (no quality) default to 33.
+pub fn detect_phred_offset(path: &Path) -> Result<PhredCensus> {
     let mut reader = needletail::parse_fastx_file(path)
         .with_context(|| format!("auto-detecting Phred offset from {}", path.display()))?;
     let mut min_q = u8::MAX;
@@ -421,8 +484,15 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
             }
         }
     }
-    if n == 0 || min_q == u8::MAX {
-        return Ok(33); // FASTA or empty file: default
+    if n_bases == 0 || min_q == u8::MAX {
+        return Ok(PhredCensus {
+            offset: 33,
+            records: n,
+            bases: 0,
+            min_q: None,
+            high: 0,
+            proven: false,
+        }); // FASTA or empty file: modern default
     }
     // A byte below 64 cannot occur under Phred+64, so its presence PROVES
     // Phred+33. Its absence proves nothing: a Phred+33 file whose lowest
@@ -435,19 +505,29 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
     // 2026-10-20: 5000/5000 reads dropped, exit 0).
     //
     // So the auto path never asserts +64. It reports +33 — the modern standard
-    // — and says when the census cannot exclude +64, naming the flag that
-    // settles it. This is exactly fastcheck::accum::offset_verdict's rule: a
-    // wrong guess here is silent, total and unrecoverable, so abstaining plus a
-    // warning is the only honest default. Legacy Phred+64 data (Illumina 1.3/1.5)
-    // is still supported, by asking for it.
-    // Deliberately silent. Warning on the ambiguous case would fire on every
-    // modern library (Q>=40 puts every byte above 64), which is noise, and the
-    // +33 default is only wrong for legacy Phred+64 data, where the symptom —
-    // qualities reported ~31 points high — is visible in the report and the fix
-    // is one flag. A warning that fires on all normal input trains users to
-    // ignore warnings.
-    let _ = (n_bases, n_high, min_q);
-    Ok(33)
+    // — and records the census as the basis of that assumption, naming the
+    // flag that settles it. This is exactly fastcheck::accum::offset_verdict's
+    // rule: a wrong guess here is silent, total and unrecoverable, so
+    // abstaining plus a labelled assumption is the only honest default. Legacy
+    // Phred+64 data (Illumina 1.3/1.5) is still supported, by asking for it.
+    Ok(PhredCensus {
+        offset: 33,
+        records: n,
+        bases: n_bases,
+        min_q: Some(min_q),
+        high: n_high,
+        proven: min_q < 64,
+    })
+}
+
+/// The assumption record for an offset the caller stated explicitly.
+fn explicit_phred_assumption(offset: u8) -> crate::stats::Assumption {
+    crate::stats::Assumption {
+        what: "phred_offset",
+        value: serde_json::json!(offset),
+        basis: format!("explicit --phred-offset {offset}"),
+        consequence: "none; the caller stated the offset".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,11 +535,14 @@ pub fn detect_phred_offset(path: &Path) -> Result<u8> {
 // ---------------------------------------------------------------------------
 
 pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Result<Stats> {
-    // Phred offset: auto-detect or use the configured value.
-    let phred_offset = if rt.phred_auto {
-        detect_phred_offset(in1)?
+    // Phred offset: a census of the input, or the configured value. Either way
+    // the choice is recorded as an assumption: a +64 file read as +33 is a
+    // silent 31-point error in every quality and D-6 forbids guessing quietly.
+    let (phred_offset, assumption) = if rt.phred_auto {
+        let census = detect_phred_offset(in1)?;
+        (census.offset, census.assumption())
     } else {
-        rt.phred_offset
+        (rt.phred_offset, explicit_phred_assumption(rt.phred_offset))
     };
 
     let mut reader = parse_fastx_reader(open_input(in1, rt.compression.gz_threads)?)
@@ -487,7 +570,11 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
         _ => None,
     };
 
-    let mut stats = Stats::default();
+    let mut stats = Stats {
+        phred_offset,
+        assumptions: vec![assumption],
+        ..Default::default()
+    };
     // Names are resolved once for the run; per-read work carries an index.
     stats.adapter.set_names(adapter_names(params));
     let parallel = rt.threads > 1;
@@ -585,7 +672,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 }
             }
             chunks_written += 1;
-            if !rt.quiet && stderr_is_tty && chunks_written % 100 == 0 {
+            if !rt.quiet && stderr_is_tty && chunks_written.is_multiple_of(100) {
                 eprint!("\r  {} reads processed", stats.reads_in);
                 progress_shown = true;
             }
@@ -699,11 +786,12 @@ pub fn run_paired(
     params_r2: &Params,
     rt: &Runtime,
 ) -> Result<PairedStats> {
-    // Phred offset: auto-detect from R1 (R2 must match).
-    let phred_offset = if rt.phred_auto {
-        detect_phred_offset(in1)?
+    // Phred offset: a census of R1 (R2 must match), or the configured value.
+    let (phred_offset, phred_assumption) = if rt.phred_auto {
+        let census = detect_phred_offset(in1)?;
+        (census.offset, census.assumption())
     } else {
-        rt.phred_offset
+        (rt.phred_offset, explicit_phred_assumption(rt.phred_offset))
     };
 
     let mut r1 = parse_fastx_reader(open_input(in1, rt.compression.gz_threads)?)
@@ -777,8 +865,13 @@ pub fn run_paired(
     };
 
     let parallel = rt.threads > 1;
+    // The offset census runs once, from R1, and applies to both mates.
+    stats.r1.phred_offset = phred_offset;
+    stats.r2.phred_offset = phred_offset;
+    stats.r1.assumptions.push(phred_assumption.clone());
+    stats.r2.assumptions.push(phred_assumption);
     // Names are resolved once for the run; per-read work carries an index.
-    let names = adapter_names(&params_r1);
+    let names = adapter_names(params_r1);
     stats.r1.adapter.set_names(names.clone());
     stats.r2.adapter.set_names(names);
     // Quality is never decoded: the offset is folded into the gate LUT and the
@@ -902,7 +995,7 @@ pub fn run_paired(
             )?;
 
             chunks_written += 1;
-            if !rt.quiet && stderr_is_tty && chunks_written % 100 == 0 {
+            if !rt.quiet && stderr_is_tty && chunks_written.is_multiple_of(100) {
                 eprint!(
                     "\r  {} reads processed",
                     stats.r1.reads_in + stats.r2.reads_in
@@ -1192,7 +1285,7 @@ fn pair_chunks(
             .map(work)
             .collect()
     } else {
-        c1.into_iter().zip(c2.into_iter()).map(work).collect()
+        c1.into_iter().zip(c2).map(work).collect()
     }
 }
 
@@ -1719,7 +1812,9 @@ mod tests {
         // evidence for +64.
         let inp = tmp_path("hq.fq");
         write_plain(&inp, "@r\nACGT\n+\nDDDD\n@r\nACGT\n+\nDDDD\n");
-        assert_eq!(detect_phred_offset(&inp).unwrap(), 33);
+        let census = detect_phred_offset(&inp).unwrap();
+        assert_eq!(census.offset, 33);
+        assert!(!census.proven, "'D' = 68 proves nothing");
         std::fs::remove_file(&inp).ok();
     }
 
@@ -1734,7 +1829,16 @@ mod tests {
         // --phred-offset 64 is the way to ask for legacy data.
         let inp = tmp_path("p64.fq");
         write_plain(&inp, "@r\nACGT\n+\nhhhh\n@r\nACGT\n+\nhhhh\n"); // 'h' = 104
-        assert_eq!(detect_phred_offset(&inp).unwrap(), 33);
+        let census = detect_phred_offset(&inp).unwrap();
+        assert_eq!(census.offset, 33);
+        assert!(!census.proven);
+        let a = census.assumption();
+        assert!(
+            a.basis.contains("cannot distinguish"),
+            "the basis must admit the census cannot decide: {}",
+            a.basis
+        );
+        assert!(a.consequence.contains("31"));
         std::fs::remove_file(&inp).ok();
     }
 
@@ -1743,7 +1847,9 @@ mod tests {
         // A byte below 64 cannot occur under Phred+64, so its presence proves +33.
         let inp = tmp_path("mix.fq");
         write_plain(&inp, "@r\nACGT\n+\n#DDD\n@r\nACGT\n+\nDDDD\n"); // '#' = 35
-        assert_eq!(detect_phred_offset(&inp).unwrap(), 33);
+        let census = detect_phred_offset(&inp).unwrap();
+        assert_eq!(census.offset, 33);
+        assert!(census.proven, "a sub-64 byte proves +33");
         std::fs::remove_file(&inp).ok();
     }
 }

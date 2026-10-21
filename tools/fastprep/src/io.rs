@@ -262,7 +262,7 @@ impl Out {
     }
 }
 
-fn strip_sigil<'a>(s: &'a [u8], sigil: u8) -> &'a [u8] {
+fn strip_sigil(s: &[u8], sigil: u8) -> &[u8] {
     if s.first() == Some(&sigil) {
         &s[1..]
     } else {

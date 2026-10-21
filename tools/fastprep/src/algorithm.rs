@@ -283,16 +283,6 @@ impl Default for Params {
 }
 
 impl Params {
-    /// Trim budget Δ_L = L_eff − L_min − extra_committed.
-    /// `L_eff` is `original_len` when set (adapter-trim sub-read path),
-    /// otherwise `l` (the actual slice length).
-    pub fn trim_budget(&self, l: usize) -> usize {
-        let l_eff = self.original_len.unwrap_or(l);
-        l_eff
-            .saturating_sub(self.min_len.resolve(l_eff))
-            .saturating_sub(self.extra_committed)
-    }
-
     /// Populate `gate_lut` from `phred_offset`, `phred_sat` and `gate_shape`.
     /// Cheap (~256 `powf` calls, ~10 µs) but should not be done per
     /// read.
@@ -1298,13 +1288,19 @@ pub struct TrimOutput {
 ///    present — it is a trim the mate pair pinned geometrically, so it needs no
 ///    adapter sequence; otherwise sequence matching from `params.adapter` is the
 ///    only mode.
-/// 2. Budget check: if adapter trim alone exceeds Δ_L, return
-///    `Drop { reason: Adapter }`.
+/// 2. The insert is what the adapter trim leaves. Adapter readthrough is not
+///    part of the fragment, so `--min-len` is resolved against the insert on
+///    both sides: the polyX budget and the final length filter. (The old
+///    adapter-specific budget check compared the adapter trim against a
+///    quantity derived from the original read length and dropped a read whose
+///    insert survived whole — a 150 bp read with a 120 bp insert and 30 bp of
+///    TruSeq was dropped as adapter overtrim at the shipped 0.9L floor.)
 /// 3. polyX scan on the adapter-trimmed sub-slice with the remaining
 ///    budget enforced via `polyx_trim_inner` (no `Params` clone — the
-///    `extra_committed` and `original_len` overrides are passed explicitly).
+///    `original_len` override is passed explicitly).
 /// 4. Reconstruct absolute coordinates (add `t5_adapter` back to all
 ///    interior-run positions).
+/// 5. The post-trim length floor, resolved against the insert.
 pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
     let l = bases.len();
 
@@ -1323,24 +1319,10 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
         },
     };
 
-    // --- Step 2: adapter-only budget check ---
-    let committed = t5_adapter + t3_adapter;
-    if committed > 0 {
-        let delta_l = params.trim_budget(l); // uses original l
-        if committed > delta_l {
-            return TrimOutput {
-                result: TrimResult::Drop {
-                    reason: DropReason::Adapter,
-                    t5_adapter,
-                    t3_adapter,
-                    t5_poly: 0,
-                    t3_poly: 0,
-                    runs: vec![],
-                },
-                adapter,
-            };
-        }
-    }
+    // --- Step 2: the insert length ---
+    // The fragment continues only as far as the adapter boundary; `--min-len`
+    // is a floor on that remainder, not on the read the sequencer emitted.
+    let insert_len = l.saturating_sub(t5_adapter + t3_adapter);
 
     // --- Step 3: polyX scan on adapter-trimmed sub-slice ---
     // Guard against pathological adapter trim consuming the whole read.
@@ -1349,9 +1331,9 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
     let sub_bases = &bases[safe_t5..l - safe_t3];
     let sub_quals = &quals[safe_t5..l - safe_t3];
 
-    // Call the inner implementation directly, passing `committed` and `Some(l)` so
-    // the budget is enforced relative to the original read length — no Params clone.
-    let poly_result = polyx_trim_inner(sub_bases, sub_quals, params, committed, Some(l));
+    // Call the inner implementation directly, passing `Some(insert_len)` so the
+    // polyX budget is enforced against the insert — no Params clone.
+    let poly_result = polyx_trim_inner(sub_bases, sub_quals, params, 0, Some(insert_len));
 
     // --- Step 4: reconstruct absolute coordinates ---
     let result = match poly_result {
@@ -1395,17 +1377,16 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
     };
 
     // --- Step 5: the post-trim length floor ---
-    // The budget in step 2 caps how much trim is ALLOWED, but it is computed
-    // from `MinLen::resolve`, which clamps to the read length — so on its own
-    // it can never reject a read that was already too short. An absolute floor
-    // (or a fraction on a short read) must actually filter, which is what the
-    // flag documents.
+    // The budget caps how much trim is ALLOWED; this filters a remainder that
+    // is simply too short. It is resolved against the INSERT, not the emitted
+    // read: the adapter bases were never part of the fragment, so a read whose
+    // whole insert survived must not be dropped for losing its readthrough.
     let result = match result {
         TrimResult::Emit { t5_adapter, t3_adapter, t5_poly, t3_poly, runs } => {
             let out_len = l.saturating_sub(
                 t5_adapter + t5_poly + t3_adapter + t3_poly,
             );
-            if out_len < params.min_len.floor(l) {
+            if out_len < params.min_len.floor(insert_len) {
                 TrimResult::Drop {
                     reason: DropReason::Length,
                     t5_adapter,
@@ -1749,7 +1730,7 @@ mod tests {
     #[test]
     fn trim_all_polya_dropped() {
         // All-A of length 150, Δ_L ≈ 60: budget fires on 5′ end-scan.
-        let (b, q) = read(&vec![b'A'; 150], 40);
+        let (b, q) = read(&[b'A'; 150], 40);
         let params = Params::default();
         assert!(matches!(
             polyx_trim(&b, &q, &params),
@@ -1761,7 +1742,7 @@ mod tests {
     fn trim_3prime_polyg() {
         // Random prefix then polyG tail.
         let mut b = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(); // 40
-        b.extend(std::iter::repeat(b'G').take(12));
+        b.extend(std::iter::repeat_n(b'G', 12));
         let q = vec![40u8; b.len()];
         let params = Params::default();
         match polyx_trim(&b, &q, &params) {
@@ -1784,7 +1765,7 @@ mod tests {
     fn trim_interior_run_accumulates() {
         // Random + interior polyA(12) + random.
         let mut b = b"ACGTACGTACGTACGT".to_vec(); // 16
-        b.extend(std::iter::repeat(b'A').take(12)); // interior run
+        b.extend(std::iter::repeat_n(b'A', 12)); // interior run
         b.extend_from_slice(b"CGTACGTACGTACGT"); // 15 more — ends with T so no 3' run
         let q = vec![40u8; b.len()];
         let params = Params::default();
@@ -1814,9 +1795,9 @@ mod tests {
         // Layout: 16 clean | 10 A interior | 23 clean middle | 10 G tail.
         let mut b = vec![];
         b.extend_from_slice(b"ACGTACGTACGTACGT"); // 16
-        b.extend(std::iter::repeat(b'A').take(10));
+        b.extend(std::iter::repeat_n(b'A', 10));
         b.extend_from_slice(b"CGTACGTACGTACGTACGTACGT"); // 23
-        b.extend(std::iter::repeat(b'G').take(10));
+        b.extend(std::iter::repeat_n(b'G', 10));
         let q = vec![40u8; b.len()];
         let params = Params::default();
         match polyx_trim(&b, &q, &params) {
@@ -1860,7 +1841,7 @@ mod tests {
         //     region, eventually mercy. T_3 straddles or covers the G-run.
         let mut b = vec![];
         b.extend_from_slice(b"CGTACGTACGTACGTACGTACGTACGTACG"); // 30 clean
-        b.extend(std::iter::repeat(b'G').take(8));
+        b.extend(std::iter::repeat_n(b'G', 8));
         b.push(b'T');
         b.push(b'A'); // final clean base, total L = 40
         let q = vec![40u8; b.len()];
@@ -2017,9 +1998,7 @@ mod tests {
                 seq.extend_from_slice(b"ACGT");
             }
             seq.truncate(l - t);
-            for _ in 0..t {
-                seq.push(b'G');
-            }
+            seq.extend(std::iter::repeat_n(b'G', t));
             let q = vec![40u8; l];
             // default (whole-run/mercy): overshoots the clean run by 2.
             let p = Params {
@@ -2087,9 +2066,7 @@ mod tests {
             seq.extend_from_slice(b"ACGT");
         }
         seq.truncate(l - t);
-        for _ in 0..t {
-            seq.push(b'G');
-        }
+        seq.extend(std::iter::repeat_n(b'G', t));
         let q = vec![40u8; l];
         let p = Params {
             min_run: 12,
@@ -2164,7 +2141,7 @@ mod tests {
             ..Default::default()
         };
         // L = 40, Δ_L = 20: a 40-A read exceeds budget ⇒ drop.
-        let (b, q) = read(&vec![b'A'; 40], 40);
+        let (b, q) = read(&[b'A'; 40], 40);
         assert!(matches!(
             polyx_trim(&b, &q, &params),
             TrimResult::Drop { .. }
@@ -2190,7 +2167,7 @@ mod tests {
         // short-circuits on the long polyG immediately ⇒ drop (same
         // outcome), but via a different path.
         let mut b = b"AAACGTACGTACGTACGTACGTACGTAC".to_vec(); // 28
-        b.extend(std::iter::repeat(b'G').take(100));
+        b.extend(std::iter::repeat_n(b'G', 100));
         let q = vec![40u8; b.len()];
 
         // With default params (Δ_L = 0.4L = 51), 100 G's exceeds budget.
@@ -2210,7 +2187,7 @@ mod tests {
         // physical t_3 value (trim is end-local, direction only changes
         // order of evaluation).
         let mut b = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(); // 52
-        b.extend(std::iter::repeat(b'G').take(10));
+        b.extend(std::iter::repeat_n(b'G', 10));
         let q = vec![40u8; b.len()];
         let fwd = polyx_trim(&b, &q, &Params::default());
         let rev = polyx_trim(
@@ -2295,8 +2272,8 @@ mod tests {
         // exercises the mean-q computation.
         let b = b"ACGTACGTACGTACGTACGT"; // L = 20
         let mut q = vec![5u8; b.len()];
-        for i in 5..15 {
-            q[i] = 40;
+        for q in q.iter_mut().take(15).skip(5) {
+            *q = 40;
         }
         let mut params = Params::default();
         params.min_len = MinLen::Abs(10);
@@ -2363,7 +2340,7 @@ mod tests {
         // Hard trim consumes 5' adapter-like region; 5' scan then trims
         // any leftover polyX at the new 5' end.
         let mut b = vec![b'N'; 5]; // fake adapter
-        b.extend(std::iter::repeat(b'A').take(10));
+        b.extend(std::iter::repeat_n(b'A', 10));
         b.extend_from_slice(b"CGTACGTACGTACGTACGTACGTACGTACGTACGTA");
         let q = vec![40u8; b.len()];
         let params = Params {
@@ -2485,8 +2462,8 @@ mod tests {
                     let run_len = 2 + rng.below(10);
                     let start = rng.below(l.saturating_sub(run_len) + 1);
                     let base = bases[rng.below(4)];
-                    for i in start..(start + run_len).min(l) {
-                        b[i] = base;
+                    for cell in b.iter_mut().take((start + run_len).min(l)).skip(start) {
+                        *cell = base;
                     }
                 }
                 let q: Vec<u8> = (0..l).map(|_| (2 + rng.below(39)) as u8).collect();
@@ -2497,7 +2474,7 @@ mod tests {
                     .saturating_add(params.mercy.floor() as usize)
                     .saturating_sub(1);
                 if w >= 2
-                    && l >= w + 1
+                    && l > w
                     && (prefilter_end_rejects(&b, 0, l, w, params.min_run)
                         || prefilter_end_rejects(&b, l - w - 1, l, w, params.min_run))
                 {

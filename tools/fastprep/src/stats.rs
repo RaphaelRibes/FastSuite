@@ -109,6 +109,19 @@ impl serde::Serialize for AdapterStats {
 // Main Stats struct.
 // ---------------------------------------------------------------------------
 
+/// One assumption the run made about its input, in the shape D-6 promises:
+/// nothing is ever guessed silently, and every assumption appears in the JSON
+/// and in the summary line.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Assumption {
+    pub what: &'static str,
+    pub value: serde_json::Value,
+    /// The evidence the assumption rests on.
+    pub basis: String,
+    /// What goes wrong if the assumption is false.
+    pub consequence: String,
+}
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Stats {
     pub reads_in: u64,
@@ -129,6 +142,12 @@ pub struct Stats {
     /// Post-trim length below `--min-len` (distinct from the trim budget: this
     /// one fires on reads that were simply too short to begin with).
     pub reads_dropped_length: u64,
+    /// Phred offset actually used to decode this mate's quality bytes.
+    pub phred_offset: u8,
+    /// Assumptions the run made. Reported at the top level of the JSON and in
+    /// the summary, so a +64 file read as +33 cannot be silent again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<Assumption>,
     /// Adapter-specific stats; separate to isolate HashMap allocation.
     pub adapter: AdapterStats,
 }
@@ -138,10 +157,9 @@ impl Stats {
         self.reads_in += 1;
         self.bases_in += original_len as u64;
         match res {
-            TrimResult::Drop { reason, t5_adapter, t3_adapter, t5_poly, t3_poly, .. } => {
+            TrimResult::Drop { reason, t5_adapter, t3_adapter, .. } => {
                 // Match ergonomics: res is &TrimResult, so fields are &T.
                 let (t5a, t3a) = (*t5_adapter, *t3_adapter);
-                let _ = (*t5_poly, *t3_poly);
                 self.reads_dropped += 1;
                 match reason {
                     DropReason::Poly5    => self.reads_dropped_poly5 += 1,
@@ -200,6 +218,7 @@ impl Stats {
             "reads_dropped_duplicate": self.reads_dropped_duplicate,
             "reads_dropped_length": self.reads_dropped_length,
             "reads_adapter_trimmed": self.adapter.reads_trimmed,
+            "phred_offset": self.phred_offset,
         })
     }
 }
@@ -212,6 +231,9 @@ pub struct ReportContext<'a> {
     pub elapsed: Duration,
     pub inputs: serde_json::Value,
     pub outputs: serde_json::Value,
+    /// `dedup` block: which anchor window the fingerprint used, and whether it
+    /// had to degenerate to an interior window. `None` when dedup is off.
+    pub dedup: Option<serde_json::Value>,
 }
 
 /// The `fastsuite.report.v1` wrapper for a single-end run (PLAN.md §1.1).
@@ -228,7 +250,7 @@ pub fn to_report_v1(
     ctx: &ReportContext,
     s: &Stats,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut doc = serde_json::json!({
         "schema":       REPORT_SCHEMA,
         "tool":         "fastprep",
         "tool_version": tool_version,
@@ -239,9 +261,15 @@ pub fn to_report_v1(
         "outputs":      ctx.outputs,
         "elapsed_s":    ctx.elapsed.as_secs_f64(),
         "metrics":      s.metrics_flat(),
+        // Every assumption the run made, in D-6's shape.
+        "assumptions":  &s.assumptions,
         // Raw stats object, exactly as fastprep used to write it.
         "legacy":       serde_json::to_value(s).unwrap_or(serde_json::Value::Null),
-    })
+    });
+    if let Some(d) = &ctx.dedup {
+        doc["dedup"] = d.clone();
+    }
+    doc
 }
 
 /// The `fastsuite.report.v1` wrapper for a paired-end run.
@@ -262,10 +290,16 @@ pub fn to_report_paired_v1(
     let (a, b) = (a.as_object().unwrap(), b.as_object().unwrap());
     // Every counter is a u64: sum as u64 so the JSON stays integral
     // (`8`, never `8.0`), matching what the single-end path emits.
+    // `phred_offset` is an identity, not a count: summing two mates would
+    // report 66 for a +33 run, so it is inserted once below.
     for key in a.keys() {
+        if key == "phred_offset" {
+            continue;
+        }
         let sum = a[key].as_u64().unwrap_or(0) + b[key].as_u64().unwrap_or(0);
         metrics.insert(key.clone(), serde_json::json!(sum));
     }
+    metrics.insert("phred_offset".into(), serde_json::json!(p.r1.phred_offset));
     // Per-mate breakdown for the keys that are genuinely mate-specific:
     // r1_* and r2_*, so neither mate is lost when the sum is what a
     // consumer wants.
@@ -281,7 +315,7 @@ pub fn to_report_paired_v1(
     metrics.insert("singletons_r1".into(), serde_json::json!(p.singletons_r1));
     metrics.insert("singletons_r2".into(), serde_json::json!(p.singletons_r2));
 
-    serde_json::json!({
+    let mut doc = serde_json::json!({
         "schema":       REPORT_SCHEMA,
         "tool":         "fastprep",
         "tool_version": tool_version,
@@ -292,9 +326,15 @@ pub fn to_report_paired_v1(
         "outputs":      ctx.outputs,
         "elapsed_s":    ctx.elapsed.as_secs_f64(),
         "metrics":      serde_json::Value::Object(metrics),
+        // The offset census is run once, from R1, and applies to both mates.
+        "assumptions":  &p.r1.assumptions,
         // Raw PairedStats object, exactly as fastprep used to write it.
         "legacy":       serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
-    })
+    });
+    if let Some(d) = &ctx.dedup {
+        doc["dedup"] = d.clone();
+    }
+    doc
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +383,16 @@ pub fn report(label: &str, s: &Stats) {
             let prefix = if i == last { "└─" } else { "├─" };
             eprintln!("      {} {:<18} {:>12}  ({})", prefix, name, count, pct(**count, s.reads_in));
         }
+    }
+
+    // D-6: nothing is guessed silently. The offset assumption is the one that
+    // turns a +64 file into a 31-point quality error, so it is stated here as
+    // well as in the JSON.
+    for a in &s.assumptions {
+        eprintln!(
+            "    assumption — {} = {}: {}; {}",
+            a.what, a.value, a.basis, a.consequence
+        );
     }
 
     eprintln!("    bases in:                {:>12}", s.bases_in);

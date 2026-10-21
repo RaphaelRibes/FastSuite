@@ -120,10 +120,11 @@ pub struct SeedTable {
 /// A wider seed is exponentially more selective — a 4-mer is shared by almost
 /// every read, a 6-mer by almost none — so each adapter gets the widest width
 /// its own length and the error rate allow, and only shrinks when the
-/// arithmetic forces it. At the shipped `--adapter-error-rate 0.2` the 34-base
-/// TruSeq adapters take a 4-mer (sound from k = 20) and the 19-base Nextera
-/// adapter a 3-mer (sound from k = 9); with the old fixed 6 every one of them
-/// was unsound and took the reference full scan.
+/// arithmetic forces it. At the shipped `--adapter-error-rate 0.2` the 33-base
+/// TruSeq adapters and the 19-base Nextera adapter both take a 4-mer: with the
+/// floor tolerance the pigeonhole bound holds from k = 16 for either length.
+/// With the old fixed 6 every one of them was unsound and took the reference
+/// full scan.
 const SEED_WIDTHS: [usize; 4] = [6, 5, 4, 3];
 
 /// Code ranges: width `s` owns `[code_base(s), code_base(s) + 4^s)`.
@@ -147,23 +148,60 @@ fn code_mask(s: usize) -> u32 {
     (1u32 << (2 * s)) - 1
 }
 
-/// Smallest `k` at which an alignment of `k` bases with `ceil(k·ε)` mismatches
-/// is guaranteed to contain an exact run of at least `s` bases, or `usize::MAX`
-/// when no `k <= a_len` satisfies it.
+/// Smallest `k` at which an alignment of `k` bases with `floor(k·ε)`
+/// mismatches is guaranteed to contain an exact run of at least `s` bases, or
+/// `usize::MAX` when no `k <= a_len` satisfies it.
 ///
 /// The test is `k >= s * (mm + 1)` — the pigeonhole bound above, in integers —
 /// not `ceil(k / (mm + 1)) >= s`: the latter is optimistic by one seed width,
 /// because the mismatch-free chunk may be one of the short ones when `k` is not
 /// a multiple of `mm + 1`. Using it would make the filter unsound, which the
 /// conformance test catches as a changed trim, not as a slow path.
+///
+/// The predicate is **not monotone in `k`**: `floor(k·ε)` steps up at
+/// `k = m/ε`, and each step raises the right-hand side by `s` while `k` rose
+/// by one, so a `k` that satisfies it can be followed by one that does not.
+/// Returning the first satisfying `k` therefore claimed coverage for later,
+/// unsound overlaps — at the shipped `s = 4, ε = 0.2` the rounds-up form was
+/// false again at 21, 22, 23, 26, 27 and 31 — and those positions were then
+/// skipped by both passes. The threshold returned here is instead the first
+/// `k` after the LAST failing one, so every `k` the seed pass claims really is
+/// covered and everything below falls into the direct scan.
 fn min_sound_k_for(a_len: usize, error_rate: f64, s: usize) -> usize {
+    if a_len < s {
+        return usize::MAX;
+    }
+    let mut last_unsound = None;
     for k in s..=a_len {
-        let max_mm = (k as f64 * error_rate).ceil() as usize;
-        if k >= s * (max_mm + 1) {
-            return k;
+        if !seed_bound_holds(k, error_rate, s) {
+            last_unsound = Some(k);
         }
     }
-    usize::MAX
+    match last_unsound {
+        // Nothing above the last failure can satisfy the bound either.
+        Some(k) if k == a_len => usize::MAX,
+        Some(k) => (k + 1).max(s),
+        None => s,
+    }
+}
+
+/// The pigeonhole predicate for one overlap length: with
+/// `mm = max_mismatches(k, ε)` mismatches the alignment still contains an
+/// exact run of at least `s` bases.
+#[inline]
+fn seed_bound_holds(k: usize, error_rate: f64, s: usize) -> bool {
+    k >= s * (max_mismatches(k, error_rate) + 1)
+}
+
+/// Mismatches tolerated in an overlap of `k` bases: `floor(k·ε)`.
+///
+/// Rounded DOWN, never up. `ceil` let `--adapter-error-rate 0.2` admit 4
+/// mismatches in 16 bases (25%) and 3 in 14 (21.4%), which is above the rate
+/// the flag documents and multiplied the false-trim rate; the floor is what
+/// the flag says and what the seed bound is derived from.
+#[inline]
+fn max_mismatches(k: usize, error_rate: f64) -> usize {
+    (k as f64 * error_rate) as usize
 }
 
 impl SeedTable {
@@ -481,14 +519,14 @@ pub fn load_fasta(path: &Path) -> Result<Vec<Adapter>> {
     for line in reader.lines() {
         let line = line.context("reading adapter FASTA")?;
         let line = line.trim();
-        if line.starts_with('>') {
+        if let Some(rest) = line.strip_prefix('>') {
             if let Some(name) = current_name.take() {
                 if !current_seq.is_empty() {
                     adapters.push(Adapter { name, seq: current_seq.clone() });
                     current_seq.clear();
                 }
             }
-            current_name = Some(line[1..].split_whitespace().next().unwrap_or("").to_string());
+            current_name = Some(rest.split_whitespace().next().unwrap_or("").to_string());
         } else if current_name.is_some() {
             current_seq.extend(line.as_bytes().iter().map(|b| b.to_ascii_uppercase()));
         }
@@ -516,7 +554,7 @@ pub fn load_fasta(path: &Path) -> Result<Vec<Adapter>> {
 /// read actually contains an adapter seed are tested with the exact
 /// [`mismatches_upto`] comparison. This is *exact*, not a heuristic:
 ///
-/// * any valid alignment of `k` bases with `mm = ceil(k·ε)` mismatches has at
+/// * any valid alignment of `k` bases with `mm = floor(k·ε)` mismatches has at
 ///   most `mm + 1` exactly-matching runs totalling `k − mm` bases, so one of
 ///   them is at least `floor(k / (mm + 1))` long;
 /// * when that is `>= seed_len` (i.e. `k >= seed_len·(mm+1)`, exactly the
@@ -577,7 +615,7 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
                     if k < min_overlap || k < ms || p > max_p {
                         continue;
                     }
-                    let max_mm = (k as f64 * set.error_rate).ceil() as usize;
+                    let max_mm = max_mismatches(k, set.error_rate);
                     if mismatches_upto(&seq[p..p + k], &set.adapters[ai as usize].seq[..k], max_mm)
                         <= max_mm
                     {
@@ -608,7 +646,7 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
                 if k < min_overlap {
                     break;
                 }
-                let max_mm = (k as f64 * set.error_rate).ceil() as usize;
+                let max_mm = max_mismatches(k, set.error_rate);
                 if mismatches_upto(&seq[p..p + k], &adapter.seq[..k], max_mm) <= max_mm {
                     consider(p, ai);
                     break; // leftmost match for this adapter
@@ -626,7 +664,7 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
                     if k < min_overlap {
                         break;
                     }
-                    let max_mm = (k as f64 * set.error_rate).ceil() as usize;
+                    let max_mm = max_mismatches(k, set.error_rate);
                     if mismatches_upto(&seq[p..p + k], &adapter.seq[..k], max_mm) <= max_mm {
                         consider(p, ai);
                         break; // leftmost match for this adapter
@@ -655,8 +693,9 @@ pub fn match_adapters(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
 /// The block body is written as an explicit byte loop rather than
 /// `iter().zip().filter(|(x, y)| x != y).count()`: the iterator closure chain
 /// defeats LLVM's vectoriser (measured ~21% of total runtime in the adapter
-/// scan), while the plain indexed loop auto-vectorises to AVX2 with
-/// `target-cpu = native` (measured ~40% faster than the closure chain).
+/// scan), while the plain indexed loop vectorises with the portable baseline
+/// ISA (measured ~40% faster than the closure chain). No `target-cpu` flag is
+/// set: shipped binaries must run on any x86-64 machine.
 #[inline]
 fn mismatches_upto(a: &[u8], b: &[u8], cap: usize) -> usize {
     debug_assert_eq!(a.len(), b.len());
@@ -724,6 +763,66 @@ mod tests {
         assert_eq!(m.t5, 0);
     }
 
+    /// The seed threshold must be monotone-safe: EVERY overlap the seed pass
+    /// claims (`k >= min_sound_k`) has to satisfy the pigeonhole predicate, or
+    /// that position is skipped by the seed pass (it is above the threshold)
+    /// AND by the direct pass (which only covers `k < min_sound_k`).
+    ///
+    /// The pre-fix form returned the FIRST satisfying `k`; at the shipped
+    /// `s = 4`, `eps = 0.2` the rounds-up predicate was false again at 21, 22,
+    /// 23, 26, 27 and 31, so a real alignment at those overlaps could be
+    /// missed.
+    #[test]
+    fn seed_bound_is_monotone_safe() {
+        for &eps in &[0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5] {
+            for s in 3..=6 {
+                for &a_len in &[19usize, 21, 34, 60] {
+                    let ms = min_sound_k_for(a_len, eps, s);
+                    if ms == usize::MAX {
+                        continue;
+                    }
+                    assert!(
+                        ms >= s && ms <= a_len,
+                        "eps={eps} s={s} a={a_len}: threshold {ms} out of range"
+                    );
+                    for k in ms..=a_len {
+                        assert!(
+                            seed_bound_holds(k, eps, s),
+                            "eps={eps} s={s} a={a_len}: k={k} is claimed seed-covered \
+                             but the pigeonhole predicate fails"
+                        );
+                    }
+                    if ms > s {
+                        assert!(
+                            !seed_bound_holds(ms - 1, eps, s),
+                            "eps={eps} s={s} a={a_len}: threshold {ms} is not minimal"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The tolerance is the documented rate, floored — never rounded up.
+    /// `ceil` admitted 4 mismatches in 16 bases (25%) and 3 in 14 (21.4%) at a
+    /// documented 20%.
+    #[test]
+    fn tolerance_never_exceeds_the_documented_rate() {
+        for &eps in &[0.05, 0.1, 0.2, 0.25, 0.3] {
+            for k in 1..=100 {
+                let mm = max_mismatches(k, eps);
+                assert!(
+                    mm as f64 <= k as f64 * eps + 1e-9,
+                    "eps={eps} k={k}: {mm} mismatches exceeds the documented rate"
+                );
+            }
+        }
+        assert_eq!(max_mismatches(16, 0.2), 3, "ceil gave 4 = 25%");
+        assert_eq!(max_mismatches(14, 0.2), 2, "ceil gave 3 = 21.4%");
+        assert_eq!(max_mismatches(21, 0.2), 4);
+        assert_eq!(max_mismatches(30, 0.2), 6);
+    }
+
     /// The implementation as it stood before the pigeonhole filter. The
     /// filter is a pure rejection optimisation, so the two must agree on
     /// every input; anything else is a silent change in what gets trimmed.
@@ -741,7 +840,7 @@ mod tests {
                 if k < set.min_overlap_se {
                     break;
                 }
-                let max_mm = (k as f64 * set.error_rate).ceil() as usize;
+                let max_mm = max_mismatches(k, set.error_rate);
                 let mut mm = 0usize;
                 let mut matched = true;
                 for i in 0..k {
@@ -755,7 +854,7 @@ mod tests {
                 }
                 if matched {
                     let t3 = l - p;
-                    if best.as_ref().map_or(true, |(prev, _)| t3 > *prev) {
+                    if best.as_ref().is_none_or(|(prev, _)| t3 > *prev) {
                         best = Some((
                             t3,
                             AdapterMatch {
@@ -854,10 +953,20 @@ mod tests {
     #[test]
     fn match_with_one_mismatch() {
         let adapter = b"AGATCGGAAGAG";
-        // Last 8 bases: 1 mismatch (10% of 8 = 0.8 → ceil = 1 allowed).
+        // Last 8 bases with 1 mismatch. floor(8 * 0.2) = 1 at the shipped
+        // rate, so this is a match. (Before the tolerance was floored, the
+        // fixture ran at 0.1 and relied on `ceil(0.8) = 1` — 1/8 = 12.5%,
+        // above the rate the flag documents.)
         let mut seq = b"ACGTACGTACGTACGT".to_vec();
         seq.extend_from_slice(b"AGATCGGX"); // X is mismatch
-        let set = simple_set(adapter);
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "test".into(),
+                seq: adapter.to_vec(),
+            }],
+            0.2,
+            4,
+        );
         let m = match_adapters(&seq, &set).expect("should match with 1 mm");
         assert_eq!(m.t3, 8);
     }
@@ -1010,9 +1119,9 @@ mod tests {
         let primer = b"CCGAGCCCA"; // as observed after the adapter in the real reads
         let reads: Vec<Vec<u8>> = (0..500)
             .map(|i| {
-                let insert = 200 + (i % 20) as usize; // 20 offsets, ~5% of reads each
+                let insert = 200 + (i % 20); // 20 offsets, ~5% of reads each
                 let mut r: Vec<u8> =
-                    (0..insert).map(|j| b"ACGT"[((i + j) % 4) as usize]).collect();
+                    (0..insert).map(|j| b"ACGT"[(i + j) % 4]).collect();
                 r.extend_from_slice(ad);
                 r.extend_from_slice(primer);
                 r
@@ -1076,17 +1185,22 @@ mod tests {
             )
         };
         // (eps, [width per adapter], [min_sound_k per adapter])
+        //
+        // `min_sound_k` is the first k after the LAST k where the pigeonhole
+        // predicate fails, so it is 16 at the shipped rate rather than the old
+        // first-match 20 — and Nextera takes a 4-mer too, because the floor
+        // tolerance makes the bound hold from 16 for a 19-base adapter.
         let expect: [(f64, [usize; 3], [usize; 3]); 6] = [
             (0.0, [6, 6, 6], [6, 6, 6]),
-            (0.05, [6, 6, 6], [12, 12, 12]),
-            (0.1, [6, 6, 6], [18, 18, 18]),
-            // 6 needs k >= 6*(mm+1), impossible for a 34-base adapter once
-            // eps >= 1/6; 5 is sound from k = 20 and fits the 34-base presets
-            // but not the 19-base Nextera one, which drops to a 4-mer.
-            (0.15, [5, 5, 4], [20, 20, 12]),
+            (0.05, [6, 6, 6], [6, 6, 6]),
+            (0.1, [6, 6, 6], [12, 12, 12]),
+            // 6 needs k >= 6*(mm+1): still satisfiable at eps 0.15 for the
+            // 19-base Nextera adapter (ms = 18) and, from k = 30, for the
+            // 33-base presentation adapters (ms = 30).
+            (0.15, [6, 6, 6], [30, 30, 18]),
             // The shipped rate: no width above 4 is satisfiable at all.
-            (0.2, [4, 4, 3], [20, 20, 9]),
-            (0.3, [3, 3, 0], [30, 30, usize::MAX]),
+            (0.2, [4, 4, 4], [16, 16, 16]),
+            (0.3, [3, 3, 3], [21, 21, 18]),
         ];
         for (eps, widths, ms) in expect {
             let set = set_at(eps);

@@ -264,10 +264,11 @@ pub struct Cli {
 
     // -------------------------------------------------------- PolyX trimming
     /// Minimum post-trim read length. Integer N (bases) or fraction FL of the
-    /// ORIGINAL read length (e.g. `0.6L`). A read whose post-trim length is
-    /// below this floor is dropped; a read that would need more trim than the
-    /// floor allows is dropped rather than trimmed past it. Integer floors are
-    /// absolute: `--min-len 100` drops a 40 bp read.
+    /// INSERT length (the read after adapter readthrough is removed; the
+    /// original read length when no adapter is trimmed). A read whose
+    /// post-trim length is below this floor is dropped; a read that would need
+    /// more trim than the floor allows is dropped rather than trimmed past it.
+    /// Integer floors are absolute: `--min-len 100` drops a 40 bp read.
     #[arg(long, value_name = "N|FL", default_value = "0.9L", help_heading = "PolyX Trimming")]
     pub min_len: MinLen,
 
@@ -378,18 +379,22 @@ pub struct Cli {
 
     /// ASCII offset used to decode FASTQ quality scores.
     /// 33 for modern Illumina; 64 for legacy Illumina 1.3/1.5.
-    /// Omit to accept the default of 33, or use --auto-phred to detect.
+    /// Omit to accept the default of 33, or use --auto-phred to census the
+    /// input (see the assumption the report records).
     #[arg(long, value_name = "N", help_heading = "Quality Filtering",
           conflicts_with = "auto_phred")]
     pub phred_offset: Option<u8>,
 
-    /// Auto-detect Phred quality offset from the first 1000 reads of the
-    /// input. Mutually exclusive with --phred-offset.
+    /// Census the first 1000 records of the input for a quality byte below
+    /// `'@'` (64), which would prove Phred+33. Bytes at or above 64 prove
+    /// nothing (a Phred+33 Q>=31 library looks identical), so the offset stays
+    /// at 33 and the report records that as an assumption, with the census as
+    /// its basis. Mutually exclusive with --phred-offset.
     #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
           action = clap::ArgAction::Set, help_heading = "Quality Filtering")]
     pub auto_phred: bool,
 
-    /// Disable Phred-offset auto-detection (the shipped default is on).
+    /// Disable the Phred-offset census (the shipped default is on).
     #[arg(long = "no-auto-phred", help_heading = "Quality Filtering")]
     pub no_auto_phred: bool,
 
@@ -924,7 +929,7 @@ impl Cli {
         base.prepare();
         // Deduplication. Resolved here so the run refuses before allocating
         // rather than after filling the table.
-        let dedup = if !(self.dedup && !self.no_dedup) {
+        let dedup = if !self.dedup || self.no_dedup {
             None
         } else {
             let read_len = peek_sequences(&in1, 1)?
@@ -973,12 +978,33 @@ impl Cli {
                 crate::memory::Admission::Proceed => {}
             }
 
+            let anchor = crate::dedup::AnchorSpec::new(&base, read_len, base.adapter.is_some());
             if !self.quiet {
-                eprintln!(
-                    "fastprep: deduplication on, {}-bit fingerprints, table pre-sized for \
-                     {} reads ({} buckets, {:.0} MB)",
-                    bits, capacity, proj.buckets, crate::memory::mib(proj.bytes),
-                );
+                if anchor.degenerate() {
+                    eprintln!(
+                        "fastprep: deduplication on, {}-bit fingerprints, table pre-sized for \
+                         {} reads ({} buckets, {:.0} MB); both read ends are trimmed, so the \
+                         fingerprint uses an interior window ({} of {} bases)",
+                        bits,
+                        capacity,
+                        proj.buckets,
+                        crate::memory::mib(proj.bytes),
+                        anchor.len,
+                        read_len,
+                    );
+                } else {
+                    eprintln!(
+                        "fastprep: deduplication on, {}-bit fingerprints, table pre-sized for \
+                         {} reads ({} buckets, {:.0} MB); fingerprint window {} bases at the \
+                         {} end",
+                        bits,
+                        capacity,
+                        proj.buckets,
+                        crate::memory::mib(proj.bytes),
+                        anchor.len,
+                        anchor.end.label(),
+                    );
+                }
             }
 
             Some(DedupConfig { bits, capacity, read_len, ceiling: cap_bytes })

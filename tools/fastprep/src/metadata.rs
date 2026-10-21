@@ -21,6 +21,7 @@
 //!                        5 = drop:meanq
 //!                        6 = drop:adapter
 //!                        7 = drop:duplicate
+//!                        8 = drop:length (below --min-len)
 //!   u32  t5_adapter      adapter bases trimmed from 5′ end
 //!   u32  t3_adapter      adapter bases trimmed from 3′ end
 //!   u32  t5_poly         polyX bases trimmed from 5′ end

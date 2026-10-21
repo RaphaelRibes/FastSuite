@@ -126,7 +126,7 @@ fn cgroup_v1(root: &Path, phys: u64) -> Option<Limit> {
     // The sentinel means unlimited; so, in practice, does anything at or
     // above physical memory.
     (bytes != V1_UNLIMITED && bytes < phys)
-        .then(|| Limit { bytes, source: LimitSource::CgroupV1(rel) })
+        .then_some(Limit { bytes, source: LimitSource::CgroupV1(rel) })
 }
 
 /// The scheduler's grant. Worth reading even under cgroup enforcement: it is
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn reserve_has_a_floor() {
-        assert_eq!(reserve_for(1 * GB), 512 * 1024 * 1024);
+        assert_eq!(reserve_for(GB), 512 * 1024 * 1024);
         assert_eq!(reserve_for(100 * GB), 10 * GB);
     }
 }

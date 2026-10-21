@@ -34,19 +34,44 @@ fn write_json(
 /// output file behind, and an empty file plus exit 0 is indistinguishable from
 /// a successful run to every downstream step. Fail loudly instead; `--allow-total-drop`
 /// is the explicit opt-out for a caller that really wants the empty file.
-fn refuse_total_drop(reads_in: u64, reads_out: u64, allow: bool, mode: &str) -> Result<()> {
-    if allow || reads_in == 0 || reads_out > 0 {
+///
+/// `reads_written` is every record the run actually wrote, not just the pairs:
+/// a paired run whose R2 all fails the quality gate still writes R1 singletons
+/// when `--singletons1` is given, and calling that an empty output was wrong.
+fn refuse_total_drop(
+    reads_in: u64,
+    reads_written: u64,
+    allow: bool,
+    mode: &str,
+    outputs: &str,
+) -> Result<()> {
+    if allow || reads_in == 0 || reads_written > 0 {
         return Ok(());
     }
     anyhow::bail!(
-        "fastprep: dropped all {reads_in} {mode} reads — the output file is empty. \
+        "fastprep: dropped all {reads_in} {mode} reads — nothing was written to {outputs}. \
          Refusing to report success on a total drop. Check the per-cause drop \
-         table above; the usual causes are --min-len above the read length, \
-         --mean-q above the library's mean quality, a Phred offset read the \
-         wrong way (pass --phred-offset 64 for legacy data), and an adapter \
-         floor that exceeds the trim budget. Pass --allow-total-drop to accept \
-         an empty output."
+         table above; the usual causes are --min-len above the trimmed insert \
+         length, --mean-q above the library's mean quality, and a Phred offset \
+         read the wrong way (pass --phred-offset 64 for legacy data). Pass \
+         --allow-total-drop to accept an empty output."
     )
+}
+
+/// The `dedup` block of the report: which anchor window the fingerprint used.
+///
+/// Recorded because the anchor is a *choice*: when both ends are trimmed the
+/// window moves inside the read, and a consumer comparing duplicate rates
+/// across runs needs to know which anchor produced them.
+fn dedup_report(rt: &fastprep::cli::Runtime, params: &fastprep::algorithm::Params) -> Option<serde_json::Value> {
+    let cfg = rt.dedup.as_ref()?;
+    let spec = fastprep::dedup::AnchorSpec::new(params, cfg.read_len, params.adapter.is_some());
+    Some(serde_json::json!({
+        "anchor_end": spec.end.label(),
+        "anchor_len": spec.len,
+        "usable": spec.is_usable(),
+        "degenerate": spec.degenerate(),
+    }))
 }
 
 fn main() -> Result<()> {
@@ -84,11 +109,18 @@ fn main() -> Result<()> {
                     elapsed,
                     inputs: serde_json::json!({ "r1": in1 }),
                     outputs: serde_json::json!({ "r1": out1 }),
+                    dedup: dedup_report(&rt, &params),
                 };
                 let doc = to_report_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
                 write_json(path, &doc)?;
             }
-            refuse_total_drop(s.reads_in, s.reads_kept, rt.allow_total_drop, "single-end")?;
+            refuse_total_drop(
+                s.reads_in,
+                s.reads_kept,
+                rt.allow_total_drop,
+                "single-end",
+                "the output file",
+            )?;
         }
         Mode::Paired {
             in1,
@@ -155,11 +187,21 @@ fn main() -> Result<()> {
                         "singletons1": singletons1,
                         "singletons2": singletons2,
                     }),
+                    dedup: dedup_report(&rt, &params_r1),
                 };
                 let doc = to_report_paired_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
                 write_json(path, &doc)?;
             }
-            refuse_total_drop(s.r1.reads_in, s.pairs_out, rt.allow_total_drop, "paired-end")?;
+            // Records actually written: pairs plus any salvaged singletons.
+            // Counting only the pairs called a run that wrote 100 singletons
+            // an empty output and exited 1.
+            refuse_total_drop(
+                s.r1.reads_in,
+                s.pairs_out + s.singletons_r1 + s.singletons_r2,
+                rt.allow_total_drop,
+                "paired-end",
+                "the R1/R2 outputs or either singleton file",
+            )?;
         }
     }
 

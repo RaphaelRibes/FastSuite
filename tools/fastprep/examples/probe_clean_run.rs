@@ -8,7 +8,7 @@ fn main() {
         let mut seq: Vec<u8> = Vec::new();
         while seq.len() < l - t { seq.extend_from_slice(b"ACGT"); }
         seq.truncate(l - t);
-        for _ in 0..t { seq.push(b'G'); }
+        seq.extend(std::iter::repeat_n(b'G', t));
         let q = vec![40u8; l];
         for ba in [false, true] {
             let mut p = Params::default();

@@ -88,15 +88,26 @@ pub fn select_width(estimated_reads: u64, threshold: f64) -> u32 {
 /// falls back to the whole available read.
 const MIN_ANCHOR: usize = 20;
 
-/// Which end of the read the fingerprint is taken from.
+/// Which part of the read the fingerprint is taken from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorEnd {
     /// 5′ prefix. Correct when the 5′ end is not scanned.
     Five,
     /// 3′ suffix. Used when the 5′ end is scanned instead.
     Three,
-    /// Both ends are targeted, so no artefact-free window exists.
-    None,
+    /// Both ends are targeted: the window sits between the two trim zones.
+    Interior,
+}
+
+impl AnchorEnd {
+    /// Stable spelling for the report (`dedup.anchor_end`).
+    pub fn label(self) -> &'static str {
+        match self {
+            AnchorEnd::Five => "five",
+            AnchorEnd::Three => "three",
+            AnchorEnd::Interior => "interior",
+        }
+    }
 }
 
 /// The anchor window, resolved **once** for the run.
@@ -113,8 +124,13 @@ pub struct AnchorSpec {
     pub end: AnchorEnd,
     /// Fixed window width in bases.
     pub len: usize,
+    /// 5′ origin of the window: the hard 5′ trim for `Five`, the fixed
+    /// interior start for `Interior`, unused for `Three`.
     t5: usize,
     t3: usize,
+    /// Resolved once: `len >= MIN_ANCHOR`, and for the interior window the
+    /// excluded ends are wide enough for the window to be worth having.
+    usable: bool,
 }
 
 impl AnchorSpec {
@@ -126,13 +142,45 @@ impl AnchorSpec {
         let t5 = params.trim_5.unwrap_or(0).min(reference_len);
         let t3 = params.trim_3.unwrap_or(0).min(reference_len - t5);
         let usable = reference_len - t5 - t3;
-        let len = params.min_len.resolve(reference_len).min(usable);
-        Self { end, len, t5, t3 }
+        let floor = params.min_len.resolve(reference_len);
+        let (start, len) = match end {
+            // Neither end is trusted. The pipeline may remove at most
+            // `reference_len - floor` bases from either end (that is what the
+            // length floor buys), so a window inset by that much is outside
+            // both trim zones. `MIN_ANCHOR` is the floor on the inset: a
+            // narrower window fingerprints too little to separate fragments,
+            // so the window degrades to the middle of that region instead.
+            AnchorEnd::Interior => {
+                let max_trim = reference_len.saturating_sub(floor);
+                let inset = max_trim.min(reference_len.saturating_sub(MIN_ANCHOR) / 2);
+                let start = t5.max(inset);
+                let stop = (reference_len - t3).min(reference_len - inset);
+                (start, stop.saturating_sub(start))
+            }
+            _ => (t5, floor.min(usable)),
+        };
+        // On a short read the interior window is almost the whole read: a
+        // 24-base read with a 0.9L floor leaves 20 bases, so the window buys
+        // four excluded bases while making every read that shares its first 20
+        // collide — a false duplicate, which deletes data. Below this width the
+        // whole read is the honest fingerprint; there is no meaningful artefact
+        // zone to exclude anyway.
+        let usable = len >= MIN_ANCHOR
+            && (end != AnchorEnd::Interior || reference_len - len >= MIN_ANCHOR);
+        Self { end, len, t5: start, t3, usable }
     }
 
     /// Whether a usable artefact-free window exists at all.
     pub fn is_usable(&self) -> bool {
-        self.end != AnchorEnd::None && self.len >= MIN_ANCHOR
+        self.usable
+    }
+
+    /// `true` when both read ends are trimmed and the fingerprint comes from an
+    /// interior window rather than an end. The report records this: it is a
+    /// weaker anchor (the window is shorter), and it used to be a degenerate
+    /// one (the whole read).
+    pub fn degenerate(&self) -> bool {
+        self.end == AnchorEnd::Interior
     }
 
     /// The slice to fingerprint.
@@ -147,29 +195,40 @@ impl AnchorSpec {
             return seq;
         }
         let l = seq.len();
-        if l < self.t5 + self.t3 + self.len {
+        let need = match self.end {
+            AnchorEnd::Three => self.t3 + self.len,
+            // `Five` and `Interior` are both positioned from the 5′ end: the
+            // interior window's origin is fixed for the run, so a shorter read
+            // must not shift it (that is exactly the divergence the anchor
+            // exists to absorb).
+            AnchorEnd::Five | AnchorEnd::Interior => self.t5 + self.len,
+        };
+        if l < need {
             return seq;
         }
         match self.end {
-            AnchorEnd::Five => &seq[self.t5..self.t5 + self.len],
+            AnchorEnd::Five | AnchorEnd::Interior => &seq[self.t5..self.t5 + self.len],
             AnchorEnd::Three => &seq[l - self.t3 - self.len..l - self.t3],
-            AnchorEnd::None => seq,
         }
     }
 }
 
-/// Picks the anchor end: the end the configured pipeline will *not* touch.
+/// Picks the anchor region: the part of the read the configured pipeline will
+/// *not* touch.
 ///
 /// Adapter readthrough is a 3′ event, so an enabled adapter set makes the 3′
 /// end unsafe just as `scan_3` does. Hard trims are deterministic and do not
-/// cause copies to diverge, so they only shift the window's origin.
+/// cause copies to diverge, so they only shift the window's origin. When both
+/// ends are unsafe the window moves INSIDE the read rather than degenerating
+/// to the full read: a full-read fingerprint keeps every polyG-tail copy of one
+/// fragment, which is the duplication the anchor exists to remove.
 pub fn anchor_end(params: &Params, adapters_enabled: bool) -> AnchorEnd {
     let five_unsafe = params.scan_5;
     let three_unsafe = params.scan_3 || adapters_enabled;
     match (five_unsafe, three_unsafe) {
         (false, _) => AnchorEnd::Five,
         (true, false) => AnchorEnd::Three,
-        (true, true) => AnchorEnd::None,
+        (true, true) => AnchorEnd::Interior,
     }
 }
 
@@ -305,6 +364,10 @@ impl<T: Fingerprint> Verifier<T> {
     pub fn len(&self) -> usize {
         self.seen.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -365,9 +428,48 @@ mod tests {
     fn anchors_on_the_end_that_is_not_scanned() {
         assert_eq!(anchor_end(&params(MinLen::Frac(0.6), false, true), true), AnchorEnd::Five);
         assert_eq!(anchor_end(&params(MinLen::Frac(0.6), true, false), false), AnchorEnd::Three);
-        assert_eq!(anchor_end(&params(MinLen::Frac(0.6), true, true), false), AnchorEnd::None);
+        assert_eq!(anchor_end(&params(MinLen::Frac(0.6), true, true), false), AnchorEnd::Interior);
         // Adapters make the 3' end unsafe even with scan_3 off.
-        assert_eq!(anchor_end(&params(MinLen::Frac(0.6), true, false), true), AnchorEnd::None);
+        assert_eq!(anchor_end(&params(MinLen::Frac(0.6), true, false), true), AnchorEnd::Interior);
+    }
+
+    /// When neither end is trusted the window must move INSIDE the read. The
+    /// pre-fix code returned `AnchorEnd::None` and `slice` handed back the whole
+    /// read, so the fingerprint changed with every polyG tail.
+    #[test]
+    fn interior_window_sits_between_the_trim_zones() {
+        let p = params(MinLen::Frac(0.9), true, true);
+        let spec = AnchorSpec::new(&p, 134, true);
+        assert_eq!(spec.end, AnchorEnd::Interior);
+        assert!(spec.degenerate(), "the report must be able to say so");
+        // floor = 120, so at most 14 bases leave either end: [14, 120).
+        assert_eq!(spec.len, 106);
+        let seq: Vec<u8> = (0..134u8).collect();
+        assert_eq!(spec.slice(&seq), &seq[14..120]);
+    }
+
+    /// The property the interior anchor exists for, at the shipped defaults:
+    /// three copies of one 120-base fragment with 8, 12 and 14-base polyG tails
+    /// must fingerprint identically.
+    #[test]
+    fn interior_anchor_is_invariant_to_divergent_polyg_tails() {
+        let p = params(MinLen::Frac(0.9), true, true);
+        let spec = AnchorSpec::new(&p, 134, true);
+        let insert: Vec<u8> = b"ACGT".iter().cycle().take(120).copied().collect();
+        let copies: Vec<Vec<u8>> = [8usize, 12, 14]
+            .iter()
+            .map(|&n| {
+                let mut c = insert.clone();
+                c.extend(std::iter::repeat_n(b'G', n));
+                c
+            })
+            .collect();
+        let fps: Vec<u64> = copies.iter().map(|c| u64::of(spec.slice(c))).collect();
+        assert_eq!(fps[0], fps[1], "12-base tail diverged");
+        assert_eq!(fps[0], fps[2], "14-base tail diverged");
+        assert_ne!(spec.slice(&copies[0]), &copies[0][..], "must not be the whole read");
+        // Whole-read fingerprints, which is what the old fallback used, differ.
+        assert_ne!(u64::of(&copies[0]), u64::of(&copies[2]));
     }
 
     #[test]
@@ -375,7 +477,7 @@ mod tests {
         let p = params(MinLen::Frac(0.6), false, true);
         let five = AnchorSpec::new(&p, 150, true);
         assert_eq!((five.end, five.len), (AnchorEnd::Five, 90));
-        assert_eq!(five.slice(&vec![b'A'; 150]).len(), 90);
+        assert_eq!(five.slice(&[b'A'; 150]).len(), 90);
 
         let q = params(MinLen::Frac(0.6), true, false);
         let three = AnchorSpec::new(&q, 150, false);
@@ -491,7 +593,7 @@ mod tests {
         // ceiling 0: every poll finds the process over the limit.
         let mut v = Verifier::<u64>::with_capacity(64, Some(0));
         for i in 0..POLL_INTERVAL - 1 {
-            assert_eq!(v.offer(i as u64), Seen::New, "insert {i}");
+            assert_eq!(v.offer(i), Seen::New, "insert {i}");
         }
         assert!(!v.saturated());
         // A duplicate on the polling read: reported as a duplicate, and the

@@ -180,6 +180,7 @@ enum StatusFilter {
     MeanQ,
     Adapter,
     Duplicate,
+    Length,
 }
 
 impl std::str::FromStr for StatusFilter {
@@ -195,8 +196,9 @@ impl std::str::FromStr for StatusFilter {
             "meanq" | "mean-q" | "mean_q" => Ok(StatusFilter::MeanQ),
             "adapter" => Ok(StatusFilter::Adapter),
             "duplicate" | "dup" => Ok(StatusFilter::Duplicate),
+            "length" | "len" | "min-len" => Ok(StatusFilter::Length),
             _ => Err(format!(
-                "invalid status {:?}, use: kept|dropped|hard|poly5|poly3|poly_int|meanq|adapter|duplicate",
+                "invalid status {:?}, use: kept|dropped|hard|poly5|poly3|poly_int|meanq|adapter|duplicate|length",
                 s
             )),
         }
@@ -211,7 +213,7 @@ impl std::str::FromStr for StatusFilter {
 struct Record {
     id: String,
     mate: u8,   // 0 = R1, 1 = R2
-    status: u8, // 0 = kept, 1-6 = drop reasons
+    status: u8, // 0 = kept, 1-8 = drop reasons
     t5_adapter: u32,
     t3_adapter: u32,
     t5_poly: u32,
@@ -231,6 +233,7 @@ impl Record {
             5 => "meanq",
             6 => "adapter",
             7 => "duplicate",
+            8 => "length",
             _ => "unknown",
         }
     }
@@ -303,6 +306,7 @@ struct Summary {
     reason_meanq: u64,
     reason_adapter: u64,
     reason_duplicate: u64,
+    reason_length: u64,
     r1: u64,
     r2: u64,
     reads_with_adapter: u64,
@@ -459,6 +463,7 @@ fn update_summary(s: &mut Summary, rec: &Record) {
             5 => s.reason_meanq += 1,
             6 => s.reason_adapter += 1,
             7 => s.reason_duplicate += 1,
+            8 => s.reason_length += 1,
             _ => {}
         }
     } else {
@@ -564,9 +569,14 @@ fn print_summary(s: &Summary) {
             pct_str(s.reason_adapter, s.total)
         );
         eprintln!(
-            "    └─ duplicate:       {:>10}  {}",
+            "    ├─ duplicate:       {:>10}  {}",
             fmt_num(s.reason_duplicate),
             pct_str(s.reason_duplicate, s.total)
+        );
+        eprintln!(
+            "    └─ below --min-len: {:>10}  {}",
+            fmt_num(s.reason_length),
+            pct_str(s.reason_length, s.total)
         );
     }
     eprintln!(
@@ -629,11 +639,11 @@ fn print_table(records: &[Record]) {
     for r in records {
         max_id_len = max_id_len.max(r.id.len().min(60));
     }
-    let id_col = max_id_len.max(12).min(60);
+    let id_col = max_id_len.clamp(12, 60);
 
     let sep = "─".repeat(id_col + 64);
     println!(
-        "  {:<id_col$} {:>4} {:>8} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5} {}",
+        "  {:<id_col$} {:>4} {:>8} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5} RUNS_DETAIL",
         "ID",
         "MATE",
         "STATUS",
@@ -643,7 +653,6 @@ fn print_table(records: &[Record]) {
         "P3",
         "LEN",
         "RUNS",
-        "RUNS_DETAIL",
         id_col = id_col,
     );
     println!("{}", sep);
@@ -732,6 +741,7 @@ fn build_filter(args: &Args, hard_trim_5: usize, hard_trim_3: usize) -> impl Fn(
                 StatusFilter::MeanQ => r.status == 5,
                 StatusFilter::Adapter => r.status == 6,
                 StatusFilter::Duplicate => r.status == 7,
+                StatusFilter::Length => r.status == 8,
             };
             if !ok {
                 return false;
@@ -830,8 +840,8 @@ fn display_view(rec: &Record, seq: &[u8], idx: u64, view_width: usize, hard_trim
     let t3_detected = t3p.saturating_sub(t3_hard);
 
     // 5' trim: █ for hard, ▒ for detected polyX
-    for i in 0..t5a.min(show_len) {
-        ann_bar[i] = '█';
+    for cell in ann_bar.iter_mut().take(t5a.min(show_len)) {
+        *cell = '█';
     }
     for i in 0..t5_hard {
         let pos = t5a + i;
@@ -861,9 +871,9 @@ fn display_view(rec: &Record, seq: &[u8], idx: u64, view_width: usize, hard_trim
         for &(start, len) in &rec.runs {
             let s = start as usize;
             let e = (s + len as usize).min(show_len);
-            for i in s..e {
-                if ann_bar[i] == '·' {
-                    ann_bar[i] = '▓';
+            for cell in ann_bar.iter_mut().take(e).skip(s) {
+                if *cell == '·' {
+                    *cell = '▓';
                 }
             }
         }
@@ -993,8 +1003,7 @@ fn view_records(
     let mut shown = 0u64;
     let mut total = 0u64;
 
-    loop {
-        let Some(rec) = pxmt.read_one()? else { break };
+    while let Some(rec) = pxmt.read_one()? {
         total += 1;
 
         // Read matching FASTQ record (advance both readers in lockstep)
@@ -1064,8 +1073,7 @@ fn export_fasta_records(
     let mut written = 0u64;
     let mut total = 0u64;
 
-    loop {
-        let Some(rec) = pxmt.read_one()? else { break };
+    while let Some(rec) = pxmt.read_one()? {
         total += 1;
 
         // Read matching FASTQ record in lockstep
@@ -1096,7 +1104,7 @@ fn export_fasta_records(
 
         // Write FASTA record
         let id = std::str::from_utf8(fq_rec.id()).unwrap_or("?");
-        write!(out, ">{id}\n")?;
+        writeln!(out, ">{id}")?;
         out.write_all(fq_rec.seq().as_ref())?;
         out.write_all(b"\n")?;
 
@@ -1159,8 +1167,7 @@ fn export_categories(
     let mut total = 0u64;
     let mut counts: [u64; 9] = [0; 9];
 
-    loop {
-        let Some(rec) = pxmt.read_one()? else { break };
+    while let Some(rec) = pxmt.read_one()? {
         total += 1;
 
         let fq_rec = if rec.mate == 0 {
@@ -1208,7 +1215,7 @@ fn export_categories(
         };
 
         if let Some(ref mut f) = files[idx] {
-            write!(f, ">{id}\n")?;
+            writeln!(f, ">{id}")?;
             f.write_all(seq.as_ref())?;
             f.write_all(b"\n")?;
             counts[idx] += 1;
@@ -1248,26 +1255,24 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if args.out_folder.is_some() {
+    if let Some(out_dir) = args.out_folder.as_ref() {
         let in_r1 = args.in_r1.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--in-r1 is required with --out-folder"))?;
-        let in_r2 = args.in_r2.as_ref().map(|v| v.as_path());
-        let out_dir = args.out_folder.as_ref().unwrap();
+        let in_r2 = args.in_r2.as_deref();
         return export_categories(reader, in_r1, in_r2, out_dir);
     }
 
-    if args.export_fasta.is_some() {
+    if let Some(out_path) = args.export_fasta.as_ref() {
         let in_r1 = args.in_r1.as_ref()
             .ok_or_else(|| anyhow::anyhow!("--in-r1 is required with --export-fasta"))?;
-        let in_r2 = args.in_r2.as_ref().map(|v| v.as_path());
-        let out_path = args.export_fasta.as_ref().unwrap();
+        let in_r2 = args.in_r2.as_deref();
         let filter = build_filter(&args, args.hard_trim_5, args.hard_trim_3);
         return export_fasta_records(reader, in_r1, in_r2, out_path, args.limit, &filter);
     }
 
     if args.view {
         let in_r1 = args.in_r1.as_ref().expect("--in-r1 required with --view");
-        let in_r2 = args.in_r2.as_ref().map(|v| v.as_path());
+        let in_r2 = args.in_r2.as_deref();
         let filter = build_filter(&args, args.hard_trim_5, args.hard_trim_3);
         return view_records(reader, in_r1, in_r2, args.limit, args.view_width, args.hard_trim_5, args.hard_trim_3, &filter);
     }
