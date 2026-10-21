@@ -252,6 +252,23 @@ fn instrument_counters_are_reported_and_stream_neutral() {
     let gt = |out: &Path| std::fs::read(format!("{}.gt.tsv", out.display())).unwrap();
     assert_eq!(gt(&dir.join("quiet")), gt(&dir.join("counted")), "--stats moved the stream");
 
+    // Task 2.3b: and neither is the READ STREAM. The GT alone is a weaker check
+    // than it looks -- it records the simulated truth, so a change confined to
+    // the emitted FASTQ (a different quality draw, say) could leave it equal.
+    // `TrackedRng` is meant to be a pure pass-through, so both mates must match
+    // byte for byte too. Measured on 200k pairs at -j 8: R1, R2 and the GT are
+    // all identical, and CPU is identical to three decimals (1.345 s both).
+    let reads = |out: &Path, mate: &str| {
+        std::fs::read(format!("{}_{mate}.fastq", out.display())).unwrap()
+    };
+    for mate in ["R1", "R2"] {
+        assert_eq!(
+            reads(&dir.join("quiet"), mate),
+            reads(&dir.join("counted"), mate),
+            "--stats changed the emitted {mate} reads, not just the ground truth"
+        );
+    }
+
     assert_eq!(quiet["metrics"]["rng_draws"], 0, "draw counting is off by default");
     assert!(
         counted["metrics"]["rng_draws"].as_u64().unwrap() > 0,
