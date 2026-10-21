@@ -467,3 +467,29 @@ Not implemented. Making a step atomic means renaming *every* declared output of
 extension-inferred encodings — and the reproduction above is the thing that
 should gate it. Recorded so the next attempt starts from byte counts and the
 extension hazard instead of the assumption that `.tmp` is safe.
+
+### Task 2.3b — fastsim `--stats` is free, and stream-neutral
+
+**[V] The counters are already behind the flag.** `TrackedRng` is built with
+`cfg.stats` and every increment sits behind an always-false branch, so nothing
+is collected and discarded. No code change was needed.
+
+**[M] And it costs nothing.** 200 000 pairs, `-j 8`, `--gz-level 1`, 3 reps:
+
+| | wall median | CPU median |
+|---|---:|---:|
+| without `--stats` | 1.348 s | 1.345 s |
+| with `--stats` | 1.353 s | 1.345 s |
+
+CPU is identical to three decimals; the 0.37 % wall difference is noise.
+
+**[M] The stronger invariant: the read stream does not move.** R1, R2 and the
+ground truth are byte-identical with and without `--stats` (`a8c7fc82…`,
+`5e3e279e…`, `140fcf18…`).
+
+The existing test compared only the ground truth, which is weaker than it
+looks: the GT records the simulated *truth*, so a change confined to the
+emitted FASTQ — a different quality draw, for instance — could leave the GT
+equal while the read stream moved. `TrackedRng` promises a pure pass-through,
+so the test now compares both mates' FASTQ bytes as well. An existing test was
+strengthened rather than added, so the manifest is unchanged.
