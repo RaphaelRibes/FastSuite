@@ -83,6 +83,32 @@ exact in **all** of `auto`/`always`/`never`, while tail20/tail30 are 500/500.
 evidence: the tails were outside the configured set, so the guard must refuse
 them regardless of the floor.)
 
+### M1b — The paired baseline (the "before" row for the round-3 work)
+
+The single-end corpus above cannot price the PE-overlap path, because that
+path needs two mates to pin a boundary. The paired corpus
+(`bench/scripts/undertrim_ab.py --paired`, 200 000 pairs, same seed, both
+mates scored against a known insert) gives the missing row.
+
+| config | residual / carrier | false trims / clean mate | R1 under | R2 under |
+|---|---|---|---|---|
+| shipped (mo=14, eps=0.2) | **41.15 %** | 0.011 % | 25 132 | 24 277 |
+| mo=12 | 35.60 % | 0.023 % | 21 802 | 20 936 |
+| mo=10 | 30.11 % | 0.136 % | 18 523 | 17 629 |
+| mo=8 | 24.98 % | 0.228 % | 15 444 | 14 542 |
+
+**The PE path buys almost nothing today.** The same corpus with
+`--pe-overlap never` gives 41.21 % residual against the shipped 41.15 % with
+`--pe-overlap always` — a **0.06 pp** difference, and R1's residual count is
+*identical* (25 132) in both. The detector pins the boundary and the guard
+discards it (M1), so the stage is a dead end below the floor.
+
+That 0.06 pp is the size of the prize UT-1 is aiming at: the boundary the
+detector already pins is worth the whole 6–13 band (58.5 % of the
+single-end residual) if the guard stops re-imposing the floor on it.
+
+Artifact: `bench/results/undertrim-ab-paired.json`.
+
 ### M2 — Terminal G-run overprint kills detection (NovaSeq no-signal)
 
 `undertrim_probe.py` Arm C, a 20-base adapter tail with its last `g` bases
