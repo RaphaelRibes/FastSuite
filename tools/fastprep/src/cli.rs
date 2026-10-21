@@ -261,6 +261,25 @@ pub struct Cli {
     #[arg(long, default_value_t = 14, value_name = "N", help_heading = "Adapter Trimming")]
     pub min_adapter_overlap: usize,
 
+    /// How much evidence an adapter trim requires.
+    ///
+    /// `floor` (the default) is today's behaviour: a 3'-anchored match of at
+    /// least `--min-adapter-overlap` bases. `boundary` also accepts a shorter
+    /// tail when the mate geometry has already pinned the boundary — the tail
+    /// must still BE the adapter prefix at that boundary, only the length
+    /// floor is lifted.
+    ///
+    /// This exists because the PE-overlap detector pins the insert boundary
+    /// exactly and then checks it with the general matcher, which applies the
+    /// overlap floor to the tail: a 10-base tail is provably unmatchable
+    /// there, so the boundary is discarded. Measured on the paired A/B
+    /// (`bench/scripts/undertrim_ab.py --paired`), the PE path currently buys
+    /// 0.06 pp of residual-adapter reduction because of that.
+    #[arg(long, value_name = "POLICY", value_enum,
+          default_value_t = crate::adapter::AdapterEvidence::Floor,
+          help_heading = "Adapter Trimming")]
+    pub adapter_evidence: crate::adapter::AdapterEvidence,
+
 
     // -------------------------------------------------------- PolyX trimming
     /// Minimum post-trim read length. Integer N (bases) or fraction FL of the
@@ -569,6 +588,11 @@ pub struct Runtime {
     /// [`PeOverlapMode::Never`]), so the pipeline reads the mode directly and
     /// the mode's reach cannot drift from the source that justifies it.
     pub pe_overlap: PeOverlapMode,
+    /// `--adapter-evidence`: what the PE-overlap guard accepts once the
+    /// boundary is pinned. `Floor` is today's behaviour; `Boundary` also
+    /// accepts a tail shorter than `min_adapter_overlap_se`, because the mate
+    /// geometry already fixed the boundary.
+    pub adapter_evidence: crate::adapter::AdapterEvidence,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
     pub dedup: Option<DedupConfig>,
@@ -1066,6 +1090,7 @@ impl Cli {
             allow_total_drop: self.allow_total_drop,
             adapter_source,
             pe_overlap,
+            adapter_evidence: self.adapter_evidence,
             dedup,
             adapter_error_rate: self.adapter_error_rate,
             min_adapter_overlap_se: self.min_adapter_overlap,

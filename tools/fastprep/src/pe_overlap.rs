@@ -244,12 +244,35 @@ pub fn detect_pe_overlap_trim(
     anchor: usize,
     adapter_set: Option<&crate::adapter::AdapterSet>,
 ) -> Option<((usize, usize), (usize, usize))> {
+    detect_pe_overlap_trim_with(
+        r1,
+        r2,
+        anchor,
+        adapter_set,
+        crate::adapter::AdapterEvidence::Floor,
+    )
+}
+
+/// [`detect_pe_overlap_trim`] with an explicit evidence policy.
+///
+/// The policy decides what the guard accepts once the boundary is pinned:
+/// [`crate::adapter::AdapterEvidence::Floor`] is today's behaviour,
+/// [`crate::adapter::AdapterEvidence::Boundary`] also accepts a tail shorter
+/// than the overlap floor, because the mate geometry already fixed the
+/// boundary (UT-1).
+pub fn detect_pe_overlap_trim_with(
+    r1: &[u8],
+    r2: &[u8],
+    anchor: usize,
+    adapter_set: Option<&crate::adapter::AdapterSet>,
+    evidence: crate::adapter::AdapterEvidence,
+) -> Option<((usize, usize), (usize, usize))> {
     let (_, t3_1) = detect_pe_overlap(r1, r2, anchor)?;
     let set = adapter_set?;
     // R1's readthrough is `l1 - I`, so the insert is `l1 - t3_1`.
     let insert = r1.len().checked_sub(t3_1)?;
     let t3_2 = r2.len().saturating_sub(insert);
-    if !readthrough_is_adapter(r1, t3_1, set) {
+    if !readthrough_is_adapter(r1, t3_1, set, evidence) {
         // The mates overlap, but the sequence past the boundary is not
         // adapter: there is nothing to trim. Falling through to the
         // ordinary path (which will also find no adapter) is the safe
@@ -272,15 +295,41 @@ pub fn detect_pe_overlap_trim(
 ///
 /// Requires the adapter's own start to coincide with the boundary: the matched
 /// position within the tail must be 0.
+///
+/// # The evidence policy (`evidence`)
+///
+/// [`AdapterEvidence::Floor`] is today's behaviour: the general matcher,
+/// with its `min_overlap_se` floor. A tail shorter than the floor is
+/// provably unmatchable there.
+///
+/// [`AdapterEvidence::Boundary`] lifts the length floor, because the caller
+/// has already fixed the boundary from the mate geometry — the tail only
+/// has to BE the adapter at that boundary. Without this the detector pins a
+/// boundary exactly and then throws it away (UT-1).
+///
+/// The two rules that protect biology are unchanged in both policies: the
+/// adapter must start AT the boundary, and the tail must actually be the
+/// adapter prefix.
 pub fn readthrough_is_adapter(
     seq: &[u8],
     readthrough: usize,
     set: &crate::adapter::AdapterSet,
+    evidence: crate::adapter::AdapterEvidence,
 ) -> bool {
     if readthrough == 0 || readthrough > seq.len() {
         return false;
     }
     let tail = &seq[seq.len() - readthrough..];
+    // PRIMARY (boundary evidence): a boundary-anchored prefix check. The
+    // caller already pinned this boundary from the mate geometry, so the
+    // length floor is the wrong guard here.
+    if evidence == crate::adapter::AdapterEvidence::Boundary
+        && crate::adapter::any_prefix_matches(tail, set)
+    {
+        return true;
+    }
+    // FALLBACK: the general matcher, unchanged. It also covers tails longer
+    // than any adapter, where the prefix check cannot apply.
     match crate::adapter::match_adapters(tail, set) {
         Some(m) => m.t3 == readthrough,
         None => false,
@@ -295,7 +344,7 @@ pub fn readthrough_is_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{Adapter, AdapterSet};
+    use crate::adapter::{Adapter, AdapterEvidence, AdapterSet};
 
     fn dna(len: usize, seed: u64) -> Vec<u8> {
         let mut x = seed | 1;
@@ -489,6 +538,87 @@ mod tests {
         r1[48..60].copy_from_slice(b"ACGTACGTACGT");
         r2[..12].copy_from_slice(b"TTTTTTTTTTTT");
         assert_eq!(detect_pe_overlap(&r1, &r2, ANCHOR), None);
+    }
+
+    // ------------------------------------------------------------------
+    // UT-1: the pinned boundary must survive its own guard.
+    //
+    // `readthrough_is_adapter` re-checks the tail with the general matcher,
+    // which applies `min_overlap_se` to the tail it is given. A 10-base
+    // tail is therefore PROVABLY unmatchable there, and the boundary the
+    // detector pinned exactly is thrown away.
+    //
+    // The fix is a boundary-anchored prefix check that does not consult the
+    // floor, used only where the mate geometry already fixed the boundary.
+    // ------------------------------------------------------------------
+
+    const TRUSEQ: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+
+    fn illumina_set(min_overlap: usize) -> AdapterSet {
+        AdapterSet::new(
+            vec![Adapter {
+                name: "TruSeq/R1".into(),
+                seq: TRUSEQ.to_vec(),
+            }],
+            0.2,
+            min_overlap,
+        )
+    }
+
+    /// A 10-base adapter readthrough: below the default floor of 14.
+    fn short_readthrough_seq() -> Vec<u8> {
+        let mut seq = dna(40, 4242);
+        seq.extend_from_slice(&TRUSEQ[..10]);
+        seq
+    }
+
+    #[test]
+    fn a_pinned_boundary_survives_a_tail_below_the_overlap_floor() {
+        // The floor the guard must NOT re-impose on a pinned boundary.
+        let set = illumina_set(14);
+        let seq = short_readthrough_seq();
+        assert!(
+            readthrough_is_adapter(&seq, 10, &set, AdapterEvidence::Boundary),
+            "a boundary the detector pinned must survive the tail check"
+        );
+    }
+
+    #[test]
+    fn the_floor_policy_still_refuses_a_short_tail() {
+        // The byte-identical property: today's behaviour is untouched.
+        let set = illumina_set(14);
+        let seq = short_readthrough_seq();
+        assert!(
+            !readthrough_is_adapter(&seq, 10, &set, AdapterEvidence::Floor),
+            "without independent evidence the floor still refuses a short tail"
+        );
+    }
+
+    #[test]
+    fn a_tail_that_is_not_the_adapter_prefix_is_refused() {
+        // Boundary evidence does not make a random tail acceptable: the tail
+        // must still BE adapter at the boundary.
+        let set = illumina_set(14);
+        let mut seq = dna(40, 4242);
+        seq.extend_from_slice(b"TTTTTTTTTT");
+        assert!(
+            !readthrough_is_adapter(&seq, 10, &set, AdapterEvidence::Boundary),
+            "a tail that is not the adapter prefix must be refused"
+        );
+    }
+
+    #[test]
+    fn the_floor_policy_still_accepts_a_long_tail() {
+        // The long-tail path is unchanged in both policies.
+        let set = illumina_set(14);
+        let mut seq = dna(40, 4242);
+        seq.extend_from_slice(&TRUSEQ[..20]);
+        for ev in [AdapterEvidence::Floor, AdapterEvidence::Boundary] {
+            assert!(
+                readthrough_is_adapter(&seq, 20, &set, ev),
+                "a 20-base adapter tail passes the floor in both policies"
+            );
+        }
     }
 }
 

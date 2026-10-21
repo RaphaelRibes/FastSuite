@@ -165,7 +165,7 @@ def build_corpus_paired(rng, n):
     return pairs, truth
 
 
-def run_paired(fp, d, extra, tag, pe_mode):
+def run_paired(fp, d, extra, tag, pe_mode, evidence=None):
     """Run fastprep on the pair; return the PXMT dict (both mates)."""
     o1 = os.path.join(d, f"o1_{tag}.fq")
     o2 = os.path.join(d, f"o2_{tag}.fq")
@@ -177,6 +177,8 @@ def run_paired(fp, d, extra, tag, pe_mode):
            "-o", o1, "-p", o2, "--metadata", px,
            "--adapter-preset", "illumina", "--pe-overlap", pe_mode,
            "--no-dedup", "--no-mean-q", "--min-len", "0", "-j", "1", "-q", *extra]
+    if evidence:
+        cmd += ["--adapter-evidence", evidence]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"fastprep failed ({tag}): {r.stderr[-1200:]}")
@@ -259,6 +261,8 @@ def main():
                     help="build mate pairs and score both mates (PE path)")
     ap.add_argument("--pe-mode", default="always", choices=["never", "auto", "always"],
                     help="--pe-overlap mode for the paired corpus (default always)")
+    ap.add_argument("--evidence", default=None, choices=["floor", "boundary"],
+                    help="--adapter-evidence policy (default: the tool's own default)")
     a = ap.parse_args()
     if a.paired:
         return main_paired(a)
@@ -314,16 +318,18 @@ def main_paired(a):
     n_mates = 2 * a.reads
     print(f"paired corpus: {a.reads} pairs, {n_clean} without readthrough, "
           f"{carriers} with readthrough ({100*carriers/a.reads:.1f}%), "
-          f"--pe-overlap {a.pe_mode}\n")
+          f"--pe-overlap {a.pe_mode}, "
+          f"--adapter-evidence {a.evidence or 'default'}\n")
     print(f"{'config':26s} {'exact':>7} {'under':>7} {'over':>6} | "
           f"{'und/carrier':>11} {'false/cmp':>10} | {'R1 und':>7} {'R2 und':>7}")
 
-    report: dict = {"mode": "paired", "pe_mode": a.pe_mode, "reads": a.reads,
+    report: dict = {"mode": "paired", "pe_mode": a.pe_mode,
+                    "evidence": a.evidence, "reads": a.reads,
                     "clean_pairs": n_clean, "carriers": carriers,
                     "n_mates": n_mates, "configs": {}}
     for name, extra in PAIRED_CONFIGS:
         tag = name.split()[0].replace("=", "").replace(",", "")
-        px = run_paired(fp, d, extra, tag, a.pe_mode)
+        px = run_paired(fp, d, extra, tag, a.pe_mode, a.evidence)
         s = score_paired(px, truth)
         allm = s["ALL"]["ALL"]        # scope "ALL", class "ALL"
         und = allm.get("under", 0)

@@ -900,6 +900,7 @@ pub fn run_paired(
     let params_r2_arc = Arc::new(params_r2);
     let thread_pool = rt.thread_pool.clone();
     let pe_overlap = rt.pe_overlap;
+    let adapter_evidence = rt.adapter_evidence;
     let compute = std::thread::spawn(move || {
         while let Ok(((b1, c1), (b2, c2))) = raw_rx.recv() {
             let results = match thread_pool.as_ref() {
@@ -914,6 +915,7 @@ pub fn run_paired(
                         parallel,
                         pe_overlap,
                         pe_anchor,
+                        adapter_evidence,
                     )
                 }),
                 None => pair_chunks(
@@ -926,6 +928,7 @@ pub fn run_paired(
                     parallel,
                     pe_overlap,
                     pe_anchor,
+                    adapter_evidence,
                 ),
             };
             if res_tx.send(((b1, b2), results)).is_err() {
@@ -1223,6 +1226,7 @@ fn pair_chunks(
     parallel: bool,
     pe_overlap: PeOverlapMode,
     pe_anchor: usize,
+    adapter_evidence: crate::adapter::AdapterEvidence,
 ) -> Vec<ProcessedPair> {
     debug_assert_eq!(c1.len(), c2.len());
     // Mates are trimmed independently, except for the one cross-mate inference
@@ -1247,8 +1251,8 @@ fn pair_chunks(
         // `(0, l_i - I)` — the same number only when the mates are the same
         // length. `Arc::make_mut` clones only when the mode actually fired.
         let (p1, p2) = if pe_overlap.runs() {
-            match crate::pe_overlap::detect_pe_overlap_trim(
-                s1, s2, pe_anchor, params_r1.adapter.as_deref(),
+            match crate::pe_overlap::detect_pe_overlap_trim_with(
+                s1, s2, pe_anchor, params_r1.adapter.as_deref(), adapter_evidence,
             ) {
                 Some((t1, t2)) => {
                     let mut a = Arc::clone(&base1);
@@ -1347,6 +1351,7 @@ mod tests {
             allow_total_drop: false,
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
+            adapter_evidence: crate::adapter::AdapterEvidence::Floor,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1737,6 +1742,7 @@ mod tests {
             allow_total_drop: false,
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
+            adapter_evidence: crate::adapter::AdapterEvidence::Floor,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1763,6 +1769,7 @@ mod tests {
             allow_total_drop: false,
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
+            adapter_evidence: crate::adapter::AdapterEvidence::Floor,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,

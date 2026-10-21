@@ -260,6 +260,7 @@ fn runtime(pe_overlap: PeOverlapMode) -> Runtime {
         adapter_error_rate: 0.2,
         min_adapter_overlap_se: 14,
         pe_overlap,
+        adapter_evidence: fastprep::adapter::AdapterEvidence::Floor,
         dedup: None,
         thread_pool: None,
     }
@@ -815,6 +816,184 @@ fn always_with_no_adapter_set_still_refuses_the_boundary() {
     assert_eq!(kept, String::from_utf8_lossy(&r1));
 
     for p in [&in1, &in2] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// UT-1 end to end: the evidence policy through the whole pipeline.
+//
+// The unit tests cover the guard in isolation. This one drives the real
+// `run_paired` over a corpus whose readthrough is BELOW the overlap floor,
+// and asserts the two properties that matter:
+//
+//   1. with `Boundary`, the pinned boundary is applied (the readthrough is
+//      removed);
+//   2. with `Floor` (the default), the output is BYTE-IDENTICAL to a run
+//      with the policy unset -- today's behaviour is untouched.
+//
+// The corpus: 100-base mates with a 90-base insert, so each mate carries 10
+// bases of readthrough -- below the default floor of 14. The readthrough is
+// the real TruSeq/R1 prefix on R1 and the real TruSeq/R2 prefix on R2, so
+// the ordinary matcher could trim it if the floor allowed.
+// ---------------------------------------------------------------------------
+
+const TRUSEQ_R1: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+const TRUSEQ_R2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
+
+/// A mate pair with `readthrough` bases of adapter past the insert, the
+/// adapter being the real TruSeq prefix for that mate.
+fn pair_with_readthrough(
+    read_len: usize,
+    readthrough: usize,
+    seed: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let insert = read_len - readthrough;
+    let frag = dna(insert, seed);
+    let mut r1 = frag.clone();
+    r1.extend_from_slice(&TRUSEQ_R1[..readthrough]);
+    let mut r2: Vec<u8> = frag.iter().rev().map(|&b| comp(b)).collect();
+    r2.extend_from_slice(&TRUSEQ_R2[..readthrough]);
+    (r1, r2)
+}
+
+/// The adapter set the two new tests run with: the two real TruSeq
+/// prefixes, and the default floor of 14.
+///
+/// NOTE: the pipeline reads the set from `Params::adapter` (what the CLI
+/// fills from the adapter source), not from `Runtime::adapter_source` — the
+/// detector is handed `params_r1.adapter`.
+fn params_with_adapters() -> fastprep::algorithm::Params {
+    fastprep::algorithm::Params {
+        min_len: fastprep::algorithm::MinLen::Abs(0),
+        mean_q: None,
+        adapter: Some(std::sync::Arc::new(fastprep::adapter::AdapterSet::new(
+            vec![
+                fastprep::adapter::Adapter {
+                    name: "TruSeq/R1".into(),
+                    seq: TRUSEQ_R1.to_vec(),
+                },
+                fastprep::adapter::Adapter {
+                    name: "TruSeq/R2".into(),
+                    seq: TRUSEQ_R2.to_vec(),
+                },
+            ],
+            0.2,
+            14,
+        ))),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_boundary_policy_trims_a_readthrough_below_the_floor() {
+    let mut r1_body = String::new();
+    let mut r2_body = String::new();
+    for i in 0..4u64 {
+        let (a, b) = pair_with_readthrough(100, 10, 5000 + i);
+        let (qa, qb) = pair_fastq(&a, &b, &format!("short{i}"));
+        r1_body.push_str(&qa);
+        r2_body.push_str(&qb);
+    }
+
+    let in1 = tmp_path("ut1_r1.fq");
+    let in2 = tmp_path("ut1_r2.fq");
+    write_plain(&in1, &r1_body);
+    write_plain(&in2, &r2_body);
+
+    let p = params_with_adapters();
+    let mut outs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (tag, ev) in [
+        ("floor", fastprep::adapter::AdapterEvidence::Floor),
+        ("boundary", fastprep::adapter::AdapterEvidence::Boundary),
+    ] {
+        let out1 = tmp_path(&format!("ut1_{tag}_1.fq"));
+        let out2 = tmp_path(&format!("ut1_{tag}_2.fq"));
+        let mut rt = runtime(PeOverlapMode::Always);
+        rt.adapter_evidence = ev;
+        run_paired(&in1, &in2, &out1, &out2, None, None, &p, &p, &rt)
+            .expect("paired run must succeed");
+        outs.push((out1, out2));
+    }
+
+    let floor_len = read_plain(&outs[0].0).lines().count();
+    let boundary_len = read_plain(&outs[1].0).lines().count();
+    assert_eq!(
+        floor_len, boundary_len,
+        "both policies keep every record; only the TRIM differs"
+    );
+
+    // The decisive difference: with `Boundary` the 10-base readthrough is
+    // removed, so the emitted R1 records are 10 bases shorter.
+    let floor_seq_len = read_plain(&outs[0].0)
+        .lines()
+        .nth(1)
+        .map(|s| s.len())
+        .unwrap_or(0);
+    let boundary_seq_len = read_plain(&outs[1].0)
+        .lines()
+        .nth(1)
+        .map(|s| s.len())
+        .unwrap_or(0);
+    assert_eq!(
+        floor_seq_len - boundary_seq_len,
+        10,
+        "the boundary policy removes the 10-base readthrough the floor refused"
+    );
+
+    for p in [
+        &in1, &in2, &outs[0].0, &outs[0].1, &outs[1].0, &outs[1].1,
+    ] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+#[test]
+fn the_floor_policy_is_byte_identical_to_no_policy_at_all() {
+    // The default must not move a single byte.
+    let mut r1_body = String::new();
+    let mut r2_body = String::new();
+    for i in 0..4u64 {
+        let (a, b) = pair_with_readthrough(100, 10, 6000 + i);
+        let (qa, qb) = pair_fastq(&a, &b, &format!("def{i}"));
+        r1_body.push_str(&qa);
+        r2_body.push_str(&qb);
+    }
+
+    let in1 = tmp_path("ut1d_r1.fq");
+    let in2 = tmp_path("ut1d_r2.fq");
+    write_plain(&in1, &r1_body);
+    write_plain(&in2, &r2_body);
+
+    let p = params_with_adapters();
+    let mut outs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for tag in ["default", "explicit_floor"] {
+        let out1 = tmp_path(&format!("ut1d_{tag}_1.fq"));
+        let out2 = tmp_path(&format!("ut1d_{tag}_2.fq"));
+        let mut rt = runtime(PeOverlapMode::Always);
+        if tag == "explicit_floor" {
+            rt.adapter_evidence = fastprep::adapter::AdapterEvidence::Floor;
+        }
+        run_paired(&in1, &in2, &out1, &out2, None, None, &p, &p, &rt)
+            .expect("paired run must succeed");
+        outs.push((out1, out2));
+    }
+
+    assert_eq!(
+        read_plain(&outs[0].0),
+        read_plain(&outs[1].0),
+        "the default policy and an explicit `floor` must produce identical R1"
+    );
+    assert_eq!(
+        read_plain(&outs[0].1),
+        read_plain(&outs[1].1),
+        "the default policy and an explicit `floor` must produce identical R2"
+    );
+
+    for p in [
+        &in1, &in2, &outs[0].0, &outs[0].1, &outs[1].0, &outs[1].1,
+    ] {
         std::fs::remove_file(p).ok();
     }
 }

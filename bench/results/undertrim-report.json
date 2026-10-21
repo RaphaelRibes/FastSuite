@@ -1,0 +1,46 @@
+{
+ "fastprep": "/home/raphael/hermes_scratch/FastSuite/tools/fastprep/target/release/fastprep",
+ "quick": false,
+ "checks": {
+  "guard.arm_B_nothing_cut": {
+   "value": true,
+   "ok": true,
+   "detail": "arm B (t=10, floor 14) must cut nothing"
+  },
+  "guard.the_floor_is_the_blocker": {
+   "value": true,
+   "ok": true,
+   "detail": "the mechanism UT-1 addresses is still present"
+  },
+  "pe.tail10_short.exact_rate": {
+   "value": 0.0,
+   "ok": false,
+   "detail": "short-tail exact rate must be >= 0.9"
+  },
+  "pe.tail6_short.exact_rate": {
+   "value": 0.0,
+   "ok": false,
+   "detail": "short-tail exact rate must be >= 0.9"
+  },
+  "se.residual_rate": {
+   "value": 0.4195143960028742,
+   "ok": false,
+   "detail": "residual/carrier <= 0.25"
+  },
+  "se.clean_false_trim_rate": {
+   "value": 7.134855911584865e-05,
+   "ok": true,
+   "detail": "false trims/clean <= 0.0002"
+  },
+  "pe.residual_rate": {
+   "value": 0.41154275433540455,
+   "ok": false,
+   "detail": "paired residual/carrier <= 0.25"
+  },
+  "pe.clean_false_trim_rate": {
+   "value": 0.00010716505561866387,
+   "ok": true,
+   "detail": "paired false trims/clean <= 0.0002"
+  }
+ }
+}

@@ -26,6 +26,59 @@ use anyhow::{Context, Result};
 // Core types.
 // ---------------------------------------------------------------------------
 
+/// How much independent evidence an adapter trim requires.
+///
+/// The general matcher needs a floor (`min_overlap_se`) because a short 3'
+/// prefix matches by chance. Where INDEPENDENT evidence already fixed the
+/// boundary — the mate geometry pinning the insert — that floor is the wrong
+/// guard: it discards the very boundary the evidence established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AdapterEvidence {
+    /// Today's behaviour: a 3'-anchored match of at least
+    /// `min_overlap_se` bases. No independent evidence is required.
+    Floor,
+    /// Accept a shorter tail when the mate geometry pinned the boundary
+    /// (paired-end only). The tail must still BE the adapter prefix at the
+    /// boundary; only the length floor is lifted.
+    Boundary,
+}
+
+impl Default for AdapterEvidence {
+    fn default() -> Self {
+        AdapterEvidence::Floor
+    }
+}
+
+/// Boundary-anchored adapter-prefix check.
+///
+/// The tail is the last `t` bases of a read and the adapter's own prefix is
+/// compared against it: this is exactly the 3'-anchored alignment at
+/// `p = len - t` with `k = t`, WITHOUT the `min_overlap_se` floor that
+/// `match_adapters` applies.
+///
+/// The floor exists to keep a short 3' prefix from matching by chance. This
+/// function is only called where independent evidence already fixed the
+/// boundary (the mate geometry), so the floor is the wrong guard there.
+///
+/// Mismatch budget: `floor(t * error_rate)`, the same rule `match_adapters`
+/// uses, so the two paths never disagree about a tail of the same length.
+pub fn prefix_matches_adapter(tail: &[u8], adapter: &[u8], error_rate: f64) -> bool {
+    let t = tail.len();
+    if t == 0 || t > adapter.len() {
+        return false;
+    }
+    let max_mm = max_mismatches(t, error_rate);
+    mismatches_upto(tail, &adapter[..t], max_mm) <= max_mm
+}
+
+/// True if ANY adapter in the set matches the tail as a boundary-anchored
+/// prefix.
+pub fn any_prefix_matches(tail: &[u8], set: &AdapterSet) -> bool {
+    set.adapters
+        .iter()
+        .any(|a| prefix_matches_adapter(tail, &a.seq, set.error_rate))
+}
+
 /// One named adapter sequence.
 ///
 /// `PartialEq`/`Eq` are needed by [`Detection`] and by the dedup checks in
