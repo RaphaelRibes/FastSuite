@@ -27,6 +27,41 @@ fn sample_name_walks_up_past_generic_dirs() {
     assert_eq!(sample_from_path(Path::new("runs/demo/E94/fastcheck.json")), "E94");
 }
 
+/// Task 2.21 defect 1: the `.report` wrapper written beside a grid must resolve
+/// to the SAMPLE, not to a phantom one.
+///
+/// `heatmap.report.json` has the stem `heatmap.report`. `heatmap` is generic, so
+/// the wrapper has to be stripped to `heatmap` and then fall through to the
+/// parent directory. Before the fix the stem `heatmap.report` matched nothing,
+/// so three samples produced four rows and the summary read
+/// "4 report(s) from 3 sample(s)".
+#[test]
+fn the_report_wrapper_beside_a_grid_resolves_to_its_sample() {
+    // The exact shape the defect was reported against.
+    assert_eq!(
+        sample_from_path(Path::new("runs/demo/E94/heatmap.report.json")),
+        "E94"
+    );
+    // A bare wrapper with no sample directory above it cannot invent one: the
+    // suffix is still stripped, so it lands on the generic "heatmap" rather than
+    // the literal stem "heatmap.report". That is the degenerate case (a report
+    // at the filesystem root with nothing to walk up to); the interesting one is
+    // the line above, where the directory supplies the identity.
+    assert_eq!(sample_from_path(Path::new("heatmap.report.json")), "heatmap");
+    // The strip is GATED on the remainder being generic, so a library genuinely
+    // named `align.report` keeps its own name instead of losing the suffix.
+    assert_eq!(
+        sample_from_path(Path::new("runs/demo/align.report.json")),
+        "align.report"
+    );
+    // And the non-wrapper spelling still works, which is the case that was
+    // already covered: both spellings must agree on the sample.
+    assert_eq!(
+        sample_from_path(Path::new("runs/demo/E94/heatmap.report.json")),
+        sample_from_path(Path::new("runs/demo/E94/heatmap.json"))
+    );
+}
+
 #[test]
 fn html_and_md_escape_the_sample_name() {
     // A sample directory may legally be named `a<b&c|d`; unescaped it closed the
