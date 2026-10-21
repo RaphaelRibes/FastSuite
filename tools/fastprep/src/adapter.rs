@@ -79,6 +79,98 @@ pub fn any_prefix_matches(tail: &[u8], set: &AdapterSet) -> bool {
         .any(|a| prefix_matches_adapter(tail, &a.seq, set.error_rate))
 }
 
+/// Boundary-anchored prefix check with NO mismatch budget.
+///
+/// A short tail must be an EXACT prefix to count as evidence: the general
+/// `floor(t * eps)` budget permits one mismatch at t=6, which a random tail
+/// hits ~0.5 % of the time per adapter, and the shipped `illumina` preset
+/// carries four adapters.
+pub fn prefix_matches_adapter_exact(tail: &[u8], adapter: &[u8]) -> bool {
+    let t = tail.len();
+    if t == 0 || t > adapter.len() {
+        return false;
+    }
+    tail == &adapter[..t]
+}
+
+/// True if ANY adapter in the set matches the tail as an EXACT
+/// boundary-anchored prefix.
+pub fn any_prefix_matches_exact(tail: &[u8], set: &AdapterSet) -> bool {
+    set.adapters
+        .iter()
+        .any(|a| prefix_matches_adapter_exact(tail, &a.seq))
+}
+
+/// The length of the terminal homopolymer run that a no-signal overprint can
+/// produce at a 3' end.
+///
+/// Six is the measured boundary: with a 20-base adapter tail whose last 4
+/// bases are G, the match still succeeds (the mismatch budget absorbs them),
+/// but with the last 6 or 8 replaced by G it fails outright — 0 of 2 000
+/// exact cuts, against 2 000 of 2 000 for g <= 4
+/// (`bench/results/undertrim-probe.json`, Arm C).
+pub const G_RUN_MIN: usize = 6;
+
+/// The length of the trailing run of `base` (case-insensitive) at the end of
+/// `seq`. Zero when the last base differs.
+pub fn terminal_run_len(seq: &[u8], base: u8) -> usize {
+    let want = base.to_ascii_uppercase();
+    let mut n = 0usize;
+    for &b in seq.iter().rev() {
+        if b.to_ascii_uppercase() == want {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
+/// Retry the 3'-anchored match on the slice BEFORE a terminal no-signal run.
+///
+/// NovaSeq's two-colour no-signal overprint replaces the last bases of a read
+/// with G. Because the matcher is 3'-anchored, those G's sit INSIDE the
+/// alignment window and spend the mismatch budget, so an adapter that is
+/// really there is not found (measured: 0 of 2 000 exact cuts at g = 6).
+///
+/// The retry matches the pre-G slice only, so the full `k >= min_overlap`
+/// bar still applies to the adapter bases themselves; the G-run is consumed
+/// with the adapter (the polyX stage removes it anyway).
+///
+/// The match must END at the pre-G terminus: the adapter occupies the window
+/// right up to where the G-run starts. A match that stops earlier means the
+/// G-run hides something else.
+pub fn match_adapters_before_terminal_run(
+    seq: &[u8],
+    set: &AdapterSet,
+    run_min: usize,
+) -> Option<AdapterMatch> {
+    let run = terminal_run_len(seq, b'G');
+    if run < run_min {
+        return None;
+    }
+    let cut = seq.len() - run;
+    let m = match_adapters(&seq[..cut], set)?;
+    // The match must REACH the pre-G terminus: the adapter occupies the
+    // window right up to where the G-run starts.
+    //
+    // `AdapterMatch::t3` is `len - p` — the bases from the match start to the
+    // 3' end — and the matched window is `k = min(adapter_len, len - p)`.
+    // So the match ends at the terminus exactly when `t3 == k`, i.e. when the
+    // adapter is not truncated by the end of the slice.
+    let a = set.adapters.get(m.adapter as usize)?.seq.len();
+    let k = a.min(m.t3);
+    if m.t3 != k {
+        return None;
+    }
+    Some(AdapterMatch {
+        adapter: m.adapter,
+        t5: m.t5,
+        // The G-run is consumed with the adapter.
+        t3: m.t3 + run,
+    })
+}
+
 /// One named adapter sequence.
 ///
 /// `PartialEq`/`Eq` are needed by [`Detection`] and by the dedup checks in
@@ -253,7 +345,12 @@ fn seed_bound_holds(k: usize, error_rate: f64, s: usize) -> bool {
 /// the flag documents and multiplied the false-trim rate; the floor is what
 /// the flag says and what the seed bound is derived from.
 #[inline]
-fn max_mismatches(k: usize, error_rate: f64) -> usize {
+/// The mismatch budget for an alignment of `k` bases: `floor(k * error_rate)`.
+///
+/// Public because the PE-overlap boundary policy uses the same rule for a
+/// long tail, and the two paths must never disagree about what a tail of a
+/// given length may cost.
+pub fn max_mismatches(k: usize, error_rate: f64) -> usize {
     (k as f64 * error_rate) as usize
 }
 

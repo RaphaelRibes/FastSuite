@@ -280,6 +280,23 @@ pub struct Cli {
           help_heading = "Adapter Trimming")]
     pub adapter_evidence: crate::adapter::AdapterEvidence,
 
+    /// Retry the adapter match before a terminal no-signal G-run.
+    ///
+    /// NovaSeq's two-colour overprint replaces the last bases of a read with
+    /// G. The adapter matcher is 3'-anchored, so those G's sit inside the
+    /// alignment window and spend the mismatch budget — with a 20-base
+    /// adapter tail whose last 6 bases are G, the match fails outright
+    /// (0 of 2 000 exact cuts, against 2 000 of 2 000 for 4 or fewer).
+    ///
+    /// With this flag, a read whose 3' end carries a G-run of at least N
+    /// bases is re-matched on the slice before the run, and the G-run is
+    /// consumed with the adapter (the polyX stage removes it anyway). The
+    /// full overlap floor still applies to the adapter bases themselves.
+    ///
+    /// The default is off (no retry).
+    #[arg(long, value_name = "N", help_heading = "Adapter Trimming")]
+    pub adapter_g_run_retry: Option<usize>,
+
 
     // -------------------------------------------------------- PolyX trimming
     /// Minimum post-trim read length. Integer N (bases) or fraction FL of the
@@ -940,6 +957,7 @@ impl Cli {
                 AdapterSource::Fixed { set, .. } => Some(Arc::clone(set)),
                 _ => None,
             },
+            adapter_g_run_retry: self.adapter_g_run_retry,
             // Set per pair in `pair_chunks` when `--pe-overlap` fires; `None`
             // here keeps the single-end path and every fallback byte-identical.
             pe_adapter: None,

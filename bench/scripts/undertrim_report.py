@@ -134,9 +134,27 @@ def main():
             record(f"pe.{name}.exact_rate", rate, rate >= PE_EXACT_MIN,
                    f"short-tail exact rate must be >= {PE_EXACT_MIN}")
 
+    # ------------------------------------------------------------- false fire
+    if not a.paired_only:
+        section("3. The false-fire probe (mates that overlap but carry no adapter)")
+        ff = run_script("undertrim_probe_falsefire.py",
+                        ["--fastprep", fp, "--n", "200" if a.quick else "500",
+                         "--out", os.path.join(d, "ff.json")],
+                        os.path.join(d, "ff.json"))
+        v = ff.get("verdict", {})
+        if v:
+            print(f"  floor    : {v.get('floor_false_fires')} false fires "
+                  f"({v.get('floor_rate', 0)*100:.3f}%)")
+            print(f"  boundary : {v.get('boundary_false_fires')} false fires "
+                  f"({v.get('boundary_rate', 0)*100:.3f}%)")
+            record("falsefire.boundary_no_worse", v.get("boundary_no_worse"),
+                   v.get("boundary_no_worse") is True,
+                   "the boundary policy must not fire materially more often "
+                   "than the shipped floor policy")
+
     # ------------------------------------------------------------ SE two-axis
     if not a.paired_only:
-        section("3. The single-end two-axis A/B")
+        section("4. The single-end two-axis A/B")
         se = run_script("undertrim_ab.py",
                         ["--fastprep", fp, "--reads", str(n_se),
                          "--out", os.path.join(d, "se.json")],
@@ -154,7 +172,7 @@ def main():
                    f"false trims/clean <= {FALSE_CLEAN_MAX}")
 
     # ----------------------------------------------------------- PE two-axis
-    section("4. The paired two-axis A/B")
+    section("5. The paired two-axis A/B")
     peab = run_script("undertrim_ab.py",
                       ["--fastprep", fp, "--paired", "--reads", str(n_se),
                        "--out", os.path.join(d, "peab.json")],

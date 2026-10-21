@@ -22,6 +22,11 @@
    "ok": false,
    "detail": "short-tail exact rate must be >= 0.9"
   },
+  "falsefire.boundary_no_worse": {
+   "value": true,
+   "ok": true,
+   "detail": "the boundary policy must not fire materially more often than the shipped floor policy"
+  },
   "se.residual_rate": {
    "value": 0.4195143960028742,
    "ok": false,

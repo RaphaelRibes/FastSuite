@@ -253,6 +253,27 @@ pub fn detect_pe_overlap_trim(
     )
 }
 
+/// The longest tail that may be accepted on a single mate's evidence alone.
+///
+/// At t <= 6 a random tail can match an adapter prefix by chance: the
+/// mismatch budget is `floor(t * eps)`, so at t=6 one mismatch is allowed,
+/// which is ~0.5 % per adapter, and the shipped `illumina` preset carries
+/// four adapters. Measured on the false-fire probe
+/// (`bench/scripts/undertrim_probe_falsefire.py`), the boundary policy
+/// without corroboration fires on **37 of 300** pairs at t=2 and 9 of 300
+/// at t=3 and t=5.
+pub const MAX_UNCORROBORATED_TAIL: usize = 6;
+
+/// The shortest tail the boundary policy will accept at all.
+///
+/// A 2-base adapter prefix is "AG" for every Illumina adapter, so a random
+/// tail matches it 1 time in 16 -- and the two mates are NOT independent
+/// here, because TruSeq/R1 and TruSeq/R2 share their first nine bases, so
+/// "both mates agree" is nearly the same statement twice. The measured
+/// false-fire rate at t=2 is 4 of 300 even WITH corroboration, against 0 for
+/// every t >= 8. A 2-base tail is not evidence of anything.
+pub const MIN_BOUNDARY_TAIL: usize = 3;
+
 /// [`detect_pe_overlap_trim`] with an explicit evidence policy.
 ///
 /// The policy decides what the guard accepts once the boundary is pinned:
@@ -260,6 +281,12 @@ pub fn detect_pe_overlap_trim(
 /// [`crate::adapter::AdapterEvidence::Boundary`] also accepts a tail shorter
 /// than the overlap floor, because the mate geometry already fixed the
 /// boundary (UT-1).
+///
+/// Under `Boundary`, a tail of at most [`MAX_UNCORROBORATED_TAIL`] bases
+/// additionally requires the SECOND mate to corroborate: its own tail must
+/// be the adapter prefix too (TruSeq/R2 for R2, not the same sequence as
+/// R1's). Two independent 5-base matches at chance would need ~1e-6 of
+/// pairs to collide, which is the level the Cell A guard requires.
 pub fn detect_pe_overlap_trim_with(
     r1: &[u8],
     r2: &[u8],
@@ -279,6 +306,26 @@ pub fn detect_pe_overlap_trim_with(
         // action, and it is what keeps the mode inert on adapter-free
         // libraries -- the Cell A guard.
         return None;
+    }
+    if evidence == crate::adapter::AdapterEvidence::Boundary {
+        // A short tail needs the second mate to agree. R2's adapter is a
+        // DIFFERENT sequence (TruSeq/R2), so the check is "is R2's tail the
+        // adapter prefix of SOME adapter in the set" -- not "does R2's tail
+        // match R1's adapter". (The two TruSeq sequences share their first
+        // nine bases, so this corroborates the boundary, not the adapter
+        // identity.)
+        //
+        // The minimum tail length and the exact-match rule live in
+        // `readthrough_is_adapter`, which has already run on R1.
+        if t3_1 <= MAX_UNCORROBORATED_TAIL
+            && (t3_2 == 0
+                || !crate::adapter::any_prefix_matches_exact(
+                    &r2[r2.len() - t3_2..],
+                    set,
+                ))
+        {
+            return None;
+        }
     }
     Some(((0, t3_1), (0, t3_2)))
 }
@@ -323,10 +370,25 @@ pub fn readthrough_is_adapter(
     // PRIMARY (boundary evidence): a boundary-anchored prefix check. The
     // caller already pinned this boundary from the mate geometry, so the
     // length floor is the wrong guard here.
-    if evidence == crate::adapter::AdapterEvidence::Boundary
-        && crate::adapter::any_prefix_matches(tail, set)
-    {
-        return true;
+    if evidence == crate::adapter::AdapterEvidence::Boundary {
+        // A 2-base tail is not evidence: "AG" is the prefix of every
+        // Illumina adapter, so a random tail matches it 1 time in 16.
+        if readthrough < MIN_BOUNDARY_TAIL {
+            return false;
+        }
+        // A short tail must match EXACTLY: the general mismatch budget
+        // permits one mismatch at t=6, which a random tail hits ~0.5 % of
+        // the time per adapter. The exact rule is the WHOLE rule here --
+        // falling through to the general matcher below would re-admit the
+        // tail this check just refused.
+        if readthrough <= MAX_UNCORROBORATED_TAIL {
+            return crate::adapter::any_prefix_matches_exact(tail, set);
+        }
+        // A long tail: the general mismatch budget is right here, because a
+        // mismatch is a sequencing error rather than chance.
+        if crate::adapter::any_prefix_matches(tail, set) {
+            return true;
+        }
     }
     // FALLBACK: the general matcher, unchanged. It also covers tails longer
     // than any adapter, where the prefix check cannot apply.
@@ -619,6 +681,59 @@ mod tests {
                 "a 20-base adapter tail passes the floor in both policies"
             );
         }
+    }
+
+    #[test]
+    fn a_two_base_tail_is_refused_under_the_boundary_policy() {
+        // "AG" is the prefix of every Illumina adapter: a random tail matches
+        // it 1 time in 16. A 2-base tail is not evidence.
+        let set = illumina_set(14);
+        let mut seq = dna(40, 4242);
+        seq.extend_from_slice(&TRUSEQ[..2]);
+        assert!(
+            !readthrough_is_adapter(&seq, 2, &set, AdapterEvidence::Boundary),
+            "a 2-base tail must be refused even though it IS the adapter prefix"
+        );
+    }
+
+    #[test]
+    fn a_short_tail_must_match_exactly() {
+        // At t=6 the general budget allows one mismatch, which a random tail
+        // hits ~0.5 % of the time per adapter. A short tail must be exact.
+        let set = illumina_set(14);
+        let mut seq = dna(40, 4242);
+        let mut tail = TRUSEQ[..6].to_vec();
+        tail[3] = if tail[3] == b'A' { b'C' } else { b'A' }; // one mismatch
+        seq.extend_from_slice(&tail);
+        assert!(
+            !readthrough_is_adapter(&seq, 6, &set, AdapterEvidence::Boundary),
+            "a short tail with one mismatch is not evidence"
+        );
+        // The shipped floor policy refuses it too, but for the OTHER reason:
+        // the tail is shorter than the overlap floor. That is the original
+        // mechanism, and the two policies refuse it for different reasons.
+        assert!(
+            !readthrough_is_adapter(&seq, 6, &set, AdapterEvidence::Floor),
+            "the floor policy refuses a sub-floor tail for the length reason"
+        );
+    }
+
+    #[test]
+    fn an_exact_short_tail_is_refused_by_the_floor_but_accepted_by_the_boundary() {
+        // The two policies differ exactly here: the same 6-base exact tail is
+        // refused by the floor (too short) and accepted by the boundary
+        // (the geometry pinned it).
+        let set = illumina_set(14);
+        let mut seq = dna(40, 4242);
+        seq.extend_from_slice(&TRUSEQ[..6]);
+        assert!(
+            !readthrough_is_adapter(&seq, 6, &set, AdapterEvidence::Floor),
+            "the floor refuses a 6-base tail"
+        );
+        assert!(
+            readthrough_is_adapter(&seq, 6, &set, AdapterEvidence::Boundary),
+            "the boundary policy accepts an exact 6-base tail"
+        );
     }
 }
 

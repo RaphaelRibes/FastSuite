@@ -216,6 +216,20 @@ pub struct Params {
     /// [`crate::pe_overlap::detect_pe_overlap`] verified a unique overlap.
     pub pe_adapter: Option<(usize, usize)>,
 
+    /// Retry the adapter match on the slice BEFORE a terminal no-signal G-run
+    /// (UT-2). `None` disables the retry (today's behaviour).
+    ///
+    /// NovaSeq's two-colour overprint replaces the last bases of a read with
+    /// G. The matcher is 3'-anchored, so those G's sit inside the alignment
+    /// window and spend the mismatch budget: with a 20-base adapter tail
+    /// whose last 6 bases are G, the match fails outright — 0 of 2 000 exact
+    /// cuts, against 2 000 of 2 000 for g <= 4.
+    ///
+    /// `Some(n)` sets the minimum G-run length that triggers the retry. The
+    /// G-run is consumed with the adapter (the polyX stage removes it
+    /// anyway), so the only extra cut is the adapter extension.
+    pub adapter_g_run_retry: Option<usize>,
+
     /// Trim budget already consumed by a prior step (e.g. adapter trim).
     /// Subtracted from the computed Δ_L inside [`polyx_trim`] so the
     /// combined trim stays within the min-len contract.
@@ -272,6 +286,7 @@ impl Default for Params {
             trim_3: None,
             adapter: None,
             pe_adapter: None,
+            adapter_g_run_retry: None,
             extra_committed: 0,
             original_len: None,
             gate_lut: [0.0; 256],
@@ -1312,10 +1327,29 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
         Some((t5, t3)) => (t5, t3, Some(crate::adapter::PE_OVERLAP_ADAPTER)),
         None => match params.adapter.as_deref() {
             None => (0, 0, None),
-            Some(set) => match crate::adapter::match_adapters(bases, set) {
-                None => (0, 0, None),
-                Some(m) => (m.t5, m.t3, Some(m.adapter)),
-            },
+            Some(set) => {
+                match crate::adapter::match_adapters(bases, set) {
+                    Some(m) => (m.t5, m.t3, Some(m.adapter)),
+                    // UT-2: the ordinary match found nothing. If the read ends
+                    // in a no-signal G-run, that run may be hiding an adapter
+                    // that is really there: the matcher is 3'-anchored, so the
+                    // G's sit inside the window and spend the mismatch
+                    // budget. Retry on the pre-G slice.
+                    None => match params.adapter_g_run_retry {
+                        None => (0, 0, None),
+                        Some(run_min) => {
+                            match crate::adapter::match_adapters_before_terminal_run(
+                                bases,
+                                set,
+                                run_min,
+                            ) {
+                                Some(m) => (m.t5, m.t3, Some(m.adapter)),
+                                None => (0, 0, None),
+                            }
+                        }
+                    },
+                }
+            }
         },
     };
 

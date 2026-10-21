@@ -1,0 +1,124 @@
+{
+ "fastprep": "/home/raphael/hermes_scratch/FastSuite/tools/fastprep/target/release/fastprep",
+ "n": 500,
+ "L": 150,
+ "seed": 99,
+ "arms": {
+  "t2_floor": {
+   "t": 2,
+   "policy": "floor",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t2_boundary": {
+   "t": 2,
+   "policy": "boundary",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t3_floor": {
+   "t": 3,
+   "policy": "floor",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t3_boundary": {
+   "t": 3,
+   "policy": "boundary",
+   "r1_trimmed": 1,
+   "r2_trimmed": 1,
+   "n": 500
+  },
+  "t4_floor": {
+   "t": 4,
+   "policy": "floor",
+   "r1_trimmed": 1,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t4_boundary": {
+   "t": 4,
+   "policy": "boundary",
+   "r1_trimmed": 1,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t5_floor": {
+   "t": 5,
+   "policy": "floor",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t5_boundary": {
+   "t": 5,
+   "policy": "boundary",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t6_floor": {
+   "t": 6,
+   "policy": "floor",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t6_boundary": {
+   "t": 6,
+   "policy": "boundary",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t8_floor": {
+   "t": 8,
+   "policy": "floor",
+   "r1_trimmed": 1,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t8_boundary": {
+   "t": 8,
+   "policy": "boundary",
+   "r1_trimmed": 2,
+   "r2_trimmed": 1,
+   "n": 500
+  },
+  "t10_floor": {
+   "t": 10,
+   "policy": "floor",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t10_boundary": {
+   "t": 10,
+   "policy": "boundary",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t14_floor": {
+   "t": 14,
+   "policy": "floor",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  },
+  "t14_boundary": {
+   "t": 14,
+   "policy": "boundary",
+   "r1_trimmed": 0,
+   "r2_trimmed": 0,
+   "n": 500
+  }
+ },
+ "verdict": {
+  "worst_false_fire": 2,
+  "no_false_fire": false
+ }
+}
