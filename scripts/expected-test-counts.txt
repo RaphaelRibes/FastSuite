@@ -33,10 +33,10 @@
 # column of its per-tool table, and copy those numbers here.
 
 fastcheck    143
-fastdedup    122
-fastprep     187
-fastsim       89
-fastmaps      77
-fasthelper    61
+fastdedup    134
+fastprep     203
+fastsim       93
+fastmaps      96
+fasthelper    70
 pathology    1
-GRAND        680
+GRAND        740
