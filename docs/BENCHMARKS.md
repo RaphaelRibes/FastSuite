@@ -190,21 +190,24 @@ default until 2026-10-18 and is 4× the peak of the 8 MB default, so a row that
 omits it is unreadable and looks like a 9× memory gap against FastQC that the
 shipped tool does not have.
 
-### Runtime and memory (largest library, 5 M pairs)
+### Runtime and memory (process-tree peak RSS, sampled every 20 ms)
 
-| tool | mode | `--buffer-mb` | wall (s) | peak RSS (MB) |
-|---|---|---|---|---|
-| fastmaps | all cores | 512 (pre-2026-10-18 default) | 9.17 | 145.2 |
-| fastmaps | pinned 1 core | 512 | 17.91 | 142.6 |
-| fastmaps | all cores | **8 (shipped default)** | not re-measured on this corpus | **36.1** at 10 M reads (`§2` preview-streaming table) |
-| fastqc | default | 16.1 | 16.4 |
-| falco | default | 8.27 | 641.5 |
-
-| tool | 100 k wall (s) | 5 M wall (s) | 5 M peak (MB) |
+| reads | tool | wall (s) | peak RSS (MB) |
 |---|---|---|---|
-| fastmaps (all cores) | 0.22 | 9.17 | 145.2 |
-| fastqc | 2.1 | 16.1 | 16.4 |
-| falco | 0.18 | 8.27 | 641.5 |
+| 100 k | fastmaps (8 MB buffer, all cores) | 0.18 | 10.6 |
+| 100 k | fastqc 0.13.0 | 3.22 | 343.5 |
+| 100 k | falco 2.0.2 | 0.27 | 18.5 |
+| 5 M | fastmaps (8 MB buffer, all cores) | 5.78 | 22.2 |
+| 5 M | fastmaps (512 MB buffer, all cores) | 5.83 | 123.8 |
+| 5 M | fastqc 0.13.0 | 20.31 | 479.1 |
+| 5 M | falco 2.0.2 | 8.48 | 641.2 |
+
+**Read the RSS column as the tree, not the root.** `fastqc` is a Python
+launcher that forks the JVM: its root process reads 16.4 MB and can never
+produce the 479.1 MB cell, so a root-only poll reports a launcher, not a
+footprint. Every number here is the summed `VmHWM` of every process in the
+run's tree, which is also what `FastMaps-Paper/benchmark/results.csv` records.
+Pinned one-core rows are in that CSV.
 
 Full matrix in `FastMaps-Paper/benchmark/results.csv` (identical to
 `FastMaps-Bench/results/results.csv`).
@@ -246,7 +249,10 @@ equivalence on the image axis.
   nothing spilled — the "budget" never bound. The preview store used to keep
   `preview_n` full read payloads per (pixel, mate) for the whole run (~76 MB,
   ≈15 MB per `--preview-reads` step). FastQC keeps neither a per-read record
-  nor a read payload, and that is the whole 9×.
+  nor a read payload, yet it still peaks at 479 MB at 5 M reads: the 8 MB
+  index buffer is not what makes fastmaps smaller. The comparison is 22.2 MB
+  against 479.1 MB, not the reverse; the old "9× gap" came from reading only
+  FastQC's launcher process.
 * **The preview payloads are now streamed, not resident** (fixed 2026-10-18).
   The spiller writes each preview read to its row's temp file as it arrives
   (the worker flushes previews on their own 4 MB threshold, independent of the
@@ -263,9 +269,11 @@ equivalence on the image axis.
   byte-identical.
 * **What stays structural.** One 8-byte index record per read is written to a
   per-row temp file and re-read to build `heatmap.data` — that is the tool's
-  contract (every read is addressable in the grid), so fastmaps cannot reach
-  FastQC's 16 MB without the PLAN-QC rewrite (dense per-pixel counters, no
-  per-read temp stream, no per-read buffer). Costed in `docs/PLAN-QC.md` §1.
+  contract (every read is addressable in the grid), so fastmaps cannot go below
+  roughly one 8-byte record per read plus the 8 MB buffer — 22.2 MB at 5 M
+  reads. That is already 22x below FastQC's measured 479 MB; the PLAN-QC
+  rewrite is only needed for a sub-10 MB target, not for parity. Costed in
+  `docs/PLAN-QC.md` §1.
 * **Pinned fastmaps is 1.95× slower than shipped-default** at 5 M (17.91 vs
   9.17 s): the win is thread scaling, and it is real, but the comparison is
   only honest with both modes shown.
@@ -405,11 +413,13 @@ more than three). MultiQC 1.35.
 
 | tool | wall (s) | CPU (s) | peak RSS (MB) | report files | manifest entries |
 |---|---|---|---|---|---|
-| fasthelper-run | 0.667 | 3.503 | 3.6 | 2 | 2 |
-| bash-chain | 0.647 | 3.389 | 4.1 | 2 | 0 |
+| fasthelper-run (adapter guard on) | 4.437 | 5.300 | 110.97 | 2 | 2 |
+| fasthelper-run (guard off) | 1.125 | 2.023 | 50.21 | 2 | 2 |
+| bash-chain | 1.124 | 1.994 | 50.24 | 2 | 0 |
 
-The runner adds **no statistically meaningful wall overhead** — 0.667 s against
-0.647 s, a ~3 % difference that is within measurement noise — while producing
+The runner adds **no statistically meaningful wall overhead** — 1.125 s against
+1.124 s with the guard off, a difference inside measurement noise; the post-trim
+adapter guard is an opt-in extra pass that costs 3.3 s and 61 MB — while producing
 the two manifest entries the bash chain structurally cannot: the resolved
 binary path, exact argv, exit code and runner-measured wall time per step,
 schema-versioned as `fastsuite.manifest.v1`.
@@ -418,12 +428,15 @@ schema-versioned as `fastsuite.manifest.v1`.
 
 | samples | fasthelper-report wall (s) / peak (MB) | multiqc wall / peak | multiqc output files |
 |---|---|---|---|
-| 25 | 0.02 / 0.02 | 1.435 / 136.87 | 0 |
-| 50 | 0.021 / 0.03 | 1.433 / 137.07 | 0 |
-| 100 | 0.02 / 0.03 | 1.556 / 136.98 | 0 |
-| 200 | 0.021 / 0.03 | 1.492 / 137.27 | 0 |
-| 400 | 0.021 / 0.04 | 1.901 / 137.56 | 0 |
-| 800 | 0.041 / 3.89 | 2.466 / 138.32 | 0 |
+| 25 | 0.003 / 17.18 | 1.304 / 137.28 | 0 |
+| 50 | 0.005 / 17.31 | 1.270 / 137.96 | 0 |
+| 100 | 0.010 / 17.31 | 1.318 / 137.74 | 0 |
+| 200 | 0.019 / 17.43 | 1.473 / 138.07 | 0 |
+| 400 | 0.037 / 17.81 | 1.840 / 138.43 | 0 |
+| 800 | 0.075 / 18.43 | 2.439 / 139.45 | 0 |
+
+The 17.2 MB floor is the harness process itself (`fasthelper-startup` with no
+input); fasthelper's own share grows by 1.25 MB (+7 %) from 25 to 800 samples.
 
 Full matrix in `FastHelper-Paper/benchmark/results.csv`.
 
@@ -441,7 +454,7 @@ what a per-tool module has been taught to parse; fasthelper owns the schema and
 parses it natively.
 
 So the comparison is **not** "same output, faster". It is "one tool reads this
-schema and the other does not". The 20 ms / 0.02 MB vs 1.4–2.5 s / 137 MB gap
+schema and the other does not". The 3–75 ms / 17.2–18.4 MB vs 1.3–2.4 s / 137–139 MB gap
 is real, but the decisive axis is that only one of them produces a report. The
 claim should be read as: *the MultiQC slot is filled, and what fills it also
 owns the schema it aggregates*.
@@ -629,12 +642,12 @@ propagated.
 
 | claim | where | stale value | committed value |
 |---|---|---|---|
-| fastmaps vs FastQC, 5 M pairs | `docs/STATUS.md` "Measured this week" | 12.25 s / 143 MB vs 72.22 s / 375 MB | 9.17 s / 145.2 MB vs 16.1 s / 16.4 MB — **both fastmaps cells are the 512 MB-buffer era**; the shipped 8 MB default measures 9.17 s / 36.1 MB (`docs/BENCHMARKS.md` §2 table) |
+| fastmaps vs FastQC, 5 M pairs | `docs/STATUS.md` "Measured this week" | 12.25 s / 143 MB vs 72.22 s / 375 MB | **5.78 s / 22.2 MB vs 20.31 s / 479.1 MB**, tree-summed RSS (`FastMaps-Paper/benchmark/results.csv`); the old comparison paired a 512 MB-buffer cell with FastQC's launcher-only 16.4 MB |
 | fastqc at 100 k | `FastMaps-Bench/.bench_run.log` | 4.36 s | 2.1 s (`FastMaps-Paper/benchmark/results.csv`) |
 | fastprep vs fastp, 5 M pairs | `docs/STATUS.md` | 32.9 s vs 84.7 s (2.58×) | **73.99 s vs 80.03 s on one properly pinned core** — fastprep leads, 1.08× (`FastPrep-Paper/benchmark/results.csv`; the `pinned` rows of `results_gz6.csv` are NOT pinned, they burn 2.4 cores) |
-| fastsim recovery | `docs/STATUS.md` | 7 / 10 parameters | 10 / 10 (`FastSim-Paper/benchmark/recovery.csv`) |
-| fasthelper orchestration | `FastHelper-Paper` abstract | "0.69 s vs 0.69 s" | 0.667 s vs 0.647 s |
-| fasthelper aggregation peak | `FastHelper-Paper` abstract | "~50 MB" | 0.02–3.89 MB (multiqc 137 MB) |
+| fastsim recovery | `docs/STATUS.md` | 7 / 10 parameters | 9 / 10 — the GC row is a **false pass** on the campaign build (`profile.gc` was inert); the field is honoured since 2026-10-21 but the row is unverified until the recovery is re-run (`FastSim-Paper/benchmark/recovery.csv`) |
+| fasthelper orchestration | `FastHelper-Paper` abstract | "0.69 s vs 0.69 s" | 1.125 s vs 1.124 s (guard off); 4.437 s with the adapter guard |
+| fasthelper aggregation peak | `FastHelper-Paper` abstract | "~50 MB" | 17.18–18.43 MB, of which 17.2 MB is the harness floor (multiqc 137–139 MB) |
 
 Two of these are worth flagging beyond the arithmetic. **The fastprep one-core
 cell has been re-measured twice for two different reasons**: the old harness was
