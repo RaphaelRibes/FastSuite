@@ -562,8 +562,8 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
     let tmp_meta_path = rt.metadata.as_deref().map(part_path);
     let guard_meta = tmp_meta_path.as_ref().map(|p| TmpFile::new(p.clone()));
     let mut meta = match (rt.metadata.as_deref(), tmp_meta_path.as_deref()) {
-        (Some(_), Some(tp)) if !rt.dry_run => {
-            let mut w = open_output(tp, METADATA_COMPRESSION)?;
+        (Some(fp), Some(tp)) if !rt.dry_run => {
+            let mut w = open_output_as(tp, fp, METADATA_COMPRESSION)?;
             metadata::write_file_header(&mut *w).context("writing metadata header")?;
             Some(w)
         }
@@ -724,7 +724,10 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
         w.flush().ok();
     }
     if let Some(mut mw) = meta.take() {
-        mw.flush().ok();
+        // D-6: a metadata file that cannot be flushed is truncated, not
+        // complete. This used to be `.ok()`, which reported success over a
+        // partial file; the staging buffer makes that loss strictly larger.
+        mw.flush().context("flushing metadata")?;
     }
 
     io_result?;
@@ -842,8 +845,8 @@ pub fn run_paired(
     let tmp_meta_path = rt.metadata.as_deref().map(part_path);
     let guard_meta = tmp_meta_path.as_ref().map(|p| TmpFile::new(p.clone()));
     let mut meta = match (rt.metadata.as_deref(), tmp_meta_path.as_deref()) {
-        (Some(_), Some(tp)) if !rt.dry_run => {
-            let mut w = open_output(tp, METADATA_COMPRESSION)?;
+        (Some(fp), Some(tp)) if !rt.dry_run => {
+            let mut w = open_output_as(tp, fp, METADATA_COMPRESSION)?;
             metadata::write_file_header(&mut *w).context("writing metadata header")?;
             Some(w)
         }
@@ -1061,7 +1064,10 @@ pub fn run_paired(
         w.flush().ok();
     }
     if let Some(mut mw) = meta.take() {
-        mw.flush().ok();
+        // D-6: a metadata file that cannot be flushed is truncated, not
+        // complete. This used to be `.ok()`, which reported success over a
+        // partial file; the staging buffer makes that loss strictly larger.
+        mw.flush().context("flushing metadata")?;
     }
 
     io_result?;

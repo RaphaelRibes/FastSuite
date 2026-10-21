@@ -46,6 +46,29 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> Output {
         .expect("spawn binary")
 }
 
+/// Write a FASTQ large enough that its metadata exceeds one BGZF member.
+///
+/// BGZF blocks are capped at 64 KiB, so a file under that fits in a SINGLE
+/// gzip member — and `GzDecoder` reads one member fine. A regression test for
+/// the multi-member read must therefore exceed 64 KiB of metadata, or it
+/// passes against the broken decoder too. At ~40 bytes per record that is a
+/// few thousand reads.
+fn write_bulk_fastq(dir: &Path, n: usize) -> PathBuf {
+    let p = dir.join("bulk.fq");
+    let mut body = String::with_capacity(n * 80);
+    for i in 0..n {
+        // A 5' polyA run on every read, so every read is *touched* and gets a
+        // metadata record (the writer skips untouched reads by design).
+        let seq = format!("{}CGTACGTACGTACGTACGTACGT", "A".repeat(30));
+        body.push_str(&format!(
+            "@bulk{i}\n{seq}\n+\n{}\n",
+            "I".repeat(seq.len()),
+        ));
+    }
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
 /// Write a small FASTQ with a read that is guaranteed to be *touched*, so the
 /// metadata file carries at least one record (the writer skips untouched
 /// reads by design).
@@ -133,6 +156,88 @@ fn metadata_written_by_fastprep_is_readable_by_the_viewer() {
 }
 
 /// A debug build must not abort on its own clap definition.
+/// A `.pxmt.gz` must be GENUINELY gzip, and the viewer must read all of it.
+///
+/// Two defects met here. First, `open_output` inferred the codec from the
+/// ".part" temp path, whose extension is not ".gz", so a file named
+/// `.pxmt.gz` was written UNCOMPRESSED — the name lied. Second, once it did
+/// compress, the output is BGZF (a chain of ~64 KiB gzip members) and the
+/// viewer used `GzDecoder`, which stops after the FIRST member and reports
+/// "failed to fill whole buffer" past 64 KiB. Each bug hid the other.
+#[test]
+fn a_gzipped_metadata_file_is_really_gzip_and_reads_back_whole() {
+    let d = tmpdir("gz");
+    // 6000 reads -> ~240 KiB of metadata -> several 64 KiB BGZF members.
+    let fq = write_bulk_fastq(&d, 6000);
+    let out = d.join("out.fq");
+    let meta = d.join("m.pxmt.gz");
+
+    let w = run(
+        fastprep(),
+        &d,
+        &[
+            "-1",
+            fq.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--metadata",
+            meta.to_str().unwrap(),
+            "--min-len",
+            "0",
+            "--no-adapter",
+            "-q",
+        ],
+    );
+    assert!(
+        w.status.success(),
+        "fastprep --metadata must succeed, stderr: {}",
+        String::from_utf8_lossy(&w.stderr)
+    );
+
+    // 1. The name must not lie: a .gz file is a gzip stream.
+    let bytes = std::fs::read(&meta).expect("metadata file written");
+    assert_eq!(
+        &bytes[..2],
+        &[0x1f, 0x8b],
+        "a file named .pxmt.gz must actually be gzip, not raw PXMT"
+    );
+
+    // 2. The viewer must read the whole stream, not just the first member.
+    //
+    // The oracle is the RECORD COUNT, not the file size: BGZF members are
+    // bounded by 64 KiB of UNCOMPRESSED data, and this fixture's records are
+    // so repetitive that 6000 of them compress to ~14 KiB. A count of "6.0K"
+    // proves every member was read; stopping after the first member would
+    // report roughly 1.9K. That also keeps the test non-vacuous — an earlier
+    // version used a fixture under 64 KiB and passed against the broken
+    // decoder, which is exactly the trap this guard exists to catch.
+    let v = run(fastprep_meta(), &d, &[meta.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&v.stdout);
+    let stderr = String::from_utf8_lossy(&v.stderr);
+    assert!(
+        v.status.success(),
+        "the viewer must read a BGZF metadata file; exit {:?}, stderr: {stderr}",
+        v.status.code()
+    );
+    assert!(
+        !stderr.contains("failed to fill whole buffer"),
+        "GzDecoder stops after the first BGZF member; the viewer needs \
+         MultiGzDecoder. stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("bulk"),
+        "the viewer must print the recorded read IDs; stdout: {stdout}"
+    );
+    // The LAST record id is the unambiguous oracle: it lives in the final
+    // BGZF member, so a decoder that stops after the first member cannot
+    // print it, however the viewer chooses to format its output.
+    assert!(
+        stdout.contains("bulk5999"),
+        "the viewer must reach the LAST record, which sits in the final BGZF \
+         member; its absence means the read stopped at the first member"
+    );
+}
+
 #[test]
 fn help_does_not_panic() {
     let d = tmpdir("help");

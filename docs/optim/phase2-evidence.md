@@ -106,3 +106,69 @@ VERDICT: parsed ONCE — adding three output formats costs render only.
 
 A re-parse would have shown ~4.0x. **Nothing to optimise here**; the probe is
 kept as the regression test for the property.
+
+---
+
+### Task 2.8 — fastprep: the PXMT writer
+
+**[V] The premise did not hold, and the real defect was elsewhere.**
+
+The plan said to "give the PXMT writer the same 256 KiB staging the FASTQ
+writer already has". It already has it, and more: `open_output` wraps every
+writer in a `BufWriter::with_capacity(1 MiB)` — ten times the proposed staging —
+and the metadata writer goes through the same `open_output`. A 256 KiB layer in
+front of a 1 MiB layer is pure overhead, so it was **not** added.
+
+**The actual defect [M]:** the metadata file was **never compressed**, even when
+named `.pxmt.gz`.
+
+`open_output(tp, …)` inferred the codec from the *temp* path, and `part_path`
+appends `.part` — so `m.pxmt.gz` became `m.pxmt.gz.part`, whose extension is
+`.part`. `encode_output`'s match fell through to the plain branch. The FASTQ
+writer never had this bug because it already used `open_output_as(tmp, final,
+…)`, which infers from the **final** name; the metadata writer did not.
+
+Evidence, 5 000 reads: the file began with `PXMT`, not `1f 8b` — raw, at
+38.8 bytes/read, which matches the plan's own "38.4 bytes per read" figure and
+explains it.
+
+**Fix:** `open_output_as(tp, fp, METADATA_COMPRESSION)`. The `.pxmt.gz` name is
+now true; a `.pxmt` name still writes plain, unchanged.
+
+| | before | after |
+|---|---:|---:|
+| on-disk size, 200 000 reads | 8 088 895 B (38.8 B/read) | **513 326 B (2.57 B/read)** |
+| cost of `--metadata` (wall) | +0.11 s (plan, pre-fix) | **+0.012 s** |
+| cost of `--metadata` (cpu) | +0.20 s (plan, pre-fix) | **+0.084 s** |
+
+A **15.8× smaller file**, and the wall cost of enabling metadata drops by about
+9×. Measured with `bench/scripts/meta_cost_probe.py` (200 000 reads, `-j 8`,
+5 reps, median).
+
+**Byte-identity of the payload [M]:** compressing the container does not touch
+the records. Two runs of the same binary produce decompressed payloads that are
+identical byte for byte (193 895 B, md5 `2b9eb83b…`, starting with `PXMT`).
+
+**The second defect this exposed [M]:** once the file really was compressed, the
+viewer failed on it —
+
+```
+$ fastprep-meta m.pxmt.gz
+Error: failed to fill whole buffer
+```
+
+The output is **BGZF**, a chain of ~64 KiB gzip *members*, and the viewer used
+`flate2::read::GzDecoder`, which decodes only the **first member**. It now uses
+`MultiGzDecoder`. The two bugs had been hiding each other: no compression meant
+no multi-member stream to mis-read.
+
+**Regression test [M]:** `a_gzipped_metadata_file_is_really_gzip_and_reads_back_whole`
+asserts (a) the `.gz` file starts with `1f 8b`, and (b) the viewer reaches
+record `bulk5999`, which lives in the final member. Verified to **fail** against
+`GzDecoder` and pass against `MultiGzDecoder`. An earlier draft used a fixture
+under 64 KiB and passed against the broken decoder — the trap this guard exists
+to catch, so the fixture is now 6 000 reads (~197 KiB of metadata, 3 members).
+
+**Flush errors now propagate.** The finalisation was `mw.flush().ok()`, which
+renamed a truncated metadata file into place and exited 0 — a D-6 violation that
+a real compressor makes more likely. It is now `?`.

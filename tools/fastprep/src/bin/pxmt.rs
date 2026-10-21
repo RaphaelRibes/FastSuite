@@ -286,7 +286,13 @@ fn open_reader(path: &PathBuf) -> std::io::Result<Box<dyn Read>> {
     };
     let file = std::fs::File::open(path)?;
     Ok(if magic[..2] == [0x1f, 0x8b] {
-        Box::new(flate2::read::GzDecoder::new(file))
+        // MultiGzDecoder, not GzDecoder: this tool's own `.gz` outputs are
+        // BGZF, which is a chain of ~64 KiB gzip MEMBERS. GzDecoder stops
+        // after the first member and reports "failed to fill whole buffer"
+        // on everything past 64 KiB — a defect that stayed hidden while the
+        // metadata writer never actually compressed (the ".part" temp path
+        // made it fall through to plain output).
+        Box::new(flate2::read::MultiGzDecoder::new(file))
     } else if magic[..4] == [0x28, 0xb5, 0x2f, 0xfd] {
         Box::new(zstd::stream::read::Decoder::new(file)?)
     } else {
