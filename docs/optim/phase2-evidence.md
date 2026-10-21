@@ -326,3 +326,43 @@ memory. When speed is the goal, change the level before adding threads.
 
 Documented in `tools/fastdedup/README.md` with this table, including the
 "uncompressed output is flat in `-j`" control that makes the diagnosis legible.
+
+### Task 2.12 — fastcheck's 785 MB peak: attributed
+
+**[M] The `dup` module is 88 % of the peak and the whole story. The plan's
+direction is right; its stated mechanism is not.**
+
+`--only` isolates each module's footprint. 5 M pairs, `-j 8`, peak RSS from
+`wait4`:
+
+| run | peak RSS | the tool's own table projection |
+|---|---:|---:|
+| `--only dup` | **688.2 MB** | 272.0 MB |
+| `--only kmer` | 104.3 MB | — |
+| `--only heatmap` | 10.3 MB | — |
+| `--only quality` | 10.2 MB | — |
+| `--only polyx` | 10.0 MB | — |
+| `--only bases` | 9.9 MB | — |
+| `--only gc` | 9.1 MB | — |
+| `--only length` | 9.1 MB | — |
+| all modules (default) | 784.9 MB | 272.0 MB |
+| all except `dup` | **105.1 MB** | — |
+
+Full minus `dup` = **679.8 MB attributable to the duplication module**, which is
+88 % of the peak. Running the rest of fastcheck costs 105 MB, and no other
+module reaches 105 MB on its own.
+
+**But the plan's explanation does not hold.** Task 2.12 says the peak comes from
+"a single 32 MB allocation dominating VmHWM" and points at the pre-allocation
+(`MAX_PREALLOC_ENTRIES`, `fp_capacity`). The table's own projection is 272 MB,
+and `--only dup` peaks at **688 MB — 2.5× its table.** The map already reserves
+its full capacity up front (`FingerprintTable::with_capacity` calls
+`counts.reserve(capacity.min(1 << 26))`), so there is no growth-and-rehash
+transient to blame either.
+
+So ~416 MB inside the `dup` module is **not** the table itself and is not
+pre-allocation. Locating it is the next step, and it matters because a compact
+table (12 B/entry, the plan's Step 2) would only address the 272 MB, not the
+other 416 MB — it would take a 785 MB peak to about 510 MB, not to fastmaps'
+22.7 MB. **The plan's Step 2 is not sufficient on its own.** Recorded honestly
+rather than assumed.
