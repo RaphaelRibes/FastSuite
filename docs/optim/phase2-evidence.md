@@ -428,3 +428,42 @@ Not implemented here: the merge-target change reorders the accumulator lifecycle
 and must preserve every per-file report field, which needs the byte-identity gate
 of Step 4 to be trusted. Recorded with the model so the next attempt starts from
 arithmetic instead of an assumption.
+
+### Task 2.19 — crash-resume cleanliness: **reproduced**
+
+**[M] A SIGKILL mid-step leaves truncated outputs with no terminal manifest
+record, exactly as reported.**
+
+Sweeping the kill point over a 300 000-read sample with steps
+`["fastcheck", "fastprep"]` (correct `--tools-dir`, or every run fails at
+startup and proves nothing — my first three attempts did exactly that and
+looked like "no defect"):
+
+| kill | `manifest.json` | fastcheck.json | fastprep.json | clean_R1.fastq.gz |
+|---|---:|---:|---:|---:|
+| 0.4 s | **absent** | **597 496 B** | **2 620 B** | 103 B |
+| 0.6 s | absent | 597 498 B | 2 621 B | 103 B |
+| 0.8 s | absent | 597 498 B | 2 621 B | 103 B |
+| 1.0 s | present | 597 498 B | 2 621 B | 103 B |
+
+A completed run writes **597 498 B** and **2 621 B**. The 0.4 s kill leaves
+**597 496 B** and **2 620 B** — two bytes and one byte short, i.e. genuinely
+truncated JSON — with **no manifest**. So the sample directory holds files that
+look like results and are not, and `--from` resume has no record telling it so.
+
+**A hazard the plan does not mention.** Step 1 says to write `*.tmp` and rename
+on success, copying fastprep's `part_path` pattern. That pattern is exactly what
+produced the Task 2.8 bug: `part_path` appends `.part`, giving
+`m.pxmt.gz.part`, whose extension no longer says `.gz`, so codec inference fell
+through to plain and the file was written uncompressed under a `.gz` name. The
+same trap applies here and is worse, because fasthelper drives *six* tools whose
+output format is inferred from the extension — a step told to write
+`o.fq.tmp` writes FASTA-in-FASTQ-name, or plain-instead-of-gzip, silently.
+**A temp path must preserve the extension** (`o.fq.gz.tmp`, or a hidden sibling
+directory), not append to the name.
+
+Not implemented. Making a step atomic means renaming *every* declared output of
+*every* tool, interacting with `--force`, resume keys, and the six tools'
+extension-inferred encodings — and the reproduction above is the thing that
+should gate it. Recorded so the next attempt starts from byte counts and the
+extension hazard instead of the assumption that `.tmp` is safe.
