@@ -17,3 +17,8 @@ serde_json = "1"
 
 [profile.release]
 opt-level = 3
+# The other five tools in the suite all carry these; fastmaps was the only
+# one left without them (Task 2.14). No CPU target is set, so the shipped
+# binary stays portable.
+lto = "fat"
+codegen-units = 1
