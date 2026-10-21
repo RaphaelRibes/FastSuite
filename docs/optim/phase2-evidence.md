@@ -189,3 +189,53 @@ to catch, so the fixture is now 6 000 reads (~197 KiB of metadata, 3 members).
 **Flush errors now propagate.** The finalisation was `mw.flush().ok()`, which
 renamed a truncated metadata file into place and exited 0 — a D-6 violation that
 a real compressor makes more likely. It is now `?`.
+
+---
+
+## Wave B — the gzip lever
+
+### Task 2.4b — fastdedup: flipping the default to level 1
+
+**[M] The plan's own warning does not materialise, but its byte estimate is off
+by a factor of five.**
+
+The plan calls this "the single most likely way the gzip lever backfires": the
+parallel compressor (gzippy) engages only at `compression_level >= 6`, so a
+level-1 default drops the writer onto the single-threaded flate2 path. That
+mechanism is real, and `parallel.rs:222` plus the `--help` text both document
+it. What it costs, measured on one 5 M-pair corpus (441.5 MB per mate) at
+three reps per arm:
+
+| arm | wall | CPU | busy cores | peak RSS | output |
+|---|---:|---:|---:|---:|---:|
+| `--gz-level 6 -j 8` (today) | 20.26 s | 124.79 s | **6.16** | **3 780 MB** | 390 MB |
+| `--gz-level 1 -j 8` | **17.46 s** | 64.51 s | 3.70 | **152 MB** | 729 MB |
+| `--gz-level 6 -j 1` | 84.22 s | 84.06 s | 1.00 | 79.6 MB | 390 MB |
+| `--gz-level 1 -j 1` | **12.86 s** | 12.83 s | 1.00 | 79.6 MB | 726 MB |
+
+**It does not backfire.** Level 1 at `-j 8` is **1.16× faster** (17.46 s vs
+20.26 s) and uses **25× less peak memory** (3 780 MB → 152 MB). Busy cores fall
+from 6.16 to 3.70 — the parallel compressor really is disengaged, exactly as the
+code says — but the level-1 single-threaded path is fast enough that it still
+wins outright.
+
+**The cost is bytes, and the plan understates it by five times.** The plan
+predicted "~18 % larger". Measured: **1.87× larger** (390 MB → 729 MB). A
+100 M-pair run would go from roughly 7.8 GB to 14.6 GB of output.
+
+Two further facts the plan did not anticipate:
+
+* **Both outputs are standard gzip.** `gzip -t` accepts the level-1 output, so
+  the proprietary-format hazard does not apply on this path — it applies only
+  to a hypothetical `-j >1` build that forced gzippy below level 6, which the
+  code does not do. It falls back to plain flate2 instead.
+* **At level 1, `-j 1` beats `-j 8`** (12.86 s vs 17.46 s). Once compression is
+  cheap, the dedup hashing is I/O-bound and extra threads only contend. This
+  also explains the long-standing `-j 1..4` flatline the plan asked about in
+  Task 2.6: it is a *level-6* phenomenon, and at level 1 the curve inverts.
+
+**Recommendation: do not flip this default unilaterally.** The trade is
+genuine — 1.16× wall and 25× memory against 1.87× disk — and neither side
+dominates. `--gz-level 1` is now the documented answer for a memory- or
+time-constrained run; whether it should be the default is a release decision
+(C-8), not a measurement outcome.
