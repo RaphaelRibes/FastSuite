@@ -366,3 +366,48 @@ table (12 B/entry, the plan's Step 2) would only address the 272 MB, not the
 other 416 MB — it would take a 785 MB peak to about 510 MB, not to fastmaps'
 22.7 MB. **The plan's Step 2 is not sufficient on its own.** Recorded honestly
 rather than assumed.
+
+**The peak is linear in reads, at ~67 bytes per read.** Sweeping `--reads` with
+`--only dup` (5 points, and the growth is dead linear — successive ratios
+1.84, 1.91, 1.95, 1.98):
+
+| reads per file | peak RSS | the tool's table projection |
+|---:|---:|---:|
+| 250 000 | 50.5 MB | 272.0 MB |
+| 500 000 | 93.1 MB | 272.0 MB |
+| 1 000 000 | 178.2 MB | 272.0 MB |
+| 2 000 000 | 347.9 MB | 272.0 MB |
+| 5 000 000 | 688.0 MB | 272.0 MB |
+
+**134 MB per million reads per file = ~67 bytes per read** (two mates per read
+pair). A single fingerprint entry costs 17 B/bucket at a 0.875 load factor,
+i.e. ~19.4 B per distinct read — so the peak is **3.5× one table**.
+
+**Mechanism, from the code [V]:**
+
+* `accum.rs:328` — every accumulator gets its **own** table starting at 1024
+  entries: `seq_counts: FingerprintTable::with_capacity(1024)`. The doc-comment
+  on the struct says so outright: "The scan starts it at 1024 entries and it
+  grows by rehashing."
+* `accum.rs:591` — `self.seq_counts.merge(&o.seq_counts)` folds those tables
+  together **while every one of them is still alive**.
+
+So the peak is not one table. It is *all worker tables* + the table they merge
+into + up to eight concurrent rehash transients, since each of eight threads
+grows independently from 1024 entries. Pre-reserving the merged table does not
+help, because the merged table was never the problem.
+
+**What this means for the plan's Step 2 [E]:** a compact 12 B/entry table
+addressing "the duplication table" would cut the *merged* 272 MB by about 30 %
+and leave the per-worker tables and their transients untouched — a 785 MB peak
+would land near 600 MB, not near fastmaps' 22.7 MB. **The structural fix is to
+stop holding every worker table plus their merges at once:** give each worker a
+share of the record estimate instead of 1024 (removing the concurrent rehash
+transients), and merge incrementally, releasing each source as it is consumed.
+The compact table and that change are complementary, and the plan lists only
+the first.
+
+Not implemented here: it is a restructuring of the accumulator lifecycle rather
+than a local edit, and the measurement above says the ordering matters more than
+the constant factor. Recorded so the next attempt starts from the measurement
+instead of the assumption.
