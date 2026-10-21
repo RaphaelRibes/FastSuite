@@ -24,6 +24,31 @@ survives as an alias for one release.** Nothing breaks, everything converges.
 | report | `--json <PATH>` | path | `fastsuite.report.v1` |
 | quiet | `-q, --quiet` | flag | suppress the summary line |
 | verbose | `-v, --verbose` | flag | per-step detail on stderr |
+
+### `--gz-level`: the measured cost of the default
+
+The default stays at **6** in every tool. The numbers below are the measured
+trade for `--gz-level 1`, so the choice is visible rather than folklore. All at
+5 M pairs, `-j 8`, one machine, three reps per arm (2026-10-21).
+
+| tool | `--gz-level 1` vs `6` | output bytes | peak RSS |
+|---|---|---|---:|
+| fastprep | **2.07× faster** (3.81 s vs 7.90 s) | 1.08× (441 vs 407 MB) | unchanged |
+| fastdedup | 1.16× faster (17.5 s vs 20.3 s) | **1.87×** (729 vs 390 MB) | **25× less** (152 MB vs 3 780 MB) |
+| fastsim | not applicable — its bytes are the ground-truth corpus | — | — |
+
+Two facts that are not obvious:
+
+* **fastprep's parallel writer has no level floor**, so level 1 keeps full
+  parallel compression (busy cores 11.79 → 10.42). **fastdedup's does**: its
+  parallel gzip engages only at level ≥6, so level 1 falls back to
+  single-threaded flate2 (busy cores 6.16 → 3.70) — and is still faster,
+  because the level-1 path is cheap enough to win outright.
+* **At level 1, `-j 1` beats `-j 8` for fastdedup** (12.9 s vs 17.5 s). Once
+  compression is cheap the hashing is I/O-bound and extra threads only contend.
+
+Both level-1 outputs pass `gzip -t`: the non-standard-format hazard applies
+only to a `-j >1` gzippy build *below* level 6, which the code does not do.
 | temp location | `--temp-dir <PATH>` | path | where spill/intermediate files go |
 | strict mode | `--strict` | flag | an assumption becomes a fatal error (D-6) |
 | help / version | `-h, --help`, `-V, --version` | flag | `-V` prints `<binary> <semver>` |

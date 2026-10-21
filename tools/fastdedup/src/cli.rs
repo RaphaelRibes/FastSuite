@@ -78,7 +78,15 @@ pub struct Cli {
 
     /// Set the GZIP compression level (1-9).
     /// FastSuite canonical name: --gz-level (--compression kept as an alias).
-    /// Note: levels < 6 disable multi-threaded gzip output (uses standard single-threaded flate2 instead).
+    /// Note: levels < 6 disable multi-threaded gzip output (uses standard
+    /// single-threaded flate2 instead).
+    ///
+    /// Measured on 5 M pairs at -j 8 (2026-10-21), because the trade is not
+    /// obvious: level 1 is 1.16x FASTER (17.5 s vs 20.3 s) and uses 25x less
+    /// peak memory (152 MB vs 3780 MB), but writes 1.87x more bytes (729 MB
+    /// vs 390 MB). Both outputs are standard gzip. Level 1 is the right choice
+    /// for a memory- or time-constrained run; level 6 is the right choice when
+    /// output size matters.
     #[arg(
         long = "gz-level",
         visible_alias = "compression",

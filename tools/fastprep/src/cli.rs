@@ -508,6 +508,11 @@ pub struct Cli {
 
     /// Compression level for gzip output (1..=9). FastSuite canonical name
     /// --gz-level; --compression is accepted as an alias.
+    ///
+    /// Measured on 5 M pairs at -j 8 (2026-10-21): level 1 is 2.07x faster
+    /// than level 6 (3.81 s vs 7.90 s) for 8% more bytes (441 MB vs 407 MB),
+    /// at the same peak RSS. Unlike fastdedup, fastprep's parallel BGZF writer
+    /// has no level floor, so level 1 keeps full parallel compression.
     #[arg(
         long = "gz-level",
         visible_alias = "compression",
