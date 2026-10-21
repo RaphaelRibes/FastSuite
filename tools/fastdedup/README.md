@@ -145,6 +145,55 @@ pixi containerize
 apptainer run fdedup.sif fdedup --input <INPUT> [OPTIONS]
 ```
 
+## Why `-j 1..4` are all the same speed
+
+With paired input and gzip output, `-j 1`, `-j 2` and `-j 4` all take about the
+same wall time, and `-j 8` is several times faster. It looks like a bug; it is
+the thread budget.
+
+Measured on 5 M pairs, median of 2 reps:
+
+| arm | wall | CPU | busy cores | peak RSS |
+|---|---:|---:|---:|---:|
+| `--gz-level 6 -j 1` | 84.20 s | 84.03 s | 1.00 | 79.5 MB |
+| `--gz-level 6 -j 2` | 80.67 s | 87.10 s | 1.08 | 101.0 MB |
+| `--gz-level 6 -j 4` | 81.80 s | 92.62 s | 1.13 | 104.4 MB |
+| `--gz-level 6 -j 8` | **20.44 s** | 125.48 s | **6.14** | 3 776 MB |
+| uncompressed output, `-j 1` | 5.83 s | 5.77 s | 0.99 | 76.9 MB |
+| uncompressed output, `-j 4` | 5.71 s | 10.73 s | 1.88 | 100.9 MB |
+| uncompressed output, `-j 8` | 8.18 s | 31.21 s | 3.82 | 149.6 MB |
+
+Two things follow from that table.
+
+**The hashing is not the problem.** With uncompressed output the whole run is
+~6 s at any `-j`, so the 75 s gap between `-j 1` and `-j 8` is entirely in the
+compressed-output path.
+
+**Parallel compression only switches on at `-j` around 6.** The busy-core count
+shows it directly: 1.00, 1.08 and 1.13 cores at `-j 1/2/4`, then 6.14 at `-j 8`.
+Compression is single-threaded for the first three. The cause is the thread
+budget in `parallel.rs`:
+
+```rust
+// paired: two output writers, so the spare threads are split between them
+let gzip_threads = (num_workers - 2) / 2;   // j2->1, j4->1, j8->3
+```
+
+and the parallel compressor requires `num_threads > 1`. One spare thread per
+writer does not engage it, so `-j 2` and `-j 4` fall back to single-threaded
+flate2 — which is why they match `-j 1` rather than beating it. The single-end
+path uses a more generous budget (`num_workers - 2`, no halving) and engages
+parallel compression already at `-j 4`.
+
+**So `-j 8` (or higher) is what makes gzip output pay on paired input.** Below
+that, spending more threads buys nothing for compression; it only helps the
+hashing, which is already close to I/O-bound.
+
+**And `--gz-level 1` sidesteps the whole thing.** On the same corpus, level 1
+single-threaded runs in 12.9 s — faster than level 6 with parallel compression
+at `-j 8` (20.4 s) — for 1.87× more bytes and 25× less peak memory. When speed
+is what you want, change the level before adding threads.
+
 ## Output order is not part of the contract
 
 The **kept set** of reads is stable across `-j`; the **order** in which they are

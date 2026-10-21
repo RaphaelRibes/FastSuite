@@ -277,3 +277,52 @@ answers, all measured:
 
 This is why Task 2.4 was written as three separate sub-tasks. A single global
 answer would be wrong for at least two of the three tools.
+
+### Task 2.6 — the fastdedup `-j 1..4` flatline, diagnosed
+
+**[M] Diagnosed: it is the gzip thread budget, not the writer queue and not the
+compression level.**
+
+Reproduced from scratch on 5 M pairs, median of 2 reps:
+
+| arm | wall | CPU | busy cores | peak RSS |
+|---|---:|---:|---:|---:|
+| `gz6 -j 1` | 84.20 s | 84.03 s | 1.00 | 79.5 MB |
+| `gz6 -j 2` | 80.67 s | 87.10 s | 1.08 | 101.0 MB |
+| `gz6 -j 4` | 81.80 s | 92.62 s | 1.13 | 104.4 MB |
+| `gz6 -j 8` | **20.44 s** | 125.48 s | **6.14** | 3 776 MB |
+| plain `-j 1` | 5.83 s | 5.77 s | 0.99 | 76.9 MB |
+| plain `-j 4` | 5.71 s | 10.73 s | 1.88 | 100.9 MB |
+| plain `-j 8` | 8.18 s | 31.21 s | 3.82 | 149.6 MB |
+
+**The plan's Step 1 does exactly what it promised.** With uncompressed output
+every thread count lands at ~6 s, so the hashing is flat and the whole 75 s gap
+sits in the compressed-output path. The queue bound is exonerated.
+
+**The cause is arithmetic.** `parallel.rs` computes, for the *paired* path:
+
+```rust
+let gzip_threads = (num_workers - 2) / 2;   // j2 -> 1, j4 -> 1, j8 -> 3
+```
+
+and `create_output_writer` engages the parallel compressor only when
+`num_threads > 1`. At `-j 2` and `-j 4` the budget is exactly 1 per writer, so
+the gate never opens and both fall back to single-threaded flate2 — which is
+why they match `-j 1` instead of beating it. The busy-core column proves it
+independently: 1.00 / 1.08 / 1.13 cores, then 6.14 at `-j 8`.
+
+Note the single-end path uses a **different** formula for the same intent —
+`num_workers - 2`, without the halving — so it engages parallel compression
+already at `-j 4`. Two expressions of one budget, and the paired one is stricter
+because it must split between two writers. That asymmetry is worth knowing about
+but is not a bug: with two writers you genuinely need `-j ≈ 8` before each gets
+more than one thread.
+
+**Resolution: documented, not "fixed".** Raising the budget would oversubscribe
+the machine (2 writers × 2 threads + 4 workers on a 4-thread ask), and the
+measured alternative is better anyway: `--gz-level 1` single-threaded is
+**12.86 s** — faster than `gz6 -j 8`'s 20.44 s — at 1.87× the bytes and 25× less
+memory. When speed is the goal, change the level before adding threads.
+
+Documented in `tools/fastdedup/README.md` with this table, including the
+"uncompressed output is flat in `-j`" control that makes the diagnosis legible.
