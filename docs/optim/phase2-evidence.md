@@ -49,6 +49,23 @@ Wall is **not** meaningfully different (0.6 %, inside run-to-run noise);
 **peak RSS falls 23 %** (21.4 → 16.4 MB). This is a memory win and a
 code-size win, not a wall-time win, and it is reported as such.
 
+**5 M-pair campaign [M]** — three builds from the same tree state, one shared
+corpus (883 MB of trimmed FASTQ), 5 reps each, `-j 8`:
+
+| build | wall min | wall median | cpu min | peak RSS | vs baseline |
+|---|---:|---:|---:|---:|---:|
+| baseline (no lto, std HashMap) | 4.626 s | 4.629 s | 9.044 s | 26.0 MB | — |
+| `+ lto` (2.14) | 4.564 s | 4.598 s | 8.880 s | 26.7 MB | −1.3 % wall |
+| `+ lto + fxhash + Vec` (2.13) | **4.457 s** | **4.473 s** | **8.702 s** | **21.4 MB** | **−3.7 % wall, −3.8 % cpu, −17.7 % peak** |
+
+Grid byte-identity across all three: `fm-lto: GRID-IDENTICAL`,
+`fm-lto-fx: GRID-IDENTICAL`.
+
+**Read the ratio, not the absolute.** The plan's reference row is 3.856 s wall
+at 5 M pairs; this campaign's baseline is 4.626 s because the corpus was
+produced at `--gz-level 1` rather than 6 and is a different simulation. Only
+the three rows above are comparable to each other.
+
 ---
 
 ### Task 2.13 — fastmaps: cheap hasher, `Vec` for per-file counts
