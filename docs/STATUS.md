@@ -87,7 +87,19 @@ The campaign ran the full corpus: **102 real ENA datasets × 57 configs ×
 3 variants = 306 comparisons**. Earlier revisions said 55 configs; the authored
 grid is **57** (`sweep.py::GRID`, which now carries the `head_dropout` axis).
 
-**PASS 142/306 = 46.4%**, 47 datasets passing every variant.
+**Current build (2026-10-21): PASS 183/306 = 59.8%**, 62 of 102 datasets passing
+every variant, median per-position G-fraction difference **0.0093 against the
+0.02 bound** (it was 0.0218, outside). Record:
+`bench/results/gt2026/closed_loop.tsv`, re-run on the desktop with
+`bench/scripts/closed_loop.py` after the profile-gc, insert-anchor and
+exact-histogram fitter fixes. Per-domain comparisons passed: human gut 51/51,
+generalised 47/51, bacterial isolates 40/51, viromes 21/51, RNA-seq 21/51,
+metagenomes 3/51 — metagenomics is the domain the simulator still cannot model.
+Gate counts over the 306: G fraction 121 over tolerance, mean quality 8, GC 4,
+duplicate ratio 0.
+
+**Campaign (2026-10-16 corpus, pre-fix binaries): 142/306 = 46.4%**, 47 datasets
+passing every variant. The paragraphs below describe that run.
 
 > **Re-measured 2026-10-16 — this replaces 167/306 = 54.6%.** That figure was
 > inflated by a corpus artefact: `sim.v1.gt.tsv` and `sim.v2.gt.tsv` were
@@ -477,19 +489,22 @@ reversal is commits
 and a stale 90-of-90 claim) in the clean FastPrep-Paper repo. **`paper.pdf` is
 rebuilt** — 28 pages, mtime 2026-10-16 14:35 — so the updated prose is in the
 built PDF.
-Separately, the Phase D closed-loop numbers have been re-measured to
+Separately, the Phase D closed-loop numbers were re-measured on 2026-10-16 to
 **142/306 = 46.4%** (was 167/306 = 54.6%, inflated by the duplicated v1/v2
 corpus rows — see `docs/CLOSED-LOOP-RERUN.md`). `bench/results/phase-d/closed_loop.tsv`
-is the 46.4% file; `FastSim-Paper/benchmark/closed_loop.tsv` has been refreshed
-from it and the FastSim and FastCheck prose updated.
+is that file. On 2026-10-21 the loop was **re-run on the fixed build**:
+**183/306 = 59.8%**, median G fraction 0.0093 — `bench/results/gt2026/closed_loop.tsv`,
+now also copied into `FastSim-Paper/benchmark/closed_loop.tsv`, with the FastSim
+and FastCheck prose updated to quote it.
 
 **Resolved (was flagged as a paper-side inconsistency):** the FastPrep paper's
 §5.6 lead-in (`sect-real-ena.typ`) cited a stale closed-loop figure,
 "94-of-305", together with the wrong dominant failure gate (it named
 duplicate-ratio; the TSV shows the per-position G-fraction at 120 of 139
 failing rows, against duplicate-ratio 18). Both were corrected in `f4a5425`.
-The authoritative figure is `bench/results/phase-d/closed_loop.tsv` —
-**142/306 = 46.4%** (re-measured; see above).
+The authoritative figure is now `bench/results/gt2026/closed_loop.tsv` —
+**183/306 = 59.8%** on the shipped build; `bench/results/phase-d/closed_loop.tsv`
+(142/306) is the campaign's, kept for the history in Section 6 of both papers.
 
 ## What the suite refuses to do (D-12)
 

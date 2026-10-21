@@ -1,3 +1,10 @@
+> **Superseded 2026-10-21.** This note records the 2026-10-16 corpus re-run
+> (167/306 -> 142/306). The loop was re-run again on the build carrying the
+> profile-gc, insert-anchor and exact-histogram fitter fixes: **183/306 = 59.8%**,
+> 62/102 datasets, median G-fraction difference 0.0093. The current record is
+> `bench/results/gt2026/closed_loop.tsv`; the numbers below stay as the history
+> both papers cite for the campaign path.
+
 # The closed loop, re-measured on a regenerated corpus
 
 **Result: 142/306 = 46.4%**, replacing the 167/306 = 54.6% that three papers
