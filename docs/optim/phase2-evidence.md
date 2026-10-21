@@ -239,3 +239,41 @@ genuine — 1.16× wall and 25× memory against 1.87× disk — and neither side
 dominates. `--gz-level 1` is now the documented answer for a memory- or
 time-constrained run; whether it should be the default is a release decision
 (C-8), not a measurement outcome.
+
+### Task 2.4a — fastprep: flipping the default to level 1
+
+**[M] This one is a clear win, and the opposite story to fastdedup.**
+
+Same corpus, same protocol, three reps per arm:
+
+| arm | wall | CPU | busy cores | peak RSS | output |
+|---|---:|---:|---:|---:|---:|
+| `--gz-level 6 -j 8` (today) | 7.90 s | 93.20 s | 11.79 | 119.0 MB | 406.9 MB |
+| `--gz-level 1 -j 8` | **3.81 s** | 39.71 s | 10.42 | 118.6 MB | 441.4 MB |
+| `--gz-level 6 -j 1` | 28.66 s | 66.22 s | 2.31 | 103.5 MB | 406.9 MB |
+| `--gz-level 1 -j 1` | **16.16 s** | 28.42 s | 1.76 | 103.1 MB | 441.4 MB |
+
+**2.07× faster at `-j 8`** (3.81 s vs 7.90 s), **8 % more bytes** (407 → 441 MB),
+and **no memory cost** (119 → 119 MB). Both outputs pass `gzip -t`.
+
+The big structural difference from fastdedup: fastprep's parallel writer is BGZF
+via gzp, which has **no level floor** — busy cores stay at 10.42 at level 1, so
+the parallel path is *not* lost. fastdedup's gzippy is gated at level ≥6, which
+is why its busy count collapses to 3.70.
+
+The plan predicted "~18 % larger" bytes here; measured **8 %** — better than
+predicted. Two thirds of the wall-clock cost of this stage is deflate
+(93.20 s CPU for 7.90 s of wall at six threads), so halving the work per byte
+is where the 2.07× comes from.
+
+**The three defaults are not one decision.** They now have three different
+answers, all measured:
+
+| tool | level 1 vs 6 at `-j 8` | bytes | peak RSS | verdict |
+|---|---|---|---:|---:|---|
+| fastprep | **2.07× faster** | 1.08× | unchanged | **flip is justified** |
+| fastdedup | 1.16× faster | **1.87×** | **25× less** | genuine trade, not a clear win |
+| fastsim | — | — | — | **must not change** (ground-truth corpus) |
+
+This is why Task 2.4 was written as three separate sub-tasks. A single global
+answer would be wrong for at least two of the three tools.
