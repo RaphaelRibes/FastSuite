@@ -47,6 +47,10 @@ fasthelper schema
    own measurement in `manifest.json` for cross-checking.
 5. `command` is the exact argv, space-joined: enough to reproduce the run
    without guessing which flags produced the numbers.
+6. **Record ORDER within a FASTQ/FASTA output is not part of the contract.**
+   `fastdedup` keeps a stable SET across thread counts but does not promise an
+   order; anything gating on byte-identity must compare sorted records. See
+   `tools/fastdedup/README.md` for the measurement.
 
 ## Versioning
 

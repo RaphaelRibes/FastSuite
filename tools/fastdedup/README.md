@@ -145,6 +145,19 @@ pixi containerize
 apptainer run fdedup.sif fdedup --input <INPUT> [OPTIONS]
 ```
 
+## Output order is not part of the contract
+
+The **kept set** of reads is stable across `-j`; the **order** in which they are
+written is not. Measured on a 200 000-pair corpus at `-j 1/2/4/8`: every run
+produced the same 200 000 records, and one single digest of the sorted records
+matched across all four — but three distinct start-to-finish orderings appeared
+(j1 and j2 happened to agree; j4 and j8 each differed).
+
+So a check that compares output byte-for-byte between two runs is comparing
+something the tool never promised. Compare **sorted** records instead. If you
+need a deterministic byte-for-byte output, sort the file once at the end; the
+tool will not do it for you, because serialising the emit order costs wall time.
+
 ## Recommendations
 
 If you are using FDedup in a pre-processing step, we recommend you to not export your file to a `.gz` format.

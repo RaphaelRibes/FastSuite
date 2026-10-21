@@ -368,3 +368,76 @@ fn the_documented_stream_refusals_report_their_own_reason() {
         assert!(!stderr.contains("An output file is required"), "case {i}: the generic bail shadowed the specific refusal: {stderr}");
     }
 }
+
+// ================================================================
+// Task 2.5: output ORDER is not part of the contract, the SET is
+// ================================================================
+
+/// The kept SET must be identical across thread counts; the emit ORDER need not
+/// be. This asserts the half that IS contractual, and deliberately does not
+/// assert the half that is not — a byte-for-byte comparison here would be
+/// asserting something the tool never promised, and would fail spuriously the
+/// first time worker interleaving changed.
+///
+/// Measured on a 200k-pair corpus at -j 1/2/4/8: one distinct sorted digest
+/// across all four runs, three distinct start-to-finish orderings. The corpus
+/// here is small, so it does not reproduce the order difference itself; the
+/// point of the test is the set equality plus the documented edge.
+#[test]
+fn the_kept_set_is_stable_across_thread_counts() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    let input = dir.child("in.fq");
+
+    // 400 reads, every fifth a duplicate of its predecessor, so the dedup path
+    // has real work and the keep set is a strict subset of the input.
+    let mut body = String::new();
+    for i in 0..400usize {
+        let idx = if i % 5 == 4 { i - 1 } else { i };
+        body.push_str(&format!("@r{idx}\nACGTACGTACGT{idx:04}\n+\nIIIIIIIIIIIIIIII\n"));
+    }
+    fs::write(input.path(), body.as_bytes()).unwrap();
+
+    let mut kept_sets = Vec::new();
+    for j in ["1", "2", "4", "8"] {
+        let out = dir.child(format!("out{j}.fq"));
+        cmd()
+            .args(["-1", input.path().to_str().unwrap(),
+                   "-o", out.path().to_str().unwrap(),
+                   "-j", j, "--force", "-q"])
+            .assert()
+            .success();
+        let text = fs::read_to_string(out.path()).unwrap();
+        // Sorted records: the order-insensitive view.
+        let mut records: Vec<String> = text
+            .split('@')
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().replace('\n', "\u{1f}"))
+            .collect();
+        records.sort();
+        kept_sets.push(records);
+    }
+
+    let first_len = kept_sets[0].len();
+    // Non-vacuity: 400 reads with every fifth a duplicate of its predecessor
+    // leaves 320. Asserting the exact number means this test fails if the
+    // parser above silently produced nothing, and proves dedup actually ran.
+    assert_eq!(
+        first_len, 320,
+        "expected 320 kept records (400 reads, 80 duplicates); got {first_len}. \
+         A different number means either dedup did not run or the record \
+         parser in this test is wrong"
+    );
+    for (i, set) in kept_sets.iter().enumerate() {
+        assert_eq!(
+            set.len(), first_len,
+            "thread count {} changed the number of kept records: {} vs {}",
+            ["1", "2", "4", "8"][i], set.len(), first_len
+        );
+        assert_eq!(
+            set, &kept_sets[0],
+            "thread count {} changed the KEPT SET, which is contractual; only \
+             the order is allowed to vary",
+            ["1", "2", "4", "8"][i]
+        );
+    }
+}
