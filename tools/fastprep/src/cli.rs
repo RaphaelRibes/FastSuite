@@ -297,6 +297,20 @@ pub struct Cli {
     #[arg(long, value_name = "N", help_heading = "Adapter Trimming")]
     pub adapter_g_run_retry: Option<usize>,
 
+    /// Retry the adapter match with quality- and N-aware mismatch scoring.
+    ///
+    /// The matcher charges an `N` a full mismatch, which spends the mismatch
+    /// budget on a base the sequencer never called. With this flag, a read
+    /// the ordinary matcher rejected is re-scored: an ambiguous base (`N`) or
+    /// a base called at quality <= N costs HALF a mismatch instead of one.
+    ///
+    /// A window with fewer than 12 real (unambiguous) calls is refused
+    /// outright, so a read of N's cannot match anything.
+    ///
+    /// The default is off (no retry).
+    #[arg(long, value_name = "LOW_Q", help_heading = "Adapter Trimming")]
+    pub adapter_scored_retry: Option<u8>,
+
 
     // -------------------------------------------------------- PolyX trimming
     /// Minimum post-trim read length. Integer N (bases) or fraction FL of the
@@ -958,6 +972,7 @@ impl Cli {
                 _ => None,
             },
             adapter_g_run_retry: self.adapter_g_run_retry,
+            adapter_scored_retry: self.adapter_scored_retry,
             // Set per pair in `pair_chunks` when `--pe-overlap` fires; `None`
             // here keeps the single-end path and every fallback byte-identical.
             pe_adapter: None,

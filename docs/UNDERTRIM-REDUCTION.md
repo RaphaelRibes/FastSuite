@@ -218,6 +218,72 @@ auto-detection sample, `cli.rs` `det.sampled`).
   false trims); corroboration must hold the clean rate below 0.02 % [E],
   measured as a new arm in `undertrim_ab.py`.
 
+### UT-1 and UT-4: the Cell A gate on the real corpus — measured, and it says "no change"
+
+**Cell A** is the hard gate: 102 datasets, 17,000,000 reads, ground-truth
+readthrough. The invariant is `pe_trims = 0` — the PE path must not disturb a
+single trim decision.
+
+`fp-bnd` (`--pe-overlap --adapter-evidence boundary`) against `fastprep-hd0`:
+
+| | fastprep-hd0 | fp-bnd |
+|---|---|---|
+| exact | 13 883 011 | **13 883 011** |
+| overtrim | 114 290 | **114 290** |
+| undertrim_recoverable | 15 851 | **15 851** |
+| dropped | 1 260 259 | **1 260 259** |
+| scored | 15 739 741 | **15 739 741** |
+| **pe_trims** | n/a | **0** |
+
+Every column is identical and `pe_trims` is zero: the boundary policy changed
+**no trim decision at all** across 17 million reads.
+
+The reason is structural, and it bounds the whole PE-line of work: this
+corpus's fragments are LONGER than the reads, so the mates never overlap and
+the boundary is never pinned. The rescue only exists for short inserts
+(I < read length). Artifacts:
+`bench/results/cellA-boundary/` (run on the desktop corpus, 2026-10-21).
+
+**What this means for the ranking.** UT-1 is *safe* (zero disturbance) but
+its benefit is confined to short-insert libraries. The 41.15% → 12.58%
+paired gain is real on a corpus built with I < L; it does not transfer to
+Cell A. Any proposal ranked above UT-1 must therefore be justified on a
+short-insert corpus, not on Cell A.
+
+### UT-4 — Quality/N-aware scoring: LIVE, but inert on the AB corpus
+
+`scored_mismatches` charges an `N` or a badly-called base half a mismatch.
+It is behind `--adapter-scored-retry LOW_Q` (default off).
+
+**The mechanism is live.** A 20-base adapter tail with 5 `N`s:
+raw budget = `floor(20 * 0.2) = 4`, raw count = 5 → refused;
+scored = `5 * 0.5 = 2.5 <= 4` → **accepted**. Measured: 100/200 exact cuts
+raw, **200/200** with the retry.
+
+**It does not move the AB corpus, and the reason is a measurement, not a
+bug.** On the 200k single-end corpus the result is byte-identical
+(174 875 exact / 25 105 under / 20 over, both arms). Two causes, both checked:
+
+* the corpus injects at most **2** `N`s per tail, and the raw budget at
+  `k = 14` is already 2 — so the `N`s are inside the raw budget;
+* the residual is concentrated in **tails shorter than 14** (`n`-class:
+  38.8 % of reads, `sub`-class: 40.2 %, `g`-class: 40.3 % have `t < 14`),
+  and a sub-floor tail is refused for LENGTH, before any mismatch count is
+  consulted. Scoring cannot help a tail that never reaches the matcher.
+
+So UT-4 is a genuine capability for N-heavy data (e.g. low-quality tails),
+but it is not a residual-reduction lever for this corpus. **UT-3 (short
+tails) is where the `n`/`sub` residual lives**, and UT-4 must not be ranked
+as if it addressed it.
+
+**Design note.** An earlier version of `scored_mismatches` counted only the
+ambiguous/low-quality positions and ignored real disagreements entirely, so a
+window matching nothing scored 0.0 and every read was trimmed — 164 248
+false trims on the SE corpus (100.000 % false). The unit tests
+`a_real_disagreement_still_costs_a_full_mismatch` and the corpus gate both
+catch it. The `MIN_UNAMBIGUOUS = 12` guard also means `N` vs `N` is **not**
+an agreeing call: two uncalled bases are not evidence.
+
 ### UT-4 — Quality/N-aware scoring in place of raw mismatch counting
 
 Score mismatches by base quality (Q<=2 counts half / N is a wildcard when >= 12
@@ -226,6 +292,31 @@ unambiguous bases agree). LUT-backed, no per-base transcendental.
 * Undertrim reduction: the 1 185 n-class + part of the 851 sub-class reads
   (~5-8 % of residual) and the Arm B e=3 gap at t=14.
 * Overtrim risk: small [E]; no eps change. A/B: AB n/sub columns + clean corpus.
+
+### UT-5 — "adapter-only reads come out partial" was a PROBE BUG, not a defect
+
+**Finding: no tool change is needed.** The plan's UT-5 was derived from
+`undertrim_probe.py` Arm C0 (insert 0, t=150), which reported 200/200 reads
+emitted *partial*. That was the scorer, not the trimmer.
+
+The probe built the read as `dna(L - t) + adapter[:t]` with `t = 150`, but
+TruSeq/R1 is **33 bases long**, so the read was 33 bases and the recorded
+truth was 150. A cut can never equal 150 on a 33-base read, so every read was
+scored `partial`.
+
+With the truth corrected to what the read actually carries
+(`bench/scripts/undertrim_probe.py`, `t_actual`):
+**200/200 exact, 0 partial.** The tool trims the whole read to empty
+(`t3_adapter = 33`, output sequence length 0), which is the correct
+behaviour for a read with no insert.
+
+A genuinely all-adapter read (150 bases of the TruSeq sequence repeated) is
+likewise trimmed to empty: `t3_adapter = 150`, output length 0.
+
+**No `--min-len` change and no `DropReason` change.** The "emit an empty
+record" question this task was meant to answer is already settled by the
+existing contract: an empty sequence is emitted, the read is counted, and
+`--min-len` governs the post-trim length as before.
 
 ### UT-5 — Correctness wart: adapter-only reads come out *partial*
 

@@ -230,6 +230,16 @@ pub struct Params {
     /// anyway), so the only extra cut is the adapter extension.
     pub adapter_g_run_retry: Option<usize>,
 
+    /// Retry the adapter match with QUALITY- and N-aware scoring (UT-4).
+    /// `None` disables the retry (today's behaviour).
+    ///
+    /// The general matcher charges an `N` a full mismatch, which spends the
+    /// budget on a base the sequencer never called; a base called at a
+    /// quality at or below `low_q` costs half instead. A window with fewer
+    /// than `MIN_UNAMBIGUOUS` real calls is refused outright, so a read of
+    /// N's cannot match.
+    pub adapter_scored_retry: Option<u8>,
+
     /// Trim budget already consumed by a prior step (e.g. adapter trim).
     /// Subtracted from the computed Δ_L inside [`polyx_trim`] so the
     /// combined trim stays within the min-len contract.
@@ -287,6 +297,7 @@ impl Default for Params {
             adapter: None,
             pe_adapter: None,
             adapter_g_run_retry: None,
+            adapter_scored_retry: None,
             extra_committed: 0,
             original_len: None,
             gate_lut: [0.0; 256],
@@ -1336,7 +1347,6 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
                     // G's sit inside the window and spend the mismatch
                     // budget. Retry on the pre-G slice.
                     None => match params.adapter_g_run_retry {
-                        None => (0, 0, None),
                         Some(run_min) => {
                             match crate::adapter::match_adapters_before_terminal_run(
                                 bases,
@@ -1344,9 +1354,38 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
                                 run_min,
                             ) {
                                 Some(m) => (m.t5, m.t3, Some(m.adapter)),
-                                None => (0, 0, None),
+                                // UT-4: still nothing. An ambiguous or badly
+                                // called base was charged a full mismatch;
+                                // score the same alignment with quality/N
+                                // awareness and try again.
+                                None => match params.adapter_scored_retry {
+                                    None => (0, 0, None),
+                                    Some(low_q) => {
+                                        match crate::adapter::match_adapters_scored(
+                                            bases, quals, set, low_q,
+                                        ) {
+                                            Some(m) => (m.t5, m.t3, Some(m.adapter)),
+                                            None => (0, 0, None),
+                                        }
+                                    }
+                                },
                             }
                         }
+                        // No G-run retry configured: try the scored retry
+                        // directly (it is a second chance on the same
+                        // alignment, so it cannot find a structurally
+                        // different match).
+                        None => match params.adapter_scored_retry {
+                            None => (0, 0, None),
+                            Some(low_q) => {
+                                match crate::adapter::match_adapters_scored(
+                                    bases, quals, set, low_q,
+                                ) {
+                                    Some(m) => (m.t5, m.t3, Some(m.adapter)),
+                                    None => (0, 0, None),
+                                }
+                            }
+                        },
                     },
                 }
             }

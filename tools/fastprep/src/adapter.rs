@@ -101,6 +101,163 @@ pub fn any_prefix_matches_exact(tail: &[u8], set: &AdapterSet) -> bool {
         .any(|a| prefix_matches_adapter_exact(tail, &a.seq))
 }
 
+/// A base whose quality is at or below this is "called, but badly".
+pub const LOW_Q: u8 = 2;
+
+/// The number of real (unambiguous, well-called) bases a window needs before
+/// its wildcards may count as half a mismatch.
+///
+/// A window of ambiguous bases is not evidence: if the read says N and the
+/// adapter says N, nothing was called at all.
+pub const MIN_UNAMBIGUOUS: usize = 12;
+
+/// Mismatch count where an ambiguous base costs HALF a mismatch and a
+/// low-quality base costs half too.
+///
+/// `N` is not a disagreement, it is an absence of information: charging it a
+/// full mismatch spends the budget on a base the sequencer never called. A
+/// base whose quality is at or below `low_q` is called, but badly, so it
+/// costs half.
+///
+/// A genuine disagreement (both bases called, both high quality) still costs
+/// a full mismatch — only the uninformative positions are discounted.
+///
+/// The wildcards are only allowed when the rest of the window agrees: a
+/// window of ambiguous bases is not evidence, so an ambiguous window counts
+/// as a FULL mismatch.
+pub fn scored_mismatches(
+    a: &[u8],
+    b: &[u8],
+    quals: Option<&[u8]>,
+    low_q: u8,
+) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut real_mm = 0usize;
+    let mut soft_mm = 0usize;
+    let mut unambig = 0usize;
+    for i in 0..a.len() {
+        // `N` matches `N` byte-wise, but two uncalled bases are not two
+        // agreeing calls: only a called base that agrees is evidence.
+        let ambiguous_base = a[i] == b'N' || b[i] == b'N';
+        if a[i] == b[i] && !ambiguous_base {
+            unambig += 1;
+            continue;
+        }
+        let low = quals
+            .map(|q| q.get(i).copied().unwrap_or(u8::MAX) <= low_q)
+            .unwrap_or(false);
+        if ambiguous_base || low {
+            soft_mm += 1;
+        } else {
+            // A real disagreement: both bases were called and both are
+            // well-called. This costs the full budget.
+            real_mm += 1;
+        }
+    }
+    if unambig < MIN_UNAMBIGUOUS {
+        // Not enough real calls: an ambiguous window is not evidence.
+        return a.len() as f64;
+    }
+    real_mm as f64 + soft_mm as f64 * 0.5
+}
+
+/// Boundary-anchored prefix check with QUALITY- and N-aware scoring.
+///
+/// The same alignment as [`prefix_matches_adapter`], but a base that is
+/// ambiguous (`N`) or badly called (quality at or below `low_q`) costs half a
+/// mismatch instead of a whole one.
+///
+/// A window with fewer than [`MIN_UNAMBIGUOUS`] real calls is refused
+/// outright, however few mismatches it has.
+pub fn prefix_matches_adapter_scored(
+    tail: &[u8],
+    adapter: &[u8],
+    quals: Option<&[u8]>,
+    error_rate: f64,
+    low_q: u8,
+) -> bool {
+    let t = tail.len();
+    if t == 0 || t > adapter.len() {
+        return false;
+    }
+    let budget = crate::adapter::max_mismatches(t, error_rate) as f64;
+    scored_mismatches(tail, &adapter[..t], quals, low_q) <= budget
+}
+
+/// True if ANY adapter in the set matches the tail as a scored
+/// boundary-anchored prefix.
+pub fn any_prefix_matches_scored(
+    tail: &[u8],
+    quals: Option<&[u8]>,
+    set: &AdapterSet,
+    low_q: u8,
+) -> bool {
+    set.adapters.iter().any(|a| {
+        prefix_matches_adapter_scored(tail, &a.seq, quals, set.error_rate, low_q)
+    })
+}
+
+/// Retry the 3'-anchored match with QUALITY- and N-aware scoring.
+///
+/// The general matcher charges an `N` a full mismatch, which spends the
+/// budget on a base the sequencer never called. This retry scores the same
+/// alignments with [`scored_mismatches`]: an ambiguous or badly-called base
+/// costs half.
+///
+/// The retry is only ever tried at the 3'-anchored position the general
+/// matcher would have used, so it cannot find a match the general matcher
+/// would have missed for a structural reason — only a match it scored too
+/// harshly.
+pub fn match_adapters_scored(
+    seq: &[u8],
+    quals: &[u8],
+    set: &AdapterSet,
+    low_q: u8,
+) -> Option<AdapterMatch> {
+    let l = seq.len();
+    let min_overlap = set.min_overlap_se;
+    if l < min_overlap {
+        return None;
+    }
+    // The 3'-anchored position: the adapter's tail at the read's 3' end.
+    //
+    // Preference matches the general matcher exactly: leftmost match wins,
+    // ties broken by adapter index. The retry must be a strict superset of
+    // the general matcher's decisions, so it scans in the same order.
+    let mut best: Option<AdapterMatch> = None;
+    for (ai, adapter) in set.adapters.iter().enumerate() {
+        let a = adapter.seq.len();
+        if a == 0 {
+            continue;
+        }
+        for p in 0..=(l - min_overlap) {
+            let k = a.min(l - p);
+            if k < min_overlap {
+                break;
+            }
+            let budget = crate::adapter::max_mismatches(k, set.error_rate) as f64;
+            if scored_mismatches(&seq[p..p + k], &adapter.seq[..k], Some(quals), low_q)
+                <= budget
+            {
+                // leftmost for this adapter; the outer loop's adapter order
+                // breaks ties the same way the general matcher does.
+                best = Some(AdapterMatch {
+                    adapter: ai as u8,
+                    t5: p,
+                    t3: l - p,
+                });
+                break;
+            }
+        }
+        if let Some(b) = best {
+            if b.t5 == 0 {
+                break; // cannot do better than leftmost
+            }
+        }
+    }
+    best
+}
+
 /// The length of the terminal homopolymer run that a no-signal overprint can
 /// produce at a 3' end.
 ///
@@ -1427,5 +1584,78 @@ mod tests {
         assert_eq!(adapters.len(), 2);
         assert_eq!(adapters[0].name, "TruSeq/R1");
         assert_eq!(adapters[1].seq, b"AGATCGGAAGAGCGTCGTG");
+    }
+
+    // ------------------------------------------------------------------
+    // scored_mismatches (UT-4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_real_disagreement_still_costs_a_full_mismatch() {
+        // The regression this test exists for: an earlier version counted
+        // only the ambiguous/low-quality positions and IGNORED real
+        // disagreements, so a window that matched nothing scored 0.0 and
+        // every read was trimmed (100 % false trims on the SE corpus).
+        let a = b"ACGTACGTACGTAC";
+        let b = b"ACGTACGTACGTAA"; // one real mismatch at the last base
+        let q = vec![40u8; 14];
+        let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
+        assert_eq!(mm, 1.0, "a real disagreement must cost a full mismatch");
+    }
+
+    #[test]
+    fn an_ambiguous_base_costs_half() {
+        let a = b"ACGTACGTACGTAC";
+        let b = b"ACGTACGTACGTAN"; // the last base is uncalled
+        let q = vec![40u8; 14];
+        let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
+        assert_eq!(mm, 0.5, "an N is an absence of information, not a disagreement");
+    }
+
+    #[test]
+    fn a_low_quality_base_costs_half() {
+        let a = b"ACGTACGTACGTAC";
+        let b = b"ACGTACGTACGTAA"; // real mismatch, but badly called
+        let mut q = vec![40u8; 14];
+        q[13] = 2;
+        let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
+        assert_eq!(mm, 0.5, "a badly called base costs half");
+    }
+
+    #[test]
+    fn a_window_of_nothing_but_n_is_not_evidence() {
+        // With no real calls at all, the window must be refused outright
+        // regardless of how many N's it has.
+        let a = b"NNNNNNNNNNNNNN";
+        let b = b"NNNNNNNNNNNNNN";
+        let q = vec![40u8; 14];
+        let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
+        assert_eq!(mm, 14.0, "an ambiguous window is not evidence");
+    }
+
+    #[test]
+    fn two_ambiguous_bases_are_worth_one_real_one() {
+        // Two N's vs two N's is NOT two agreeing calls: an N is not a call.
+        // So unambig == 0 and the window is refused outright.
+        let a = b"NNNNNNNNNNNNNN";
+        let b = b"NNNNNNNNNNNNNN";
+        let q = vec![40u8; 14];
+        let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
+        assert_eq!(mm, 14.0, "N vs N is not an agreeing call");
+
+        // With real calls elsewhere, each ambiguous disagreement costs half.
+        // Here both trailing positions are ambiguous (N vs A, N vs N).
+        let a = b"ACGTACGTACGTNN";
+        let b = b"ACGTACGTACGTAN"; // 12 real calls agree, two bases are N
+        let q = vec![40u8; 14];
+        let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
+        assert_eq!(mm, 1.0, "two ambiguous disagreements cost half each");
+
+        // A single ambiguous disagreement against 12 agreeing real calls.
+        let a = b"ACGTACGTACGTAC";
+        let b = b"ACGTACGTACGTAN"; // one N at the last base
+        let q = vec![40u8; 14];
+        let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
+        assert_eq!(mm, 0.5, "one ambiguous disagreement costs half");
     }
 }

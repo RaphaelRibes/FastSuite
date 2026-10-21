@@ -114,7 +114,13 @@ def arm_tail(fp, rng, n, t, errs=0, g_contam=0, n_contam=0, adapter=TRUSEQ_R1,
         t_eff = min(t, L)
         bio_len = L - t_eff
         bio = dna(rng, bio_len)
+        # The readthrough is the adapter's first `t_eff` bases -- but the
+        # adapter may be SHORTER than t_eff (TruSeq/R1 is 33 bases), in which
+        # case the read carries only as much adapter as exists. The truth
+        # must be what the read actually carries, or the scorer compares the
+        # cut against a number the read could never reach.
         tail = list(adapter[:t_eff])
+        t_actual = len(tail)
         # substitutions inside the adapter portion
         for _ in range(errs):
             if not tail:
@@ -131,7 +137,7 @@ def arm_tail(fp, rng, n, t, errs=0, g_contam=0, n_contam=0, adapter=TRUSEQ_R1,
         rid = f"{tag}{t}_{errs}_{g_contam}_{n_contam}_{k}"
         ids.append(rid)
         recs.append((rid, "".join(seq)))
-        meta[rid] = t_eff
+        meta[rid] = t_actual
     d = tempfile.mkdtemp(prefix="ut_")
     sq = os.path.join(d, "in.fq")
     write_fastq(sq, recs)
