@@ -75,7 +75,7 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 | fastprep vs fastp (5M pairs, 1 and 2 cores pinned with `taskset`, gzip level 6 both) | **fastprep 73.99 s vs fastp 80.03 s on one core; 37.55 vs 40.55 on two.** fastprep leads at every size on both core counts (1.08–1.21× one core, 1.08–1.28× two). The earlier "34.37 vs 28.50, fastp leads" row came from a harness that set `-j N` without `taskset`: its `pinned` rows burned 2.4 cores. Source of truth: `FastPrep-Paper/benchmark/results.csv` (`cores` column, `cpu_s/wall_s` ≈ 1.00 on every row) |
 | fastprep's drop rate tracks the injected must-drop + polyG | 7.7–7.9% drops vs the 4.7–4.8% injected (a retention check, not a trim-accuracy claim) — carried from the paper campaign, not re-measured this session |
 | fasthelper vs MultiQC | zero orchestration overhead (0.667 s vs 0.647 s) + manifest provenance; MultiQC v1.35 emits **no output** on `fastsuite.report.v1` (no module for it) — 0 report files at every N from 25 to 800 samples |
-| fastsim ground-truth recovery | **10/10 parameters within tolerance** (was 8/10; the two failures were fastcheck fitter defects, now fixed — see "Known defects" 2–3) |
+| fastsim ground-truth recovery | **10/10 parameters within tolerance**, re-run 2026-10-21 on the build that honours `profile.gc` (`gc_fragment` 0.48 -> 0.4854, error 0.0054). The campaign's tenth row was a **false pass**: `profile.gc` was inert, so the fitter measured the `--gc` default back. The two earlier failures were fastcheck fitter defects, fixed — see "Known defects" 2–3 |
 | fastsim insert resolution | 94–95% measured exactly at 200–288 bp (18 982 of 20 000 at insert 200, p50 200); the 288 bp ceiling is geometry, not a defect |
 | trim accuracy vs simulator ground truth, tolerance 0 (102 real libraries, one harness) | **fastprep with `--head-dropout 0` leads**: 89.1% exact / 0.6% overtrim / 10.3% undertrim. fastp-default 88.6 / 0.8 / 10.6; fastp-tuned 80.4 / 9.6 / 10.0; **fastprep's historical default (`--head-dropout 4`) is worst at 75.5 / 22.5 / 2.0**. Tolerance 2: 99.1 / 98.5 / 90.2 / 98.5. Re-measured on the regenerated corpus (see above); the ordering is unchanged but the level dropped ~3pp and undertrim roughly doubled, because the simulator now emits N-runs that no trimmer removes. Aggregate of `bench/results/phase-d/overtrim-vs-fastp.tsv`; see `docs/TRIM-ACCURACY.md` |
 | `head_dropout` axis (1515 runs, 3030 rows = 101 datasets × 3 variants × hd {0,1,2,3,4}) | `0` is the per-dataset winner on **100 of 101** datasets, `1` on the remaining one, `4` on **none**. Corpus total error at tolerance 0: **7.44% at `0` vs 24.64% at `4` (3.3×)**. `docs/OVERTRIM-SWEEP.md`, `bench/results/phase-d/head-dropout-axis.tsv` |
@@ -173,6 +173,18 @@ on real 3′-biased libraries. That is the 54.6% → 46.4% drop above. Do not re
 "the fitter is fixed" as a settled claim: it is better at the metric it was
 tuned against and worse at the one the loop scores. See
 `docs/CLOSED-LOOP-RERUN.md` §3.
+
+## Re-measured in the 2026-10-21 review round
+
+- **fastsim profile recovery**: re-run end to end (`FastSim-Bench/scripts/
+  recover.py`, 2,000,000 pairs, `--seed 7`, current binaries) because the
+  campaign table's GC row was green for the wrong reason. 10/10 rows inside
+  tolerance; `gc_fragment` 0.48 injected against 0.4854 recovered. The other
+  rows moved in the third decimal, as they must: the emitted sequences changed
+  when the GC changed. `FastSim-Bench/results/recovery.csv` is the record.
+- **One gap stays open**: the *closed-loop* campaign TSVs still predate the GT
+  `full_flag` change (pair-level AND, per-mate `r1_full`/`r2_full`), so their
+  numbers describe the previous GT semantics until that campaign is re-run.
 
 ## Fixed in the 2026-10-21 review round (full-suite review: six crates + six papers)
 
