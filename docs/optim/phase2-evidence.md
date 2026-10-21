@@ -383,31 +383,48 @@ rather than assumed.
 pair). A single fingerprint entry costs 17 B/bucket at a 0.875 load factor,
 i.e. ~19.4 B per distinct read — so the peak is **3.5× one table**.
 
-**Mechanism, from the code [V]:**
+**Mechanism, from the code [V] — and it is a counted model, not a guess.**
 
-* `accum.rs:328` — every accumulator gets its **own** table starting at 1024
-  entries: `seq_counts: FingerprintTable::with_capacity(1024)`. The doc-comment
-  on the struct says so outright: "The scan starts it at 1024 entries and it
-  grows by rehashing."
-* `accum.rs:591` — `self.seq_counts.merge(&o.seq_counts)` folds those tables
-  together **while every one of them is still alive**.
+* `main.rs:464` — `scan_one` builds **one accumulator per input file**.
+* `accum.rs:328` — that accumulator's table starts at 1024 entries:
+  `FingerprintTable::with_capacity(1024)`, and the struct's doc-comment says so
+  outright: "The scan starts it at 1024 entries and it grows by rehashing."
+* `main.rs:275` — `for r in &reports { total.merge(&r.acc) }` builds a **third**
+  kind of table: the run total. The per-file accumulators cannot be freed
+  afterwards, because the report still needs them (`main.rs:358/377/397`).
 
-So the peak is not one table. It is *all worker tables* + the table they merge
-into + up to eight concurrent rehash transients, since each of eight threads
-grows independently from 1024 entries. Pre-reserving the merged table does not
-help, because the merged table was never the problem.
+So the resident set is *per-file tables + one merged total*, each
+`next_pow2(distinct / 0.875) x 17 B`:
 
-**What this means for the plan's Step 2 [E]:** a compact 12 B/entry table
-addressing "the duplication table" would cut the *merged* 272 MB by about 30 %
-and leave the per-worker tables and their transients untouched — a 785 MB peak
-would land near 600 MB, not near fastmaps' 22.7 MB. **The structural fix is to
-stop holding every worker table plus their merges at once:** give each worker a
-share of the record estimate instead of 1024 (removing the concurrent rehash
-transients), and merge incrementally, releasing each source as it is consumed.
-The compact table and that change are complementary, and the plan lists only
-the first.
+| | per-file tables | merged total | predicted | measured | unexplained |
+|---|---:|---:|---:|---:|---:|
+| 1 file x 5 M reads | 142.6 MB | 142.6 MB | 285.2 MB | **325.0 MB** | 39.8 MB (12 %) |
+| 2 files x 5 M reads | 285.2 MB | 285.2 MB | 570.4 MB | **688.1 MB** | 117.7 MB (17 %) |
 
-Not implemented here: it is a restructuring of the accumulator lifecycle rather
-than a local edit, and the measurement above says the ordering matters more than
-the constant factor. Recorded so the next attempt starts from the measurement
-instead of the assumption.
+The model accounts for 88 % and 83 % of the two peaks; the remainder is rehash
+transients (the last generation allocates the new table before freeing the old,
+which `with_capacity(1024)` guarantees must happen) plus the read buffers. A
+one-file run is 2.12x cheaper than a two-file run at the same per-file size, and
+that is the *data*, not a per-file overhead: two files means two per-file tables
+and a twice-as-large total.
+
+**What this means for the plan's Step 2 [E].** The plan's premise is right that
+the table is the cost, and its Step 2 is a real improvement — a 12 B/entry table
+instead of 19.4 B/entry effective is about 30 % off all three tables, taking
+785 MB to roughly 480 MB. But it is not the whole gap, and there is a larger
+structural win the plan does not list: **the merged total duplicates data the
+per-file tables already hold.** Extracting the per-file duplication statistics
+first and then reusing one per-file table as the merge target would remove the
+third table outright — about 285 MB of the 688 MB — before any compaction. The
+two changes are complementary: compaction alone lands near 480 MB, and the
+merge-target change alone near 400 MB; together, near 280 MB.
+
+Still not fastmaps' 22.7 MB, because fastmaps keeps a fixed 256x256 histogram
+while this module keeps one entry per distinct read. The honest target for
+`fastcheck --only dup` on 10 M reads is a few hundred MB, and the report should
+say so rather than promise parity with a tool that solves a different problem.
+
+Not implemented here: the merge-target change reorders the accumulator lifecycle
+and must preserve every per-file report field, which needs the byte-identity gate
+of Step 4 to be trusted. Recorded with the model so the next attempt starts from
+arithmetic instead of an assumption.
