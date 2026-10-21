@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
@@ -58,10 +59,10 @@ impl PixelAcc {
 pub enum SpillerMsg {
     Chunk(SpillChunk),
     Done {
-        counts: HashMap<(u16, u16), PixelAcc>,
-        counts_r1: HashMap<(u16, u16), u64>,
-        counts_r2: HashMap<(u16, u16), u64>,
-        per_file_counts: HashMap<u16, u64>,
+        counts: FxHashMap<(u16, u16), PixelAcc>,
+        counts_r1: FxHashMap<(u16, u16), u64>,
+        counts_r2: FxHashMap<(u16, u16), u64>,
+        per_file_counts: Vec<u64>,
         no_call: u64,
         no_call_r1: u64,
         no_call_r2: u64,
@@ -143,11 +144,11 @@ pub struct WorkerLocal {
     /// the whole run, not per chunk. Empty in `Exact`/`Off` mode.
     pub data_count: HashMap<((u16, u16), u16), u8>,
     /// Per-pixel (count, quality sums) — for PNG/HTML.
-    pub counts: HashMap<(u16, u16), PixelAcc>,
+    pub counts: FxHashMap<(u16, u16), PixelAcc>,
     /// Per-pixel R1-only count.
-    pub counts_r1: HashMap<(u16, u16), u64>,
+    pub counts_r1: FxHashMap<(u16, u16), u64>,
     /// Per-pixel R2-only count.
-    pub counts_r2: HashMap<(u16, u16), u64>,
+    pub counts_r2: FxHashMap<(u16, u16), u64>,
     /// Reads with zero ACGT bases (all-N / no-call). They land on (0,0) like an
     /// all-A read but have no measurable composition, so the corner metrics
     /// keep them out of their denominators and report them separately.
@@ -155,7 +156,7 @@ pub struct WorkerLocal {
     pub no_call_r1: u64,
     pub no_call_r2: u64,
     /// Per-file total read count.
-    pub per_file_counts: HashMap<u16, u64>,
+    pub per_file_counts: Vec<u64>,
     /// Shortest read length seen (`None` until a read arrives).
     ///
     /// Published next to `max_seq_len` because `size` is derived from the
@@ -175,13 +176,13 @@ impl WorkerLocal {
             previews: Vec::new(),
             preview_count: HashMap::new(),
             data_count: HashMap::new(),
-            counts: HashMap::new(),
-            counts_r1: HashMap::new(),
-            counts_r2: HashMap::new(),
+            counts: FxHashMap::default(),
+            counts_r1: FxHashMap::default(),
+            counts_r2: FxHashMap::default(),
             no_call: 0,
             no_call_r1: 0,
             no_call_r2: 0,
-            per_file_counts: HashMap::new(),
+            per_file_counts: Vec::new(),
             min_seq_len: None,
             max_seq_len: 0,
             total_reads: 0,
@@ -393,7 +394,10 @@ pub fn process_fastq(
             }
         }
         state.total_reads += 1;
-        *state.per_file_counts.entry(file_id).or_insert(0) += 1;
+        if state.per_file_counts.len() <= file_id as usize {
+            state.per_file_counts.resize(file_id as usize + 1, 0);
+        }
+        state.per_file_counts[file_id as usize] += 1;
 
         // Index entry for heatmap.data (unless --data-mode says otherwise).
         state.push_index(xy, file_id, read_num, cfg.data_mode);

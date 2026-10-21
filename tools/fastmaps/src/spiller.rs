@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -13,13 +14,13 @@ use crate::worker::{PixelAcc, SpillerMsg};
 /// all workers have finished.
 pub struct SpillerState {
     /// Combined per-pixel (count, quality sums).
-    pub counts: HashMap<(u16, u16), PixelAcc>,
+    pub counts: FxHashMap<(u16, u16), PixelAcc>,
     /// Per-pixel R1 counts.
-    pub counts_r1: HashMap<(u16, u16), u64>,
+    pub counts_r1: FxHashMap<(u16, u16), u64>,
     /// Per-pixel R2 counts.
-    pub counts_r2: HashMap<(u16, u16), u64>,
+    pub counts_r2: FxHashMap<(u16, u16), u64>,
     /// Per-file total read count.
-    pub per_file_counts: HashMap<u16, u64>,
+    pub per_file_counts: Vec<u64>,
     /// Reads with zero ACGT bases (no-call): unplaceable on the composition
     /// plane, so the corner metrics exclude them instead of calling them polyA.
     pub no_call: u64,
@@ -92,10 +93,10 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
     let mut row_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
     let mut preview_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
 
-    let mut counts: HashMap<(u16, u16), PixelAcc> = HashMap::new();
-    let mut counts_r1: HashMap<(u16, u16), u64> = HashMap::new();
-    let mut counts_r2: HashMap<(u16, u16), u64> = HashMap::new();
-    let mut per_file_counts: HashMap<u16, u64> = HashMap::new();
+    let mut counts: FxHashMap<(u16, u16), PixelAcc> = FxHashMap::default();
+    let mut counts_r1: FxHashMap<(u16, u16), u64> = FxHashMap::default();
+    let mut counts_r2: FxHashMap<(u16, u16), u64> = FxHashMap::default();
+    let mut per_file_counts: Vec<u64> = Vec::new();
     let mut no_call = 0u64;
     let mut no_call_r1 = 0u64;
     let mut no_call_r2 = 0u64;
@@ -167,8 +168,14 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
                 for (k, cnt) in cr2 {
                     *counts_r2.entry(k).or_insert(0) += cnt;
                 }
-                for (fid, cnt) in pfc {
-                    *per_file_counts.entry(fid).or_insert(0) += cnt;
+                // Indexed accumulation over a dense Vec, exact in any `Done`
+                // arrival order (FM-12). A partial may carry ids beyond the
+                // current length; grow to fit them (a gap, not an error).
+                for (fid, cnt) in pfc.iter().enumerate() {
+                    if per_file_counts.len() <= fid {
+                        per_file_counts.resize(fid + 1, 0);
+                    }
+                    per_file_counts[fid] += cnt;
                 }
             }
         }
@@ -226,9 +233,9 @@ mod tests {
     ) -> SpillerMsg {
         SpillerMsg::Done {
             counts: counts.iter().copied().collect(),
-            counts_r1: HashMap::new(),
-            counts_r2: HashMap::new(),
-            per_file_counts: HashMap::new(),
+            counts_r1: FxHashMap::default(),
+            counts_r2: FxHashMap::default(),
+            per_file_counts: Vec::new(),
             no_call: 0,
             no_call_r1: 0,
             no_call_r2: 0,

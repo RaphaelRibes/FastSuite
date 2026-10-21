@@ -437,15 +437,10 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             data_mode.reads_per_pixel()
         )
     };
+    // A dense Vec indexed by file id. Out-of-range ids are a gap, not an
+    // error, so they serialise as 0 exactly as the old HashMap's `.get()` did.
     let per_file_json = (0..files.len())
-        .map(|i| {
-            state
-                .per_file_counts
-                .get(&(i as u16))
-                .copied()
-                .unwrap_or(0)
-                .to_string()
-        })
+        .map(|i| state.per_file_counts.get(i).copied().unwrap_or(0).to_string())
         .collect::<Vec<_>>()
         .join(",");
 

@@ -11,6 +11,10 @@ path = "src/main.rs"
 png    = "0.18.1"
 flate2 = "1.0"
 clap   = { version = "4", features = ["derive"] }
+# The suite's hashing crate (fastcheck pins the same version). fastmaps' map
+# keys are (u16, u16) pairs derived from read content — never untrusted network
+# input — so SipHash's DoS resistance buys nothing here (Task 2.13).
+rustc-hash = "2"
 
 [dev-dependencies]
 serde_json = "1"
