@@ -24,7 +24,7 @@ shared crate, kept consistent by tests rather than by a compiler.
 | **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data or fitted by `fastcheck` | v0.1.0, WIP |
 | **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | v0.1.0, WIP |
 | **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, polyX runs, bounded repeated-sequence and k-mer counters, insert-size histogram — no sampling, no verdicts, memory printed before the run. `--profile` writes a fastsim profile directly | v0.1.0, WIP |
-| **fasthelper** | MultiQC (+ workflow glue) | a toolbox: `run` (the chain from one TOML config, with a provenance manifest), `concatenate` (per-sample reports → one table/report), `compare` (raw vs processed side by side), `check` (validate a config before the run), `doctor`, `install`, `schema` — owns the report schema | v0.1.0, WIP |
+| **fasthelper** | MultiQC (+ workflow glue) | a toolbox: `run` (the chain from one TOML config, with a provenance manifest), `concatenate` (per-sample reports → one table/report), `compare` (raw vs processed side by side), `check` (validate a config before the run), `guard` (adapter residual in a trimmed FASTQ, exit 2 when it is too high), `doctor`, `install`, `schema` — owns the report schema | v0.1.0, WIP |
 
 Release history and per-tool maturity: `docs/RELEASES.md`.
 What the suite replaces today, feature by feature, honestly: `docs/REPLACEMENT-MAP.md`.
@@ -62,6 +62,7 @@ fasthelper compare --before raw/ --after processed/ -o cmp/    # before/after si
 
 # validate first, then run: a typo or a missing input fails at minute zero
 fasthelper check -c fastsuite.toml                 # fail at minute zero, not hour three
+fasthelper guard -1 trimmed_R1.fastq.gz --fail-on-adapter-residual   # adapter survived? exit 2
 fasthelper run -c fastsuite.toml -P 8 --from fastprep
 fasthelper concatenate runs/ --fail-on polyG_frac>0.05
 

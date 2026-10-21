@@ -270,3 +270,138 @@ fn the_guard_can_be_disabled() {
     let man = read_manifest(&out);
     assert_eq!(man["adapter_guard"]["enabled"], false);
 }
+
+// ---------------------------------------------------------------------------
+// The standalone `fasthelper guard` verb (Task 1.7).
+// ---------------------------------------------------------------------------
+
+/// A FASTQ record with a fixed length.
+fn record(id: &str, seq: &str) -> String {
+    format!("@{id}\n{seq}\n+\n{}\n", "I".repeat(seq.len()))
+}
+
+fn write_fastq(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+}
+
+#[test]
+fn guard_trips_on_a_read_that_is_all_adapter() {
+    require_tools(&["fastcheck"]);
+    let d = tmpdir("trip");
+    let f = d.join("adapter.fq");
+    // 40 reads of 150 bases, each entirely the TruSeq sequence repeated.
+    let mut body = String::new();
+    for k in 0..40 {
+        body.push_str(&record(&format!("a{k}"), &(TRUSEQ_R1.repeat(5))[..150]));
+    }
+    write_fastq(&f, &body);
+
+    let out = Command::new(fasthelper())
+        .args([
+            "guard",
+            "-1",
+            f.to_str().unwrap(),
+            "--adapter-preset",
+            "illumina",
+            "--fail-on-adapter-residual",
+        ])
+        .output()
+        .expect("spawn fasthelper");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an all-adapter read must trip the guard (exit 2); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("RESIDUAL TOO HIGH"),
+        "the message must name the failure: {err}"
+    );
+}
+
+#[test]
+fn guard_passes_on_a_clean_read_and_reports_the_residual() {
+    require_tools(&["fastcheck"]);
+    let d = tmpdir("clean");
+    let f = d.join("clean.fq");
+    let mut body = String::new();
+    for k in 0..400 {
+        body.push_str(&record(&format!("c{k}"), &random_dna(150, k)));
+    }
+    write_fastq(&f, &body);
+
+    let out = Command::new(fasthelper())
+        .args([
+            "guard",
+            "-1",
+            f.to_str().unwrap(),
+            "--adapter-preset",
+            "illumina",
+            "--fail-on-adapter-residual",
+        ])
+        .output()
+        .expect("spawn fasthelper");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean read must pass; stderr: {err}"
+    );
+    assert!(
+        err.contains("-- OK"),
+        "the report must be one readable line: {err}"
+    );
+    assert!(
+        err.contains("% of 400 reads still carry adapter"),
+        "the report must name the measured residual and the read count: {err}"
+    );
+}
+
+#[test]
+fn guard_exits_2_only_when_fail_is_requested() {
+    require_tools(&["fastcheck"]);
+    let d = tmpdir("nofail");
+    let f = d.join("adapter.fq");
+    let mut body = String::new();
+    for k in 0..40 {
+        body.push_str(&record(&format!("a{k}"), &(TRUSEQ_R1.repeat(5))[..150]));
+    }
+    write_fastq(&f, &body);
+
+    let out = Command::new(fasthelper())
+        .args([
+            "guard",
+            "-1",
+            f.to_str().unwrap(),
+            "--adapter-preset",
+            "illumina",
+        ])
+        .output()
+        .expect("spawn fasthelper");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "without --fail-on-adapter-residual a trip is a warning, not a failure"
+    );
+}
+
+/// Deterministic pseudo-random ACGT of length `n`.
+fn random_dna(n: usize, seed: u64) -> String {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            match x % 4 {
+                0 => 'A',
+                1 => 'C',
+                2 => 'G',
+                _ => 'T',
+            }
+        })
+        .collect()
+}
+
+const TRUSEQ_R1: &str = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";

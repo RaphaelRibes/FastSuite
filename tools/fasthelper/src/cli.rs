@@ -42,6 +42,44 @@ pub enum Cmd {
     Install(InstallArgs),
     /// Print the report schema (version, fields, how each tool contributes).
     Schema,
+    /// Measure adapter residual in a trimmed FASTQ and fail if it is too high.
+    ///
+    /// This is the standalone form of the guard that `run --fail-on-adapter-
+    /// residual` applies to a step: it measures a trimmed file directly, so a
+    /// user can check their own output without running the whole chain.
+    Guard(GuardArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GuardArgs {
+    /// The trimmed reads to check (mate 1).
+    #[arg(short = '1', long = "in1")]
+    pub in1: PathBuf,
+
+    /// Mate 2, when the data is paired.
+    #[arg(short = '2', long = "in2")]
+    pub in2: Option<PathBuf>,
+
+    /// The adapter catalogue used for the measurement.
+    #[arg(long = "adapter-preset", default_value = "illumina")]
+    pub adapter_preset: String,
+
+    /// Residual fraction above which the guard trips (0.01 = 1%).
+    #[arg(long, default_value_t = 0.01)]
+    pub threshold: f64,
+
+    /// Relative fall required from the raw fraction. Ignored here: there is no
+    /// raw input to compare against, so the guard trips on the residual alone.
+    #[arg(long, default_value_t = 0.5)]
+    pub min_reduction: f64,
+
+    /// Exit 2 when the residual exceeds the threshold (the `--fail-on` convention).
+    #[arg(long)]
+    pub fail_on_adapter_residual: bool,
+
+    /// Thread count for the underlying fastcheck pass.
+    #[arg(short = 'j', long, default_value_t = 1)]
+    pub threads: usize,
 }
 
 #[derive(Args, Debug)]

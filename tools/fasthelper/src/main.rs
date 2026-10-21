@@ -34,6 +34,7 @@ fn main() -> Result<()> {
         cli::Cmd::Doctor(a) => runner::doctor(&a),
         cli::Cmd::Check(a) => fasthelper::check::cmd_check(&a),
         cli::Cmd::Install(a) => fasthelper::install::cmd_install(&a),
+        cli::Cmd::Guard(a) => fasthelper::adapter_guard::cmd_guard(&a),
         cli::Cmd::Schema => {
             print!("{}", report::SCHEMA_DOC);
             Ok(())

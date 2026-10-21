@@ -182,9 +182,29 @@ Ordered by user-visible value:
   missing or unreadable config, a config `check` rejects, or a step that
   failed); `2` "ran fine but a threshold tripped" (a `--fail-on` violation in
   `concatenate`, or a residual-adapter trip under `--fail-on-adapter-residual`
-  in `run`; the report and manifest are still written first), and equally the
-  usage errors clap reports before the run (unknown flag, missing argument — see
-  §4, item 8); `>2` reserved. All of `0`, `1` and `2` are produced today.
+  in `run` or in the standalone `guard`; the report and manifest are still
+  written first), and equally the usage errors clap reports before the run
+  (unknown flag, missing argument — see §4, item 8); `>2` reserved. All of `0`,
+  `1` and `2` are produced today.
+
+### `fasthelper guard` — the adapter-residual contract
+
+One command, one exit code, one sentence of what it proves:
+
+```
+fasthelper guard -1 trimmed_R1.fastq.gz [-2 trimmed_R2.fastq.gz] \
+    --adapter-preset illumina --fail-on-adapter-residual
+```
+
+It measures adapter content in a file the user already has — the same
+measurement `run --fail-on-adapter-residual` applies to a step — so "adapter
+survived trimming" is a machine-checkable failure rather than a judgement call.
+Exit `2` when the residual exceeds `--threshold` (default 1 %), `0` otherwise.
+The one-line report names the measured percentage and the read count, e.g.
+`fasthelper guard: 100.00% of 20 reads still carry adapter (threshold 1.00%) -- RESIDUAL TOO HIGH`.
+Without `--fail-on-adapter-residual` a trip is a warning and the exit code is
+`0`. A file that cannot be measured is an error (`1`), never a clean bill of
+health (D-6).
 
 ## fastcheck
 

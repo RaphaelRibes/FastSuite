@@ -422,6 +422,82 @@ pub fn guard_step(
     })
 }
 
+/// The standalone `fasthelper guard` verb (Task 1.7).
+///
+/// Measures a trimmed FASTQ for adapter residual and exits 2 when it exceeds
+/// the threshold. This is the same measurement `run --fail-on-adapter-
+/// residual` applies to a step, exposed so a user can check their own output
+/// without running the whole chain.
+///
+/// Exit codes: 0 = residual at or below the threshold, 2 = above it (and
+/// `--fail-on-adapter-residual` was given), 1 = the measurement itself failed.
+pub fn cmd_guard(args: &crate::cli::GuardArgs) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // The catalogue is only ever passed through to fastcheck; it is never
+    // used to build a set here.
+    // The suite's own build tree first (tools/fastcheck/target/release), then
+    // $PATH, so the verb works right after `pixi run build` without an install.
+    let check_bin = crate::runner::resolve(
+        "fastcheck",
+        Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap()),
+    )
+    .or_else(|| crate::runner::resolve("fastcheck", None))
+    .with_context(|| {
+        "fastcheck not found; build the suite (pixi run build) or add it to PATH"
+    })?;
+
+    let mut files = vec![args.in1.clone()];
+    if let Some(p2) = &args.in2 {
+        files.push(p2.clone());
+    }
+    for f in &files {
+        if !f.is_file() {
+            anyhow::bail!("input not found: {}", f.display());
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!("fasthelper-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).ok();
+    let json = tmp.join("guard.json");
+    let log = tmp.join("guard.log");
+
+    let m = measure(
+        &check_bin,
+        &files,
+        &json,
+        &log,
+        Some(&args.adapter_preset),
+        args.threads,
+    )?;
+
+    let Some(m) = m else {
+        eprintln!(
+            "fasthelper guard: fastcheck produced no adapter measurement \
+(see {}); refusing to report a clean bill of health",
+            log.display()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::process::exit(1);
+    };
+
+    let frac = m.fraction();
+    let pct = frac * 100.0;
+    let ok = frac <= args.threshold;
+    eprintln!(
+        "fasthelper guard: {:.2}% of {} reads still carry adapter (threshold {:.2}%) -- {}",
+        pct,
+        m.reads,
+        args.threshold * 100.0,
+        if ok { "OK" } else { "RESIDUAL TOO HIGH" }
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+    if !ok && args.fail_on_adapter_residual {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
