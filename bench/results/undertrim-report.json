@@ -46,6 +46,16 @@
    "value": 0.00010716505561866387,
    "ok": true,
    "detail": "paired false trims/clean <= 0.0002"
+  },
+  "se.candidate_residual_rate": {
+   "value": 0.24335344150527213,
+   "ok": true,
+   "detail": "the UT-3 arm's residual/carrier <= 0.25"
+  },
+  "se.candidate_false_trim_rate": {
+   "value": 0.00015696683005486705,
+   "ok": true,
+   "detail": "the UT-3 arm's false trims/clean <= 0.0002"
   }
  }
 }

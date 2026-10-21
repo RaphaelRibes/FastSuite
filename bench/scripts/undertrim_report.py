@@ -189,6 +189,28 @@ def main():
                fr is not None and fr <= FALSE_CLEAN_MAX,
                f"paired false trims/clean <= {FALSE_CLEAN_MAX}")
 
+    # ------------------------------------------------- the candidate config
+    # The driver above measures the SHIPPED defaults, which is what it must
+    # do: a regression in the shipped path is a bug. But the whole point of
+    # UT-3 is a candidate that is NOT the shipped default, so the report
+    # also prices that arm explicitly. Without this section the report can
+    # only ever say "the shipped path is still 41.95%".
+    if not a.paired_only:
+        section("6. The candidate configuration (UT-3, the short-tail arm)")
+        cand = se.get("configs", {}).get("UT-3 st=6, enr=100", {})
+        if cand:
+            ur = cand.get("undertrim_rate")
+            fr = cand.get("clean_false_trim_rate")
+            print(f"  residual / carrier : {ur*100:.2f}%  (max {RESIDUAL_SE_MAX*100:.0f}%)")
+            print(f"  false trims / clean : {fr*100:.3f}%  (max {FALSE_CLEAN_MAX*100:.3f}%)")
+            print(f"  exact cuts          : {cand.get('exact_cuts')} of {cand.get('reads')}")
+            record("se.candidate_residual_rate", ur,
+                   ur is not None and ur <= RESIDUAL_SE_MAX,
+                   f"the UT-3 arm's residual/carrier <= {RESIDUAL_SE_MAX}")
+            record("se.candidate_false_trim_rate", fr,
+                   fr is not None and fr <= FALSE_CLEAN_MAX,
+                   f"the UT-3 arm's false trims/clean <= {FALSE_CLEAN_MAX}")
+
     # ---------------------------------------------------------------- verdict
     section("VERDICT")
     failed = 0

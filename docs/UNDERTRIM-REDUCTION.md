@@ -218,6 +218,51 @@ auto-detection sample, `cli.rs` `det.sampled`).
   false trims); corroboration must hold the clean rate below 0.02 % [E],
   measured as a new arm in `undertrim_ab.py`.
 
+## §5 — Task 1.6: the measurement wave and the default decision
+
+**Before → after, single-end two-axis corpus (200 000 reads, seed 31):**
+
+| metric | before | after (UT-3 arm) | threshold | verdict |
+|---|---|---|---|---|
+| SE residual / carriers | 41.95 % | **24.34 %** | <= 25 % | **PASS** |
+| SE false trims / clean | 0.007 % | **0.016 %** | <= 0.020 % | **PASS** |
+| PE residual / carriers | 41.15 % | 41.15 % (unchanged) | <= 25 % | FAIL (no PE change) |
+| PE false trims / clean | 0.011 % | 0.011 % (unchanged) | <= 0.020 % | PASS |
+| Cell A `pe_trims` | 0 | 0 (UT-1 arm) | = 0 | **PASS** |
+
+The UT-3 arm is `--adapter-short-tail 6 --adapter-min-enrichment 100`
+(50 and 100 give identical results on this corpus; 100 is the more
+conservative and is the recommended operating point).
+
+### The default decision: no default flips
+
+**None of UT-1..UT-4 becomes the default.** The reasoning is per item:
+
+* **UT-3 — keep behind the flag.** It is the one real win (41.95 % -> 24.34 %
+  residual), but it moves the false-trim rate from 0.007 % to 0.016 % — a
+  2.3x regression on the overtrim axis — and the plan's own rule is that a
+  change must be measured before it becomes a default, not after. The flag
+  exists, is tested, and has a measured operating point; flipping the default
+  is a release decision, not a measurement outcome. **Recommendation: ship
+  behind the flag, revisit after a real short-insert corpus is measured.**
+* **UT-1 — keep behind the flag.** Cell A shows zero disturbance
+  (`pe_trims = 0`), which is the safety result, but the corpus's fragments
+  are longer than the reads so the rescue never fires. There is no measured
+  benefit on Cell A to justify a default, and the benefit is confined to
+  short-insert libraries.
+* **UT-2 — keep behind the flag.** Byte-identical by default; the retry fires
+  only on a terminal G-run, which is a NovaSeq-specific artefact. The default
+  should not change for a machine-specific artefact.
+* **UT-4 — keep behind the flag, and do not rank it as a residual lever.** It
+  is inert on this corpus (byte-identical) because the residual sits in
+  sub-floor tails, not in N-heavy tails. It is a capability for N-heavy data.
+
+**What the measurement wave established, positively:**
+the shipped path is unchanged and green (`pixi run ci`: 762 passed, 0 failed);
+every new capability is opt-in; the one arm that fails the false-trim gate
+(factor 5) is recorded in the artifact next to the arms that pass, so the
+trade-off is visible rather than hidden.
+
 ### UT-1 and UT-4: the Cell A gate on the real corpus — measured, and it says "no change"
 
 **Cell A** is the hard gate: 102 datasets, 17,000,000 reads, ground-truth
