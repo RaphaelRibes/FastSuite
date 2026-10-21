@@ -200,7 +200,7 @@ impl Stats {
     /// The flat `metrics` block for one mate (single-end, or one side of a
     /// paired run). Nothing structured goes in here: the per-adapter counts
     /// stay under the `legacy` block, per REPORT-SCHEMA.md rule 1.
-    fn metrics_flat(&self) -> serde_json::Value {
+    fn metrics_flat(&self, cost: &RunCost) -> serde_json::Value {
         serde_json::json!({
             "reads_in":        self.reads_in,
             "reads_out":       self.reads_kept,
@@ -219,7 +219,67 @@ impl Stats {
             "reads_dropped_length": self.reads_dropped_length,
             "reads_adapter_trimmed": self.adapter.reads_trimmed,
             "phred_offset": self.phred_offset,
+            // Task 2.9: run-level, not a counter. In the paired report these
+            // are inserted once instead of summed, because busy cores describe
+            // the process and summing two mates would report 2x the truth.
+            "busy_cores": cost.busy_cores,
+            "threads_used": cost.threads_used,
         })
+    }
+}
+
+/// Process CPU time in seconds (user + system), for the `busy_cores` metric.
+///
+/// Task 2.9: a wall time alone cannot tell a user whether `-j 16` bought
+/// anything. CPU-seconds divided by wall-seconds answers that directly — a
+/// value near 1 means the run was serial whatever `-j` said, and a value that
+/// keeps climbing while wall time does not means the threads are over-subscribed
+/// (the plateau this task documents).
+///
+/// `getrusage` on a single process is cheap and needs no extra dependency:
+/// `libc` is already here for `memory.rs`.
+pub fn cpu_seconds() -> f64 {
+    let mut ru = libc::rusage {
+        ru_utime: libc::timeval { tv_sec: 0, tv_usec: 0 },
+        ru_stime: libc::timeval { tv_sec: 0, tv_usec: 0 },
+        ..unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: getrusage only writes into the struct we hand it; a failure
+    // leaves the zeroed value, so the metric degrades to 0 rather than lying.
+    let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0;
+    if !ok {
+        return 0.0;
+    }
+    let secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    secs(ru.ru_utime) + secs(ru.ru_stime)
+}
+
+/// How much of the machine a run actually used.
+///
+/// Run-level, not per-mate: `busy_cores` describes the process, so the paired
+/// report must carry it once rather than sum it over R1 and R2.
+#[derive(Debug, Clone, Copy)]
+pub struct RunCost {
+    /// CPU-seconds per wall-second, i.e. cores actually kept busy.
+    pub busy_cores: f64,
+    /// The `-j` value the run was asked for, so the two can be compared.
+    pub threads_used: u64,
+}
+
+impl RunCost {
+    /// Measure against a wall-clock elapsed time.
+    ///
+    /// A zero-length run reports 0 rather than an infinity: the report is read
+    /// by scripts, and `null` or `inf` would break every consumer that sums it.
+    pub fn measure(elapsed: Duration, threads: usize) -> Self {
+        let wall = elapsed.as_secs_f64();
+        let busy = if wall > 0.0 { cpu_seconds() / wall } else { 0.0 };
+        // Rounded to 3 decimals: the underlying clock is not more precise than
+        // that, and a full float obscures the comparison in a diff.
+        RunCost {
+            busy_cores: (busy * 1000.0).round() / 1000.0,
+            threads_used: threads as u64,
+        }
     }
 }
 
@@ -234,6 +294,8 @@ pub struct ReportContext<'a> {
     /// `dedup` block: which anchor window the fingerprint used, and whether it
     /// had to degenerate to an interior window. `None` when dedup is off.
     pub dedup: Option<serde_json::Value>,
+    /// The `-j` value this run was asked for (Task 2.9).
+    pub threads: usize,
 }
 
 /// The `fastsuite.report.v1` wrapper for a single-end run (PLAN.md §1.1).
@@ -260,7 +322,7 @@ pub fn to_report_v1(
         "inputs":       ctx.inputs,
         "outputs":      ctx.outputs,
         "elapsed_s":    ctx.elapsed.as_secs_f64(),
-        "metrics":      s.metrics_flat(),
+        "metrics":      s.metrics_flat(&RunCost::measure(ctx.elapsed, ctx.threads)),
         // Every assumption the run made, in D-6's shape.
         "assumptions":  &s.assumptions,
         // Raw stats object, exactly as fastprep used to write it.
@@ -286,27 +348,41 @@ pub fn to_report_paired_v1(
     p: &crate::pipeline::PairedStats,
 ) -> serde_json::Value {
     let mut metrics = serde_json::Map::new();
-    let (a, b) = (p.r1.metrics_flat(), p.r2.metrics_flat());
+    let cost = RunCost::measure(ctx.elapsed, ctx.threads);
+    let (a, b) = (p.r1.metrics_flat(&cost), p.r2.metrics_flat(&cost));
     let (a, b) = (a.as_object().unwrap(), b.as_object().unwrap());
     // Every counter is a u64: sum as u64 so the JSON stays integral
     // (`8`, never `8.0`), matching what the single-end path emits.
-    // `phred_offset` is an identity, not a count: summing two mates would
-    // report 66 for a +33 run, so it is inserted once below.
+    //
+    // Three keys are NOT counts and must not be summed:
+    //   * `phred_offset` is an identity: +33 twice would report 66.
+    //   * `busy_cores` describes the PROCESS (CPU-s / wall-s), so summing two
+    //     mates would claim twice the cores the machine has.
+    //   * `threads_used` is the `-j` that was asked for, not a per-mate count.
+    // All three are inserted once below, from the run-level values.
     for key in a.keys() {
-        if key == "phred_offset" {
+        if matches!(key.as_str(), "phred_offset" | "busy_cores" | "threads_used") {
             continue;
         }
         let sum = a[key].as_u64().unwrap_or(0) + b[key].as_u64().unwrap_or(0);
         metrics.insert(key.clone(), serde_json::json!(sum));
     }
     metrics.insert("phred_offset".into(), serde_json::json!(p.r1.phred_offset));
+    metrics.insert("busy_cores".into(), serde_json::json!(cost.busy_cores));
+    metrics.insert("threads_used".into(), serde_json::json!(cost.threads_used));
     // Per-mate breakdown for the keys that are genuinely mate-specific:
     // r1_* and r2_*, so neither mate is lost when the sum is what a
     // consumer wants.
     for (key, val) in a {
+        if matches!(key.as_str(), "busy_cores" | "threads_used") {
+            continue;
+        }
         metrics.insert(format!("r1_{key}"), val.clone());
     }
     for (key, val) in b {
+        if matches!(key.as_str(), "busy_cores" | "threads_used") {
+            continue;
+        }
         metrics.insert(format!("r2_{key}"), val.clone());
     }
     // Pair-level counters, from the PairedStats header.

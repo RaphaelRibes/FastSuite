@@ -31,7 +31,7 @@ use crate::algorithm::{trim, DropReason, Params, TrimOutput, TrimResult};
 use crate::cli::{PeOverlapMode, Runtime};
 use crate::dedup::{AnchorSpec, Fingerprint, Seen, Verifier};
 use crate::io::{
-    open_input, open_output, open_output_as, Out, OutputWriter, RecordFormat,
+    open_input, open_output_as, Out, OutputWriter, RecordFormat,
 };
 use crate::metadata::{self, Mate};
 use crate::stats::Stats;

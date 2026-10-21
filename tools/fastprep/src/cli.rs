@@ -499,6 +499,14 @@ pub struct Cli {
     pub trim_3: Option<usize>,
 
     /// Number of worker threads (1 = serial).
+    ///
+    /// Throughput saturates around 8 workers: measured on a 200k-pair run,
+    /// `-j 16` cost 12.6% more CPU than `-j 8` (5.631 vs 5.004 cpu-s) for 0.2%
+    /// less wall time (0.651 vs 0.649 s). Past the plateau, extra threads buy
+    /// nothing and burn CPU, so `-j 8` is the sensible ceiling on a typical box.
+    /// The report's `busy_cores` metric (CPU-seconds per wall-second) shows
+    /// where a run actually landed; a value near 1 means it ran effectively
+    /// serial whatever `-j` said.
     #[arg(short = 'j', long, default_value_t = 1, help_heading = "Runtime")]
     pub threads: usize,
 

@@ -110,6 +110,7 @@ fn main() -> Result<()> {
                     inputs: serde_json::json!({ "r1": in1 }),
                     outputs: serde_json::json!({ "r1": out1 }),
                     dedup: dedup_report(&rt, &params),
+                    threads: rt.threads,
                 };
                 let doc = to_report_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
                 write_json(path, &doc)?;
@@ -188,6 +189,7 @@ fn main() -> Result<()> {
                         "singletons2": singletons2,
                     }),
                     dedup: dedup_report(&rt, &params_r1),
+                    threads: rt.threads,
                 };
                 let doc = to_report_paired_v1(env!("CARGO_PKG_VERSION"), &command_line(), &ctx, &s);
                 write_json(path, &doc)?;

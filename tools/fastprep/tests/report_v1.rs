@@ -266,3 +266,92 @@ fn wrapper_carries_the_derived_retention_keys() {
 
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// Task 2.9: the report must say how much of the machine the run actually used.
+///
+/// A wall time alone cannot answer "did `-j 16` buy anything?", and the CLI says
+/// throughput saturates near 8 workers. `busy_cores` is CPU-seconds per
+/// wall-second, so a run that ignored `-j` and stayed serial reports ~1 however
+/// many threads it was asked for — which is exactly the diagnostic the user
+/// needs. `threads_used` records what was asked, so the two can be compared.
+#[test]
+fn report_records_busy_cores_and_the_threads_asked_for() {
+    let d = tmpdir("busy");
+    let fq = d.join("in.fastq");
+    std::fs::write(&fq, four_reads()).unwrap();
+    let json = d.join("report.json");
+    let out = d.join("out.fastq");
+
+    let (_, stderr, code) = run(&[
+        "-1", fq.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--json", json.to_str().unwrap(),
+        "--min-len", "0",
+        "--no-adapter",
+        "-j", "4",
+    ]);
+    assert_eq!(code, 0, "fastprep must succeed: {stderr}");
+
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    let m = &doc["metrics"];
+
+    assert_eq!(
+        m["threads_used"], 4,
+        "threads_used must echo the -j value, got {}",
+        m["threads_used"]
+    );
+    let busy = m["busy_cores"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("busy_cores must be a number, got {}", m["busy_cores"]));
+    assert!(
+        busy > 0.0,
+        "a run that did work must report a positive busy_cores, got {busy}"
+    );
+    // Deliberately an upper bound rather than an equality: busy_cores counts
+    // the gzip threads as well as the workers, so it may legitimately exceed
+    // `-j`. What it must never do is go negative or be absurd.
+    assert!(
+        busy < 128.0,
+        "busy_cores {busy} is not a plausible core count for this machine"
+    );
+}
+
+/// The paired report must carry the run-level cost ONCE.
+///
+/// `busy_cores` describes the process. Summing two mates would report twice the
+/// machine, and emitting `r1_busy_cores`/`r2_busy_cores` would invite a consumer
+/// to sum them again — the same trap `phred_offset` has.
+#[test]
+fn paired_report_does_not_sum_the_run_level_cost() {
+    let d = tmpdir("busy_paired");
+    let fq = d.join("in.fastq");
+    std::fs::write(&fq, four_reads()).unwrap();
+    let json = d.join("report.json");
+
+    let (_, stderr, code) = run(&[
+        "-1", fq.to_str().unwrap(),
+        "-2", fq.to_str().unwrap(),
+        "-o", d.join("o1.fastq").to_str().unwrap(),
+        "-p", d.join("o2.fastq").to_str().unwrap(),
+        "--json", json.to_str().unwrap(),
+        "--min-len", "0",
+        "--no-adapter",
+        "-j", "4",
+    ]);
+    assert_eq!(code, 0, "fastprep must succeed: {stderr}");
+
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    let m = &doc["metrics"];
+
+    assert_eq!(m["threads_used"], 4, "threads_used must be the -j value, not 2x it");
+    assert!(
+        m["busy_cores"].as_f64().unwrap_or(0.0) > 0.0,
+        "busy_cores must be present in the paired report"
+    );
+    for k in ["r1_busy_cores", "r2_busy_cores", "r1_threads_used", "r2_threads_used"] {
+        assert!(
+            m.get(k).is_none(),
+            "{k} must not exist: the run-level cost is not per-mate"
+        );
+    }
+}
