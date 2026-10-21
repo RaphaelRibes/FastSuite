@@ -81,6 +81,13 @@ CONFIGS = [
     ("mo=10, eps=0.3", ["--min-adapter-overlap", "10", "--adapter-error-rate", "0.3"]),
     ("mo=14, eps=0.3", ["--adapter-error-rate", "0.3"]),
     ("mo=6", ["--min-adapter-overlap", "6"]),
+    # UT-3: the corroborated short tail. Factor 50-100 is the measured sweet
+    # spot on this corpus; factor 5 is recorded as the arm that FAILS the
+    # false-trim gate, because that contrast is the whole argument for the
+    # corroboration.
+    ("UT-3 st=6, enr=50", ["--adapter-short-tail", "6", "--adapter-min-enrichment", "50"]),
+    ("UT-3 st=6, enr=100", ["--adapter-short-tail", "6", "--adapter-min-enrichment", "100"]),
+    ("UT-3 st=6, enr=5 (fails the gate)", ["--adapter-short-tail", "6", "--adapter-min-enrichment", "5"]),
 ]
 
 

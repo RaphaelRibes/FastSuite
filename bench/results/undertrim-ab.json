@@ -278,6 +278,129 @@
    },
    "undertrim_rate": 0.20558795514930736,
    "clean_false_trim_rate": 0.0146621288983069
+  },
+  "UT-3 st=6, enr=50": {
+   "name": "UT-3 st=6, enr=50",
+   "extra": [
+    "--adapter-short-tail",
+    "6",
+    "--adapter-min-enrichment",
+    "50"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 140135,
+     "over": 22
+    },
+    "ALL": {
+     "exact": 185405,
+     "under": 14563,
+     "over": 32
+    },
+    "plain": {
+     "exact": 40147,
+     "under": 8858,
+     "over": 1
+    },
+    "n": {
+     "under": 1185,
+     "exact": 1869,
+     "over": 1
+    },
+    "sub": {
+     "under": 847,
+     "exact": 938
+    },
+    "g": {
+     "under": 3673,
+     "exact": 2316,
+     "over": 8
+    }
+   },
+   "undertrim_rate": 0.24335344150527213,
+   "clean_false_trim_rate": 0.00015696683005486705
+  },
+  "UT-3 st=6, enr=100": {
+   "name": "UT-3 st=6, enr=100",
+   "extra": [
+    "--adapter-short-tail",
+    "6",
+    "--adapter-min-enrichment",
+    "100"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 140135,
+     "over": 22
+    },
+    "ALL": {
+     "exact": 185405,
+     "under": 14563,
+     "over": 32
+    },
+    "plain": {
+     "exact": 40147,
+     "under": 8858,
+     "over": 1
+    },
+    "n": {
+     "under": 1185,
+     "exact": 1869,
+     "over": 1
+    },
+    "sub": {
+     "under": 847,
+     "exact": 938
+    },
+    "g": {
+     "under": 3673,
+     "exact": 2316,
+     "over": 8
+    }
+   },
+   "undertrim_rate": 0.24335344150527213,
+   "clean_false_trim_rate": 0.00015696683005486705
+  },
+  "UT-3 st=6, enr=5 (fails the gate)": {
+   "name": "UT-3 st=6, enr=5 (fails the gate)",
+   "extra": [
+    "--adapter-short-tail",
+    "6",
+    "--adapter-min-enrichment",
+    "5"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 140103,
+     "over": 54
+    },
+    "ALL": {
+     "exact": 186848,
+     "under": 13088,
+     "over": 64
+    },
+    "plain": {
+     "exact": 41620,
+     "under": 7385,
+     "over": 1
+    },
+    "n": {
+     "under": 1185,
+     "exact": 1869,
+     "over": 1
+    },
+    "sub": {
+     "under": 845,
+     "exact": 940
+    },
+    "g": {
+     "under": 3673,
+     "exact": 2316,
+     "over": 8
+    }
+   },
+   "undertrim_rate": 0.2187056130207376,
+   "clean_false_trim_rate": 0.00038528221922558276
   }
  }
 }

@@ -311,6 +311,47 @@ pub struct Cli {
     #[arg(long, value_name = "LOW_Q", help_heading = "Adapter Trimming")]
     pub adapter_scored_retry: Option<u8>,
 
+    /// Trim corroborated short adapter tails (6-13 bases).
+    ///
+    /// Tails shorter than `--min-adapter-overlap` are refused by the ordinary
+    /// matcher before any mismatch count is consulted, and most of the
+    /// remaining undertrimming lives there. With this flag, an EXACT adapter
+    /// prefix of at least MIN bases at the 3' end is trimmed when the quality
+    /// drops sharply at the boundary: the bases just before it are at least
+    /// `--adapter-q-drop` lower in mean quality than the bases before those.
+    ///
+    /// Exactness plus the quality cliff is deliberate. Lowering the overlap
+    /// floor without corroboration is the `mo=6` arm: 1.29 % false trims on
+    /// clean reads, a 180x overtrim regression.
+    ///
+    /// The default is off.
+    #[arg(long, value_name = "MIN", help_heading = "Adapter Trimming")]
+    pub adapter_short_tail: Option<usize>,
+
+    /// The minimum quality drop required for a short-tail trim.
+    ///
+    /// The mean quality of the 4 bases before the candidate boundary must be
+    /// at least this far below the mean quality of the 10 bases before
+    /// those. Higher is more conservative.
+    #[arg(long, value_name = "Q", default_value_t = 8,
+          requires = "adapter_short_tail", help_heading = "Adapter Trimming")]
+    pub adapter_q_drop: u8,
+
+    /// The dataset-level prefix enrichment a short tail must clear.
+    ///
+    /// The expected number of sampled reads ending with a given 6-base
+    /// adapter prefix is `n * 4^-6`; the observed count divided by that is
+    /// the enrichment. A factor of 10 means the prefix occurs ten times
+    /// more often than chance predicts.
+    ///
+    /// This is the corroboration signal that works on data whose qualities
+    /// are flat, where the quality cliff cannot be seen.
+    ///
+    /// The default is off.
+    #[arg(long, value_name = "FACTOR", default_value_t = 0,
+          requires = "adapter_short_tail", help_heading = "Adapter Trimming")]
+    pub adapter_min_enrichment: u32,
+
 
     // -------------------------------------------------------- PolyX trimming
     /// Minimum post-trim read length. Integer N (bases) or fraction FL of the
@@ -682,6 +723,26 @@ fn peek_sequences(path: &Path, n: usize) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
+/// How many reads are sampled for the dataset-level enrichment signal.
+const SAMPLE: usize = 10_000;
+
+/// Peek a sample of reads for the dataset-level enrichment signal.
+///
+/// Both mates are sampled, because TruSeq R1 and R2 diverge after a 13-base
+/// shared prefix: a fingerprint from R1's divergent tail would leave R2
+/// uncorroborated.
+fn peek_for_enrichment(
+    in1: &Path,
+    in2: Option<&Path>,
+    n: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut seqs = peek_sequences(in1, n)?;
+    if let Some(p2) = in2 {
+        seqs.extend(peek_sequences(p2, n)?);
+    }
+    Ok(seqs)
+}
+
 impl Cli {
     /// Every path this run would create or replace, in the order they are
     /// committed. Used by the `--force` clobber check: refusing on the first
@@ -973,6 +1034,38 @@ impl Cli {
             },
             adapter_g_run_retry: self.adapter_g_run_retry,
             adapter_scored_retry: self.adapter_scored_retry,
+            short_tail: self.adapter_short_tail.map(|min| {
+                let max_len = min.max(self.min_adapter_overlap.saturating_sub(1));
+                // The dataset-level corroboration signal (UT-3). It needs a
+                // sample of the reads, so it is computed here rather than
+                // inside the per-read path.
+                let enrichment = match &adapter_source {
+                    AdapterSource::Fixed { set, .. } => {
+                        match peek_for_enrichment(&in1, self.in2.as_deref(), SAMPLE) {
+                            Ok(sample) => crate::adapter::prefix_enrichment(
+                                &sample.iter().map(|s| s.as_slice()).collect::<Vec<_>>(),
+                                set,
+                                min,
+                                max_len,
+                                self.adapter_min_enrichment as f64,
+                            ),
+                            Err(_) => Default::default(),
+                        }
+                    }
+                    _ => Default::default(),
+                };
+                crate::adapter::ShortTail {
+                    min_len: min,
+                    // Never reach the ordinary floor: above it the ordinary
+                    // matcher already had its chance.
+                    max_len,
+                    q_drop: self.adapter_q_drop,
+                    n_before: 4,
+                    n_ref: 10,
+                    enrichment,
+                    min_factor: self.adapter_min_enrichment as f64,
+                }
+            }),
             // Set per pair in `pair_chunks` when `--pe-overlap` fires; `None`
             // here keeps the single-end path and every fallback byte-identical.
             pe_adapter: None,

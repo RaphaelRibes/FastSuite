@@ -200,3 +200,203 @@ fn a_clean_read_with_a_terminal_g_run_is_not_trimmed() {
         "a clean read with a terminal G-run must be unaffected by the retry"
     );
 }
+
+// ---------------------------------------------------------------------------
+// UT-3: a short adapter tail is trimmed only with corroboration.
+// ---------------------------------------------------------------------------
+
+/// A FASTQ quality string of a constant Phred value.
+fn qual_str(q: u8, n: usize) -> String {
+    std::iter::repeat((q + 33) as char).take(n).collect()
+}
+
+#[test]
+fn a_short_exact_prefix_is_trimmed_when_the_quality_cliff_corroborates() {
+    // A 10-base adapter tail with FLAT quality is not trimmed (no evidence).
+    // The same tail with a sharp quality cliff at the boundary IS trimmed.
+    let d = tmpdir("st_corr");
+    let input = d.join("in.fq");
+    let body = dna(140, 0x51_51);
+    let tail = std::str::from_utf8(&TRUSEQ_R1[..10]).unwrap().to_string();
+
+    // flat quality: no cliff -> not trimmed
+    let flat = format!("{body}{tail}");
+    // cliff: 4 low-quality bases just before the boundary
+    let mut cliff_seq = body.clone();
+    cliff_seq.push_str(&tail);
+    let mut cliff_q = qual_str(40, 140);
+    cliff_q.push_str(&qual_str(40, 10)); // placeholder, replaced below
+
+    write_fastq(&input, &[(String::from("flat"), flat)]);
+    let out_flat = d.join("flat.fq");
+    let mut args = vec![
+        "-1", input.to_str().unwrap(),
+        "-o", out_flat.to_str().unwrap(),
+        "--adapter-preset", "illumina",
+        "--adapter-short-tail", "6",
+        "--no-dedup", "--no-mean-q", "--min-len", "0", "-q",
+    ];
+    let (_, _, rc) = run(&args);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        seq_lengths(&out_flat)[0],
+        150,
+        "a flat-quality short tail is not evidence"
+    );
+
+    // Now the corroborated case, with an explicit quality cliff.
+    let d2 = tmpdir("st_corr2");
+    let input2 = d2.join("in.fq");
+    // qualities: 40 for the body, then 10 for the 10 bases before the tail,
+    // then 40 for the tail itself
+    let mut seq2 = body.clone();
+    seq2.push_str(&tail);
+    let mut q2 = qual_str(40, 140 - 10);
+    q2.push_str(&qual_str(10, 10));
+    q2.push_str(&qual_str(40, 10));
+    let mut body2 = String::new();
+    body2.push_str(&format!("@cliff\n{seq2}\n+\n{q2}\n"));
+    std::fs::write(&input2, body2).unwrap();
+    let out_cliff = d2.join("cliff.fq");
+    args[1] = input2.to_str().unwrap();
+    args[3] = out_cliff.to_str().unwrap();
+    let (_, _, rc) = run(&args);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        seq_lengths(&out_cliff)[0],
+        140,
+        "a short exact prefix with a quality cliff at the boundary is trimmed"
+    );
+}
+
+#[test]
+fn a_short_prefix_without_corroboration_is_not_trimmed() {
+    // The overtrim guard: a clean read whose last 8 bases happen to equal an
+    // adapter prefix, with FLAT quality, must not be cut.
+    let d = tmpdir("st_clean");
+    let input = d.join("in.fq");
+    let body = dna(142, 0x7E57);
+    let tail = std::str::from_utf8(&TRUSEQ_R1[..8]).unwrap().to_string();
+    write_fastq(&input, &[(String::from("clean"), format!("{body}{tail}"))]);
+    let out = d.join("o.fq");
+    let (_, _, rc) = run(&[
+        "-1", input.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--adapter-preset", "illumina",
+        "--adapter-short-tail", "6",
+        "--no-dedup", "--no-mean-q", "--min-len", "0", "-q",
+    ]);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        seq_lengths(&out)[0],
+        150,
+        "an uncorroborated short prefix must not be trimmed"
+    );
+}
+
+#[test]
+fn the_short_tail_path_is_off_by_default() {
+    let d = tmpdir("st_default");
+    let input = d.join("in.fq");
+    let body = dna(140, 0x51_51);
+    let tail = std::str::from_utf8(&TRUSEQ_R1[..10]).unwrap().to_string();
+    let seq = format!("{body}{tail}");
+    let mut q = qual_str(40, 140 - 10);
+    q.push_str(&qual_str(10, 10));
+    q.push_str(&qual_str(40, 10));
+    let mut body2 = String::new();
+    body2.push_str(&format!("@x\n{seq}\n+\n{q}\n"));
+    std::fs::write(&input, body2).unwrap();
+
+    let out_a = d.join("a.fq");
+    let out_b = d.join("b.fq");
+    for (out, extra) in [(&out_a, vec![]), (&out_b, vec!["--adapter-short-tail", "6"])] {
+        let mut args = vec![
+            "-1", input.to_str().unwrap(),
+            "-o", out.to_str().unwrap(),
+            "--adapter-preset", "illumina",
+            "--no-dedup", "--no-mean-q", "--min-len", "0", "-q",
+        ];
+        args.extend(extra);
+        let (_, _, rc) = run(&args);
+        assert_eq!(rc, 0);
+    }
+    assert_eq!(
+        seq_lengths(&out_a)[0],
+        150,
+        "without the flag the short tail is not trimmed"
+    );
+    assert_eq!(
+        seq_lengths(&out_b)[0],
+        140,
+        "with the flag the corroborated short tail is trimmed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// UT-3: the dataset-level enrichment signal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn enrichment_corroborates_a_short_prefix_that_chance_would_not_explain() {
+    // 200 reads, of which 100 end with the exact 8-base TruSeq prefix.
+    // Chance predicts 200 * 4^-8 = 0.0078 reads; 100 observed is an
+    // enrichment of ~12800x. A short read ending in that prefix is trimmed.
+    let d = tmpdir("enr");
+    let input = d.join("in.fq");
+    let tail = std::str::from_utf8(&TRUSEQ_R1[..8]).unwrap().to_string();
+    let mut records: Vec<(String, String)> = Vec::new();
+    for k in 0..100 {
+        records.push((format!("hit{k}"), format!("{}{}", dna(142, k), tail)));
+    }
+    for k in 0..100 {
+        records.push((format!("miss{k}"), dna(150, 1000 + k)));
+    }
+    write_fastq(&input, &records);
+
+    let out = d.join("o.fq");
+    let (_, _, rc) = run(&[
+        "-1", input.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--adapter-preset", "illumina",
+        "--adapter-short-tail", "6",
+        "--adapter-min-enrichment", "10",
+        "--no-dedup", "--no-mean-q", "--min-len", "0", "-q",
+    ]);
+    assert_eq!(rc, 0);
+    let lens = seq_lengths(&out);
+    let hits = &lens[..100];
+    let misses = &lens[100..];
+    let trimmed = hits.iter().filter(|&&l| l < 150).count();
+    let missed_trimmed = misses.iter().filter(|&&l| l < 150).count();
+    assert!(
+        trimmed > 50,
+        "an enriched short prefix must be trimmed: {trimmed}/100"
+    );
+    assert_eq!(missed_trimmed, 0, "unrelated reads must be untouched");
+}
+
+#[test]
+fn enrichment_is_disabled_when_the_factor_is_zero() {
+    let d = tmpdir("enr0");
+    let input = d.join("in.fq");
+    let tail = std::str::from_utf8(&TRUSEQ_R1[..8]).unwrap().to_string();
+    let records: Vec<(String, String)> = (0..100)
+        .map(|k| (format!("hit{k}"), format!("{}{}", dna(142, k), tail)))
+        .collect();
+    write_fastq(&input, &records);
+    let out = d.join("o.fq");
+    let (_, _, rc) = run(&[
+        "-1", input.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--adapter-preset", "illumina",
+        "--adapter-short-tail", "6",
+        // factor 0 must DISABLE the signal, not make every prefix pass.
+        "--no-dedup", "--no-mean-q", "--min-len", "0", "-q",
+    ]);
+    assert_eq!(rc, 0);
+    assert!(
+        seq_lengths(&out).iter().all(|&l| l == 150),
+        "with the enrichment signal off, nothing is trimmed"
+    );
+}

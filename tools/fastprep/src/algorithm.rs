@@ -11,7 +11,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::adapter::AdapterSet;
+use crate::adapter::{AdapterSet, ShortTail};
 
 // ---------------------------------------------------------------------------
 // MinLen — either an absolute base count or a fraction of read length L.
@@ -230,6 +230,20 @@ pub struct Params {
     /// anyway), so the only extra cut is the adapter extension.
     pub adapter_g_run_retry: Option<usize>,
 
+    /// Corroborated short-tail adapter trimming (UT-3).
+    /// `None` disables the path (today's behaviour).
+    ///
+    /// Tails shorter than `min_adapter_overlap` are refused by the ordinary
+    /// matcher before any mismatch count is consulted, which is where most of
+    /// the undertrimming lives. With this set, an EXACT adapter prefix of
+    /// length `min..=max` at the 3' end is accepted when the quality-drop
+    /// rule corroborates it: the bases immediately before the boundary are
+    /// at least `q_drop` lower in mean quality than the bases before those.
+    ///
+    /// Exactness plus corroboration is the whole point: the uncorroborated
+    /// form is the `mo=6` arm, a 1.29 % false-trim rate on clean reads.
+    pub short_tail: Option<ShortTail>,
+
     /// Retry the adapter match with QUALITY- and N-aware scoring (UT-4).
     /// `None` disables the retry (today's behaviour).
     ///
@@ -298,6 +312,7 @@ impl Default for Params {
             pe_adapter: None,
             adapter_g_run_retry: None,
             adapter_scored_retry: None,
+            short_tail: None,
             extra_committed: 0,
             original_len: None,
             gate_lut: [0.0; 256],
@@ -1339,54 +1354,64 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
         None => match params.adapter.as_deref() {
             None => (0, 0, None),
             Some(set) => {
-                match crate::adapter::match_adapters(bases, set) {
-                    Some(m) => (m.t5, m.t3, Some(m.adapter)),
-                    // UT-2: the ordinary match found nothing. If the read ends
-                    // in a no-signal G-run, that run may be hiding an adapter
-                    // that is really there: the matcher is 3'-anchored, so the
-                    // G's sit inside the window and spend the mismatch
-                    // budget. Retry on the pre-G slice.
-                    None => match params.adapter_g_run_retry {
-                        Some(run_min) => {
-                            match crate::adapter::match_adapters_before_terminal_run(
-                                bases,
-                                set,
-                                run_min,
-                            ) {
-                                Some(m) => (m.t5, m.t3, Some(m.adapter)),
-                                // UT-4: still nothing. An ambiguous or badly
-                                // called base was charged a full mismatch;
-                                // score the same alignment with quality/N
-                                // awareness and try again.
-                                None => match params.adapter_scored_retry {
-                                    None => (0, 0, None),
-                                    Some(low_q) => {
-                                        match crate::adapter::match_adapters_scored(
-                                            bases, quals, set, low_q,
-                                        ) {
-                                            Some(m) => (m.t5, m.t3, Some(m.adapter)),
-                                            None => (0, 0, None),
-                                        }
-                                    }
-                                },
-                            }
+                // A flat chain of fallbacks. Each retry is INDEPENDENT: it
+                // must be reachable whether or not the ones above it are
+                // enabled. (Nesting them made the short-tail path
+                // unreachable unless the scored retry was on, because the
+                // short tail is shorter than the overlap floor and the scored
+                // retry can never find it.)
+                let mut found = None;
+
+                // 1. The ordinary matcher.
+                if found.is_none() {
+                    found = crate::adapter::match_adapters(bases, set);
+                }
+
+                // 2. UT-2: the G-overprint retry. The matcher is 3'-anchored,
+                // so a terminal no-signal G-run sits inside the window and
+                // spends the mismatch budget. Retry on the pre-G slice.
+                if found.is_none() {
+                    if let Some(run_min) = params.adapter_g_run_retry {
+                        found = crate::adapter::match_adapters_before_terminal_run(
+                            bases,
+                            set,
+                            run_min,
+                        );
+                    }
+                }
+
+                // 3. UT-4: quality/N-aware scoring. An ambiguous or badly
+                // called base was charged a full mismatch; score the same
+                // alignment with quality awareness and try again.
+                if found.is_none() {
+                    if let Some(low_q) = params.adapter_scored_retry {
+                        found =
+                            crate::adapter::match_adapters_scored(bases, quals, set, low_q);
+                    }
+                }
+
+                // 4. UT-3: the corroborated short tail. A tail shorter than
+                // the overlap floor never reaches a mismatch count at all,
+                // so steps 1-3 cannot find it. Try an EXACT adapter prefix,
+                // accepted only when the quality cliff at the boundary
+                // corroborates it.
+                if found.is_none() {
+                    if let Some(st) = &params.short_tail {
+                        let (t5, t3, ai) =
+                            crate::adapter::short_tail_trim(bases, quals, set, st);
+                        if let Some(ai) = ai {
+                            found = Some(crate::adapter::AdapterMatch {
+                                adapter: ai,
+                                t5,
+                                t3,
+                            });
                         }
-                        // No G-run retry configured: try the scored retry
-                        // directly (it is a second chance on the same
-                        // alignment, so it cannot find a structurally
-                        // different match).
-                        None => match params.adapter_scored_retry {
-                            None => (0, 0, None),
-                            Some(low_q) => {
-                                match crate::adapter::match_adapters_scored(
-                                    bases, quals, set, low_q,
-                                ) {
-                                    Some(m) => (m.t5, m.t3, Some(m.adapter)),
-                                    None => (0, 0, None),
-                                }
-                            }
-                        },
-                    },
+                    }
+                }
+
+                match found {
+                    Some(m) => (m.t5, m.t3, Some(m.adapter)),
+                    None => (0, 0, None),
                 }
             }
         },

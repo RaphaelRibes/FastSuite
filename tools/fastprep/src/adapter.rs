@@ -197,6 +197,191 @@ pub fn any_prefix_matches_scored(
     })
 }
 
+/// Dataset-level prefix enrichment for a candidate short tail.
+///
+/// For each adapter and each tail length in `min_len..=max_len`, count how
+/// many sampled reads END with that exact adapter prefix.
+///
+/// A prefix that occurs far more often than chance predicts is real: the
+/// chance probability of a specific `t`-mer at the 3' end of a random read
+/// is `4^-t`, so the expected count in `n` reads is `n * 4^-t`. The
+/// enrichment factor is `observed / expected`.
+///
+/// This is the second corroboration signal: it does not depend on the
+/// quality profile at all, so it works on data whose qualities are flat.
+///
+/// Returns the enrichment factor per `(adapter_index, tail_len)`, restricted
+/// to candidates that clear `min_factor`.
+pub fn prefix_enrichment(
+    reads: &[&[u8]],
+    set: &AdapterSet,
+    min_len: usize,
+    max_len: usize,
+    min_factor: f64,
+) -> std::collections::HashMap<(u8, usize), f64> {
+    let mut out = std::collections::HashMap::new();
+    if reads.is_empty() {
+        return out;
+    }
+    if min_factor <= 0.0 {
+        // The signal is off; report no corroboration at all.
+        return out;
+    }
+    let n = reads.len() as f64;
+    for (ai, a) in set.adapters.iter().enumerate() {
+        let hi = max_len.min(a.seq.len());
+        for tl in min_len..=hi {
+            let mut count = 0usize;
+            for read in reads {
+                if read.len() >= tl && read[read.len() - tl..] == a.seq[..tl] {
+                    count += 1;
+                }
+            }
+            // The chance probability of this exact prefix at the 3' end.
+            let expected = n * 0.25f64.powi(tl as i32);
+            if expected <= 0.0 {
+                continue;
+            }
+            let factor = count as f64 / expected;
+            if factor >= min_factor {
+                out.insert((ai as u8, tl), factor);
+            }
+        }
+    }
+    out
+}
+
+/// Configuration for corroborated short-tail trimming (UT-3).
+#[derive(Clone, Debug)]
+pub struct ShortTail {
+    /// The shortest adapter prefix to consider.
+    pub min_len: usize,
+    /// The longest adapter prefix to consider.
+    pub max_len: usize,
+    /// The quality drop required between the reference window and the bases
+    /// immediately before the boundary.
+    pub q_drop: u8,
+    /// How many bases immediately before the boundary form the "before" window.
+    pub n_before: usize,
+    /// How many bases before that form the reference window.
+    pub n_ref: usize,
+    /// Dataset-level prefix enrichment per `(adapter_index, tail_len)`.
+    ///
+    /// A candidate whose enrichment clears the factor is corroborated
+    /// WITHOUT any quality signal. This is the signal that works on data
+    /// whose qualities are flat.
+    pub enrichment: std::collections::HashMap<(u8, usize), f64>,
+    /// The enrichment factor a candidate must clear to be corroborated.
+    pub min_factor: f64,
+}
+
+/// Corroborated short-tail trim: an EXACT adapter prefix at the 3' end,
+/// accepted only when the quality-drop rule corroborates it.
+///
+/// Returns the trim to apply, or `(0, 0, None)` when no candidate is
+/// corroborated. The shortest corroborated candidate wins, because a shorter
+/// exact prefix is the more conservative claim about how much of the read is
+/// adapter.
+pub fn short_tail_trim(
+    seq: &[u8],
+    quals: &[u8],
+    set: &AdapterSet,
+    st: &ShortTail,
+) -> (usize, usize, Option<u8>) {
+    let cands = exact_prefix_candidates(seq, set, st.min_len, st.max_len);
+    for (ai, t) in cands {
+        // Either corroboration is sufficient.
+        let quality = quality_drop_corroborates(quals, t, st.q_drop, st.n_before, st.n_ref);
+        // A factor of 0 DISABLES the enrichment signal: it must not mean
+        // "every candidate passes". A factor of 0 as a *threshold* would
+        // corroborate every exact prefix, which is the uncorroborated form
+        // this whole task exists to avoid.
+        let enriched = st.min_factor > 0.0
+            && st.enrichment
+                .get(&(ai, t))
+                .copied()
+                .map(|f| f >= st.min_factor)
+                .unwrap_or(false);
+        if quality || enriched {
+            // Same shape as `match_adapters`: an adapter readthrough is
+            // always a pure 3' trim (t5 = 0, t3 = the adapter length).
+            return (0, t, Some(ai));
+        }
+    }
+    (0, 0, None)
+}
+
+/// Enumerate 3'-terminal adapter-prefix candidates of length
+/// `min_len..=max_len` for every adapter in the set, returning
+/// `(adapter_index, tail_len)` pairs that match EXACTLY (0 mismatches).
+///
+/// Exactness is the point: a 6-base prefix matches by chance with probability
+/// 4^-6 = 2.4e-4, and the corroboration rules decide the rest.
+///
+/// Candidates are returned shortest-first, so the caller can prefer the
+/// smallest defensible tail.
+pub fn exact_prefix_candidates(
+    seq: &[u8],
+    set: &AdapterSet,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<(u8, usize)> {
+    let mut out = Vec::new();
+    let l = seq.len();
+    for (ai, a) in set.adapters.iter().enumerate() {
+        let hi = max_len.min(a.seq.len()).min(l);
+        for t in min_len..=hi {
+            if seq[l - t..] == a.seq[..t] {
+                out.push((ai as u8, t));
+            }
+        }
+    }
+    out
+}
+
+/// The mean quality of `quals[start..end]`, or `None` when the slice is
+/// empty or out of range. FASTQ quality bytes are Phred+33.
+fn mean_qual(quals: &[u8], start: usize, end: usize) -> Option<f64> {
+    if start >= end || end > quals.len() {
+        return None;
+    }
+    let sum: u32 = quals[start..end]
+        .iter()
+        .map(|q| (*q as u32).saturating_sub(33))
+        .sum();
+    Some(sum as f64 / (end - start) as f64)
+}
+
+/// Quality-drop corroboration for a short 3' tail of length `t`.
+///
+/// A real adapter readthrough is where the sequencer starts hitting the
+/// adapter; biology does not produce a sharp quality cliff at an arbitrary
+/// position. The `n_before` bases immediately before the boundary must be at
+/// least `drop` lower in mean quality than the `n_ref` bases before that.
+///
+/// `false` when the read is too short to have both windows.
+pub fn quality_drop_corroborates(
+    quals: &[u8],
+    t: usize,
+    drop: u8,
+    n_before: usize,
+    n_ref: usize,
+) -> bool {
+    let l = quals.len();
+    if t + n_before + n_ref > l {
+        return false;
+    }
+    let before = match mean_qual(quals, l - t - n_before, l - t) {
+        Some(q) => q,
+        None => return false,
+    };
+    let reference = match mean_qual(quals, l - t - n_before - n_ref, l - t - n_before) {
+        Some(q) => q,
+        None => return false,
+    };
+    (reference - before) >= drop as f64
+}
+
 /// Retry the 3'-anchored match with QUALITY- and N-aware scoring.
 ///
 /// The general matcher charges an `N` a full mismatch, which spends the

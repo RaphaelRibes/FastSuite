@@ -250,6 +250,54 @@ paired gain is real on a corpus built with I < L; it does not transfer to
 Cell A. Any proposal ranked above UT-1 must therefore be justified on a
 short-insert corpus, not on Cell A.
 
+### UT-3 — Corroborated short tails: the biggest single win, and it passes both axes
+
+**The lever.** ~40 % of every residual class sits in tails shorter than the
+14-base overlap floor, and a sub-floor tail is refused for LENGTH before any
+mismatch count is consulted. Lowering the floor is the `mo=6` arm: 1.29 %
+false trims, a 180x overtrim regression.
+
+**The corroboration.** An EXACT adapter prefix at the 3' end is accepted only
+when one of two independent signals says it is real:
+
+1. **Quality drop** — the 4 bases before the boundary are at least
+   `--adapter-q-drop` (default 8) lower in mean quality than the 10 bases
+   before those.
+2. **Dataset-level prefix enrichment** — the prefix occurs at the 3' end of
+   more sampled reads than chance predicts. The expected count of a specific
+   `t`-mer at a 3' end is `n * 4^-t`, so the enrichment is
+   `observed / expected`; `--adapter-min-enrichment FACTOR` sets the bar.
+
+The second signal is the one that works on flat-quality data. Signal 1 alone
+is **inert on the AB corpus** (its qualities are flat): 41.95 % residual,
+byte-identical to the shipped arm.
+
+**Measured on the 200k single-end two-axis corpus** (SE):
+
+| factor | residual/carrier | false/clean | gate (<= 0.020 %) |
+|---|---|---|---|
+| shipped | 41.95 % | 0.007 % | PASS |
+| 5 | 21.87 % | 0.039 % | FAIL |
+| 20 | 21.87 % | 0.037 % | FAIL |
+| 50 | **24.34 %** | **0.016 %** | **PASS** |
+| 100 | **24.34 %** | **0.016 %** | **PASS** |
+| 150 | 26.85 % | 0.009 % | PASS |
+| 500 | 26.85 % | 0.009 % | PASS |
+
+**Factor 50-100 is the operating point: residual 41.95 % -> 24.34 % (a 42 %
+reduction) with the false-trim rate at 0.016 %, inside the 0.020 % gate.**
+
+**The false trims are understood, not mysterious.** 30 of the 140 157 clean
+reads end with a 6-base TruSeq prefix by chance (9 at 7 bases, 2 at 8, 1 at
+9); the run trims 22 of them. That is the whole of the 0.016 %: exact
+chance hits on a 4^-6 prefix, and nothing else.
+
+**A note on the flag's off-semantics.** `--adapter-min-enrichment 0` DISABLES
+the enrichment signal. It must not mean "factor >= 0 passes", which would
+corroborate every exact prefix — the uncorroborated form this task exists to
+avoid. The first implementation had exactly that bug and trimmed every read
+ending in a 6-base prefix.
+
 ### UT-4 — Quality/N-aware scoring: LIVE, but inert on the AB corpus
 
 `scored_mismatches` charges an `N` or a badly-called base half a mismatch.
