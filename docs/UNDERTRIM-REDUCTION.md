@@ -228,7 +228,7 @@ auto-detection sample, `cli.rs` `det.sampled`).
 | SE false trims / clean | 0.007 % | **0.016 %** | <= 0.020 % | **PASS** |
 | PE residual / carriers | 41.15 % | 41.15 % (unchanged) | <= 25 % | FAIL (no PE change) |
 | PE false trims / clean | 0.011 % | 0.011 % (unchanged) | <= 0.020 % | PASS |
-| Cell A `pe_trims` | 0 | 0 (UT-1 arm) | = 0 | **PASS** |
+| Cell A `pe_trims` | 0 | 0 (UT-1 arm AND UT-3 arm) | = 0 | **PASS** |
 
 The UT-3 arm is `--adapter-short-tail 6 --adapter-min-enrichment 100`
 (50 and 100 give identical results on this corpus; 100 is the more
@@ -263,13 +263,14 @@ every new capability is opt-in; the one arm that fails the false-trim gate
 (factor 5) is recorded in the artifact next to the arms that pass, so the
 trade-off is visible rather than hidden.
 
-### UT-1 and UT-4: the Cell A gate on the real corpus — measured, and it says "no change"
+### Cell A — the hard gate on the real corpus, for BOTH behaviour changes
 
-**Cell A** is the hard gate: 102 datasets, 17,000,000 reads, ground-truth
-readthrough. The invariant is `pe_trims = 0` — the PE path must not disturb a
-single trim decision.
+**Cell A** is the hard gate (invariant C-3): 102 datasets, 17,000,000 reads,
+ground-truth readthrough. The invariant is `pe_trims = 0` — no trim decision
+may change.
 
-`fp-bnd` (`--pe-overlap --adapter-evidence boundary`) against `fastprep-hd0`:
+**`fp-bnd`** (`--pe-overlap --adapter-evidence boundary`, UT-1) against
+`fastprep-hd0`:
 
 | | fastprep-hd0 | fp-bnd |
 |---|---|---|
@@ -280,8 +281,24 @@ single trim decision.
 | scored | 15 739 741 | **15 739 741** |
 | **pe_trims** | n/a | **0** |
 
-Every column is identical and `pe_trims` is zero: the boundary policy changed
-**no trim decision at all** across 17 million reads.
+**`fp-st`** (`--adapter-short-tail 6 --adapter-min-enrichment 50`, UT-3)
+against `fastprep-hd0` — the SAME numbers, every column:
+
+| | fastprep-hd0 | fp-st |
+|---|---|---|
+| exact | 13 883 011 | **13 883 011** |
+| overtrim | 114 290 | **114 290** |
+| undertrim_recoverable | 15 851 | **15 851** |
+| dropped | 1 260 259 | **1 260 259** |
+| scored | 15 739 741 | **15 739 741** |
+| **pe_trims** | n/a | **0** |
+
+**Both behaviour changes leave Cell A byte-identical, with `pe_trims = 0`.**
+The corpus has no adapter readthrough at all, so this measures the false-fire
+rate only — and it is zero for both.
+
+Artifacts: `bench/results/cellA-boundary/` (UT-1) and `bench/results/cellA-ut3/`
+(UT-3), both run on the desktop corpus, 2026-10-21.
 
 The reason is structural, and it bounds the whole PE-line of work: this
 corpus's fragments are LONGER than the reads, so the mates never overlap and
