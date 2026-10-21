@@ -5,44 +5,76 @@
   "n_per_arm": 200,
   "adapter": "TRUSEQ_R1",
   "pe_mode": "always",
-  "set": "--adapter-preset illumina"
+  "set": "--adapter-preset illumina",
+  "seed": 31
  },
+ "fastprep": "/home/raphael/hermes_scratch/FastSuite/tools/fastprep/target/release/fastprep",
  "arms": {
   "A_t20_mo14_PE_fires_when_guard_passes": {
-   "R1_adapter_tail": {
+   "arm": "A",
+   "t": 20,
+   "floor": 14,
+   "r1": {
+    "n": 200,
     "exact": 200,
-    "none": 0,
-    "other": 0
+    "no_trim": 0,
+    "partial": 0,
+    "past_truth": 0
    },
-   "R2_random_tail_PE_only": {
+   "r2": {
+    "n": 200,
     "exact": 200,
-    "none": 0,
-    "other": 0
-   }
+    "no_trim": 0,
+    "partial": 0,
+    "past_truth": 0
+   },
+   "name": "A_t20_mo14_PE_fires_when_guard_passes"
   },
   "B_t10_mo14_guard_floor_blocks": {
-   "R1_adapter_tail": {
+   "arm": "B",
+   "t": 10,
+   "floor": 14,
+   "r1": {
+    "n": 200,
     "exact": 0,
-    "none": 200,
-    "other": 0
+    "no_trim": 200,
+    "partial": 0,
+    "past_truth": 0
    },
-   "R2_random_tail_PE_only": {
+   "r2": {
+    "n": 200,
     "exact": 0,
-    "none": 200,
-    "other": 0
-   }
+    "no_trim": 200,
+    "partial": 0,
+    "past_truth": 0
+   },
+   "name": "B_t10_mo14_guard_floor_blocks"
   },
   "C_t10_mo10_floor_lowered_guard_passes": {
-   "R1_adapter_tail": {
+   "arm": "C",
+   "t": 10,
+   "floor": 10,
+   "r1": {
+    "n": 200,
     "exact": 200,
-    "none": 0,
-    "other": 0
+    "no_trim": 0,
+    "partial": 0,
+    "past_truth": 0
    },
-   "R2_random_tail_PE_only": {
+   "r2": {
+    "n": 200,
     "exact": 200,
-    "none": 0,
-    "other": 0
-   }
+    "no_trim": 0,
+    "partial": 0,
+    "past_truth": 0
+   },
+   "name": "C_t10_mo10_floor_lowered_guard_passes"
   }
+ },
+ "verdict": {
+  "arm_A_both_mates_cut": true,
+  "arm_B_nothing_cut": true,
+  "arm_C_both_mates_cut": true,
+  "the_floor_is_the_blocker": true
  }
 }
