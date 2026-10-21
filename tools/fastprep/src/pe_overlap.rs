@@ -99,7 +99,29 @@ fn base_eq(a: u8, b: u8) -> bool {
 /// `N`, which can never satisfy a comparison against a real base, so an
 /// ambiguous base can only cost a pair a detection, never create a false one.
 pub fn revcomp(s: &[u8]) -> Vec<u8> {
-    s.iter().rev().map(|&b| comp(b)).collect()
+    let mut out = vec![0u8; s.len()];
+    revcomp_into(s, &mut out);
+    out
+}
+
+/// Reverse complement into a caller-provided buffer, `dst.len() == src.len()`.
+///
+/// The allocating [`revcomp`] is the public convenience form (tests use it);
+/// the detector uses this so it can recycle one buffer per thread instead of
+/// allocating per pair (Task 2.7).
+#[inline]
+fn revcomp_into(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (d, &s) in dst.iter_mut().zip(src.iter().rev()) {
+        *d = comp(s);
+    }
+}
+
+thread_local! {
+    /// One reverse-complement buffer per thread, reused across pairs. The
+    /// detector is called once per pair, so an allocation here used to cost
+    /// one `Vec<u8>` per pair for the whole run.
+    static RC2_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// True when two equal-length slices agree within [`MAX_ANCHOR_MISMATCHES`]
@@ -174,7 +196,26 @@ pub fn detect_pe_overlap(
         return None;
     }
 
-    let rc2 = revcomp(r2);
+    RC2_SCRATCH.with(|cell| {
+        let mut rc2 = cell.borrow_mut();
+        if rc2.len() != r2.len() {
+            rc2.resize(r2.len(), 0);
+        }
+        revcomp_into(r2, &mut rc2);
+        // `rc2` is borrowed for the scan; reborrow immutably so the loop below
+        // reads the same code path it always did.
+        detect_with_rc2(r1, l1, &rc2, anchor, max_insert)
+    })
+}
+
+/// The scan itself, against a prepared `revcomp(R2)`.
+fn detect_with_rc2(
+    r1: &[u8],
+    l1: usize,
+    rc2: &[u8],
+    anchor: usize,
+    max_insert: usize,
+) -> Option<(usize, usize)> {
     let l2 = rc2.len();
     // Candidate overlap `o`: R1's prefix of length `o` against the SUFFIX of
     // `revcomp(R2)`, which is the 5' end of R2 read backwards. That is the
@@ -193,7 +234,12 @@ pub fn detect_pe_overlap(
     // ~1e-5, so this is the locality device that keeps the scan from verifying
     // every offset. A chance hit additionally has to agree base for base over
     // the window it implies, which is ~1e-5 * (3/4)^o.
-    let mut admissible: Vec<usize> = Vec::new();
+    // Exactly one admissible overlap, or none. The scan visits each `o` once,
+    // so a Vec + sort + dedup here only ever encoded "count to one": track the
+    // single hit and refuse as soon as a second appears. That removes a
+    // per-pair allocation (Task 2.7) and stops the scan early on ambiguity
+    // instead of collecting all of it first.
+    let mut found: Option<usize> = None;
     for o in (anchor..=max_insert).rev() {
         if !anchor_matches(&r1[o - anchor..o], &rc2[l2 - anchor..]) {
             continue;
@@ -201,16 +247,14 @@ pub fn detect_pe_overlap(
         if window_mismatches(r1, &rc2, o) > MAX_OVERLAP_MISMATCHES {
             continue;
         }
-        admissible.push(o);
+        if found.is_some() {
+            // Ambiguity: more than one insert size verifies. Refuse rather
+            // than choose.
+            return None;
+        }
+        found = Some(o);
     }
-
-    // Ambiguity: more than one insert size verifies. Refuse rather than choose.
-    admissible.sort_unstable();
-    admissible.dedup();
-    let o = match admissible.as_slice() {
-        [single] => *single,
-        _ => return None,
-    };
+    let o = found?;
     // A boundary of 0 is no boundary at all: the read is entirely insert.
     if o >= l1 {
         return None;
