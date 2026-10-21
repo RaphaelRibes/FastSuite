@@ -1,0 +1,20 @@
+{
+  "version": "v1",
+  "weights_version": "v1",
+  "created": "2026-10-21",
+  "model": "per-read (one error class per mate); a per-base variant may be reported as a secondary column but is NOT the primary score",
+  "w_over": 1.0,
+  "w_under": 7.0,
+  "anchor_r": 7.0,
+  "ladder_r": [1.0, 3.0, 5.0, 7.0, 10.0],
+  "errors": {
+    "undertrim": "w_under",
+    "keep_wrong": "w_under",
+    "overtrim": "w_over",
+    "drop_wrong": "w_over",
+    "mixed_trim": "w_under + w_over",
+    "unaligned": "reported as its own column, never weighted into the score"
+  },
+  "break_even": "r* = -delta_over / delta_under for a rule-vs-baseline pair (in reads); a rule is net-positive at r iff r > r*",
+  "rationale": "user anchor 2026-10-21 ('we prefer less data than wrong data') priced at 7:1 and fixed BEFORE the sweep so the margin cannot be tuned to the result; 7 sits just above the measured 6.73 break-even of the 3' terminal-run trade (-35,196 undertrim bought at +236,779 overtrim), which is therefore re-scored at r=7 rather than kept closed by its symmetric-rate verdict"
+}

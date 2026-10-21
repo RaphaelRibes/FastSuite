@@ -262,3 +262,39 @@ by 106 — **+0.000 pp overall** against a pre-registered 0.5 pp threshold
 because its guard is real and because it is the only way to re-run the question
 on a different corpus. Throughput cost measured: **+3.7% single-threaded, +7.8%
 at 4 threads** (best-of, 400k pairs).
+
+---
+
+## D-15 — Trim cost model: undertrim priced at 7× overtrim ✅ decided (2026-10-21)
+
+The exactness work needs one number the scorer cannot invent: the exchange rate
+between the two ways to miss. **`w_over = 1`, `w_under = 7`** — artefact left in
+the output (wrong data) costs seven times real sequence deleted (less data).
+This is the standing preference ("we prefer less data than wrong data") made
+numeric, fixed *before* the sweep so the margin cannot be tuned to its result.
+
+* Weights live in `bench/weights/trim-weights-v1.json`; every result row
+  records `weights_version = v1`. The ladder `r ∈ {1, 3, 5, 7, 10}` is reported
+  alongside, plus a per-rule break-even `r* = −Δover/Δunder` (in reads), so any
+  verdict can be re-read at another ratio from the same counts — the per-axis
+  raw numbers never depend on the weights.
+* Scoring is per-read (primary, comparable to the existing trim-accuracy
+  numbers); a per-base variant is a secondary column only. A deliberate 2 bp
+  margin and a whole-read wrong drop both cost `w_over` in the primary score.
+* The formula is homogeneous: only the ratio is a decision, and 7 is the
+  ship/no-ship anchor.
+
+**What 7 does to the one closed band:** the measured 3′ terminal-run trade
+(`--min-run-3p 6`: −35,196 undertrim bought at +236,779 overtrim) breaks even
+at `r* = 236779/35196 ≈ 6.73`, so at r = 7 it is net-positive by **+9,593
+weighted reads**. The band's closure verdict was computed on the symmetric
+exact rate and does not carry over: it is re-scored (plan Step 5) and the
+result is a decision for the user, not a rule change — the generic polyX form
+stays a non-goal until he reopens it (the A/C/T census is a correctness
+argument, the weight is a cost argument; both must agree before it ships).
+
+**Deliberate margins are attributed from the config, never from PXMT:** the
+PXMT v3 record stays byte-stable (25+ bench parsers unpack it at fixed
+offsets), and the ≤2 bp class is split jitter-vs-margin from the margin-flag
+on/off delta per dataset — tolerance decay alone cannot tell them apart,
+because both decay at ±2.
