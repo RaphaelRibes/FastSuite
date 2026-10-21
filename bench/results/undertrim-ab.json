@@ -1,0 +1,283 @@
+{
+ "reads": 200000,
+ "clean": 140157,
+ "configs": {
+  "shipped (mo=14, eps=0.2)": {
+   "name": "shipped (mo=14, eps=0.2)",
+   "extra": [],
+   "buckets": {
+    "clean": {
+     "exact": 140147,
+     "over": 10
+    },
+    "ALL": {
+     "exact": 174875,
+     "under": 25105,
+     "over": 20
+    },
+    "plain": {
+     "exact": 29609,
+     "under": 19396,
+     "over": 1
+    },
+    "n": {
+     "under": 1185,
+     "exact": 1869,
+     "over": 1
+    },
+    "sub": {
+     "under": 851,
+     "exact": 934
+    },
+    "g": {
+     "under": 3673,
+     "exact": 2316,
+     "over": 8
+    }
+   },
+   "undertrim_rate": 0.4195143960028742,
+   "clean_false_trim_rate": 7.134855911584865e-05
+  },
+  "mo=12": {
+   "name": "mo=12",
+   "extra": [
+    "--min-adapter-overlap",
+    "12"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 140126,
+     "over": 31
+    },
+    "ALL": {
+     "exact": 178222,
+     "under": 21733,
+     "over": 45
+    },
+    "plain": {
+     "exact": 32631,
+     "under": 16370,
+     "over": 5
+    },
+    "n": {
+     "exact": 2074,
+     "under": 980,
+     "over": 1
+    },
+    "sub": {
+     "under": 830,
+     "exact": 955
+    },
+    "g": {
+     "under": 3553,
+     "exact": 2436,
+     "over": 8
+    }
+   },
+   "undertrim_rate": 0.36316695352839934,
+   "clean_false_trim_rate": 0.00022118053325913083
+  },
+  "mo=10": {
+   "name": "mo=10",
+   "extra": [
+    "--min-adapter-overlap",
+    "10"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 139961,
+     "over": 196
+    },
+    "ALL": {
+     "exact": 181378,
+     "under": 18398,
+     "over": 224
+    },
+    "plain": {
+     "exact": 35633,
+     "under": 13355,
+     "over": 18
+    },
+    "n": {
+     "exact": 2234,
+     "under": 820,
+     "over": 1
+    },
+    "sub": {
+     "under": 799,
+     "exact": 985,
+     "over": 1
+    },
+    "g": {
+     "under": 3424,
+     "exact": 2565,
+     "over": 8
+    }
+   },
+   "undertrim_rate": 0.3074377955650619,
+   "clean_false_trim_rate": 0.0013984317586706336
+  },
+  "mo=8": {
+   "name": "mo=8",
+   "extra": [
+    "--min-adapter-overlap",
+    "8"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 139816,
+     "over": 341
+    },
+    "ALL": {
+     "exact": 184289,
+     "under": 15340,
+     "over": 371
+    },
+    "plain": {
+     "exact": 38640,
+     "under": 10346,
+     "over": 20
+    },
+    "n": {
+     "exact": 2234,
+     "under": 820,
+     "over": 1
+    },
+    "sub": {
+     "under": 789,
+     "exact": 995,
+     "over": 1
+    },
+    "g": {
+     "under": 3385,
+     "exact": 2604,
+     "over": 8
+    }
+   },
+   "undertrim_rate": 0.2563374162391591,
+   "clean_false_trim_rate": 0.002432985865850439
+  },
+  "mo=10, eps=0.3": {
+   "name": "mo=10, eps=0.3",
+   "extra": [
+    "--min-adapter-overlap",
+    "10",
+    "--adapter-error-rate",
+    "0.3"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 138127,
+     "over": 2030
+    },
+    "ALL": {
+     "exact": 181205,
+     "over": 2343,
+     "under": 16452
+    },
+    "plain": {
+     "exact": 35580,
+     "under": 13163,
+     "over": 263
+    },
+    "n": {
+     "exact": 2233,
+     "under": 818,
+     "over": 4
+    },
+    "sub": {
+     "exact": 1220,
+     "under": 548,
+     "over": 17
+    },
+    "g": {
+     "under": 1923,
+     "exact": 4045,
+     "over": 29
+    }
+   },
+   "undertrim_rate": 0.2749193723576692,
+   "clean_false_trim_rate": 0.014483757500517277
+  },
+  "mo=14, eps=0.3": {
+   "name": "mo=14, eps=0.3",
+   "extra": [
+    "--adapter-error-rate",
+    "0.3"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 139634,
+     "over": 523
+    },
+    "ALL": {
+     "exact": 175646,
+     "under": 23667,
+     "over": 687
+    },
+    "plain": {
+     "exact": 29568,
+     "under": 19301,
+     "over": 137
+    },
+    "n": {
+     "under": 1184,
+     "exact": 1868,
+     "over": 3
+    },
+    "sub": {
+     "exact": 1068,
+     "under": 712,
+     "over": 5
+    },
+    "g": {
+     "under": 2470,
+     "exact": 3508,
+     "over": 19
+    }
+   },
+   "undertrim_rate": 0.39548485202947714,
+   "clean_false_trim_rate": 0.0037315296417588847
+  },
+  "mo=6": {
+   "name": "mo=6",
+   "extra": [
+    "--min-adapter-overlap",
+    "6"
+   ],
+   "buckets": {
+    "clean": {
+     "exact": 138102,
+     "over": 2055
+    },
+    "ALL": {
+     "exact": 185588,
+     "under": 12303,
+     "over": 2109
+    },
+    "plain": {
+     "exact": 41620,
+     "under": 7356,
+     "over": 30
+    },
+    "n": {
+     "exact": 2234,
+     "under": 820,
+     "over": 1
+    },
+    "sub": {
+     "under": 775,
+     "exact": 1005,
+     "over": 5
+    },
+    "g": {
+     "under": 3352,
+     "exact": 2627,
+     "over": 18
+    }
+   },
+   "undertrim_rate": 0.20558795514930736,
+   "clean_false_trim_rate": 0.0146621288983069
+  }
+ }
+}

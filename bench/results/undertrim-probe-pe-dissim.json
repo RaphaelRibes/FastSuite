@@ -1,0 +1,82 @@
+{
+ "purpose": "Is the PE-overlap guard's refusal on sub-floor tails caused by junction ambiguity (TruSeq R1/R2 share a 13 bp 5' prefix) or by readthrough_is_adapter re-imposing min_overlap_se=14? Custom 31 bp adapters A1/A2 share no prefix, so the insert junction is unambiguous.",
+ "adapters": {
+  "A1": "ACGTTGCATGCCAGTTACGGATCCAAGGTTA",
+  "A2": "TGCACCATGGTACGATTCCAGGCAACTGCTT"
+ },
+ "n_per_case": 200,
+ "read_len": 150,
+ "fastprep_flags": "--adapter-preset illumina --pe-overlap {auto,never,always} --no-dedup --no-mean-q --min-len 0 -j 1",
+ "note": "--adapter-preset was illumina in the shared runner; the custom tails are checked by the detector (mate geometry) and by readthrough_is_adapter against the configured set. See docs/optim/raw/round2/fastprep-undertrim.md M1.",
+ "cases": {
+  "tail10_dissim": {
+   "insert": 140,
+   "t": 10,
+   "always/r1": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "always/r2": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "auto/r1": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "auto/r2": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "never/r1": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "never/r2": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   }
+  },
+  "tail6_dissim": {
+   "insert": 144,
+   "t": 6,
+   "always/r1": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "always/r2": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "auto/r1": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "auto/r2": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "never/r1": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   },
+   "never/r2": {
+    "exact": 0,
+    "none": 200,
+    "partial": 0
+   }
+  }
+ },
+ "verdict": "CONFONDED NEGATIVE CONTROL, not a mechanism test: run_paired hardcodes --adapter-preset illumina, so the custom A1/A2 tails were never in the configured set and readthrough_is_adapter must refuse them regardless of the floor. Kept for the record; see undertrim-probe-pe-guard.json for the decisive test."
+}

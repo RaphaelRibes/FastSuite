@@ -1,0 +1,42 @@
+{
+ "config": "shipped (min_overlap=14, eps=0.2), corpus=undertrim_ab build_corpus seed=31, 200000 reads",
+ "bands": {
+  "1-5": {
+   "n": 9028,
+   "exact": 0,
+   "under": 9026,
+   "over": 2,
+   "dropped": 0
+  },
+  "6-9": {
+   "n": 7314,
+   "exact": 0,
+   "under": 7309,
+   "over": 5,
+   "dropped": 0
+  },
+  "10-13": {
+   "n": 7377,
+   "exact": 0,
+   "under": 7374,
+   "over": 3,
+   "dropped": 0
+  },
+  "14-21": {
+   "n": 14428,
+   "exact": 13676,
+   "under": 752,
+   "over": 0,
+   "dropped": 0
+  },
+  "22-33": {
+   "n": 21696,
+   "exact": 21052,
+   "under": 644,
+   "over": 0,
+   "dropped": 0
+  }
+ },
+ "total_under": 25105,
+ "sub14_under_share": 0.9444
+}

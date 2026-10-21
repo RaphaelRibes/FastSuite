@@ -1,0 +1,78 @@
+# PROPOSED, NOT APPLIED, NOT COMPILED — round-2 sketch, 2026-10-21
+# Illustrative hunks for the two flagship undertrimming fixes only; every
+# other round-2 proposition lives as code anchors (function + file:line) in
+# docs/optim/round2-<tool>.md. Nothing here is applied to tools/*/src.
+# Gate before any real patch: bench/scripts/undertrim_ab.py on BOTH axes,
+# bench/scripts/undertrim_probe_pe.py (t=3/6/10 must go 0/500 -> ~500/500),
+# and Cell A pe_trims ~= 0 on the 102-dataset corpus.
+
+--- a/tools/fastprep/src/pe_overlap.rs
++++ b/tools/fastprep/src/pe_overlap.rs
+@@ readthrough_is_adapter (275-288) — UT-1: PE boundary as primary evidence @@
+-/// Requires the adapter's own start to coincide with the boundary: the matched
+-/// position within the tail must be 0.
++/// Requires the adapter's own start to coincide with the boundary.
++///
++/// UT-1 (proposed): when `detect_pe_overlap` has pinned a UNIQUE insert, the
++/// mate geometry IS the corroboration a bare 14-mer match lacks. Re-checking
++/// the tail through `match_adapters` re-imposes `min_overlap_se` (14) on a
++/// tail of length `readthrough`, so every insert >= L-13 is discarded after
++/// being pinned exactly (bench/results/undertrim-probe-pe-guard.json: arm B,
++/// t=10/floor 14 -> 0/200 even with --pe-overlap always; arm C, same geometry,
++/// floor 10 -> 200/200). Replace the matcher call with a boundary-anchored
++/// prefix check that does NOT consult min_overlap_se:
++///
++///   t = readthrough;
++///   ok if tail == adapter.seq[..t]                      (t >= 2, exact)
++///    or t >= 3 and mismatches(tail, adapter.seq[..t]) <= floor(t*eps),
++///       N = 0.5 mismatch when >= 12 unambiguous bases agree (UT-4).
++///
++/// Keep the "adapter starts AT the boundary" rule (matched position == 0):
++/// that is the guard that protects biology, and it stays. Gate t <= 5 on
++/// BOTH mates agreeing. Overtrim counterweight: Cell A
++/// (docs/plans/2026-10-19_004500-pe-overlap-with-without.md) must keep
++/// pe_trims ~= 0 on the 102-dataset corpus.
+ pub fn readthrough_is_adapter(
+     seq: &[u8],
+     readthrough: usize,
+     set: &crate::adapter::AdapterSet,
+ ) -> bool {
+-    if readthrough == 0 || readthrough > seq.len() {
+-        return false;
+-    }
+-    let tail = &seq[seq.len() - readthrough..];
+-    match crate::adapter::match_adapters(tail, set) {
+-        Some(m) => m.t3 == readthrough,
+-        None => false,
+-    }
++    if readthrough == 0 || readthrough > seq.len() {
++        return false;
++    }
++    let tail = &seq[seq.len() - readthrough..];
++    // PRIMARY: boundary-anchored prefix check (no min_overlap_se floor).
++    if let Some(a) = set.adapters.first() {           // + per-adapter in the set
++        if prefix_ok(tail, &a.seq, readthrough, set.error_rate) {
++            return true;
++        }
++    }
++    // FALLBACK: the old full-matcher semantics for long tails (t >= 14),
++    // unchanged, so existing behaviour is a strict subset.
++    matches!(crate::adapter::match_adapters(tail, set), Some(m) if m.t3 == readthrough)
+ }
+
+--- a/tools/fastprep/src/algorithm.rs
++++ b/tools/fastprep/src/algorithm.rs
+@@ trim() step 1 (1304-1320) — UT-2: G-overprint retry @@
+-    let (t5_adapter, t3_adapter, adapter) = match params.pe_adapter {
++    let (t5_adapter, t3_adapter, adapter) = match params.pe_adapter {
+...
++    // UT-2 (proposed): when the anchored pass finds nothing and the 3' terminus
++    // carries a poly-G/N run (>= 4 bases, NovaSeq no-signal), retry the match on
++    // the pre-G slice; on a hit, cut at the match start, consuming adapter+G.
++    // Arm C (undertrim-probe.json): 20 bp tail + G*6/G*8 -> 0/2000 exact today,
++    // because the G's sit inside the 3'-anchored window and spend the
++    // floor(k*eps)=4 mismatch budget; G*4 already trims. The terminal G-run is
++    // removed by the later polyX stage anyway, so the added cut is the adapter
++    // extension only, and the full k>=14 bar applies to the pre-G bases.
++    // Overtrim risk: require the match to END at the pre-G terminus (the same
++    // "starts at the boundary" discipline as pe_overlap.rs's guard).

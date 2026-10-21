@@ -1,0 +1,48 @@
+{
+ "purpose": "Decisive A/B: does detect_pe_overlap pin short-tail boundaries, or does readthrough_is_adapter's min_overlap_se floor block them? R2 carries a RANDOM tail, so any exact R2 cut is PE-path-only evidence.",
+ "config": {
+  "read_len": 150,
+  "n_per_arm": 200,
+  "adapter": "TRUSEQ_R1",
+  "pe_mode": "always",
+  "set": "--adapter-preset illumina"
+ },
+ "arms": {
+  "A_t20_mo14_PE_fires_when_guard_passes": {
+   "R1_adapter_tail": {
+    "exact": 200,
+    "none": 0,
+    "other": 0
+   },
+   "R2_random_tail_PE_only": {
+    "exact": 200,
+    "none": 0,
+    "other": 0
+   }
+  },
+  "B_t10_mo14_guard_floor_blocks": {
+   "R1_adapter_tail": {
+    "exact": 0,
+    "none": 200,
+    "other": 0
+   },
+   "R2_random_tail_PE_only": {
+    "exact": 0,
+    "none": 200,
+    "other": 0
+   }
+  },
+  "C_t10_mo10_floor_lowered_guard_passes": {
+   "R1_adapter_tail": {
+    "exact": 200,
+    "none": 0,
+    "other": 0
+   },
+   "R2_random_tail_PE_only": {
+    "exact": 200,
+    "none": 0,
+    "other": 0
+   }
+  }
+ }
+}

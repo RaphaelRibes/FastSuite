@@ -450,3 +450,11 @@ removes the last heap allocation from the steady-state trim output.
 4. **Dropping `--gz-level` to 4 to match fastp's default.** The benchmark equalises at 6 on purpose
    (an earlier revision "charged fastprep for compression the others never paid for"). Lowering it
    wins a cell by changing the question and changes every output byte.
+
+---
+
+## Round 2 (2026-10-21)
+
+Re-priced on the post-fix tree (`30e8fb3` + `af268d4` + the 2026-10-21 wave): see `docs/optim/round2-fastprep.md` (propositions) and `docs/optim/raw/round2/` (probe evidence). Round 1 above is history — deferred items there are re-priced, not repeated.
+
+Trimming accuracy: `docs/UNDERTRIM-REDUCTION.md` (mechanisms M1-M4, ranked fixes UT-1..UT-5), dossier `docs/optim/raw/round2/fastprep-undertrim.md`.

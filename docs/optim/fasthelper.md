@@ -401,3 +401,9 @@ $BIN check -c dup.toml --tools-dir tools/          # duplicate names: exits 0 to
 
 Peak RSS is the kernel high-water mark, `VmHWM`. Scratch trees are pruned after 24 h; regenerate them
 from `examples/runs/demo` plus one `fastmaps --json` run per sample.
+
+---
+
+## Round 2 (2026-10-21)
+
+Re-priced on the post-fix tree (`30e8fb3` + `af268d4` + the 2026-10-21 wave): see `docs/optim/round2-fasthelper.md` (propositions) and `docs/optim/raw/round2/` (probe evidence). Round 1 above is history — deferred items there are re-priced, not repeated.

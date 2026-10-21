@@ -370,3 +370,9 @@ proposition that cannot show its mechanism in this table does not ship.
    (`tests/streaming_tests.rs:13`), so the surviving representative varies: output is neither
    byte-identical to `-j 1` nor stable across runs. Today the code is accidentally safe because only
    the writer calls `verify`.
+
+---
+
+## Round 2 (2026-10-21)
+
+Re-priced on the post-fix tree (`30e8fb3` + `af268d4` + the 2026-10-21 wave): see `docs/optim/round2-fastdedup.md` (propositions) and `docs/optim/raw/round2/` (probe evidence). Round 1 above is history — deferred items there are re-priced, not repeated.

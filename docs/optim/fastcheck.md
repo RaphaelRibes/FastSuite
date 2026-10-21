@@ -397,3 +397,9 @@ straddle 1 MiB.
 4. **Replace the per-position histograms with moments or a quantile sketch.** `pos_stats` needs exact
    q10/q50/q90 per position (`report.rs:96-116`) and the accumulator's claim is that nothing is
    estimated; a t-digest would halve the array and break that claim.
+
+---
+
+## Round 2 (2026-10-21)
+
+Re-priced on the post-fix tree (`30e8fb3` + `af268d4` + the 2026-10-21 wave): see `docs/optim/round2-fastcheck.md` (propositions) and `docs/optim/raw/round2/` (probe evidence). Round 1 above is history — deferred items there are re-priced, not repeated.
