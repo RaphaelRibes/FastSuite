@@ -21,7 +21,10 @@ pairing.
 """
 import argparse, collections, csv, gzip, os, shlex, struct, subprocess, sys
 
-W = "/mnt/Fast/fastsuite-scratch/work"
+# The corpus moved when the simulator was regenerated on 2026-10-15; the old
+# path still exists and still contains a v0 tree, so pointing at it does not
+# fail --- it silently scores the wrong reads. Override with FASTPREP_CORPUS.
+W = os.environ.get("FASTPREP_CORPUS", "/mnt/Fast/fastsuite-scratch/work-gt2026")
 R = "/mnt/Fast/fastsuite-scratch/results"
 FP = "/home/raphael/FastSuite/tools/fastprep/target/release/fastprep"
 FASTP = "/home/raphael/.local/bin/fastp"
@@ -280,12 +283,14 @@ def main():
                     [dom, acc, tool, tol, sub["exact"], sub["overtrim"],
                      sub["undertrim"], sub["unaligned"], sub["dropped"], tot])
 
+    skipped, emitted = [], 0
     for i, w in enumerate(winners, 1):
         dom, acc = w["domain"], w["run_accession"]
         v0 = f"{W}/{dom}/{acc}/v0"
         gtp, s1, s2 = (f"{v0}/sim.v0.gt.tsv", f"{v0}/sim.v0_R1.fastq.gz",
                        f"{v0}/sim.v0_R2.fastq.gz")
         if not (os.path.exists(gtp) and os.path.exists(s1)):
+            skipped.append(f"{dom}/{acc} (no gt.tsv or no R1 under {v0})")
             continue
         gt = gt_rows(gtp)
         coremap = core_to_pid([s1, s2])
@@ -340,8 +345,21 @@ def main():
                                  for t in (0, 2)})
         subprocess.run(["rm", "-rf", d], capture_output=True)
         if i % 10 == 0:
-            print(f"  [{i}/{len(winners)}] {acc}", flush=True)
-    print("done", flush=True)
+            emitted += 1
+            print(f"  [{i}/{len(winners)}] {dom}/{acc}", flush=True)
+    # An empty table used to be a success: the resolved corpus path was the
+    # pre-regeneration one, every dataset failed the existence check, and the
+    # run exited 0 having measured nothing. Fail loudly instead.
+    if emitted == 0:
+        sys.exit(
+            f"overtrim_vs_fastp: scored 0 of {len(winners)} datasets under {W}. "
+            f"First skip: {skipped[0] if skipped else 'none'}. Set FASTPREP_CORPUS "
+            f"to the corpus that holds the v0 sim reads."
+        )
+    if skipped:
+        print(f"WARNING: skipped {len(skipped)} dataset(s): {skipped[:3]}", flush=True)
+    print(f"done: {emitted} dataset(s), {emitted * (4 if want_fastp else 1)} tool rows",
+          flush=True)
 
 
 if __name__ == "__main__":
