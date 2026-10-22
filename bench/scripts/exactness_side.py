@@ -37,8 +37,8 @@ BUCKETS = (1, 2, 3, 4, 5, 6)          # 6 means "6 or more"
 
 
 def run_one(task):
-    fp, ds, r1, r2, gt, cfg = task
-    d = tempfile.mkdtemp(dir=task[6], prefix="side-")
+    fp, ds, r1, r2, gt, cfg, work = task
+    d = tempfile.mkdtemp(dir=work, prefix="side-")
     try:
         px = os.path.join(d, "cuts.pxmt")
         argv = [fp, "-1", r1, "-2", r2, "-o", os.path.join(d, "o1.fq"),
