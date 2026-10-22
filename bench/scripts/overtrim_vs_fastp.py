@@ -292,6 +292,7 @@ def main():
         if not (os.path.exists(gtp) and os.path.exists(s1)):
             skipped.append(f"{dom}/{acc} (no gt.tsv or no R1 under {v0})")
             continue
+        emitted += 1          # the dataset resolved; it will be measured
         gt = gt_rows(gtp)
         coremap = core_to_pid([s1, s2])
         d = os.path.join(os.environ.get("FASTSCRATCH_OVF", "/tmp/ovf"), f"{a.offset}_{dom}_{acc}")
@@ -345,7 +346,6 @@ def main():
                                  for t in (0, 2)})
         subprocess.run(["rm", "-rf", d], capture_output=True)
         if i % 10 == 0:
-            emitted += 1
             print(f"  [{i}/{len(winners)}] {dom}/{acc}", flush=True)
     # An empty table used to be a success: the resolved corpus path was the
     # pre-regeneration one, every dataset failed the existence check, and the
@@ -358,8 +358,7 @@ def main():
         )
     if skipped:
         print(f"WARNING: skipped {len(skipped)} dataset(s): {skipped[:3]}", flush=True)
-    print(f"done: {emitted} dataset(s), {emitted * (4 if want_fastp else 1)} tool rows",
-          flush=True)
+    print(f"done: {emitted} dataset(s) resolved, {len(skipped)} skipped", flush=True)
 
 
 if __name__ == "__main__":
