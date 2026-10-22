@@ -16,9 +16,14 @@ winner plus nothing.
 
 Arms (all default-off in the tool; this script is what arms them):
 
-    base  the swept winner, no extra flag — the reference every arm is priced
-          against
-    ba    --boundary-anchored                     Tier 2
+    base  the swept winner, no extra flag — after fastprep 0.4.0 this IS the
+          anchored cut, so it is the reference every arm is priced against
+    ba    --boundary-anchored                     Tier 2 (no-op since 0.4.0;
+                                                   kept so pre-flip rows stay
+                                                   comparable)
+    nba   --no-boundary-anchored                  the pre-0.4.0 whole-run cut,
+                                                   i.e. the other side of the
+                                                   Tier-2 trade
     m1    --overtrim-margin 1                      Tier 3a, N=1
     m2    --overtrim-margin 2                      Tier 3a, N=2
     poly  --boundary-anchored --overtrim-margin 2  the polyX package
@@ -65,6 +70,7 @@ import overtrim_vs_fastp as ovf      # noqa: E402  (the authoritative flag set)
 ARMS = {
     "base": [],
     "ba": ["--boundary-anchored"],
+    "nba": ["--no-boundary-anchored"],
     "m1": ["--overtrim-margin", "1"],
     "m2": ["--overtrim-margin", "2"],
     "poly": ["--boundary-anchored", "--overtrim-margin", "2"],
@@ -340,7 +346,7 @@ def main(argv=None):
     ap.add_argument("--weights", default=os.path.join(
         HERE, os.pardir, "weights", "trim-weights-v1.json"))
     ap.add_argument("--arms",
-                    default="base,ba,m1,m2,poly,hd0,hd1,hd2,st6,stl,peov,pe")
+                    default="base,nba,ba,m1,m2,poly,hd0,hd1,hd2,st6,stl,peov,pe")
     ap.add_argument("--tol", default="0,2")
     ap.add_argument("--variants", default="v0",
                     help="comma list of sim variants (default v0: the corpus "

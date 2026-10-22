@@ -310,7 +310,10 @@ other arm within 0.01 pp.
    should decide it. That is exactly what point 2 says it does.
 
 **Recommendation, therefore:** flip `--boundary-anchored` to default (needs the
-user's OK + the version bump, per §2), keep `--overtrim-margin`,
+user's OK + the version bump, per §2) — **done 2026-10-22: fastprep 0.4.0,
+`--no-boundary-anchored` restores the old cut, and the new default reproduces
+the `ba` arm's PXMT byte-for-byte (md5 `3311dd96…` on DRR000466 v0, the old
+default `1cd9b6e6…`)**. Keep `--overtrim-margin`,
 `--short-tail-longest` and `--pe-ambiguous-smallest` default-off as instruments
 for corpora that contain their classes, and do not touch `--head-dropout`: at
 the 7:1 anchor the shipped value is already the optimal one, and the honest
