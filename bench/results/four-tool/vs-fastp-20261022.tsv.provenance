@@ -1,6 +1,8 @@
 host cachyos-x8664 x86_64
 date 2026-10-22T13:08:55
-fastprep /home/raphael/FastSuite/tools/fastprep/target/release/fastprep md5 035138a4f6f36ef5095e1f2655eef04c
+fastprep /home/raphael/FastSuite/tools/fastprep/target/release/fastprep md5 48fa71a6b9a3c7d934a832523ffe3966
 fastp fastp/1.4.0
 corpus /mnt/Fast/fastsuite-scratch/work-gt2026 results /mnt/Fast/fastsuite-scratch/results
 tools all stride 1 offset 0
+note re-run byte-identical under the final 0.4.1 build (md5 48fa71a6),
+     which differs from the first run only in the CLI help text

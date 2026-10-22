@@ -284,8 +284,9 @@ other arm within 0.01 pp.
 **What this says, in order of how much it matters:**
 
 1. **The exactness question on this corpus is the 5′ G-run policy, not boundary
-   resolution.** A decomposition over 1.2 M mates put **100% of the overtrim at
-   the 5′ end and 80% of it at exactly 1 bp**, with a 1-2-3-4 bp histogram that is
+   resolution.** A decomposition over the full campaign (`side.tsv`) put **99.4%
+   of the overtrim at the 5′ end** (3 788 704 reads against 23 523 at the 3′ end,
+   a factor of 161) **and 99.95% of the 5′ overshoot at 1–4 bp**, with a 1-2-3-4 bp histogram that is
    `--head-dropout`'s own 1..=4 window. The 3′ polyX boundary — the target of
    Tier 2 and Tier 3a — produces **40** overtrimmed mates in 1.2 M (0.003%).
 2. **The user's 7:1 anchor already picks the shipped policy.** Turning
@@ -308,6 +309,14 @@ other arm within 0.01 pp.
    per-read evidence separating "dark cycle" from "biology" here, which makes the
    1 bp class a genuine either/or, and the 7:1 anchor is the only thing that
    should decide it. That is exactly what point 2 says it does.
+
+**Re-measured 2026-10-22 with the shipped binary.** The four-tool table of the
+paper (`bench/scripts/overtrim_vs_fastp.py`, 102 libraries, 18.96 M mates, binary
+md5 `035138a4`) gives `--head-dropout 4` **77.85% strict exact / 20.13% overtrim /
+2.02% undertrim** and `0` gives 89.51 / 0.17 / 10.33, against `fastp` default
+88.73 / 0.63 / 10.64. That is the number to quote for the shipped default; the
+75.59% figure above is the older phase-D table, `_minlen` caveat included, and it
+is not the same measurement.
 
 **Recommendation, therefore:** flip `--boundary-anchored` to default (needs the
 user's OK + the version bump, per §2) — **done 2026-10-22: fastprep 0.4.0,
