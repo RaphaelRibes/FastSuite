@@ -84,6 +84,12 @@ ARMS = {
     "hd0": [],
     "hd1": [],
     "hd2": [],
+    # min_run is the tail-scan threshold: 12 by default, which is why the
+    # decomposition found 3' GT runs of 6-11 bp left untouched. These arms price
+    # lowering it, and the winner config already carries --min-run, so the value
+    # is overridden through MINRUN_OVERRIDE rather than appended.
+    "mr6": [],
+    "mr8": [],
     "peov": ["--adapter-preset", "illumina", "--pe-overlap", "always"],
     "pe": ["--adapter-preset", "illumina", "--pe-overlap", "always",
            "--pe-ambiguous-smallest"],
@@ -92,6 +98,10 @@ ARMS = {
 # arm -> the value that REPLACES the winner config's --head-dropout, because
 # the winner row already carries one and clap refuses a repeated flag
 HD_OVERRIDE = {"hd0": 0, "hd1": 1, "hd2": 2}
+
+# arm -> the value that REPLACES the winner config's --min-run, for the same
+# clap reason (the flag cannot be passed twice).
+MINRUN_OVERRIDE = {"mr6": 6, "mr8": 8}
 
 # arm -> the arm it is priced against when it enables a prerequisite flag
 REFERENCE = {"stl": "st6", "pe": "peov"}
@@ -159,6 +169,14 @@ def run_one(task):
             i = cfg.index("--head-dropout")
             del cfg[i:i + 2]
             cfg += ["--head-dropout", str(HD_OVERRIDE[arm])]
+        if arm in MINRUN_OVERRIDE:
+            cfg = list(cfg)
+            # The winner config carries --min-run (CONF has it), so replace it;
+            # clap refuses the flag twice. A winner without one gets it appended.
+            if "--min-run" in cfg:
+                i = cfg.index("--min-run")
+                del cfg[i:i + 2]
+            cfg += ["--min-run", str(MINRUN_OVERRIDE[arm])]
         o1 = os.path.join(d, "o1.fq")
         o2 = os.path.join(d, "o2.fq")
         px = os.path.join(d, "cuts.pxmt")
