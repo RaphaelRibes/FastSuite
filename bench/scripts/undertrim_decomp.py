@@ -26,6 +26,7 @@ import sys
 
 HARNESS = pathlib.Path(__file__).resolve().parent / "overtrim_vs_fastp.py"
 spec = importlib.util.spec_from_file_location("ovf", HARNESS)
+assert spec is not None and spec.loader is not None, "cannot load the harness"
 ovf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ovf)
 
