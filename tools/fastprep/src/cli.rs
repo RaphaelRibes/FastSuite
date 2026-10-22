@@ -426,19 +426,22 @@ pub struct Cli {
     /// G-run with normal quality is removed exactly, no quality gate.
     /// Must be < --min-run so the scan stays in charge of long runs.
     ///
-    /// `0` IS the default: it disables the rule. The rule is a prior, not a
-    /// detector — a leading biological G is indistinguishable from a 1 bp
-    /// dropout by base identity — so on a real library trimming it is wrong
-    /// roughly three times in four. Measured on the 101-library corpus against
-    /// fastsim ground truth, `0` is the per-dataset winner on 100 of 101
-    /// datasets and `1` on the remaining one; `4` wins on none. Corpus-wide at
-    /// tolerance 0, of kept mates, `0` gives 92.56% exact / 0.07% overtrim /
-    /// 7.37% undertrim (total error 7.44%) against 75.36 / 23.64 / 1.00
-    /// (24.64%) at `4`: the same trade is 3.3x cheaper in total error when the
-    /// prior is off. Raise it only for a library known to drop its first-cycle
-    /// base. See docs/OVERTRIM-CEILING.md and
+    /// `4` IS the default. The rule is a prior, not a detector — a leading
+    /// biological G is indistinguishable from a 1 bp dropout by base identity —
+    /// so trimming it is wrong on roughly three times in four affected reads.
+    /// Whether that makes the rule wrong depends on the PRICE of the two
+    /// errors, not on the rate: with undertrim costed at r x overtrim, the rule
+    /// pays whenever r > P(biology)/P(artefact) = 2.6, measured three ways
+    /// (posterior 0.72/0.28; the 102-library table 21.94/8.33; the 101-library
+    /// axis sweep 3.70). At 7:1 — the standing preference "prefer less data to
+    /// wrong data" — the shipped 4 scores +39.1 of mates against +16.4 for 0,
+    /// i.e. a 22.7-point margin; at 1:1 (total error) the ordering flips and 0
+    /// is the better setting (7.44% against 24.64% total error). Both readings
+    /// are true; the default encodes the 7:1 one. `--head-dropout 0` disables
+    /// the rule for a pipeline that prices a lost base and a kept artefact
+    /// equally. See docs/DECISIONS.md D-16, docs/TRIM-ACCURACY.md and
     /// bench/results/phase-d/head-dropout-axis.tsv.
-    #[arg(long, value_name = "N", default_value = "0", help_heading = "PolyX Trimming")]
+    #[arg(long, value_name = "N", default_value = "4", help_heading = "PolyX Trimming")]
     pub head_dropout: Option<usize>,
 
     /// Target letter for anchored mode (repeatable, max 5 distinct).
@@ -1461,7 +1464,11 @@ mod tests {
         assert_eq!(cli.adapter_error_rate, 0.2, "--adapter-error-rate");
         assert_eq!(cli.min_adapter_overlap, 14, "--min-adapter-overlap");
         assert_eq!(cli.min_run, 12, "--min-run");
-        assert_eq!(cli.head_dropout, Some(0), "--head-dropout");
+        // 4, not 0: the 7:1 cost model of D-16 prices an artefact left in the
+        // output at seven lost bases, and at that anchor the rule pays (its
+        // break-even is 2.6). The 1:1 total-error reading prefers 0 and is
+        // reachable with an explicit flag.
+        assert_eq!(cli.head_dropout, Some(4), "--head-dropout");
         assert_eq!(cli.mean_q, Some(25.0), "--mean-q");
         assert!(matches!(cli.min_len, MinLen::Frac(f) if (f - 0.9).abs() < 1e-9), "--min-len");
         assert!(cli.dedup, "--dedup ships on");

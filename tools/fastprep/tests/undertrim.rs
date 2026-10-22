@@ -361,6 +361,12 @@ fn enrichment_corroborates_a_short_prefix_that_chance_would_not_explain() {
         "--adapter-preset", "illumina",
         "--adapter-short-tail", "6",
         "--adapter-min-enrichment", "10",
+        // The 5' leading-G prior is a separate decision and it is ON by
+        // default (4 since 0.4.1); these reads are random, so ~a quarter of
+        // them start with a G and the prior would trim them. Pin it off so the
+        // assertion below is about the ADAPTER path, which is what the test
+        // claims to measure.
+        "--head-dropout", "0",
         "--no-dedup", "--no-mean-q", "--min-len", "0", "-q",
     ]);
     assert_eq!(rc, 0);
