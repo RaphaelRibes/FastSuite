@@ -257,3 +257,63 @@ scores at all five r values post-hoc; never multiply the run matrix by five.**
 * No hard trim for exactness (a mandatory cut makes `exact` structurally
   unreachable — the scorer's own warning).
 * No default flips without the user's OK + version bump.
+
+## 7. Measured result — 2026-10-22, desktop only
+
+`bench/scripts/exactness_sweep.py`, 102 datasets (v0) × 12 arms = 1 224 rows, one
+host (`cachyos-x8664`), one binary (md5 `defb04d4`), winner config per dataset,
+scored by `score_weighted` at the 7:1 anchor. Raw:
+`bench/results/exactness/sweep-raw.jsonl`; rows:
+`sweep.tol0.tsv` / `sweep.tol2.tsv`.
+
+| tol 0, per mate | exact | overtrim | undertrim | clean-read cuts | score @7 | Δ vs base |
+|---|---|---|---|---|---|---|
+| base (hd 4, as shipped) | 72.04% | 19.03% | 1.87% | 20.37% | 0.6628 | — |
+| `--boundary-anchored` | 72.35% | 18.71% | 1.88% | 20.37% | 0.6749 | **+0.0121** |
+| `--overtrim-margin 1` | 72.04% | 19.03% | 1.87% | 20.37% | 0.6628 | 0.0000 |
+| `--overtrim-margin 2` | 72.04% | 19.03% | 1.87% | 20.37% | 0.6628 | 0.0000 |
+| `--short-tail-longest` (vs `st6`) | 72.04% | 19.03% | 1.87% | 20.37% | 0.6628 | 0.0000 |
+| `--pe-ambiguous-smallest` (vs `peov`) | 72.03% | 19.04% | 1.87% | 20.38% | 0.6626 | 0.0000 |
+| `--head-dropout 2` | 72.50% | 18.20% | 2.24% | 19.45% | 0.6373 | −0.0255 |
+| `--head-dropout 1` | 74.13% | 15.12% | 3.69% | 16.05% | 0.5290 | −0.1338 |
+| `--head-dropout 0` | **82.80%** | 0.57% | 9.58% | 0.02% | 0.1680 | −0.4947 |
+
+At tol ±2 the whole spread collapses: base 91.58% exact, hd0 92.06%, every
+other arm within 0.01 pp.
+
+**What this says, in order of how much it matters:**
+
+1. **The exactness question on this corpus is the 5′ G-run policy, not boundary
+   resolution.** A decomposition over 1.2 M mates put **100% of the overtrim at
+   the 5′ end and 80% of it at exactly 1 bp**, with a 1-2-3-4 bp histogram that is
+   `--head-dropout`'s own 1..=4 window. The 3′ polyX boundary — the target of
+   Tier 2 and Tier 3a — produces **40** overtrimmed mates in 1.2 M (0.003%).
+2. **The user's 7:1 anchor already picks the shipped policy.** Turning
+   head-dropout off buys the highest strict exactness available (82.80%, +10.8 pp)
+   by converting 18.5 pp of overtrim into 7.7 pp of undertrim — and at 7× that is
+   −0.49 per mate, a decisive loss. hd 2/1 are also negative. `hd = 4` is the
+   measured optimum of the shipped knob at this anchor; no change is needed.
+3. **Tier 2 pays, barely: +0.0121 at r = 7** (0.32 pp of mates move from
+   overtrim to exact, no undertrim cost, clean-read cuts unchanged). It is free
+   and it is real, but it is 40× smaller than the head-dropout trade above.
+4. **Tier 3a/3b/3c are 0.0000 on this corpus, and correctly so.** The margin
+   never fires because its target class is 0.003% here; the short-tail and
+   PE-ambiguity arms cannot fire because adapter readthrough is 0.01%. They are
+   not wrong, they are simply unpriced by this corpus — their classes live in the
+   synthetic readthrough cohorts (`OVERTRIM-PAIRED.md`, `undertrim_ab.py`).
+5. **A quality gate cannot rescue the 1 bp class.** The leading G-run's mean Q is
+   statistically identical for the reads the GT calls biology (median 36–37,
+   p10 5) and the reads inside artefact windows (median 36–37, p10 5) — the
+   simulator gives artefact bases normal quality, by design. There is no
+   per-read evidence separating "dark cycle" from "biology" here, which makes the
+   1 bp class a genuine either/or, and the 7:1 anchor is the only thing that
+   should decide it. That is exactly what point 2 says it does.
+
+**Recommendation, therefore:** flip `--boundary-anchored` to default (needs the
+user's OK + the version bump, per §2), keep `--overtrim-margin`,
+`--short-tail-longest` and `--pe-ambiguous-smallest` default-off as instruments
+for corpora that contain their classes, and do not touch `--head-dropout`: at
+the 7:1 anchor the shipped value is already the optimal one, and the honest
+statement of the exactness ceiling on real-library data is "82.8% strict
+exactness, 0.02% clean-read damage, paid for with 9.6% undertrim" — a trade this
+cost model rejects.

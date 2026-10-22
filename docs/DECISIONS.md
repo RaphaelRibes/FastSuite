@@ -308,6 +308,13 @@ result is a decision for the user, not a rule change — the generic polyX form
 stays a non-goal until he reopens it (the A/C/T census is a correctness
 argument, the weight is a cost argument; both must agree before it ships).
 
+**Measured at the anchor (2026-10-22, desktop, 1 224 rows):** the shipped
+`--head-dropout 4` is the optimum of that knob at 7:1 — hd0 reaches 82.80% strict
+exactness but buys it with 9.58% undertrim and scores **−0.4947** against base,
+hd1 −0.1338, hd2 −0.0255. `--boundary-anchored` is **+0.0121** and
+`--overtrim-margin` is **0.0000** on this corpus (its target class is 0.003% of
+mates). Full table: plan §7.
+
 **Baseline correction (2026-10-22):** the tolerance-0 yardstick for r = 7 is
 **75.59% exact / 23.4% overtrim / 1.0% undertrim** (`overtrim-vs-fastp.tsv`;
 75.35% after the `_minlen` repair), against fastp-default's 92.19%. The
