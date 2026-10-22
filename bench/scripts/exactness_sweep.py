@@ -73,14 +73,19 @@ ARMS = {
     # the head-dropout POLICY arms: the campaign's first decomposition showed
     # the 5' G-run cut is the whole overtrim signal on this corpus (100% of it
     # at 5', 80% of it exactly 1 bp), so the policy, not the boundary maths, is
-    # what has to be priced
-    "hd0": ["--head-dropout", "0"],
-    "hd1": ["--head-dropout", "1"],
-    "hd2": ["--head-dropout", "2"],
+    # what has to be priced. They OVERRIDE the winner's --head-dropout (clap
+    # refuses a repeated flag), see HD_OVERRIDE.
+    "hd0": [],
+    "hd1": [],
+    "hd2": [],
     "peov": ["--adapter-preset", "illumina", "--pe-overlap", "always"],
     "pe": ["--adapter-preset", "illumina", "--pe-overlap", "always",
            "--pe-ambiguous-smallest"],
 }
+
+# arm -> the value that REPLACES the winner config's --head-dropout, because
+# the winner row already carries one and clap refuses a repeated flag
+HD_OVERRIDE = {"hd0": 0, "hd1": 1, "hd2": 2}
 
 # arm -> the arm it is priced against when it enables a prerequisite flag
 REFERENCE = {"stl": "st6", "pe": "peov"}
@@ -143,6 +148,11 @@ def run_one(task):
     (fp, fp_md5, ds, r1, r2, gt, arm, cfg, tols, workroot, min_frac) = task
     d = tempfile.mkdtemp(dir=workroot, prefix=arm + "-")
     try:
+        if arm in HD_OVERRIDE:
+            cfg = list(cfg)
+            i = cfg.index("--head-dropout")
+            del cfg[i:i + 2]
+            cfg += ["--head-dropout", str(HD_OVERRIDE[arm])]
         o1 = os.path.join(d, "o1.fq")
         o2 = os.path.join(d, "o2.fq")
         px = os.path.join(d, "cuts.pxmt")
