@@ -1,0 +1,5 @@
+component	side	lo	hi	mates	pct_of_mates	pct_of_undertrim
+5' runs of 1-4	5p	1	4	1559147	8.2231	79.58
+3' runs of 1-5	3p	1	5	372363	1.9639	19.01
+3' runs of 6 or more	3p	6	1000000000	18568	0.0979	0.95
+pooled	side	0	0	1959221	10.3331	100.00
