@@ -11,15 +11,16 @@ the measurement that justified them.
   that is a mistake depends on the price of the two errors, and the price was
   never written down before this round.
   Measured at the 7:1 anchor ("prefer less data to wrong data": an artefact
-  left in the output costs seven deleted bases), on 102 datasets, desktop only,
-  20.4 M mates (`bench/results/exactness/`): `4` scores **+39.1** of mates,
-  `0` scores **+16.4** — a 22.7-point margin for the rule being on. The
-  break-even is a cost ratio of **2.6**, measured three ways: the quality
+  left in the output costs seven deleted bases), 102 libraries, desktop only,
+  18.96 M mates (`bench/results/four-tool/`): `4` scores **+43.6** of mates,
+  `0` scores **+17.1** — a 26.5-point margin for the rule being on. The
+  break-even is a cost ratio of **2.4**, measured four ways: the quality
   posterior for a 1..4 bp leading run is 0.27–0.29 artefact, so
-  P(biology)/P(artefact) ≈ 2.6; the 102-library four-tool table gives
-  21.94/8.33 = 2.63; the 101-library head-dropout axis gives 3.70. At 1:1 the
-  ordering inverts (total error 24.6 % with the rule, 7.4 % without), which is
-  the reading that made `0` the default on 2026-10-16 (`3d76a31`).
+  P(biology)/P(artefact) ≈ 2.5–2.7; the 102-library four-tool table gives
+  19.97/8.31 = 2.40; the twelve-arm campaign gives 2.39; the 101-library
+  head-dropout axis gives 3.70. At 1:1 the ordering inverts (total error 22.2 %
+  with the rule, 10.5 % without), which is the reading that made `0` the default
+  on 2026-10-16 (`3d76a31`).
   So the two defaults are both defensible and encode different prices; this
   release encodes the 7:1 one, because that is the project's stated preference.
   `--head-dropout 0` remains the setting for a pipeline that prices a lost base

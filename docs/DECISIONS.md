@@ -337,9 +337,10 @@ disables the rule and `1`-`3` shorten it.
 **Why the default moved twice.** The rule trims a 1..=4 bp leading G-run
 exactly. It is a prior, not a detector, so it is wrong on roughly three of every
 four reads it touches. On 2026-10-16 (`3d76a31`) the default went to `0` on a
-*total-error* argument: at tolerance 0 of kept mates the rule costs 24.64 %
-error against 7.44 % without it, so switching it off looked like a 3.3x
-improvement. That argument holds only if a deleted base and an artefact left in
+*total-error* argument: at tolerance 0 of kept mates the rule cost 24.6 % error
+against 7.4 % without it, so switching it off looked like a 3.3x improvement.
+Re-measured on the current corpus with the shipped binary it is 22.2 % against
+10.5 %: a 2.1x improvement, not 3.3x, and still an improvement at 1:1. That argument holds only if a deleted base and an artefact left in
 the output are priced equally.
 
 **The price settles it, and the break-even is measurable.** With undertrim
@@ -349,13 +350,14 @@ for the affected class. Measured three ways, that ratio is 2.6:
 | route | value |
 |---|---|
 | quality posterior for a 1..4 bp leading run (0.27-0.29 artefact) | 2.5-2.7 |
-| the 102-library four-tool table, Δover / Δunder (21.94 / 8.33) | 2.63 |
+| the 102-library four-tool table, Δover / Δunder (19.97 / 8.31) | 2.40 |
 | the 101-library head-dropout axis, same ratio | 3.70 |
 | the 7:1 campaign (1 224 rows, desktop), same ratio | 2.39 |
 
 At 1:1 (below 2.6) `0` is right; at 7:1 (above it) `4` is right, and the
-campaign measures the margin: `+39.1` of mates with the rule against `+16.4`
-without, i.e. **+22.7 points** for `4`. The standing project preference is
+measurements agree on the margin: `+43.6` of mates with the rule against `+17.1`
+without on the four-tool table, i.e. **+26.5 points** for `4` (`+39.9` against
+`+15.2` on the twelve-arm campaign, a +24.7-point margin). The standing project preference is
 "prefer less data than wrong data", fixed at 7:1 in D-15 — so the shipped
 default must be the 7:1 optimum. Shipping `0` made a bare invocation run the
 configuration this project's own cost model rejects.

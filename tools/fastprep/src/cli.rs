@@ -432,11 +432,11 @@ pub struct Cli {
     /// Whether that makes the rule wrong depends on the PRICE of the two
     /// errors, not on the rate: with undertrim costed at r x overtrim, the rule
     /// pays whenever r > P(biology)/P(artefact) = 2.6, measured three ways
-    /// (posterior 0.72/0.28; the 102-library table 21.94/8.33; the 101-library
+    /// (posterior 0.72/0.28; the 102-library table 19.97/8.31; the 101-library
     /// axis sweep 3.70). At 7:1 — the standing preference "prefer less data to
-    /// wrong data" — the shipped 4 scores +39.1 of mates against +16.4 for 0,
-    /// i.e. a 22.7-point margin; at 1:1 (total error) the ordering flips and 0
-    /// is the better setting (7.44% against 24.64% total error). Both readings
+    /// wrong data" — the shipped 4 scores +43.6 of mates against +17.1 for 0,
+    /// i.e. a 26.5-point margin; at 1:1 (total error) the ordering flips and 0
+    /// is the better setting (10.5% against 22.2% total error). Both readings
     /// are true; the default encodes the 7:1 one. `--head-dropout 0` disables
     /// the rule for a pipeline that prices a lost base and a kept artefact
     /// equally. See docs/DECISIONS.md D-16, docs/TRIM-ACCURACY.md and
