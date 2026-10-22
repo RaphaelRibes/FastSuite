@@ -93,6 +93,12 @@ and keeps its raw object under `legacy`.
 | `reads_adapter_trimmed` | `r1.adapter.reads_trimmed + r2.adapter.reads_trimmed` |
 | `read_retention` | `reads_out / reads_in` |
 | `pairs_out`, `pairs_dropped`, `singletons_r1/r2` | top-level, paired runs |
+| `margin_bases_5p`, `margin_bases_3p`, `reads_with_margin` | aggregate-only `--overtrim-margin` counters: bases the deliberate overtrim extension added at each end, and reads that received at least one (a read with no margin is not counted). Emitted in **both** `metrics` and `legacy`, mirrored, so a v1 consumer and the pre-v1 adapter read the same numbers |
+
+There is deliberately **no per-read margin record and no PXMT field**. PXMT v3 is
+unpacked at fixed offsets by the bench scripts, so inserting a field would
+silently misalign every one of them; the margin is attributed from the run
+configuration plus these counters (D-15, and the plan's Tier 3a guardrail).
 
 ### fastmaps `heatmap.json`
 

@@ -10,19 +10,34 @@ cost model: "we prefer less data than wrong data").
 
 ## 1. Diagnosis — where the inexactness actually lives
 
-Measured (101-dataset corpus, exact simulator ground truth, gzip 6 / -j 4,
-`bench/scripts/trim_accuracy.py`; see `references/measurement-pitfalls.md`
-"Trim accuracy"):
+**Baseline corrected 2026-10-22.** The round this section was first drafted
+from (`bench/results/phase-d/trim-accuracy.tsv`: fastprep-winner 66.5 / 29.5 /
+4.0) is **invalid**: `docs/TRIM-ACCURACY-DISCREPANCY.md` shows it scored
+sim-generation-1 trim decisions against sim-generation-2 ground truth, so its
+29.5% / 4.0% split is the ±1-2 bp spread of two independent draws, not trimming
+behaviour. The authoritative, generation-consistent re-measurement
+(`bench/results/phase-d/overtrim-vs-fastp.tsv`, 102 datasets / 20.4 M mates),
+tol 0:
 
-| tool | tol 0 exact / over / under | tol ±2 exact |
-|---|---|---|
-| fastp-default | 92.2% / 0.2% / 7.6% | 99.6% |
-| fastprep-winner | 66.5% / **29.5%** / 4.0% | 98.4% |
+| tool | tol 0 exact |
+|---|---|
+| fastp-default | 92.19% |
+| fastp-tuned | 84.06% |
+| fastprep-hd0 (head-dropout 0) | 92.60% |
+| fastprep winner (shipped default) | 75.59% (75.35% after the `_minlen` repair) |
 
-The 29.5% overtrim collapses to 1.3% at ±2 → it is **boundary jitter**, not
-biology loss. So "make it exact" is mostly "kill the jitter", and the residual
-undertrim (4.0%, mostly adapter readthrough the matcher never sees) is where the
-overtrim bias must bite.
+fastprep-winner's tol-0 over/under split: **23.4% / 1.0%**. fastp-default's
+0.2% / 7.6% split reproduces identically in both rounds, so it was never
+affected. Every bucket at both tolerances is in the TSV.
+
+What survives the correction: at tol 0 fastprep puts ~23% of mates off-boundary
+while losing only ~1.0% to artefact left behind, so overtrim still carries
+essentially the whole ~17 pp exactness gap against fastp, and the tie-break
+toward cutting is still the lever. What does NOT survive is the specific jitter
+claim ("29.5% collapses to 1.3% at ±2"): that decay was measured on the invalid
+generation. The jitter-vs-deliberate split must be re-measured on the desktop
+(Step 4) from tolerance decay **and** the margin-on/off delta before any number
+in this section is quoted again.
 
 **The thesis: the algorithm's tie-breaks currently resolve ambiguity toward
 KEEPING bases, while the user's cost model resolves toward CUTTING them.**
@@ -88,9 +103,11 @@ net-positive at w_under/w_over ≳ 6.7. That re-scoring is Step 5 below.
 ```
 
 Flipping the default converts the mercy overshoot (~2 bp) from cut-signal into
-nothing-to-cut. Expected effect: most of the 29.5% tol-0 overtrim → exact. This
-is a **user-visible default change**: measure it (Step 4), document the trade at
-the flag, hold the flip for the user's OK with the version bump (0.1.0 → 0.2.0).
+nothing-to-cut. Expected effect: a large share of the valid 23.4% tol-0
+overtrim → exact. That is a **hypothesis until Step 4 measures it** — the
+invalid round's tolerance decay cannot stand in for the measurement. This is a
+**user-visible default change**: measure it, document the trade at the flag,
+hold the flip for the user's OK with the version bump (0.1.0 → 0.2.0).
 
 ### Tier 3 — the ambiguity band, resolved toward overtrim
 
@@ -105,8 +122,14 @@ is more likely artefact continuation than a biological boundary base — the
 simulator's own boundary rule forces the base at the true boundary to be
 non-run, i.e. the only ambiguous class on real data). Bounded at +2 bp. Never
 generic: the run base is whatever the scan matched (G at 3′ on NovaSeq two-
-colour), so this is base-specific by construction. Applies symmetrically to the
-5′ head (head_dropout and the forward scan).
+colour), so this is base-specific by construction. Applies to the forward and
+reverse scan cuts at both ends. **Excluded by construction from the
+`--head-dropout` cut** (implementation note, 2026-10-22): head-dropout trims the
+*maximal* case-sensitive leading G-run, so the base immediately past that cut can
+never equal the run base — the only continuation the margin could match is a
+lowercase `g`, which real FASTQ does not carry. That boundary is exact by
+construction, so there is no ambiguity for a margin to resolve; the margin stays
+on the scan cuts, where the boundary genuinely is ambiguous.
 
 **(b) Nested adapter prefixes: longest-wins.** In `short_tail_trim`, iterate
 candidates longest-first and return the first corroborated one instead of the
@@ -166,7 +189,11 @@ ship/no-ship anchor. Weights live in `bench/weights/trim-weights-v1.json`
 (written before the first run so the margin cannot be tuned to its result);
 every result row records `weights_version = v1`. Scoring is per-read (primary,
 comparable to the existing trim-accuracy numbers); a per-base variant is a
-secondary column only. The per-axis raw counts never depend on the weights.
+secondary column only. The per-axis raw counts never depend on the weights. **Scale warning:**
+`score` divides the numerator by **pairs** (the pre-registered model), while the
+numerator counts **mates**, so a perfect paired run reads 2.0, not 1.0. Ladder
+rankings, every Δ and every `r*` are invariant to that factor, but never compare
+`score` to a per-mate percentage (75.59%) — compare the per-axis columns.
 
 Known gap to close before the first weighted row: `trim_accuracy.py`'s
 `classify()` emits five buckets and leaves `dropped_or_missing` unweighted,
@@ -184,17 +211,20 @@ scores at all five r values post-hoc; never multiply the run matrix by five.**
    boundary G vs a non-G boundary), assert the recovered cut equals the GT cut
    at every offset for the unambiguous cases and equals `true + margin` for the
    ambiguous class. Catches off-by-ones before any corpus run.
-2. **Two-axis corpus sweep** on the existing 101-dataset GT corpus: each rule
+2. **Two-axis corpus sweep** on the GT corpus as it exists on the desktop
+   (306 datasets = 102 accessions × 3 variants, `/mnt/Fast/fastsuite-scratch/
+   work-gt2026`): each rule
    measured alone and combined; report tol 0 and tol ±2 exact/over/under,
    false-trim on clean reads, and the tolerance-decay split (jitter vs
    deliberate). Compare against fastp-default (the current exactness leader,
-   92.2% tol-0) head-to-head.
+   92.19% tol-0 in the valid round) head-to-head.
 3. **Re-score the closed 3′ band** (the −35,196/+236,779 trade) under the
    user's weights before deciding the band stays closed.
 4. Acceptance (pre-registered):
-   * tol-0 exact rate up substantially (the jitter class must convert);
-   * undertrim (tol 0 and ±2) ≤ current 4.0%, and the residual adapter-
-     readthrough class (scored by `undertrim_ab.py`) down;
+   * tol-0 exact rate up substantially from the valid 75.59% baseline;
+   * undertrim (tol 0 and ±2) ≤ the re-derived current 1.0% (no regression),
+     with the residual adapter-readthrough class (scored by `undertrim_ab.py`)
+     down;
    * clean-read false trims under the per-rule ceiling;
    * overtrim surviving at tol ±2 = only the deliberate margin, reported as
      such.
@@ -207,10 +237,13 @@ scores at all five r values post-hoc; never multiply the run matrix by five.**
   re-confirmed on the desktop before any of its numbers are quoted).
 * **Venue (user rule, 2026-10-21): every bench row is produced on the desktop,
   exclusively.** The laptop is edit + `cargo test` only. Each bench row records
-  the machine identity, and the 66.5/29.5/4.0 baseline is re-derived on the
-  desktop before it is used as an acceptance yardstick.
+  the  machine identity, and the acceptance baseline is re-derived on the desktop
+  before it is used as a yardstick: the only valid repository numbers are
+  75.59% / 23.4% / 1.0% from `overtrim-vs-fastp.tsv` (see §1), and even those
+  are re-checked against `work-gt2026` before use. The retired 66.5/29.5/4.0
+  round is not an acceptance value at all.
 * The corpus sweep re-scores existing sims (GT files exist) — a handful of
-  configs × 101 datasets is **low core-hours; overnight on the desktop with
+  configs × 306 datasets is **low core-hours; overnight on the desktop with
   3–4 parallel subagents is the honest continuous estimate**. The sims need
   regenerating only if we also change fastsim (we do not).
 * Implementation + TDD: one session per tier, committed per task.

@@ -263,6 +263,14 @@ because its guard is real and because it is the only way to re-run the question
 on a different corpus. Throughput cost measured: **+3.7% single-threaded, +7.8%
 at 4 threads** (best-of, 400k pairs).
 
+**Amendment (2026-10-21, exactness work Tier 3c):** the new opt-in
+`--pe-ambiguous-smallest` narrows the *refusal*, it does not remove the source
+rule above. With more than one verifying insert it takes the smallest one
+(shortest insert = largest readthrough trim, i.e. the overtrim side) **only
+when `readthrough_is_adapter` confirms adapter behind that boundary on the
+pinned mate**. With no explicit adapter set the flag still cannot fire, so the
+tri-state safety property is unchanged.
+
 ---
 
 ## D-15 — Trim cost model: undertrim priced at 7× overtrim ✅ decided (2026-10-21)
@@ -283,6 +291,13 @@ numeric, fixed *before* the sweep so the margin cannot be tuned to its result.
   margin and a whole-read wrong drop both cost `w_over` in the primary score.
 * The formula is homogeneous: only the ratio is a decision, and 7 is the
   ship/no-ship anchor.
+* **Provenance of the trade quoted below** (verified 2026-10-22):
+  `bench/results/phase-d/fastprep-flags-analysis-20261018.tsv`, commit
+  `c46cbd3` (2026-10-18) — measured *after* the sim regeneration (2026-10-15)
+  and after the discrepancy fix `73c2385`, over 102 datasets / 20.4 M mates,
+  baseline `fastprep-hd0`. It is generation-consistent. The retired
+  66.5 / 29.5 / 4.0 round is **not** generation-consistent and is not an
+  acceptance value (`docs/TRIM-ACCURACY-DISCREPANCY.md`).
 
 **What 7 does to the one closed band:** the measured 3′ terminal-run trade
 (`--min-run-3p 6`: −35,196 undertrim bought at +236,779 overtrim) breaks even
@@ -292,6 +307,13 @@ exact rate and does not carry over: it is re-scored (plan Step 5) and the
 result is a decision for the user, not a rule change — the generic polyX form
 stays a non-goal until he reopens it (the A/C/T census is a correctness
 argument, the weight is a cost argument; both must agree before it ships).
+
+**Baseline correction (2026-10-22):** the tolerance-0 yardstick for r = 7 is
+**75.59% exact / 23.4% overtrim / 1.0% undertrim** (`overtrim-vs-fastp.tsv`;
+75.35% after the `_minlen` repair), against fastp-default's 92.19%. The
+proposal's original 66.5 / 29.5 / 4.0 figures came from a defective pairing
+(generation-1 trims scored against generation-2 ground truth) and must not be
+quoted as a baseline.
 
 **Deliberate margins are attributed from the config, never from PXMT:** the
 PXMT v3 record stays byte-stable (25+ bench parsers unpack it at fixed
