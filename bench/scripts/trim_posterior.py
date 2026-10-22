@@ -43,6 +43,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--end", choices=["5", "3"], default="5")
+    ap.add_argument("--out", default=None,
+                    help="write the per-run table as TSV, so the paper's table "
+                         "can be generated instead of typed")
     a = ap.parse_args()
 
     winners = list(H.csv.DictReader(open(f"{H.R}/winners.tsv"), delimiter="\t"))
@@ -98,6 +101,16 @@ def main():
         print(f"  {r:>4} {na:>10} {nb:>10} {t:>11} {p:>13.3f}   {act:4s} {bar}")
     t = tot_a + tot_b
     print(f"\n  overall P(artefact) = {tot_a/t:.3f}   ({tot_a} artefact / {tot_b} biology of {t})")
+    if a.out:
+        with open(a.out, "w") as fh:
+            fh.write("r\tartefact\tbiology\ttotal\tp_artefact\n")
+            for r in sorted(tab):
+                if r > 12:
+                    continue
+                na, nb = tab[r]
+                tt = na + nb
+                fh.write(f"{r}\t{na}\t{nb}\t{tt}\t{na/tt:.4f}\n" if tt else "")
+        print(f"  wrote {a.out}")
     reach = sum(tab[r][0] for r in tab if tab[r][0] + tab[r][1] and
                 tab[r][0] / (tab[r][0] + tab[r][1]) > 0.5)
     print(f"  artefacts a Bayes-optimal rule of r alone could recover: {reach} "
