@@ -479,10 +479,23 @@ pub struct Cli {
     /// Boundary-anchored cut: place the polyX cut at the homopolymer run
     /// boundary (the last matching base) instead of the mercy walk's end.
     /// The mercy walk absorbs ~2 flanking non-run bases past a clean run
-    /// before Δ_m trips, so the default whole-run cut overshoots the run by
-    /// that much. This trims exactly the run extent, dropping the overshoot.
+    /// before Δ_m trips, so the whole-run cut overshoots the run by that much.
+    /// Anchoring trims exactly the run extent, dropping the overshoot.
+    ///
+    /// **Default ON since 0.4.0.** Measured on 102 datasets at the 7:1 trim
+    /// cost anchor: +0.0121 per mate, 0.32 pp of mates moved from overtrim to
+    /// exact, no undertrim cost (`docs/plans/2026-10-21_fastprep-exactness.md`
+    /// §7). `--boundary-anchored` is therefore accepted as a no-op for existing
+    /// invocations; `--boundary-anchored=false` (or `--no-boundary-anchored`)
+    /// restores the pre-0.4.0 cut.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true",
+          value_name = "BOOL", help_heading = "PolyX Trimming")]
+    pub boundary_anchored: Option<bool>,
+
+    /// Restore the pre-0.4.0 whole-run cut, including the mercy walk's ~2 bp
+    /// flank overshoot.
     #[arg(long, help_heading = "PolyX Trimming")]
-    pub boundary_anchored: bool,
+    pub no_boundary_anchored: bool,
 
     /// After a qualifying polyX end cut, extend it by up to N bases toward the
     /// read interior while each extension base is the run's own base (case
@@ -1095,7 +1108,15 @@ impl Cli {
             scan_5: !self.no_5,
             scan_3: !self.no_3,
             scan_interior: self.interior || !self.no_interior,
-            boundary_anchored: self.boundary_anchored,
+            // default ON: the anchoring cut is the measured winner, and the
+            // positive flag survives so bench invocations written before 0.4.0
+            // keep parsing. The negation wins if both are somehow given.
+            boundary_anchored: match (self.boundary_anchored,
+                                      self.no_boundary_anchored) {
+                (_, true) => false,
+                (Some(v), false) => v,
+                (None, false) => true,
+            },
             overtrim_margin: self.overtrim_margin,
             direction: Direction::Forward,
             mean_q: if self.no_mean_q { None } else { self.mean_q },
@@ -1574,6 +1595,53 @@ mod tests {
             !cli.pe_ambiguous_smallest,
             "--pe-ambiguous-smallest defaults off"
         );
+    }
+
+    #[test]
+    fn boundary_anchored_defaults_on_and_has_a_negation() {
+        use clap::Parser;
+        // 0.4.0 flipped the default: the anchoring cut is the measured winner
+        // (+0.0121/read at 7:1, plan §7), and the pre-flip cut stays reachable.
+        // finalize() reads the input for adapter auto-detection, so the test
+        // needs a real (tiny) FASTQ: 94 bp with a qualifying 3' G-run.
+        let dir = std::env::temp_dir().join(format!("fp-ba-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inp = dir.join("in.fq");
+        let out = dir.join("out.fq");
+        std::fs::write(
+            &inp,
+            format!("@r1\n{}\n+\n{}\n", "ACGT".repeat(20) + &"G".repeat(14), "I".repeat(94)),
+        )
+        .unwrap();
+
+        let anchored = |extra: &[&str]| -> bool {
+            let mut v: Vec<String> = vec![
+                "fastprep".into(),
+                "-1".into(), inp.to_string_lossy().into_owned(),
+                "-o".into(), out.to_string_lossy().into_owned(),
+                "--no-auto-phred".into(), "--no-dedup".into(), "-q".into(),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            match Cli::parse_from(v).finalize().unwrap().0 {
+                Mode::Single { params, .. } => params.boundary_anchored,
+                _ => panic!("expected single-end"),
+            }
+        };
+
+        assert!(anchored(&[]), "anchoring is ON by default since 0.4.0");
+        assert!(
+            anchored(&["--boundary-anchored"]),
+            "the pre-0.4.0 spelling still parses and is now a no-op"
+        );
+        assert!(
+            !anchored(&["--no-boundary-anchored"]),
+            "--no-boundary-anchored restores the mercy-walk overshoot"
+        );
+        assert!(
+            !anchored(&["--boundary-anchored=false"]),
+            "--boundary-anchored=false is the second escape"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
