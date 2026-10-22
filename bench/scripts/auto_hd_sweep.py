@@ -75,9 +75,16 @@ def prescan(path, max_reads=PRESCAN):
     pg = g / total
     obs = amb / mates
     exp_bio = max(0.0, min(1.0, pg - pg ** 5))
-    est = max(0.0, min(1.0, obs - exp_bio))
+    est_all = max(0.0, min(1.0, obs - exp_bio))
+    # The break-even (1 in 8) is about the mates the rule acts on, i.e. the
+    # ambiguous class, not about all mates. est_all is a share of ALL mates, so
+    # dividing by the ambiguous rate converts it back to the class the decision
+    # is about. Without this the estimator reads 5.7% for a library whose
+    # ambiguous class is 29% injected and keeps a library it should trim.
+    est_cls = min(1.0, est_all / obs) if obs > 0 else 0.0
     return {"mates": mates, "p_g": pg, "obs_1_4": obs, "exp_bio": exp_bio,
-            "est_injected": est, "trim": est > THRESH}
+            "est_injected_all": est_all, "est_injected_cls": est_cls,
+            "trim": est_cls > THRESH}
 
 
 def run_one(task):
