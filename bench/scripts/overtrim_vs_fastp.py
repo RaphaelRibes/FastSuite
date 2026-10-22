@@ -212,7 +212,15 @@ def main():
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing --out instead of refusing")
+    ap.add_argument("--tools", default="all",
+                    help="all (default) or fastprep; fastprep skips the two "
+                         "fastp rows, which is what a re-measure of the "
+                         "fastprep binary needs (fastp did not change)")
     a = ap.parse_args()
+    want_fastp = a.tools != "fastprep"
+    want_fastprep = a.tools != "fastp"
+    if not (want_fastp or want_fastprep):
+        sys.exit("--tools takes 'all', 'fastprep' or 'fastp'")
 
     # Refuse to append — checked FIRST, before any work, so a re-run against an
     # existing output costs nothing. `emit` below opens --out in mode "a" so
@@ -239,7 +247,19 @@ def main():
 
     # Write the header (the append-refusal happens at the top of main(), before
     # any work, so that a re-run against an existing path costs nothing).
+    # Provenance travels with the rows: a level that moved between two runs of
+    # this script is otherwise unattributable to a binary or a corpus.
     if a.offset == 0:
+        import hashlib, platform, socket, time
+        md5 = hashlib.md5(open(FP, "rb").read()).hexdigest() if os.path.exists(FP) else "missing"
+        with open(a.out + ".provenance", "w") as ph:
+            ph.write(f"host {socket.gethostname()} {platform.machine()}\n")
+            ph.write(f"date {time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+            ph.write(f"fastprep {FP} md5 {md5}\n")
+            ph.write(f"fastp {'/'.join(os.popen(f'{FASTP} --version 2>&1').read().split()[:2])}\n")
+            ph.write(f"corpus {W} results {R}\n")
+            ph.write(f"tools {a.tools} stride {a.stride} offset {a.offset}\n")
+        print(f"fastprep md5 {md5}", flush=True)
         with open(a.out, "w", newline="") as fh:
             csv.writer(fh, delimiter="\t", lineterminator="\n").writerow(
                 ["domain", "acc", "tool", "tol", "exact", "overtrim",
@@ -287,7 +307,8 @@ def main():
             base += ["--interior"]
 
         # ---- fastprep: the then-shipped value (head_dropout 4), then 0
-        for tag, hdv in (("fastprep-hd4", None), ("fastprep-hd0", 0)):
+        for tag, hdv in ((("fastprep-hd4", None), ("fastprep-hd0", 0))
+                         if want_fastprep else ()):
             argv = list(base)
             argv += ["--head-dropout", str(eff_hd(w) if hdv is None else hdv)]
             px = f"{d}/{tag}.pxmt"
@@ -301,6 +322,9 @@ def main():
             emit(dom, acc, tag, {t: score_fastprep(p, coremap, gt, t)
                                  for t in (0, 2)})
 
+        if not want_fastp:
+            subprocess.run(["rm", "-rf", d], capture_output=True)
+            continue
         # ---- fastp: shipped default and tuned, scored by alignment
         orig = read_fastq_keyed(s1) + read_fastq_keyed(s2)
         for tag, extra in (("fastp-default", []), ("fastp-tuned", FASTP_TUNED)):
