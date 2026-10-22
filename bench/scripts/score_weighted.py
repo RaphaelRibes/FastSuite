@@ -129,6 +129,7 @@ ROW_FIELDS = [
     "variant", "r", "w_over", "w_under", "anchor_r", "tol", "min_len_frac",
     "min_len_floor", "read_len", "pairs", "pairs_scored", "unaligned_pairs",
     "mates_scored", "mates_unscored", "dup_pairs_skipped",
+    "clean_mates", "clean_false_trims", "clean_false_trim_rate",
 ] + list(CLASSES) + [
     "mixed_trim", "over_units", "under_units", "weighted_numerator", "score",
     "delta_over", "delta_under", "r_star", "break_even_status",
@@ -359,6 +360,9 @@ def score_dataset(decisions, gt, read_len, min_len_floor, tol, skip_dup=False):
     bases_over = bases_under = 0
     mates_unscored = 0
     dup_pairs_skipped = 0
+    # the pre-registered false-trim ceiling is measured on CLEAN reads: mates
+    # whose GT window is the whole read, i.e. nothing should have been cut
+    clean_mates = clean_false_trims = 0
     by_pid = collections.defaultdict(dict)
     for (pid, mate), dec in decisions.items():
         by_pid[pid][mate] = dec
@@ -389,6 +393,14 @@ def score_dataset(decisions, gt, read_len, min_len_floor, tol, skip_dup=False):
             classes[mate] = cls
             bases_over += bo
             bases_under += bu
+            h_gt, t_gt, full_gt = row[mate]
+            if h_gt == 0 and t_gt == 0 and not full_gt:
+                clean_mates += 1
+                st, t5d, t3d, _ = dec
+                # an unaligned classification is a join/length failure, not a
+                # trim decision, so it never enters the false-trim ceiling
+                if cls != "unaligned" and st == 0 and (t5d or 0) + (t3d or 0) > 0:
+                    clean_false_trims += 1
         if "unaligned" in classes.values():
             unaligned_pairs += 1
         elif len(classes) == 2 and set(classes.values()) == {"overtrim", "undertrim"}:
@@ -404,6 +416,8 @@ def score_dataset(decisions, gt, read_len, min_len_floor, tol, skip_dup=False):
         "dup_pairs_skipped": dup_pairs_skipped,
         "bases_over": bases_over,
         "bases_under": bases_under,
+        "clean_mates": clean_mates,
+        "clean_false_trims": clean_false_trims,
     }
 
 
@@ -504,6 +518,10 @@ def emit_rows(w, args_cfg, measurements, out_fh):
                 mates_scored=m["mates_scored"],
                 mates_unscored=m["mates_unscored"],
                 dup_pairs_skipped=m["dup_pairs_skipped"],
+                clean_mates=m["clean_mates"],
+                clean_false_trims=m["clean_false_trims"],
+                clean_false_trim_rate=(m["clean_false_trims"] / m["clean_mates"]
+                                       if m["clean_mates"] else ""),
                 mixed_trim=m["counts"]["mixed_trim"],
                 over_units=over_units(m["counts"]),
                 under_units=under_units(m["counts"]),
@@ -525,7 +543,8 @@ def emit_rows(w, args_cfg, measurements, out_fh):
         agg = buckets()
         acc = {"counts": agg, "pairs": 0, "pairs_scored": 0, "unaligned_pairs": 0,
                "mates_scored": 0, "mates_unscored": 0, "dup_pairs_skipped": 0,
-               "bases_over": 0, "bases_under": 0}
+               "bases_over": 0, "bases_under": 0, "clean_mates": 0,
+               "clean_false_trims": 0}
         for (ds, lab), m in sorted(measurements.items()):
             if lab != label:
                 continue
@@ -533,7 +552,7 @@ def emit_rows(w, args_cfg, measurements, out_fh):
                 agg[k] += m["counts"][k]
             for k in ("pairs", "pairs_scored", "unaligned_pairs", "mates_scored",
                       "mates_unscored", "dup_pairs_skipped", "bases_over",
-                      "bases_under"):
+                      "bases_under", "clean_mates", "clean_false_trims"):
                 acc[k] += m[k]
         pooled[label] = acc
         score_rows("AGGREGATE", "*", label, acc)

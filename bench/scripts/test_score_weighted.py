@@ -230,6 +230,14 @@ check("fx9 ladder is the pre-registered one",
 check("fx9 secondary bases destroyed > 0", int(fx["SECONDARY_bases_over"]) > 0, True)
 check("fx9 secondary artefact bases left > 0", int(fx["SECONDARY_bases_under"]) > 0, True)
 
+# ---- the false-trim ceiling is measured on CLEAN reads only: GT window = the
+# whole read. fx9 has pids 0,1,5,6,8 clean (10 mates); only pid1 is cut (5 bp
+# on each mate), so 2/10. A dropped clean read is a drop error, not a cut. pid8's
+# impossible 200 bp cut is unaligned and stays out of the ceiling.
+check("fx9 clean mates", int(fx["clean_mates"]), 10)
+check("fx9 clean-read false trims (pid1's two mates)", int(fx["clean_false_trims"]), 2)
+check("fx9 clean-read false-trim rate", float(fx["clean_false_trim_rate"]), 0.2)
+
 # unaligned must not be folded in: pid8's two unaligned mates are inside
 # mates_scored (18) but in no weighted term, and its pair leaves the denominator
 # (pairs 9 -> pairs_scored 8) instead of being scored as exact or as an error
