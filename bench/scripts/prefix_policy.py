@@ -86,9 +86,15 @@ def main():
         obs = amb / mates if mates else 0.0
         under_bio = pg - pg ** 5          # expected 1-4 bp leading rate under biology
         est = max(0.0, min(1.0, obs - under_bio))
-        rows.append({"dataset": f"{dom}/{acc}", "mates": mates, "amb": amb,
-                     "obs_rate": obs, "p_g": pg, "exp_bio": under_bio,
-                     "est_injected": est})
+        row = {"dataset": f"{dom}/{acc}", "mates": mates, "amb": amb,
+               "obs_rate": obs, "p_g": pg, "exp_bio": under_bio,
+               "est_injected": est}
+        # The whole leading-run histogram, so a self-calibrated estimator (p
+        # fitted from the tail the injection barely touches) can be compared to
+        # the base-composition one without another pass over the corpus.
+        for k in range(0, 9):
+            row[f"run_{k}"] = hist.get(k, 0)
+        rows.append(row)
         print(f"  {dom}/{acc}: obs {100*obs:5.2f}%  pG {pg:.3f}  bio {100*under_bio:5.2f}%"
               f"  est {100*est:5.2f}%", flush=True)
 
