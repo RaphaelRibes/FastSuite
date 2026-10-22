@@ -261,6 +261,7 @@ fn runtime(pe_overlap: PeOverlapMode) -> Runtime {
         min_adapter_overlap_se: 14,
         pe_overlap,
         adapter_evidence: fastprep::adapter::AdapterEvidence::Floor,
+        pe_ambiguous_smallest: false,
         dedup: None,
         thread_pool: None,
     }

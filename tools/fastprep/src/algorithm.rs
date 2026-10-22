@@ -199,6 +199,20 @@ pub struct Params {
     /// dropping the flanking overshoot. Default `false` preserves the shipped
     /// whole-run/mercy cut.
     pub boundary_anchored: bool,
+
+    /// `--overtrim-margin N` (default `0` = off). After a qualifying polyX END
+    /// cut resolves to a non-zero trim, extend that cut by up to `N` further
+    /// bases toward the read interior while each extension base
+    /// (i) equals the run's own base, case-insensitively, and
+    /// (ii) carries a decoded quality below `phred_sat`.
+    ///
+    /// The shipped mercy cut already overshoots a clean run by ~2 flanking
+    /// bases (the walk absorbs them before Δ_m trips), so a read whose run is
+    /// followed by more of the same base at low quality has artefact evidence
+    /// past the cut. This continues the cut over nothing but same-base
+    /// low-quality calls: a cut of 0 stays 0, an interior run is untouched,
+    /// and an `N` is never the run base nor an extension base.
+    pub overtrim_margin: usize,
     pub direction: Direction,
     pub mean_q: Option<f64>,
     pub trim_5: Option<usize>,
@@ -304,6 +318,7 @@ impl Default for Params {
             scan_3: true,
             scan_interior: true,
             boundary_anchored: false,
+            overtrim_margin: 0,
             direction: Direction::Forward,
             mean_q: None,
             trim_5: None,
@@ -615,6 +630,75 @@ fn resolve_trim(res: ScanResult, min_run: usize, boundary_anchored: bool) -> usi
     } else {
         res.k_star + 1 // boundary
     }
+}
+
+/// Bases added by `--overtrim-margin` on one read, per physical end.
+#[derive(Debug, Default, Clone, Copy)]
+struct MarginBases {
+    five: usize,
+    three: usize,
+}
+
+/// Bases to add to an end cut under `--overtrim-margin`.
+///
+/// `cut` is the resolved trim at one end, `from_five` says whether that end is
+/// the 5' one, and `[win_lo, win_hi)` is the scanned window in the same frame
+/// as `bases`. The run's own base is the end-scan's anchor
+/// (`bases[win_lo]` for the 5' end, `bases[win_hi - 1]` for the 3' end) — the
+/// homopolymer's base, not the last trimmed base, because the mercy walk's
+/// overshoot can leave a flanking non-run base at the cut.
+///
+/// Returns at most `params.overtrim_margin`, and 0 whenever the cut is 0, the
+/// run base is `N`, or the first candidate base fails either condition.
+#[inline]
+fn margin_extension(
+    bases: &[u8],
+    quals: &[u8],
+    win_lo: usize,
+    win_hi: usize,
+    cut: usize,
+    from_five: bool,
+    params: &Params,
+) -> usize {
+    let n = params.overtrim_margin;
+    if n == 0 || cut == 0 {
+        return 0;
+    }
+    let run_base = if from_five {
+        bases[win_lo]
+    } else {
+        bases[win_hi - 1]
+    };
+    // An N-run is never the base for an extension: an ambiguous call is not a
+    // homopolymer, and extending over it would invent a boundary.
+    if run_base.eq_ignore_ascii_case(&b'N') {
+        return 0;
+    }
+    let mut added = 0usize;
+    while added < n {
+        let idx = if from_five {
+            let i = win_lo + cut + added;
+            if i >= win_hi {
+                break;
+            }
+            i
+        } else {
+            match win_hi.checked_sub(cut + added + 1) {
+                Some(i) if i >= win_lo => i,
+                _ => break,
+            }
+        };
+        let b = bases[idx];
+        if !b.eq_ignore_ascii_case(&run_base) {
+            break;
+        }
+        // Decoded quality, as the scan's own gate decodes it.
+        if quals[idx].saturating_sub(params.phred_offset) >= params.phred_sat {
+            break;
+        }
+        added += 1;
+    }
+    added
 }
 
 /// Output of the streaming walk: state needed by the rest of
@@ -948,30 +1032,38 @@ pub fn polyx_trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimResult {
         params.extra_committed,
         params.original_len,
     )
+    .0
 }
 
 /// Inner implementation. `extra_committed` and `original_len` are passed explicitly
 /// so `trim()` can invoke it without cloning `Params` (avoiding an `Arc` bump on
 /// every adapter-trimmed read — ~15 M atomic ops on a typical Illumina lane).
+///
+/// Returns the trim decision plus the bases `--overtrim-margin` added on each
+/// end, so the pipeline can report them. The margin is already folded into the
+/// returned `t5_poly`/`t3_poly`.
 fn polyx_trim_inner(
     bases: &[u8],
     quals: &[u8],
     params: &Params,
     extra_committed: usize,
     original_len: Option<usize>,
-) -> TrimResult {
+) -> (TrimResult, MarginBases) {
     assert_eq!(bases.len(), quals.len());
     let l = bases.len();
 
     // Preserve existing behavior for very short inputs.
     if l < 2 {
-        return TrimResult::Emit {
-            t5_adapter: 0,
-            t3_adapter: 0,
-            t5_poly: 0,
-            t3_poly: 0,
-            runs: vec![],
-        };
+        return (
+            TrimResult::Emit {
+                t5_adapter: 0,
+                t3_adapter: 0,
+                t5_poly: 0,
+                t3_poly: 0,
+                runs: vec![],
+            },
+            MarginBases::default(),
+        );
     }
 
     let delta_l = {
@@ -1012,24 +1104,30 @@ fn polyx_trim_inner(
 
     // Hard trim alone consumes the read, or leaves nothing scannable.
     if sub_l < 2 {
-        return TrimResult::Drop {
-            reason: DropReason::Hard,
-            t5_adapter: 0,
-            t3_adapter: 0,
-            t5_poly: t_front,
-            t3_poly: t_tail,
-            runs: vec![],
-        };
+        return (
+            TrimResult::Drop {
+                reason: DropReason::Hard,
+                t5_adapter: 0,
+                t3_adapter: 0,
+                t5_poly: t_front,
+                t3_poly: t_tail,
+                runs: vec![],
+            },
+            MarginBases::default(),
+        );
     }
     if t_front + t_tail > delta_l {
-        return TrimResult::Drop {
-            reason: DropReason::Hard,
-            t5_adapter: 0,
-            t3_adapter: 0,
-            t5_poly: t_front,
-            t3_poly: t_tail,
-            runs: vec![],
-        };
+        return (
+            TrimResult::Drop {
+                reason: DropReason::Hard,
+                t5_adapter: 0,
+                t3_adapter: 0,
+                t5_poly: t_front,
+                t3_poly: t_tail,
+                runs: vec![],
+            },
+            MarginBases::default(),
+        );
     }
     let rem_budget = delta_l - (t_front + t_tail);
 
@@ -1137,19 +1235,44 @@ fn polyx_trim_inner(
             Direction::Forward => DropReason::Poly5,
             Direction::Reverse => DropReason::Poly3,
         };
-        return TrimResult::Drop {
-            reason,
-            t5_adapter: 0,
-            t3_adapter: 0,
-            t5_poly: t_front,
-            t3_poly: t_tail,
-            runs: vec![],
-        };
+        return (
+            TrimResult::Drop {
+                reason,
+                t5_adapter: 0,
+                t3_adapter: 0,
+                t5_poly: t_front,
+                t3_poly: t_tail,
+                runs: vec![],
+            },
+            MarginBases::default(),
+        );
     }
-    let first_trim = stream_out.first_trim;
+    let mut first_trim = stream_out.first_trim;
     let h_int = stream_out.h_int;
     let mut runs = stream_out.runs;
     let quality_sum = stream_out.quality_sum;
+
+    // ----- --overtrim-margin (streaming end) -----
+    //
+    // The extension is applied to the resolved end cut BEFORE the reverse pass
+    // and the reconciliation, so it participates in the trim budget exactly
+    // like the run it extends (the reverse pass's own cap is
+    // `rem_budget - first_trim`, and the reconciliation sums both ends).
+    let win_lo = t_front;
+    let win_hi = l - t_tail;
+    let mut margin = MarginBases::default();
+    if first_trim > 0 {
+        let from_five = matches!(dir, Direction::Forward);
+        let add = margin_extension(bases, quals, win_lo, win_hi, first_trim, from_five, params);
+        if add > 0 {
+            first_trim += add;
+            if from_five {
+                margin.five += add;
+            } else {
+                margin.three += add;
+            }
+        }
+    }
 
     // ----- Mean-quality filter -----
     //
@@ -1160,14 +1283,17 @@ fn polyx_trim_inner(
     if let Some(threshold) = params.mean_q {
         let mean = quality_sum as f64 / l as f64;
         if mean < threshold {
-            return TrimResult::Drop {
-                reason: DropReason::MeanQ,
-                t5_adapter: 0,
-                t3_adapter: 0,
-                t5_poly: 0,
-                t3_poly: 0,
-                runs: vec![],
-            };
+            return (
+                TrimResult::Drop {
+                    reason: DropReason::MeanQ,
+                    t5_adapter: 0,
+                    t3_adapter: 0,
+                    t5_poly: 0,
+                    t3_poly: 0,
+                    runs: vec![],
+                },
+                MarginBases::default(),
+            );
         }
     }
 
@@ -1211,14 +1337,17 @@ fn polyx_trim_inner(
                 Direction::Forward => (first_trim, 0),
                 Direction::Reverse => (0, first_trim),
             };
-            return TrimResult::Drop {
-                reason,
-                t5_adapter: 0,
-                t3_adapter: 0,
-                t5_poly: t_front + scan_t5_poly,
-                t3_poly: t_tail + scan_t3_poly,
-                runs: vec![],
-            };
+            return (
+                TrimResult::Drop {
+                    reason,
+                    t5_adapter: 0,
+                    t3_adapter: 0,
+                    t5_poly: t_front + scan_t5_poly,
+                    t3_poly: t_tail + scan_t3_poly,
+                    runs: vec![],
+                },
+                margin,
+            );
         }
         // A budget stop means "the walk consumed Δ_L steps", not "a run
         // extends past it": on a short read a walk of mismatches reaches the
@@ -1234,6 +1363,23 @@ fn polyx_trim_inner(
     } else {
         0
     };
+    // ----- --overtrim-margin (bounded-scan end) -----
+    //
+    // The same extension on the other end. `Direction::Forward` puts the 3'
+    // cut here and `Direction::Reverse` the 5'.
+    let mut second_trim = second_trim;
+    if second_trim > 0 {
+        let from_five = matches!(dir, Direction::Reverse);
+        let add = margin_extension(bases, quals, win_lo, win_hi, second_trim, from_five, params);
+        if add > 0 {
+            second_trim += add;
+            if from_five {
+                margin.five += add;
+            } else {
+                margin.three += add;
+            }
+        }
+    }
 
     // ----- Reconciliation -----
     //
@@ -1262,7 +1408,18 @@ fn polyx_trim_inner(
         };
         let hard = t_front + t_tail;
         let max_poly = scan_t5_poly.max(scan_t3_poly).max(h_int_adj);
-        let reason = if max_poly >= hard {
+        let margin_total = margin.five + margin.three;
+        let reason = if margin_total > 0
+            && (first_trim + second_trim + h_int_adj).saturating_sub(margin_total) <= rem_budget
+        {
+            // The EXTENSION is what broke the budget, not the run: without it
+            // the trim fits. For an end cut the budget and the `--min-len`
+            // floor are the same condition in trim bases (`Δ_L = insert −
+            // floor`, and the emitted length is `insert − trim`), so the
+            // honest reason is the length floor — the read is too short for
+            // the extended cut, not dropped for an artefact.
+            DropReason::Length
+        } else if max_poly >= hard {
             if scan_t5_poly >= scan_t3_poly && scan_t5_poly >= h_int_adj {
                 DropReason::Poly5
             } else if scan_t3_poly >= h_int_adj {
@@ -1273,14 +1430,17 @@ fn polyx_trim_inner(
         } else {
             DropReason::Hard
         };
-        return TrimResult::Drop {
-            reason,
-            t5_adapter: 0,
-            t3_adapter: 0,
-            t5_poly: t_front + scan_t5_poly,
-            t3_poly: t_tail + scan_t3_poly,
-            runs,
-        };
+        return (
+            TrimResult::Drop {
+                reason,
+                t5_adapter: 0,
+                t3_adapter: 0,
+                t5_poly: t_front + scan_t5_poly,
+                t3_poly: t_tail + scan_t3_poly,
+                runs,
+            },
+            margin,
+        );
     }
 
     let (scan_t5_poly, scan_t3_poly) = match dir {
@@ -1296,13 +1456,16 @@ fn polyx_trim_inner(
         })
         .collect();
 
-    TrimResult::Emit {
-        t5_adapter: 0,
-        t3_adapter: 0,
-        t5_poly: t_front + scan_t5_poly,
-        t3_poly: t_tail + scan_t3_poly,
-        runs: abs_runs,
-    }
+    (
+        TrimResult::Emit {
+            t5_adapter: 0,
+            t3_adapter: 0,
+            t5_poly: t_front + scan_t5_poly,
+            t3_poly: t_tail + scan_t3_poly,
+            runs: abs_runs,
+        },
+        margin,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,6 +1483,10 @@ pub struct TrimOutput {
     /// trimmed read and crossed two heap allocations (one here, one in the
     /// stats hash) that bought nothing until the report is printed.
     pub adapter: Option<u8>,
+    /// Bases `--overtrim-margin` added to this read's polyX 5′ cut.
+    pub margin_5: usize,
+    /// Bases it added to the polyX 3′ cut.
+    pub margin_3: usize,
 }
 
 /// Full single-read processing: adapter detection then polyX trimming.
@@ -1431,7 +1598,7 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
 
     // Call the inner implementation directly, passing `Some(insert_len)` so the
     // polyX budget is enforced against the insert — no Params clone.
-    let poly_result = polyx_trim_inner(sub_bases, sub_quals, params, 0, Some(insert_len));
+    let (poly_result, margin) = polyx_trim_inner(sub_bases, sub_quals, params, 0, Some(insert_len));
 
     // --- Step 4: reconstruct absolute coordinates ---
     let result = match poly_result {
@@ -1500,7 +1667,7 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
         other => other,
     };
 
-    TrimOutput { result, adapter }
+    TrimOutput { result, adapter, margin_5: margin.five, margin_3: margin.three }
 }
 // ===========================================================================
 
@@ -2639,5 +2806,467 @@ mod tests {
             n_rejected > 0,
             "tier-1 prefilter never engaged on the randomized corpus"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier-2: boundary-anchored run-span agreement between the two scan paths.
+    // -----------------------------------------------------------------------
+    //
+    // `scan()` reports `run_span = last_match_step + 2` and the streaming walk
+    // tracks `run_span_curr` for the same quantity in its own frame. Both feed
+    // `resolve_trim` / `resolve_subscan`, so a disagreement between them would
+    // make the boundary-anchored cut depend on which end of the read (and
+    // which direction) it is applied to. These tests pin the agreement.
+
+    /// `bio` bases of plain ACGT, ending in a non-`base` character so the
+    /// homopolymer run starts at a clean boundary.
+    fn acgt_bio(len: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        while v.len() < len {
+            v.extend_from_slice(b"ACGT");
+        }
+        v.truncate(len);
+        if v.last() == Some(&b'G') {
+            *v.last_mut().unwrap() = b'A';
+        }
+        v
+    }
+
+    #[test]
+    fn boundary_anchored_run_span_agrees_between_scan_and_streaming_walk() {
+        let p = Params {
+            min_run: 12,
+            scan_interior: false,
+            boundary_anchored: true,
+            ..Default::default()
+        };
+
+        // 5' end, Forward: the streaming walk owns this end.
+        let mut five = vec![b'G'; 14];
+        five.extend_from_slice(b"TC");
+        five.extend_from_slice(&acgt_bio(34));
+        let q5 = vec![40u8; five.len()];
+        let scanned = scan(&five, &q5, 0, five.len() - 1, Direction::Forward, &p, None);
+        assert_eq!(scanned.run_span, 14, "scan() must report the run extent");
+        let cut5 = match polyx_trim(&five, &q5, &p) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(
+            cut5, scanned.run_span,
+            "the streaming 5' cut must equal scan()'s run_span"
+        );
+        // The shipped whole-run/mercy cut really is longer: that overshoot is
+        // what the boundary-anchored cut exists to drop.
+        let whole = match polyx_trim(
+            &five,
+            &q5,
+            &Params {
+                boundary_anchored: false,
+                ..p.clone()
+            },
+        ) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert!(
+            whole > cut5,
+            "mercy cut {} must overshoot the run extent {}",
+            whole,
+            cut5
+        );
+
+        // 3' end, Forward: the bounded scan() pass owns this end.
+        let mut three = acgt_bio(36);
+        three.extend(std::iter::repeat_n(b'G', 14));
+        let q3 = vec![40u8; three.len()];
+        let scanned = scan(&three, &q3, 0, three.len() - 1, Direction::Reverse, &p, None);
+        assert_eq!(scanned.run_span, 14, "scan() must report the run extent");
+        let cut3 = match polyx_trim(&three, &q3, &p) {
+            TrimResult::Emit { t3_poly, .. } => t3_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(
+            cut3, scanned.run_span,
+            "the reverse-pass 3' cut must equal scan()'s run_span"
+        );
+    }
+
+    #[test]
+    fn boundary_anchored_run_span_agrees_in_reverse_direction() {
+        // Direction::Reverse swaps which physical end each pass owns: the
+        // streaming walk takes the 3' end (in the reversed frame) and the
+        // bounded scan() pass takes the 5' end (in the forward frame). The
+        // run-span cut must be identical either way.
+        let p = Params {
+            min_run: 12,
+            scan_interior: false,
+            boundary_anchored: true,
+            direction: Direction::Reverse,
+            ..Default::default()
+        };
+
+        let mut three = acgt_bio(36);
+        three.extend(std::iter::repeat_n(b'G', 14));
+        let q3 = vec![40u8; three.len()];
+        let scanned = scan(&three, &q3, 0, three.len() - 1, Direction::Reverse, &p, None);
+        assert_eq!(scanned.run_span, 14);
+        let cut3 = match polyx_trim(&three, &q3, &p) {
+            TrimResult::Emit { t3_poly, .. } => t3_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut3, scanned.run_span, "streaming 3' cut vs scan() run_span");
+
+        let mut five = vec![b'G'; 14];
+        five.extend_from_slice(b"TC");
+        five.extend_from_slice(&acgt_bio(34));
+        let q5 = vec![40u8; five.len()];
+        let scanned = scan(&five, &q5, 0, five.len() - 1, Direction::Forward, &p, None);
+        assert_eq!(scanned.run_span, 14);
+        let cut5 = match polyx_trim(&five, &q5, &p) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut5, scanned.run_span, "reverse-pass 5' cut vs scan() run_span");
+    }
+
+    #[test]
+    fn boundary_anchored_budget_stop_yields_the_normal_drop_reason() {
+        // `--min-len 34` leaves Δ_L = 6 for polyX on a 40-base read. A run
+        // that consumes the budget must drop with the ordinary polyX reason —
+        // `resolve_subscan`'s `debug_assert!(mode != StopMode::Budget)` forbids
+        // the run-span path from ever being reached on a budget stop.
+        let p = Params {
+            min_run: 6,
+            scan_interior: false,
+            boundary_anchored: true,
+            min_len: MinLen::Abs(34),
+            ..Default::default()
+        };
+        let mut five = vec![b'G'; 20];
+        five.extend_from_slice(b"TC");
+        five.extend_from_slice(&acgt_bio(18));
+        let q = vec![40u8; five.len()];
+        assert!(
+            matches!(
+                polyx_trim(&five, &q, &p),
+                TrimResult::Drop {
+                    reason: DropReason::Poly5,
+                    t5_poly: 0,
+                    t3_poly: 0,
+                    ..
+                }
+            ),
+            "a 5' run that exhausts the budget drops as polyX 5', with no cut"
+        );
+
+        let mut three = acgt_bio(20);
+        three.extend(std::iter::repeat_n(b'G', 20));
+        let q = vec![40u8; three.len()];
+        assert!(
+            matches!(
+                polyx_trim(&three, &q, &p),
+                TrimResult::Drop {
+                    reason: DropReason::Poly3,
+                    t5_poly: 0,
+                    t3_poly: 0,
+                    ..
+                }
+            ),
+            "a 3' run that exhausts the budget drops as polyX 3', with no cut"
+        );
+
+        // And the flag must not change the budget outcome at all.
+        let p_off = Params {
+            boundary_anchored: false,
+            ..p.clone()
+        };
+        assert!(matches!(
+            polyx_trim(&five, &q, &p_off),
+            TrimResult::Drop {
+                reason: DropReason::Poly5,
+                ..
+            }
+        ));
+        assert!(matches!(
+            polyx_trim(&three, &q, &p_off),
+            TrimResult::Drop {
+                reason: DropReason::Poly3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_g_run_boundary_at_every_index_gives_the_exact_polyx_cut() {
+        // A terminal G-run whose start slides across a small read: the
+        // boundary-anchored cut is exactly the run extent at every index, and
+        // the shipped mercy cut overshoots it by exactly the 2 flanking bases
+        // the mercy walk absorbs before Δ_m trips (3 mismatches at 1.5 each on
+        // Q40 bases, against Δ_m = 3).
+        let anchored = Params {
+            min_run: 6,
+            scan_interior: false,
+            boundary_anchored: true,
+            min_len: MinLen::Abs(10),
+            ..Default::default()
+        };
+        let whole = Params {
+            boundary_anchored: false,
+            ..anchored.clone()
+        };
+        let l = 60usize;
+        for t in 6..=30usize {
+            let mut seq = acgt_bio(l - t);
+            assert_ne!(seq.last(), Some(&b'G'), "t={t}: clean run boundary");
+            seq.extend(std::iter::repeat_n(b'G', t));
+            let q = vec![40u8; l];
+            let cut = match polyx_trim(&seq, &q, &anchored) {
+                TrimResult::Emit { t3_poly, .. } => t3_poly,
+                r => panic!("t={t}: unexpected {:?}", r),
+            };
+            assert_eq!(cut, t, "t={t}: the boundary-anchored cut must be the run");
+            let over = match polyx_trim(&seq, &q, &whole) {
+                TrimResult::Emit { t3_poly, .. } => t3_poly,
+                r => panic!("t={t}: unexpected {:?}", r),
+            };
+            assert_eq!(over, t + 2, "t={t}: the mercy cut overshoots by 2 bases");
+        }
+    }
+
+    #[test]
+    fn a_g_run_merged_with_a_biological_g_is_one_run_and_a_non_g_boundary_ends_it() {
+        let p = Params {
+            min_run: 12,
+            scan_interior: false,
+            boundary_anchored: true,
+            min_len: MinLen::Abs(5),
+            ..Default::default()
+        };
+        let run = 12usize;
+        let mut bio = Vec::new();
+        while bio.len() < 30 {
+            bio.extend_from_slice(b"TCAG");
+        }
+        bio.truncate(30);
+
+        // A biological G at the cut point is indistinguishable from the
+        // artefact run, so the run genuinely extends over it.
+        let mut merged = bio.clone();
+        merged[29] = b'G';
+        merged.extend(std::iter::repeat_n(b'G', run));
+        let q = vec![40u8; merged.len()];
+        let cut = match polyx_trim(&merged, &q, &p) {
+            TrimResult::Emit { t3_poly, .. } => t3_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut, run + 1, "a boundary G merges into the run");
+
+        // A non-G boundary ends the run exactly at the artefact.
+        let mut split = bio.clone();
+        split[29] = b'C';
+        split.extend(std::iter::repeat_n(b'G', run));
+        let q = vec![40u8; split.len()];
+        let cut = match polyx_trim(&split, &q, &p) {
+            TrimResult::Emit { t3_poly, .. } => t3_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut, run, "a non-G boundary ends the run at the artefact");
+    }
+
+    // -----------------------------------------------------------------------
+    // --overtrim-margin: extending a qualifying end cut over further copies of
+    // the run's base at sub-saturation quality.
+    // -----------------------------------------------------------------------
+
+    /// A read whose 5' end carries a `run`-base homopolymer followed by two
+    /// mismatching flank bases and then `ext` bases at quality `ext_q`. The
+    /// shipped mercy cut lands 2 bases into the flank, so `ext` sits
+    /// immediately past the cut — exactly where the margin looks.
+    fn margin_fixture(run: u8, ext: &[u8], ext_q: u8, bio_len: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut b = vec![run; 12];
+        b.extend_from_slice(b"TC");
+        let ext_start = b.len();
+        b.extend_from_slice(ext);
+        let ext_end = b.len();
+        b.extend_from_slice(&acgt_bio(bio_len));
+        let mut q = vec![40u8; b.len()];
+        for x in q.iter_mut().take(ext_end).skip(ext_start) {
+            *x = ext_q;
+        }
+        (b, q)
+    }
+
+    fn margin_params(n: usize) -> Params {
+        Params {
+            min_run: 12,
+            scan_interior: false,
+            min_len: MinLen::Abs(4),
+            overtrim_margin: n,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn margin_extends_a_same_base_low_quality_flank_up_to_n() {
+        // 12 G + "TC" + three low-quality G's: the mercy cut is 14, and the
+        // three G's sit immediately past it.
+        let (b, q) = margin_fixture(b'G', b"GGG", 0, 20);
+        let cut = |n: usize| match polyx_trim(&b, &q, &margin_params(n)) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut(0), 14, "the base cut is the mercy walk's end");
+        assert_eq!(cut(1), 15, "N=1 extends by exactly one base");
+        assert_eq!(cut(2), 16, "N=2 extends by two bases");
+    }
+
+    #[test]
+    fn margin_stops_at_a_high_quality_flank() {
+        // Same shape, but the flank is called at Q40: a saturated call is not
+        // the low-quality tail the margin exists for.
+        let (b, q) = margin_fixture(b'G', b"GGG", 40, 20);
+        let cut = match polyx_trim(&b, &q, &margin_params(2)) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut, 14, "a high-quality flank stops the extension");
+    }
+
+    #[test]
+    fn margin_stops_at_a_different_base_flank() {
+        let (b, q) = margin_fixture(b'G', b"AAA", 0, 20);
+        let cut = match polyx_trim(&b, &q, &margin_params(2)) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut, 14, "only the run's own base may be extended through");
+    }
+
+    #[test]
+    fn margin_never_extends_through_an_n_base() {
+        // An N base is not the run's base, even at Q0.
+        let (b, q) = margin_fixture(b'G', b"NGG", 0, 20);
+        let cut = match polyx_trim(&b, &q, &margin_params(2)) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut, 14, "an N base is never extended through");
+    }
+
+    #[test]
+    fn margin_never_uses_an_n_run_as_the_extension_base() {
+        // A run of N's does qualify as a homopolymer (N == N), but its base is
+        // not a base: it must never seed an extension.
+        let mut b = vec![b'N'; 12];
+        b.extend_from_slice(b"TC");
+        b.extend_from_slice(b"NN");
+        b.extend_from_slice(&acgt_bio(20));
+        let mut q = vec![40u8; b.len()];
+        for x in q.iter_mut().take(16).skip(14) {
+            *x = 0;
+        }
+        let cut = match polyx_trim(&b, &q, &margin_params(2)) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut, 14, "an N-run is never the run base for an extension");
+    }
+
+    #[test]
+    fn margin_does_not_create_a_cut_where_the_base_cut_is_zero() {
+        // No qualifying run at either end: the margin must add nothing.
+        let b = acgt_bio(40);
+        let q = vec![40u8; b.len()];
+        match polyx_trim(&b, &q, &margin_params(2)) {
+            TrimResult::Emit {
+                t5_poly, t3_poly, ..
+            } => assert_eq!((t5_poly, t3_poly), (0, 0), "0 + margin must stay 0"),
+            r => panic!("unexpected {:?}", r),
+        }
+    }
+
+    #[test]
+    fn margin_extends_both_ends() {
+        // A run at each end, each with three low-quality same-base bases just
+        // past its cut.
+        let mut b = vec![b'G'; 12];
+        b.extend_from_slice(b"TC");
+        b.extend_from_slice(b"GGG");
+        b.extend_from_slice(&acgt_bio(10));
+        b.extend_from_slice(b"GGG");
+        b.extend_from_slice(b"TC");
+        b.extend(std::iter::repeat_n(b'G', 12));
+        let l = b.len();
+        let mut q = vec![40u8; l];
+        for x in q.iter_mut().take(17).skip(14) {
+            *x = 0;
+        }
+        for x in q.iter_mut().take(l - 14).skip(l - 17) {
+            *x = 0;
+        }
+        let p = Params {
+            min_run: 12,
+            scan_interior: false,
+            min_len: MinLen::Abs(4),
+            overtrim_margin: 2,
+            ..Default::default()
+        };
+        match polyx_trim(&b, &q, &p) {
+            TrimResult::Emit {
+                t5_poly, t3_poly, ..
+            } => assert_eq!(
+                (t5_poly, t3_poly),
+                (16, 16),
+                "both ends extend by N over their own run base"
+            ),
+            r => panic!("unexpected {:?}", r),
+        }
+    }
+
+    #[test]
+    fn margin_that_pushes_under_the_min_len_floor_drops_as_length() {
+        // L = 37, --min-len 22 leaves Δ_L = 15: the unextended cut of 14 fits,
+        // the N=1 cut of 15 fits exactly, and the N=2 cut of 16 does not. The
+        // read must be dropped for LENGTH — the trim was a legitimate run, and
+        // emitting it would silently violate the floor.
+        let (b, q) = margin_fixture(b'G', b"GGG", 0, 20);
+        assert_eq!(b.len(), 37);
+        let p = |n: usize| Params {
+            min_run: 12,
+            scan_interior: false,
+            min_len: MinLen::Abs(22),
+            overtrim_margin: n,
+            ..Default::default()
+        };
+        assert!(matches!(
+            polyx_trim(&b, &q, &p(0)),
+            TrimResult::Emit { t5_poly: 14, .. }
+        ));
+        assert!(matches!(
+            polyx_trim(&b, &q, &p(1)),
+            TrimResult::Emit { t5_poly: 15, .. }
+        ));
+        assert!(
+            matches!(
+                polyx_trim(&b, &q, &p(2)),
+                TrimResult::Drop {
+                    reason: DropReason::Length,
+                    ..
+                }
+            ),
+            "the margin must go through the length drop, not emit under the floor"
+        );
+    }
+
+    #[test]
+    fn margin_is_off_by_default() {
+        assert_eq!(Params::default().overtrim_margin, 0);
+        let (b, q) = margin_fixture(b'G', b"GGG", 0, 20);
+        let cut = match polyx_trim(&b, &q, &margin_params(0)) {
+            TrimResult::Emit { t5_poly, .. } => t5_poly,
+            r => panic!("unexpected {:?}", r),
+        };
+        assert_eq!(cut, 14, "the default extends nothing");
     }
 }

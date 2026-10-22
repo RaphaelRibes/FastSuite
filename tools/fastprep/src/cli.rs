@@ -280,6 +280,22 @@ pub struct Cli {
           help_heading = "Adapter Trimming")]
     pub adapter_evidence: crate::adapter::AdapterEvidence,
 
+    /// Take the smallest insert when the mate overlap is ambiguous.
+    ///
+    /// The overlap detector refuses an alignment that verifies at more than one
+    /// insert size (a repeated fragment): choosing would be a guess. With this
+    /// flag it chooses anyway — the SMALLEST verifying insert, i.e. the largest
+    /// readthrough — but only when the adapter-checked boundary guard confirms
+    /// that adapter starts exactly behind it on the pinned mate. Any other
+    /// ambiguous pair keeps today's refusal.
+    ///
+    /// The guard still needs an adapter set: with none, the boundary is refused
+    /// outright whatever this flag says (DECISIONS.md D-14).
+    ///
+    /// The default is off (ambiguity refuses).
+    #[arg(long, help_heading = "Adapter Trimming")]
+    pub pe_ambiguous_smallest: bool,
+
     /// Retry the adapter match before a terminal no-signal G-run.
     ///
     /// NovaSeq's two-colour overprint replaces the last bases of a read with
@@ -351,6 +367,25 @@ pub struct Cli {
     #[arg(long, value_name = "FACTOR", default_value_t = 0,
           requires = "adapter_short_tail", help_heading = "Adapter Trimming")]
     pub adapter_min_enrichment: u32,
+
+    /// Prefer the LONGEST corroborated short-tail candidate instead of the
+    /// shortest.
+    ///
+    /// `--adapter-short-tail` enumerates nested EXACT adapter prefixes and
+    /// trims the shortest corroborated one: the smaller claim about how much
+    /// of the read is adapter. With this flag the longest corroborated
+    /// candidate wins instead, so a tail whose whole length is adapter is
+    /// removed whole rather than down to the first corroborated prefix.
+    ///
+    /// Which bias is right is a property of the library: shortest-wins is the
+    /// conservative one where trimming biology costs more than leaving
+    /// adapter, longest-wins where residual adapter costs more than the
+    /// residual chance of an exact longer prefix. Neither mode accepts an
+    /// uncorroborated candidate.
+    ///
+    /// The default is off (shortest wins).
+    #[arg(long, requires = "adapter_short_tail", help_heading = "Adapter Trimming")]
+    pub short_tail_longest: bool,
 
 
     // -------------------------------------------------------- PolyX trimming
@@ -448,6 +483,25 @@ pub struct Cli {
     /// that much. This trims exactly the run extent, dropping the overshoot.
     #[arg(long, help_heading = "PolyX Trimming")]
     pub boundary_anchored: bool,
+
+    /// After a qualifying polyX end cut, extend it by up to N bases toward the
+    /// read interior while each extension base is the run's own base (case
+    /// insensitive) AND is called below --phred-sat.
+    ///
+    /// The shipped mercy cut already overshoots a clean run by ~2 flanking
+    /// bases, so on a read whose run is followed by more of the same base at
+    /// low quality the cut stops short of the artefact evidence. This extends
+    /// it, one base at a time, over nothing but same-base low-quality calls.
+    ///
+    /// Accepted values are 0, 1 and 2. `0` (the default) disables the
+    /// extension, leaving every existing behaviour unchanged. An interior run
+    /// is never touched, a cut of 0 stays 0, `N` is never the run base nor an
+    /// extension base, and an extension that would push the emitted read under
+    /// --min-len drops the read (DropReason::Length) rather than violating the
+    /// floor.
+    #[arg(long, value_name = "N", default_value_t = 0,
+          value_parser = parse_overtrim_margin, help_heading = "PolyX Trimming")]
+    pub overtrim_margin: usize,
 
     // ------------------------------------------------------- Quality filtering
     /// Minimum whole-read mean Phred quality (raw, not ASCII offset).
@@ -678,6 +732,10 @@ pub struct Runtime {
     /// accepts a tail shorter than `min_adapter_overlap_se`, because the mate
     /// geometry already fixed the boundary.
     pub adapter_evidence: crate::adapter::AdapterEvidence,
+    /// `--pe-ambiguous-smallest`: let the overlap detector resolve an ambiguous
+    /// alignment to the smallest verifying insert, when the boundary guard
+    /// confirms adapter behind it. `false` (the default) keeps the refusal.
+    pub pe_ambiguous_smallest: bool,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
     pub dedup: Option<DedupConfig>,
@@ -856,9 +914,10 @@ impl Cli {
         // bare spelling maps to `always`, so it still refuses as it always did.
         if !paired && (self.singletons1.is_some() || self.singletons2.is_some()
             || self.r1_scan_reverse || self.r2_scan_reverse
+            || self.pe_ambiguous_smallest
             || self.pe_overlap != PeOverlapMode::Auto)
         {
-            bail!("--singletons*, --r1-scan-reverse, --r2-scan-reverse and --pe-overlap apply to paired-end mode only");
+            bail!("--singletons*, --r1-scan-reverse, --r2-scan-reverse, --pe-overlap and --pe-ambiguous-smallest apply to paired-end mode only");
         }
 
         // Numeric ranges.
@@ -1037,6 +1096,7 @@ impl Cli {
             scan_3: !self.no_3,
             scan_interior: self.interior || !self.no_interior,
             boundary_anchored: self.boundary_anchored,
+            overtrim_margin: self.overtrim_margin,
             direction: Direction::Forward,
             mean_q: if self.no_mean_q { None } else { self.mean_q },
             trim_5: self.trim_5,
@@ -1077,6 +1137,7 @@ impl Cli {
                     n_ref: 10,
                     enrichment,
                     min_factor: self.adapter_min_enrichment as f64,
+                    longest_wins: self.short_tail_longest,
                 }
             }),
             // Set per pair in `pair_chunks` when `--pe-overlap` fires; `None`
@@ -1230,6 +1291,7 @@ impl Cli {
             adapter_source,
             pe_overlap,
             adapter_evidence: self.adapter_evidence,
+            pe_ambiguous_smallest: self.pe_ambiguous_smallest,
             dedup,
             adapter_error_rate: self.adapter_error_rate,
             min_adapter_overlap_se: self.min_adapter_overlap,
@@ -1238,6 +1300,22 @@ impl Cli {
 
         Ok((mode, runtime))
     }
+}
+
+/// `--overtrim-margin` accepts 0, 1 and 2 only.
+///
+/// A hard cap rather than a range: the extension fires on reads whose end cut
+/// already overshot a run, so every base of margin spends biology, and the
+/// useful range was measured at 0-2. Anything larger is a different feature
+/// (a run-base overtrim policy), not a bigger knob on this one.
+fn parse_overtrim_margin(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("--overtrim-margin: {s:?} is not a non-negative integer"))?;
+    if n > 2 {
+        return Err(format!("--overtrim-margin must be 0, 1 or 2 (got {n})"));
+    }
+    Ok(n)
 }
 
 fn build_match_rule(letters: &[char]) -> Result<MatchRule> {
@@ -1483,6 +1561,137 @@ mod tests {
         assert_eq!(rt.pe_overlap, PeOverlapMode::Always);
 
         std::fs::remove_file(&inp).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_three_new_trimming_flags_default_off() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["fastprep", "-1", "in.fq", "-o", "out.fq"]);
+        assert_eq!(cli.overtrim_margin, 0, "--overtrim-margin defaults to 0 (off)");
+        assert!(!cli.short_tail_longest, "--short-tail-longest defaults off");
+        assert!(
+            !cli.pe_ambiguous_smallest,
+            "--pe-ambiguous-smallest defaults off"
+        );
+    }
+
+    #[test]
+    fn overtrim_margin_accepts_zero_to_two_and_refuses_more() {
+        use clap::Parser;
+        for n in 0..=2usize {
+            let cli = Cli::parse_from([
+                "fastprep",
+                "-1",
+                "in.fq",
+                "-o",
+                "out.fq",
+                "--overtrim-margin",
+                &n.to_string(),
+            ]);
+            assert_eq!(cli.overtrim_margin, n);
+        }
+        for bad in ["3", "9", "-1", "x"] {
+            assert!(
+                Cli::try_parse_from([
+                    "fastprep",
+                    "-1",
+                    "in.fq",
+                    "-o",
+                    "out.fq",
+                    "--overtrim-margin",
+                    bad,
+                ])
+                .is_err(),
+                "--overtrim-margin {bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn short_tail_longest_requires_the_short_tail_path() {
+        use clap::Parser;
+        assert!(
+            Cli::try_parse_from([
+                "fastprep",
+                "-1",
+                "in.fq",
+                "-o",
+                "out.fq",
+                "--short-tail-longest",
+            ])
+            .is_err(),
+            "--short-tail-longest means nothing without --adapter-short-tail"
+        );
+        let cli = Cli::parse_from([
+            "fastprep",
+            "-1",
+            "in.fq",
+            "-o",
+            "out.fq",
+            "--adapter-short-tail",
+            "6",
+            "--short-tail-longest",
+        ]);
+        assert!(cli.short_tail_longest);
+    }
+
+    /// A flag that parses but is never wired into `Params`/`ShortTail`/
+    /// `Runtime` is a silent no-op: this is the end-to-end check that each of
+    /// the three new flags actually reaches the code that acts on it.
+    #[test]
+    fn finalize_wires_the_new_trimming_flags() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("fastprep-new-flags-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inp = dir.join("in.fq");
+        let inp2 = dir.join("in2.fq");
+        let out = dir.join("out.fq");
+        let out2 = dir.join("out2.fq");
+        let body = "@r0\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+        std::fs::write(&inp, body).unwrap();
+        std::fs::write(&inp2, body).unwrap();
+
+        let (mode, rt) = Cli::parse_from([
+            "fastprep",
+            "-1",
+            inp.to_str().unwrap(),
+            "-2",
+            inp2.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "-p",
+            out2.to_str().unwrap(),
+            "--no-dedup",
+            "--no-auto-phred",
+            "-q",
+            "--adapter-preset",
+            "illumina",
+            "--overtrim-margin",
+            "2",
+            "--adapter-short-tail",
+            "6",
+            "--short-tail-longest",
+            "--pe-ambiguous-smallest",
+        ])
+        .finalize()
+        .unwrap();
+
+        let params = match mode {
+            Mode::Paired { params_r1, .. } => params_r1,
+            _ => panic!("paired-end mode expected"),
+        };
+        assert_eq!(params.overtrim_margin, 2, "--overtrim-margin must reach Params");
+        let st = params
+            .short_tail
+            .as_ref()
+            .expect("--adapter-short-tail must build a ShortTail");
+        assert!(st.longest_wins, "--short-tail-longest must reach the ShortTail");
+        assert!(
+            rt.pe_ambiguous_smallest,
+            "--pe-ambiguous-smallest must reach the Runtime"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

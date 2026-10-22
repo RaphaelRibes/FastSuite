@@ -180,6 +180,24 @@ pub fn detect_pe_overlap(
     r2: &[u8],
     anchor: usize,
 ) -> Option<(usize /* mate */, usize /* readthrough */)> {
+    detect_pe_overlap_with(r1, r2, anchor, None)
+}
+
+/// [`detect_pe_overlap`] with an optional boundary policy.
+///
+/// `boundary` is `Some((set, evidence))` only when the caller has an adapter
+/// set to check a boundary against AND has opted into
+/// `--pe-ambiguous-smallest`. It changes exactly one thing: an ambiguous
+/// alignment no longer refuses outright, and the SMALLEST verifying insert is
+/// taken instead — but only when `readthrough_is_adapter` confirms adapter
+/// immediately behind that boundary. With `None`, every decision is the one
+/// this module always made.
+fn detect_pe_overlap_with(
+    r1: &[u8],
+    r2: &[u8],
+    anchor: usize,
+    boundary: Option<(&crate::adapter::AdapterSet, crate::adapter::AdapterEvidence)>,
+) -> Option<(usize /* mate */, usize /* readthrough */)> {
     if anchor < 2 {
         return None;
     }
@@ -204,7 +222,7 @@ pub fn detect_pe_overlap(
         revcomp_into(r2, &mut rc2);
         // `rc2` is borrowed for the scan; reborrow immutably so the loop below
         // reads the same code path it always did.
-        detect_with_rc2(r1, l1, &rc2, anchor, max_insert)
+        detect_with_rc2(r1, l1, &rc2, anchor, max_insert, boundary)
     })
 }
 
@@ -215,6 +233,7 @@ fn detect_with_rc2(
     rc2: &[u8],
     anchor: usize,
     max_insert: usize,
+    boundary: Option<(&crate::adapter::AdapterSet, crate::adapter::AdapterEvidence)>,
 ) -> Option<(usize, usize)> {
     let l2 = rc2.len();
     // Candidate overlap `o`: R1's prefix of length `o` against the SUFFIX of
@@ -239,7 +258,14 @@ fn detect_with_rc2(
     // single hit and refuse as soon as a second appears. That removes a
     // per-pair allocation (Task 2.7) and stops the scan early on ambiguity
     // instead of collecting all of it first.
+    //
+    // With `boundary` set, the second hit is not an immediate refusal: the
+    // scan runs largest-first, so keeping the last hit leaves the SMALLEST
+    // verifying insert (the largest readthrough), which is what
+    // `--pe-ambiguous-smallest` asks for — and it is checked against the
+    // adapter below before it is returned.
     let mut found: Option<usize> = None;
+    let mut ambiguous = false;
     for o in (anchor..=max_insert).rev() {
         if !anchor_matches(&r1[o - anchor..o], &rc2[l2 - anchor..]) {
             continue;
@@ -248,9 +274,12 @@ fn detect_with_rc2(
             continue;
         }
         if found.is_some() {
-            // Ambiguity: more than one insert size verifies. Refuse rather
-            // than choose.
-            return None;
+            if boundary.is_none() {
+                // Ambiguity: more than one insert size verifies. Refuse
+                // rather than choose.
+                return None;
+            }
+            ambiguous = true;
         }
         found = Some(o);
     }
@@ -258,6 +287,22 @@ fn detect_with_rc2(
     // A boundary of 0 is no boundary at all: the read is entirely insert.
     if o >= l1 {
         return None;
+    }
+    if ambiguous {
+        // The ambiguity was resolved by a policy, so the chosen (smallest)
+        // boundary has to earn its place: adapter must start exactly there on
+        // the pinned mate, under the same evidence policy a unique detection
+        // is checked with.
+        match boundary {
+            Some((set, evidence)) => {
+                if !readthrough_is_adapter(r1, l1 - o, set, evidence) {
+                    return None;
+                }
+            }
+            // Unreachable: `ambiguous` is only ever set when `boundary` is
+            // `Some`, and the `None` arm above returns first.
+            None => return None,
+        }
     }
     Some((1, l1 - o))
 }
@@ -294,6 +339,7 @@ pub fn detect_pe_overlap_trim(
         anchor,
         adapter_set,
         crate::adapter::AdapterEvidence::Floor,
+        false,
     )
 }
 
@@ -331,15 +377,35 @@ pub const MIN_BOUNDARY_TAIL: usize = 3;
 /// be the adapter prefix too (TruSeq/R2 for R2, not the same sequence as
 /// R1's). Two independent 5-base matches at chance would need ~1e-6 of
 /// pairs to collide, which is the level the Cell A guard requires.
+///
+/// `ambiguous_smallest` (`--pe-ambiguous-smallest`) lifts the detector's
+/// ambiguity refusal — a repeated fragment that verifies at several insert
+/// sizes — but only for a boundary the guard still accepts: the SMALLEST
+/// verifying insert wins when adapter starts exactly behind it, and anything
+/// else keeps today's refusal. It needs a set to check against, so it can
+/// never bypass the D-14 refusal above.
 pub fn detect_pe_overlap_trim_with(
     r1: &[u8],
     r2: &[u8],
     anchor: usize,
     adapter_set: Option<&crate::adapter::AdapterSet>,
     evidence: crate::adapter::AdapterEvidence,
+    ambiguous_smallest: bool,
 ) -> Option<((usize, usize), (usize, usize))> {
-    let (_, t3_1) = detect_pe_overlap(r1, r2, anchor)?;
+    // The guard needs the set, so the set is resolved FIRST: with no set there
+    // is nothing to check a boundary against, and the mode must not apply one
+    // (D-14). `ambiguous_smallest` only chooses BETWEEN boundaries the guard
+    // accepts, so it can never bypass this refusal.
     let set = adapter_set?;
+    // `--pe-ambiguous-smallest` is the only thing that lets the detector look
+    // past the first ambiguity, and even then only because a set is available
+    // to corroborate the boundary it would choose.
+    let boundary = if ambiguous_smallest {
+        Some((set, evidence))
+    } else {
+        None
+    };
+    let (_, t3_1) = detect_pe_overlap_with(r1, r2, anchor, boundary)?;
     // R1's readthrough is `l1 - I`, so the insert is `l1 - t3_1`.
     let insert = r1.len().checked_sub(t3_1)?;
     let t3_2 = r2.len().saturating_sub(insert);
@@ -777,6 +843,152 @@ mod tests {
         assert!(
             readthrough_is_adapter(&seq, 6, &set, AdapterEvidence::Boundary),
             "the boundary policy accepts an exact 6-base tail"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // --pe-ambiguous-smallest: choosing between several verifying inserts.
+    // -----------------------------------------------------------------------
+
+    /// A pair whose shared window is a 10-base period repeated, so several
+    /// insert sizes verify (o = 20, 30, 40 at least): the ambiguity the flag
+    /// exists for. `r1` is the period five times over, which makes the
+    /// SMALLEST verifying boundary (o = 20) sit exactly on the start of an
+    /// adapter built from the same period.
+    fn periodic_ambiguous_pair(period: &[u8; 10]) -> (Vec<u8>, Vec<u8>) {
+        let mut r1 = Vec::new();
+        for _ in 0..5 {
+            r1.extend_from_slice(period);
+        }
+        // `rc2[10..50]` is R1's first 40 bases (the paper's identity);
+        // `rc2[0..10]` is free, and is what makes o = 50 a chance hit.
+        let mut rc2 = dna(10, 0xABCD);
+        rc2.extend_from_slice(&r1[..40]);
+        let r2: Vec<u8> = rc2.iter().rev().map(|&b| comp(b)).collect();
+        (r1, r2)
+    }
+
+    #[test]
+    fn an_ambiguous_overlap_without_adapter_behind_it_refuses_in_both_modes() {
+        let (r1, r2) = periodic_ambiguous_pair(b"ACGTACGTAC");
+        // Nothing is ligated at the boundary: neither mode may apply it.
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "unrelated".into(),
+                seq: dna(30, 0x1234),
+            }],
+            0.1,
+            4,
+        );
+        for flag in [false, true] {
+            assert_eq!(
+                detect_pe_overlap_trim_with(
+                    &r1,
+                    &r2,
+                    ANCHOR,
+                    Some(&set),
+                    AdapterEvidence::Floor,
+                    flag
+                ),
+                None,
+                "flag={flag}: an ambiguous overlap with no adapter behind it refuses"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_overlap_takes_the_smallest_insert_only_with_the_flag() {
+        let period = b"ACGTACGTAC";
+        let (r1, r2) = periodic_ambiguous_pair(period);
+        // The adapter is the period three times over: `r1[20..50]` is exactly
+        // its 30-base prefix, so the smallest insert's boundary IS adapter.
+        let mut adapter = Vec::new();
+        for _ in 0..3 {
+            adapter.extend_from_slice(period);
+        }
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "three-period".into(),
+                seq: adapter,
+            }],
+            0.1,
+            4,
+        );
+        assert_eq!(
+            detect_pe_overlap_trim_with(
+                &r1,
+                &r2,
+                ANCHOR,
+                Some(&set),
+                AdapterEvidence::Floor,
+                false
+            ),
+            None,
+            "flag off: several verifying inserts still refuse (today's behaviour)"
+        );
+        assert_eq!(
+            detect_pe_overlap_trim_with(
+                &r1,
+                &r2,
+                ANCHOR,
+                Some(&set),
+                AdapterEvidence::Floor,
+                true
+            ),
+            Some(((0, 30), (0, 30))),
+            "flag on: the smallest insert (largest readthrough) wins"
+        );
+    }
+
+    #[test]
+    fn a_unique_insert_size_behaves_identically_with_and_without_the_flag() {
+        let frag = dna(60, 17);
+        let adapter = dna(120, 99);
+        let mut r1 = frag.clone();
+        r1.extend_from_slice(&adapter[..90]);
+        let mut r2: Vec<u8> = frag.iter().rev().map(|&b| comp(b)).collect();
+        r2.extend_from_slice(&adapter[..40]);
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "long".into(),
+                seq: adapter.clone(),
+            }],
+            0.2,
+            4,
+        );
+        let off = detect_pe_overlap_trim_with(
+            &r1,
+            &r2,
+            ANCHOR,
+            Some(&set),
+            AdapterEvidence::Floor,
+            false,
+        );
+        assert_eq!(off, Some(((0, 90), (0, 40))), "the unique insert is found");
+        assert_eq!(
+            detect_pe_overlap_trim_with(
+                &r1,
+                &r2,
+                ANCHOR,
+                Some(&set),
+                AdapterEvidence::Floor,
+                true
+            ),
+            off,
+            "a unique insert size is unaffected by the flag"
+        );
+    }
+
+    #[test]
+    fn no_adapter_set_refuses_the_ambiguous_boundary_even_with_the_flag() {
+        // D-14: the guard is structural, not a flag default. With no set to
+        // check the boundary against, the mode must not apply one — the flag
+        // only chooses BETWEEN boundaries the guard already accepts.
+        let (r1, r2) = periodic_ambiguous_pair(b"ACGTACGTAC");
+        assert_eq!(
+            detect_pe_overlap_trim_with(&r1, &r2, ANCHOR, None, AdapterEvidence::Floor, true),
+            None,
+            "no adapter set ⇒ no boundary, whatever the flag says"
         );
     }
 }

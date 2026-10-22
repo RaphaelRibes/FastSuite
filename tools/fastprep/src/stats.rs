@@ -142,6 +142,12 @@ pub struct Stats {
     /// Post-trim length below `--min-len` (distinct from the trim budget: this
     /// one fires on reads that were simply too short to begin with).
     pub reads_dropped_length: u64,
+    /// Bases `--overtrim-margin` added to 5′ polyX cuts (aggregate only).
+    pub margin_bases_5p: u64,
+    /// Bases it added to 3′ polyX cuts.
+    pub margin_bases_3p: u64,
+    /// Reads on which the extension fired at least once.
+    pub reads_with_margin: u64,
     /// Phred offset actually used to decode this mate's quality bytes.
     pub phred_offset: u8,
     /// Assumptions the run made. Reported at the top level of the JSON and in
@@ -197,6 +203,20 @@ impl Stats {
         self.bases_trimmed_5 + self.bases_trimmed_3
     }
 
+    /// Count one read's `--overtrim-margin` extension: the bases it added on
+    /// each end, and whether it added any at all.
+    ///
+    /// Aggregate only — there is no per-read record of where the margin fell,
+    /// and nothing in the report depends on one. `reads_with_margin` counts a
+    /// read once however many bases it extended by, on either end.
+    pub fn record_margin(&mut self, m5: usize, m3: usize) {
+        self.margin_bases_5p += m5 as u64;
+        self.margin_bases_3p += m3 as u64;
+        if m5 + m3 > 0 {
+            self.reads_with_margin += 1;
+        }
+    }
+
     /// The flat `metrics` block for one mate (single-end, or one side of a
     /// paired run). Nothing structured goes in here: the per-adapter counts
     /// stay under the `legacy` block, per REPORT-SCHEMA.md rule 1.
@@ -218,6 +238,11 @@ impl Stats {
             "reads_dropped_duplicate": self.reads_dropped_duplicate,
             "reads_dropped_length": self.reads_dropped_length,
             "reads_adapter_trimmed": self.adapter.reads_trimmed,
+            // --overtrim-margin, aggregate only (REPORT-SCHEMA v1 rule 1:
+            // additive numeric metrics keep the schema at v1).
+            "margin_bases_5p": self.margin_bases_5p,
+            "margin_bases_3p": self.margin_bases_3p,
+            "reads_with_margin": self.reads_with_margin,
             "phred_offset": self.phred_offset,
             // Task 2.9: run-level, not a counter. In the paired report these
             // are inserted once instead of summed, because busy cores describe
@@ -578,5 +603,40 @@ mod tests {
         assert_eq!(v["reads_trimmed"], 3);
         assert_eq!(v["bases_trimmed_5"], 7);
         assert_eq!(v["bases_trimmed_3"], 17);
+    }
+
+    /// The `--overtrim-margin` counters are aggregate-only. They ride the v1
+    /// `metrics` namespace — REPORT-SCHEMA.md's versioning rule says adding a
+    /// metric is a minor change, and rule 1 keeps `metrics` a flat numeric
+    /// namespace, which three integer counters are — and they appear in the
+    /// preserved raw object under `legacy` as well, so a consumer written
+    /// against either shape can read them.
+    #[test]
+    fn margin_counters_are_reported_in_metrics_and_legacy() {
+        let mut s = Stats::default();
+        s.record_margin(2, 3);
+        s.record_margin(0, 0);
+        s.record_margin(1, 0);
+        assert_eq!(s.margin_bases_5p, 3);
+        assert_eq!(s.margin_bases_3p, 3);
+        assert_eq!(s.reads_with_margin, 2, "a read with no margin is not counted");
+
+        let ctx = ReportContext {
+            mode: "single",
+            dry_run: false,
+            elapsed: Duration::from_secs(1),
+            inputs: serde_json::json!({}),
+            outputs: serde_json::json!({}),
+            dedup: None,
+            threads: 1,
+        };
+        let doc = to_report_v1("0.1.0", "fastprep -1 in.fq -o out.fq", &ctx, &s);
+        assert_eq!(doc["schema"], REPORT_SCHEMA);
+        assert_eq!(doc["metrics"]["margin_bases_5p"], 3);
+        assert_eq!(doc["metrics"]["margin_bases_3p"], 3);
+        assert_eq!(doc["metrics"]["reads_with_margin"], 2);
+        assert_eq!(doc["legacy"]["margin_bases_5p"], 3);
+        assert_eq!(doc["legacy"]["margin_bases_3p"], 3);
+        assert_eq!(doc["legacy"]["reads_with_margin"], 2);
     }
 }

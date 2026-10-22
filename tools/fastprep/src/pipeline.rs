@@ -656,6 +656,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 };
                 stats.record(seq.len(), result, p.output.adapter);
                 if !dup {
+                    stats.record_margin(p.output.margin_5, p.output.margin_3);
                     if let Some(w) = writer.as_mut() {
                         p.emit_to(&res_buf, w)?;
                     }
@@ -697,6 +698,7 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
                 &p.output.result,
                 p.output.adapter,
             );
+            stats.record_margin(p.output.margin_5, p.output.margin_3);
             if io_result.is_ok() {
                 if let Some(w) = writer.as_mut() {
                     let _ = p.emit_to(&res_buf, w);
@@ -904,6 +906,7 @@ pub fn run_paired(
     let thread_pool = rt.thread_pool.clone();
     let pe_overlap = rt.pe_overlap;
     let adapter_evidence = rt.adapter_evidence;
+    let pe_ambiguous_smallest = rt.pe_ambiguous_smallest;
     let compute = std::thread::spawn(move || {
         while let Ok(((b1, c1), (b2, c2))) = raw_rx.recv() {
             let results = match thread_pool.as_ref() {
@@ -919,6 +922,7 @@ pub fn run_paired(
                         pe_overlap,
                         pe_anchor,
                         adapter_evidence,
+                        pe_ambiguous_smallest,
                     )
                 }),
                 None => pair_chunks(
@@ -932,6 +936,7 @@ pub fn run_paired(
                     pe_overlap,
                     pe_anchor,
                     adapter_evidence,
+                    pe_ambiguous_smallest,
                 ),
             };
             if res_tx.send(((b1, b2), results)).is_err() {
@@ -1146,6 +1151,14 @@ fn write_pairs(
         stats
             .r2
             .record(s2.len(), res2, pp.p2.output.adapter);
+        if !dup {
+            stats
+                .r1
+                .record_margin(pp.p1.output.margin_5, pp.p1.output.margin_3);
+            stats
+                .r2
+                .record_margin(pp.p2.output.margin_5, pp.p2.output.margin_3);
+        }
         if let Some(mw) = meta.as_deref_mut() {
             metadata::write_record(
                 &mut **mw,
@@ -1233,6 +1246,7 @@ fn pair_chunks(
     pe_overlap: PeOverlapMode,
     pe_anchor: usize,
     adapter_evidence: crate::adapter::AdapterEvidence,
+    pe_ambiguous_smallest: bool,
 ) -> Vec<ProcessedPair> {
     debug_assert_eq!(c1.len(), c2.len());
     // Mates are trimmed independently, except for the one cross-mate inference
@@ -1259,6 +1273,7 @@ fn pair_chunks(
         let (p1, p2) = if pe_overlap.runs() {
             match crate::pe_overlap::detect_pe_overlap_trim_with(
                 s1, s2, pe_anchor, params_r1.adapter.as_deref(), adapter_evidence,
+                pe_ambiguous_smallest,
             ) {
                 Some((t1, t2)) => {
                     let mut a = Arc::clone(&base1);
@@ -1358,6 +1373,7 @@ mod tests {
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
             adapter_evidence: crate::adapter::AdapterEvidence::Floor,
+            pe_ambiguous_smallest: false,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1749,6 +1765,7 @@ mod tests {
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
             adapter_evidence: crate::adapter::AdapterEvidence::Floor,
+            pe_ambiguous_smallest: false,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1776,6 +1793,7 @@ mod tests {
             adapter_source: crate::cli::AdapterSource::None,
             pe_overlap: PeOverlapMode::Never,
             adapter_evidence: crate::adapter::AdapterEvidence::Floor,
+            pe_ambiguous_smallest: false,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,

@@ -273,15 +273,42 @@ pub struct ShortTail {
     pub enrichment: std::collections::HashMap<(u8, usize), f64>,
     /// The enrichment factor a candidate must clear to be corroborated.
     pub min_factor: f64,
+    /// Which corroborated candidate wins when several are nested.
+    ///
+    /// `false` (the default) keeps the shipped shortest-wins behaviour: the
+    /// shortest corroborated exact prefix is the smaller claim about how much
+    /// of the read is adapter. `true` (`--short-tail-longest`) takes the
+    /// LONGEST corroborated candidate instead.
+    pub longest_wins: bool,
 }
 
 /// Corroborated short-tail trim: an EXACT adapter prefix at the 3' end,
-/// accepted only when the quality-drop rule corroborates it.
+/// accepted only when the quality-drop rule (or the dataset-level enrichment)
+/// corroborates it.
 ///
 /// Returns the trim to apply, or `(0, 0, None)` when no candidate is
-/// corroborated. The shortest corroborated candidate wins, because a shorter
-/// exact prefix is the more conservative claim about how much of the read is
-/// adapter.
+/// corroborated. `exact_prefix_candidates` enumerates nested candidates
+/// shortest-first, and `st.longest_wins` decides which end of that list is
+/// preferred:
+///
+/// * `false` (default) — the SHORTEST corroborated candidate wins. A shorter
+///   exact prefix is the more conservative claim about how much of the read is
+///   adapter, and every longer candidate contains it, so the short claim is
+///   never wrong in the "this base is adapter" direction; it is wrong in the
+///   "this base is biology" direction, by up to the difference in length.
+///   Choose this when the cost of trimming biology is higher than the cost of
+///   leaving adapter on the read (the shipped bias, and the right one on
+///   libraries whose 3' ends are ordinary biology).
+/// * `true` — the LONGEST corroborated candidate wins. Exactness already makes
+///   a false positive improbable, so if the whole tail is the adapter the
+///   longer cut is the correct one, and the read keeps no residual adapter.
+///   Choose this when leaving adapter on the read costs more than the residual
+///   risk of an exact longer prefix matching by chance — a library whose
+///   adapter readthrough is long and whose qualities are flat enough that the
+///   cliff is seen at the far end of the tail rather than the near end.
+///
+/// Neither mode changes WHICH candidates exist or how they are corroborated:
+/// an uncorroborated candidate is refused by both.
 pub fn short_tail_trim(
     seq: &[u8],
     quals: &[u8],
@@ -289,6 +316,7 @@ pub fn short_tail_trim(
     st: &ShortTail,
 ) -> (usize, usize, Option<u8>) {
     let cands = exact_prefix_candidates(seq, set, st.min_len, st.max_len);
+    let mut best: Option<(u8, usize)> = None;
     for (ai, t) in cands {
         // Either corroboration is sufficient.
         let quality = quality_drop_corroborates(quals, t, st.q_drop, st.n_before, st.n_ref);
@@ -302,13 +330,26 @@ pub fn short_tail_trim(
                 .copied()
                 .map(|f| f >= st.min_factor)
                 .unwrap_or(false);
-        if quality || enriched {
-            // Same shape as `match_adapters`: an adapter readthrough is
-            // always a pure 3' trim (t5 = 0, t3 = the adapter length).
+        if !(quality || enriched) {
+            continue;
+        }
+        if !st.longest_wins {
+            // Shortest wins: candidates come shortest-first, so the first
+            // corroborated one is the answer.
             return (0, t, Some(ai));
         }
+        // Longest wins: strictly longer candidates replace the incumbent, so
+        // ties keep the first (lowest adapter index, then shortest) one.
+        if best.is_none_or(|(_, bt)| t > bt) {
+            best = Some((ai, t));
+        }
     }
-    (0, 0, None)
+    match best {
+        // Same shape as `match_adapters`: an adapter readthrough is always a
+        // pure 3' trim (t5 = 0, t3 = the adapter length).
+        Some((ai, t)) => (0, t, Some(ai)),
+        None => (0, 0, None),
+    }
 }
 
 /// Enumerate 3'-terminal adapter-prefix candidates of length
@@ -1842,5 +1883,193 @@ mod tests {
         let q = vec![40u8; 14];
         let mm = crate::adapter::scored_mismatches(a, b, Some(&q), 2);
         assert_eq!(mm, 0.5, "one ambiguous disagreement costs half");
+    }
+
+    // -----------------------------------------------------------------------
+    // Boundary sweep: the adapter slid across every offset of a small read.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic pseudo-random ACGT.
+    fn dna(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[((x >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    /// Params that isolate the adapter stage: every polyX scan off, no
+    /// mean-quality filter, and a zero length floor so the emitted read is
+    /// whatever the adapter cut leaves.
+    fn adapter_only_params(set: &AdapterSet) -> crate::algorithm::Params {
+        crate::algorithm::Params {
+            adapter: Some(std::sync::Arc::new(set.clone())),
+            scan_5: false,
+            scan_3: false,
+            scan_interior: false,
+            min_len: crate::algorithm::MinLen::Abs(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_adapter_slid_across_every_offset_gives_the_exact_cut() {
+        // The 3'-anchored matcher must cut exactly at the adapter's start for
+        // every offset at which the tail is still at least the overlap floor.
+        let adapter = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA".to_vec();
+        let min_overlap = 14usize;
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "t".into(),
+                seq: adapter.clone(),
+            }],
+            0.1,
+            min_overlap,
+        );
+        let p = adapter_only_params(&set);
+        let bio = dna(60, 0x51D3);
+        for off in 0..=(60 - min_overlap) {
+            // Biology, then the adapter starting at `off`, then biology again
+            // (the adapter's own tail is bounded by the read end, not by the
+            // adapter sequence length).
+            let mut seq = bio.clone();
+            let n = (60 - off).min(adapter.len());
+            seq[off..off + n].copy_from_slice(&adapter[..n]);
+            let tail = 60 - off;
+            let q = vec![40u8; 60];
+            let (t5, t3) = match crate::algorithm::trim(&seq, &q, &p).result {
+                crate::algorithm::TrimResult::Emit {
+                    t5_adapter,
+                    t3_adapter,
+                    ..
+                } => (t5_adapter, t3_adapter),
+                r => panic!("off={off}: unexpected {:?}", r),
+            };
+            assert_eq!(
+                (t5, t3),
+                (0, tail),
+                "off={off}: the cut must be the adapter's own start"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tail_below_the_overlap_floor_is_never_cut() {
+        // Below the floor the matcher is provably blind to the adapter, and a
+        // tail shorter than the floor must never produce a cut. The biology is
+        // a single repeated base so a window that crosses the boundary cannot
+        // match the adapter by chance.
+        let adapter = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA".to_vec();
+        let min_overlap = 14usize;
+        let set = AdapterSet::new(
+            vec![Adapter {
+                name: "t".into(),
+                seq: adapter.clone(),
+            }],
+            0.1,
+            min_overlap,
+        );
+        let p = adapter_only_params(&set);
+        for tail in 1..min_overlap {
+            let mut seq = vec![b'C'; 60 - tail];
+            seq.extend_from_slice(&adapter[..tail]);
+            let q = vec![40u8; 60];
+            let (t5, t3) = match crate::algorithm::trim(&seq, &q, &p).result {
+                crate::algorithm::TrimResult::Emit {
+                    t5_adapter,
+                    t3_adapter,
+                    ..
+                } => (t5_adapter, t3_adapter),
+                r => panic!("tail={tail}: unexpected {:?}", r),
+            };
+            assert_eq!((t5, t3), (0, 0), "tail={tail}: below the floor, no cut");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // --short-tail-longest: which corroborated candidate wins.
+    // -----------------------------------------------------------------------
+
+    /// A short-tail config whose enrichment corroborates EVERY exact-prefix
+    /// candidate the scan can produce, so the only thing that decides the
+    /// answer is which end of the candidate list is preferred.
+    fn corroborating_short_tail(
+        min_len: usize,
+        max_len: usize,
+        longest_wins: bool,
+    ) -> ShortTail {
+        let mut enrichment = std::collections::HashMap::new();
+        for t in min_len..=max_len {
+            enrichment.insert((0u8, t), 10.0);
+        }
+        ShortTail {
+            min_len,
+            max_len,
+            q_drop: 8,
+            n_before: 4,
+            n_ref: 10,
+            enrichment,
+            min_factor: 5.0,
+            longest_wins,
+        }
+    }
+
+    /// A read ending in an 8-base exact adapter prefix, with flat Q40
+    /// qualities. The adapter's alternating period makes the 6- and 8-base
+    /// candidates BOTH exist (the 8-base tail ends with the 6-base prefix), so
+    /// the two nested candidates are what the preference has to choose between.
+    fn nested_prefix_read(adapter: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut seq = b"ACGTACGTACGTACGTACGT".to_vec();
+        seq.extend_from_slice(&adapter[..8]);
+        let q = vec![40u8; seq.len()];
+        (seq, q)
+    }
+
+    #[test]
+    fn shortest_corroborated_candidate_wins_by_default() {
+        let adapter = b"ACACACACACACACACACAC".to_vec();
+        let (seq, q) = nested_prefix_read(&adapter);
+        let set = simple_set(&adapter);
+        let st = corroborating_short_tail(6, 10, false);
+        assert_eq!(
+            short_tail_trim(&seq, &q, &set, &st),
+            (0, 6, Some(0)),
+            "the shortest corroborated exact prefix is the conservative claim"
+        );
+    }
+
+    #[test]
+    fn longest_corroborated_candidate_wins_with_short_tail_longest() {
+        let adapter = b"ACACACACACACACACACAC".to_vec();
+        let (seq, q) = nested_prefix_read(&adapter);
+        let set = simple_set(&adapter);
+        let st = corroborating_short_tail(6, 10, true);
+        assert_eq!(
+            short_tail_trim(&seq, &q, &set, &st),
+            (0, 8, Some(0)),
+            "the longest corroborated exact prefix is the whole tail"
+        );
+    }
+
+    #[test]
+    fn uncorroborated_candidates_are_refused_in_both_modes() {
+        // Flat qualities and no enrichment: nothing corroborates any
+        // candidate, so both preferences must refuse.
+        let adapter = b"ACACACACACACACACACAC".to_vec();
+        let (seq, q) = nested_prefix_read(&adapter);
+        let set = simple_set(&adapter);
+        for longest_wins in [false, true] {
+            let mut st = corroborating_short_tail(6, 10, longest_wins);
+            st.enrichment.clear();
+            assert_eq!(
+                short_tail_trim(&seq, &q, &set, &st),
+                (0, 0, None),
+                "longest_wins={longest_wins}: an uncorroborated tail is refused"
+            );
+        }
     }
 }
