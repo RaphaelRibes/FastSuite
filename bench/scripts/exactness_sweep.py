@@ -84,6 +84,10 @@ ARMS = {
     "hd0": [],
     "hd1": [],
     "hd2": [],
+    # hd 0 with anchoring on: the like-for-like partner of the shipped `ba` arm,
+    # so the quality-maximising setting can be quoted from the same binary and
+    # harness as the default instead of from a different campaign.
+    "hd0a": ["--boundary-anchored"],
     # min_run is the tail-scan threshold: 12 by default, which is why the
     # decomposition found 3' GT runs of 6-11 bp left untouched. These arms price
     # lowering it, and the winner config already carries --min-run, so the value
@@ -102,7 +106,7 @@ ARMS = {
 
 # arm -> the value that REPLACES the winner config's --head-dropout, because
 # the winner row already carries one and clap refuses a repeated flag
-HD_OVERRIDE = {"hd0": 0, "hd1": 1, "hd2": 2}
+HD_OVERRIDE = {"hd0": 0, "hd1": 1, "hd2": 2, "hd0a": 0}
 
 # arm -> the value that REPLACES the winner config's --min-run, for the same
 # clap reason (the flag cannot be passed twice).
