@@ -32,9 +32,12 @@ def main():
     for key, (flag, conv) in CONF.items():
         if w.get(key) not in (None, ""):
             base += [flag, conv(w[key])]
-    if w.get("min_len"):
-        ml = w["min_len"]
-        base += ["--min-len", ml]
+    # sweep.py records the RESOLVED floor (a fraction like "0.85L"), not the
+    # grid's raw integer: passing the raw value runs a different configuration
+    eff = w.get("min_len_effective") or w.get("min_len")
+    if not eff:
+        sys.exit(f"winner {ACC}: no min_len_effective column")
+    base += ["--min-len", eff]
     if w.get("r2_reverse") in ("True", "true", "1"):
         base += ["--r2-scan-reverse"]
     if w.get("interior") in ("True", "true", "1"):
