@@ -372,3 +372,39 @@ that prices a lost base and a kept artefact equally.
 `sweep.tol2.tsv`, `side.tsv`, `qgate.tsv`), `bench/results/phase-d/head-dropout-axis.tsv`,
 `bench/results/phase-d/overtrim-vs-fastp.tsv`, and the rendered tables in
 `tools/fastprep/CHANGELOG.md` (0.4.1 entry) and `docs/plans/2026-10-21_fastprep-exactness.md` §7.
+
+## D-17: the 5' dropout is priced, and the price is a library property (2026-10-22)
+
+`--head-dropout` was measured as two global policies (trim every 1-4 bp leading
+G-run, or none). Neither is the end of the question: the injected share is not
+the same in every library, and on a 21-library probe it runs from 0% to 63%.
+A per-library decision is therefore available, and it is estimable from the reads
+alone -- the excess of the short leading-G rate over the library's own G
+frequency (`p - p^5`), divided by the ambiguous rate, thresholded at the cost
+model's own break-even `w_over/(w_over+w_under) = 1/8`.
+
+Measured end to end through the real binary over 102 libraries and 20.4 M mates
+(`bench/scripts/auto_hd_sweep.py`, raw in `bench/results/exactness/auto-hd-*`):
+
+| policy | exact | overtrim | undertrim | score@7 | total error (1:1) |
+|---|---:|---:|---:|---:|---:|
+| hd 4, anchored (shipped) | 72.35% | 18.71% | 1.88% | +0.6749 | 20.59% |
+| per-library, class threshold | 83.06% | 7.50% | 2.38% | +0.5218 | 9.88% |
+| per-library, all-mates threshold | 84.38% | 5.32% | 3.24% | +0.4961 | 8.56% |
+| hd 0, anchored | 83.19% | 0.15% | 9.60% | +0.1820 | 9.75% |
+
+Decision: the default does not change. The estimate is worth +10.7 pp of exactness
+and dominates `hd 0` outright (same exactness, a quarter of the undertrim), but it
+still misses libraries -- an undertrim mistake costs 7x, so 0.5 pp of extra
+undertrim outweighs 3.5 pp of overtrim -- and at 7:1 the global policy wins
+(+0.6749 against +0.5218). It is not shipped: it needs a prescan and a per-library
+decision the binary does not take, and there is nothing for it to win at the
+shipped price. `--head-dropout 0` is no longer the recommended way to buy quality;
+the estimate is, as soon as someone writes the flag.
+
+Also negative, and recorded because it closes the search: no per-read feature
+separates the classes (1 171 418 ambiguous mates, six features, dataset-level
+train/test split; the best rule returns 6 594 mate-units on the held-out half, 0.8%
+of what that class is worth, and every other threshold is negative), and lowering
+`--min-run` to reach the recoverable 3' class loses at the anchor (mr8 72.17%
+exact / +0.6720; mr6 70.65% / +0.6228).
