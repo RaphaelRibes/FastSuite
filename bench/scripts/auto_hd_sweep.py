@@ -88,7 +88,7 @@ def prescan(path, max_reads=PRESCAN):
 
 
 def run_one(task):
-    (fp, fp_md5, ds, r1, r2, gt, cfg, workroot, min_frac) = task
+    (fp, fp_md5, ds, r1, r2, gt, cfg, workroot, min_frac, anchor) = task
     d = tempfile.mkdtemp(dir=workroot, prefix="auto-")
     try:
         census = prescan(r1)
@@ -98,6 +98,8 @@ def run_one(task):
             i = cfg.index("--head-dropout")
             del cfg[i:i + 2]
         cfg += ["--head-dropout", str(hd)]
+        if anchor and "--boundary-anchored" not in cfg:
+            cfg += ["--boundary-anchored"]
         o1, o2 = os.path.join(d, "o1.fq"), os.path.join(d, "o2.fq")
         px = os.path.join(d, "cuts.pxmt")
         argv = [fp, "-1", r1, "-2", r2, "-o", o1, "-p", o2,
@@ -125,6 +127,10 @@ def main():
     ap.add_argument("--raw", required=True)
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--work", default="/tmp/auto-hd")
+    ap.add_argument("--anchor", action="store_true",
+                    help="add --boundary-anchored, so the policy is comparable "
+                         "to the shipped default rather than to the unanchored "
+                         "arms of the campaign")
     a = ap.parse_args()
     if os.path.exists(a.raw):
         sys.exit(f"{a.raw} exists; move it aside")
@@ -138,7 +144,7 @@ def main():
         if not all(os.path.exists(p) for p in (r1, r2, gt)):
             continue
         tasks.append((ovf.FP, es.md5_of(ovf.FP), f"{dom}/{acc}", r1, r2, gt,
-                      es.winner_flags(w), a.work, 0.9))
+                      es.winner_flags(w), a.work, 0.9, a.anchor))
     if not tasks:
         sys.exit("no datasets resolved")
     os.makedirs(a.work, exist_ok=True)
