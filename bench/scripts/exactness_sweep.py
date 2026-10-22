@@ -90,6 +90,11 @@ ARMS = {
     # is overridden through MINRUN_OVERRIDE rather than appended.
     "mr6": [],
     "mr8": [],
+    # anchored + lowered tail scan, i.e. the two candidates that could actually
+    # ship: mr8 alone beat unanchored base but not the anchored default, and the
+    # arms above cannot be compared to it without the anchoring term.
+    "mr6a": ["--boundary-anchored"],
+    "mr8a": ["--boundary-anchored"],
     "peov": ["--adapter-preset", "illumina", "--pe-overlap", "always"],
     "pe": ["--adapter-preset", "illumina", "--pe-overlap", "always",
            "--pe-ambiguous-smallest"],
@@ -101,7 +106,7 @@ HD_OVERRIDE = {"hd0": 0, "hd1": 1, "hd2": 2}
 
 # arm -> the value that REPLACES the winner config's --min-run, for the same
 # clap reason (the flag cannot be passed twice).
-MINRUN_OVERRIDE = {"mr6": 6, "mr8": 8}
+MINRUN_OVERRIDE = {"mr6": 6, "mr8": 8, "mr6a": 6, "mr8a": 8}
 
 # arm -> the arm it is priced against when it enables a prerequisite flag
 REFERENCE = {"stl": "st6", "pe": "peov"}
