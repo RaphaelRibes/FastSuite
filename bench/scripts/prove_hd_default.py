@@ -57,7 +57,7 @@ def main():
             sys.exit(f"{tag}: rc={r.returncode} {r.stderr[-400:]}")
         res[tag] = hashlib.md5(open(px, "rb").read()).hexdigest()
     print(f"dataset {DOM}/{ACC}  config_id {w['config_id']}  "
-          f"read_len {open(f'{v0}/sim.v0.gt.tsv').readline().split(chr(9))[3] if True else '?'}")
+          f"min-len {eff}  min-run {w.get('min_run')}")
     for k, v in res.items():
         print(f"  {k:5} pxmt md5 {v}")
     assert res["bare"] == res["hd4"], "a bare invocation is NOT the 4 configuration"

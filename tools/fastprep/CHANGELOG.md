@@ -25,6 +25,12 @@ the measurement that justified them.
   `--head-dropout 0` remains the setting for a pipeline that prices a lost base
   and a kept artefact equally. Full table: `docs/plans/2026-10-21_fastprep-exactness.md`
   §7 and `docs/TRIM-ACCURACY.md`; decision record: `docs/DECISIONS.md` D-16.
+  Verified behaviourally, not by inspection: on `bacterial_isolate/DRR014197`
+  (config 45, a dataset where the knob bites) the bare invocation and an
+  explicit `--head-dropout 4` produce the same PXMT md5
+  (`3afed057…`) and `--head-dropout 0` produces a different one (`cfc0186f…`) —
+  `bench/scripts/prove_hd_default.py`, which refuses a dataset where the two
+  agree because that would prove nothing.
 
 ## 0.4.0
 
