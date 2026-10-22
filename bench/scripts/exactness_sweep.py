@@ -70,6 +70,13 @@ ARMS = {
     "poly": ["--boundary-anchored", "--overtrim-margin", "2"],
     "st6": ["--adapter-short-tail", "6"],
     "stl": ["--adapter-short-tail", "6", "--short-tail-longest"],
+    # the head-dropout POLICY arms: the campaign's first decomposition showed
+    # the 5' G-run cut is the whole overtrim signal on this corpus (100% of it
+    # at 5', 80% of it exactly 1 bp), so the policy, not the boundary maths, is
+    # what has to be priced
+    "hd0": ["--head-dropout", "0"],
+    "hd1": ["--head-dropout", "1"],
+    "hd2": ["--head-dropout", "2"],
     "peov": ["--adapter-preset", "illumina", "--pe-overlap", "always"],
     "pe": ["--adapter-preset", "illumina", "--pe-overlap", "always",
            "--pe-ambiguous-smallest"],
@@ -322,7 +329,8 @@ def main(argv=None):
     ap.add_argument("--out", default="bench/results/exactness/sweep.tsv")
     ap.add_argument("--weights", default=os.path.join(
         HERE, os.pardir, "weights", "trim-weights-v1.json"))
-    ap.add_argument("--arms", default="base,ba,m1,m2,poly,st6,stl,peov,pe")
+    ap.add_argument("--arms",
+                    default="base,ba,m1,m2,poly,hd0,hd1,hd2,st6,stl,peov,pe")
     ap.add_argument("--tol", default="0,2")
     ap.add_argument("--variants", default="v0",
                     help="comma list of sim variants (default v0: the corpus "
