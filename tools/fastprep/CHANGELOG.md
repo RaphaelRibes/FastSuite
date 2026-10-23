@@ -5,6 +5,93 @@ the measurement that justified them.
 
 ## Unreleased
 
+**DEFAULT — `--min-len` is `0.67L`, not `0.9L`.** The floor is also the trim
+budget (a read needing more trim than the floor allows is dropped, not trimmed),
+so `0.9L` let a read lose only 10 % of its length. Measured on a 150 bp read
+carrying a 30 bp 5′ polyG artefact: **dropped** at `0.9L`, trimmed to 117 bp at
+`0.67L`; in paired mode the same library gave **0 pairs out of 2000** at
+`0.9L` and 500/500 pairs at `0.67L`. `0.67L` keeps 100 bp of a 150 bp read — a
+third of the read is trimmable — and is a pipeline-owner decision, NOT a sweep
+result: the 90-dataset campaign and Phase D both ran at `0.9L`, so the trim-accuracy
+tables in `docs/TRIM-ACCURACY.md` describe the old floor. Re-benchmark before
+comparing across the change. `--min-len 0.9L` pins the old behaviour, and every
+run now prints the resolved floor in bases ("100 bp of a 150 bp mean read;
+50 bp of trim allowed") so the budget is never invisible.
+
+**DEFAULT — the mercy clause no longer charges a run's own bases.** Δ_m bounds
+how far the cut walks *past* a run's end (the overshoot window), not how long
+the run may be. Charging matches turned the budget into a length cap because a
+match costs `μ(1−W)`: at Q2 that is 0.09, so 30 bases exhausted Δ_m = 3 and a
+**low-quality (4-colour) polyG tail — the normal case for that chemistry — was
+trimmed only 37 bases deep however long it was** (measured: 50, 70 and 100 bp
+tails all cut at 37; Q5 at 43, Q10 at 64, Q20 uncapped). A match now costs
+nothing until the first mismatch; after it the walk is charged as before, so the
+overshoot window is unchanged (still the ~2 flanking bases the mercy walk
+absorbs). Measured after: every tail length cuts tail + 2 at Q0…Q37. The corpus
+cannot see this (its longest injected 3′ tail is 20 bp and `undertrim-decomp.tsv`
+attributes 0.95 % of undertrim to 3′ runs ≥ 6), so it needs a long-tail bench
+arm before any number is quoted from it.
+
+**The report closes at base level.** `bases_trimmed` counted only reads that
+were emitted, so a run that removed 1 M bases from reads it then dropped
+reported "0 bases trimmed (0.00 %)". Trims on dropped reads count; `bases_out`
+(a recommended shared key in REPORT-SCHEMA.md that no tool emitted until now) and
+`bases_dropped` are reported, and `bases_in == bases_out + bases_trimmed +
+bases_dropped` holds on every run. `reads_out` counts records written, not trim
+decisions: a kept mate discarded for want of `--singletons1` no longer inflates
+it. `bases_interior_mass` is in the v1 `metrics` block. `by_name` accumulates
+when a FASTA reuses an adapter ID.
+
+**Correctness fixes** (each pinned by a test in `tests/safety_2026_10_23.rs`,
+`tests/pe_overlap.rs` or the module's own suite):
+
+* `--adapter-scored-retry` set `t5` to the window offset as well as
+  `t3 = l − p`, so `t5 + t3 == l` and every read the retry rescued was emitted
+  at **length 0**, exit 0 (measured 50/50). `t5` is 0 (a 3′-anchored window
+  trims nothing from the 5′ end) and the adapter-choice rule is the general
+  matcher's: leftmost window, ties by adapter index.
+* `--json PATH` naming `-o PATH` overwrote the FASTQ with the report and exited
+  0; `-o x -p x`, `-o x --metadata x` and `-o x` with `-1 x` wrote two streams
+  into one `.part` and failed at the second rename, after the first commit. Any
+  pair of colliding paths is refused before anything is created.
+* `.bz2` / `.xz` outputs fell through to the plain-text arm: an uncompressed
+  file under a compressed name, exit 0. Refused now.
+* the final flush of every FASTQ/singleton writer was `flush().ok()`: a write
+  error discarded the last staged block, the truncated file was renamed into
+  place and the run exited 0 (reproduced with `ulimit -f 1`: 1024 of 6440
+  bytes). All five sites propagate.
+* `infer_insert` computed `l1 + l2 − min_ovl` unchecked: a `--pe-correct-min-overlap`
+  above the read sum wrapped to ~1.8e19 and the first pair spun forever.
+* `--pe-correct` never corrected a Q0 base (p = 1 → degenerate posterior): the
+  most decisive disagreement was the one skipped. Decoded Q is clamped at 1.
+* `--pe-correct`'s overlap floor applies to the doubly-retained window, not the
+  geometric one.
+* `--mean-q` was measured on the post-adapter insert, so the same read was kept
+  with `--adapters` and dropped with `--no-adapter`; it is the whole-read mean.
+* `--target` (anchored) lost its modal trim: the tier-1 prefilter hard-codes
+  `b[i] == b[i+1]` and rejected windows the anchored scan accepts (an 11 bp
+  terminal G-run trimmed 0 bases). No prefilter in non-homopolymer rules.
+* `--no-5 --interior` disabled the interior scan (interior mass 12 → 0): the
+  walk now runs whenever any scan is enabled, and an interior-only pass does not
+  become the 5′ cut.
+* interior runs were measured from an anchor one base past the pair the
+  sub-scan re-examines, so every interior run's start, length and mass was off
+  by one; an interior-only budget drop was reported as Poly5/Poly3.
+* `--head-dropout` matched uppercase `G` only (soft-masked reads lost the trim).
+* a trim that consumed the whole read emitted a zero-length FASTQ record when
+  `--min-len 0` made both sides of the floor comparison 0.
+* adapter matching is case-insensitive end to end (a lowercase adapter tail was
+  seeded, then failed every verification compare: 0 trims).
+* `--adapter-error-rate 1.0` is refused; short-tail candidates are sorted
+  shortest-first as documented; a FASTA with > 255 adapters is refused.
+
+**Flags and report**: `--no-mean-q`/`--mean-q` and `--no-auto-phred`/`--auto-phred`
+are last-wins like `--dedup`; `--no-adapter` conflicts with an explicit adapter
+set; `--dedup-max-mem` refuses at admission as its help promises; `-c` is
+accepted for `--gz-level`; `--dry-run --json` emits the report with
+`"dry_run": true` instead of leaving a stale one; `--metadata` help says one
+record per read; the dedup block reports the window actually used.
+
 * `--pe-correct [GATE]` (opt-in; paired-end FASTQ only): posterior consensus
   correction of base errors in the doubly-retained mate overlap. At overlap
   disagreements a two-hypothesis posterior over the mates' quality strings

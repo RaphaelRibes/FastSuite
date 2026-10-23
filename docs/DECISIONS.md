@@ -408,3 +408,40 @@ train/test split; the best rule returns 6 594 mate-units on the held-out half, 0
 of what that class is worth, and every other threshold is negative), and lowering
 `--min-run` to reach the recoverable 3' class loses at the anchor (mr8 72.17%
 exact / +0.6720; mr6 70.65% / +0.6228).
+
+## D-18: the floor is a trim budget, and the mercy clause bounds overshoot only (2026-10-23)
+
+Two coupled defaults changed after the 2026-10-23 fastprep review. Both are
+recorded here because they move every number in `docs/TRIM-ACCURACY.md`.
+
+**`--min-len 0.67L` (was `0.9L`).** The floor and the trim budget are one
+number: a read that needs more trim than the floor allows is DROPPED rather
+than trimmed, so `0.9L` permitted a read to lose only 10 % of its length.
+Measured on a 150 bp read with a 30 bp 5′ polyG artefact: dropped at `0.9L`,
+trimmed to 117 bp at `0.67L`; in paired mode the same library gave **0 pairs
+out of 2000** at `0.9L` and 500/500 at `0.67L`. `0.67L` keeps 100 bp of a
+150 bp read — a third of the read trimmable — which is the pipeline owner's
+stated requirement. It is NOT a sweep result: the 90-dataset campaign and
+Phase D both ran at `0.9L`, and their exact-rate metric excludes dropped
+reads, so a floor that discards the hard reads was never charged for it. The
+resolved floor is printed in bases at the end of every run ("100 bp of a
+150 bp mean read; 50 bp of trim allowed"). `--min-len 0.9L` reproduces the old
+behaviour; every table measured before this entry must state that floor.
+
+**The mercy clause charges a run's own bases nothing.** Δ_m is meant to bound
+how far the cut walks *past* a run's end — the overshoot window, where a chance
+match in the flanking biology can extend the run span. Charging matches turned
+it into a length cap, because a match costs `μ(1−W)`: at Q2 that is 0.09, so
+roughly 33 bases exhausted Δ_m = 3. Measured cap on a single read: 50, 70 and
+100 bp Q2 tails all cut at exactly 37 bases; Q5 at 43, Q10 at 64, Q20 uncapped.
+For 4-colour chemistry a low-quality polyG tail is the normal artefact, so the
+model trimmed *least* on the case it exists for. After the change a match costs
+nothing until the first mismatch; from there the walk is charged exactly as
+before, so the overshoot window is unchanged (the ~2 flanking bases). Measured
+after: tail + 2 at Q0, Q2, Q5, Q10, Q20, Q37 for tails of 10–100 bp.
+
+What this does NOT settle: the corpus cannot measure either change. Its longest
+injected 3′ tail is 20 bp (below the old cap), its 5′ artefact is a single G
+(`HEAD2 = {0: 8154, 1: 1846}`), and `bench/results/exactness/undertrim-decomp.tsv`
+attributes 0.95 % of undertrim to 3′ runs ≥ 6. A bench arm with long low-quality
+tails is required before any number is quoted about either.

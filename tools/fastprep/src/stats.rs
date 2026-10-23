@@ -134,8 +134,8 @@ pub struct Stats {
     pub bases_in: u64,
     /// Bases actually written for this mate. With `bases_trimmed` it closes
     /// the identity `bases_in == bases_out + bases_trimmed` for every run,
-    /// dropped reads included — `bases_out` was in REPORT-SCHEMA.md's
-    /// mandatory list and emitted by no tool, so a consumer could not
+    /// dropped reads included — `bases_out` is a recommended shared key
+    /// (REPORT-SCHEMA rule 3) that no tool emitted, so a consumer could not
     /// reconcile a run at base level.
     pub bases_out: u64,
     /// Bases of DROPPED reads that survived their trim (the remainder that was

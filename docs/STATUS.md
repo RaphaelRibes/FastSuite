@@ -1,6 +1,9 @@
 # FastSuite status
 
-Verified 2026-10-19 against the current `main` (`3c0aa92`). Every number here was
+Verified 2026-10-19 against `3c0aa92` for every tool EXCEPT fastprep, whose row
+was re-verified 2026-10-23 after the review that fixed six silent data-loss
+paths (`784b9a2`, `c2f896b`, `6763a4f`): its suite, its defaults and the
+reproductions quoted below were all executed on that build. Every number here was
 verified by running it or by re-reading the cited artifact: the six cargo test
 suites under `pixi run ci`, `scripts/test.sh` (pathology corpus included), the
 Phase D closed loop re-read from its TSV, the trim-accuracy, `head_dropout` and
@@ -14,22 +17,21 @@ production-ready** (see the README banner).
 | tool | version | tests | state | next plan |
 |---|---|---|---|---|
 | fastdedup | 1.3.0 | 134 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
-| fastprep | 0.3.0 | 203 | working — `--force`/`--dry-run`/`-q`, emits `fastsuite.report.v1` with the raw stats under `legacy`. Shipped `--head-dropout` default is now **0** (was 4 in 0.1.0; `3d76a31`, version bumped to **0.2.0** — a behaviour change, so a minor bump) | — |
+| fastprep | 0.4.1 (tree ahead of the tag: CHANGELOG `Unreleased`) | 288 | working — `--force`/`--dry-run`/`-q`, `fastsuite.report.v1` with the raw stats under `legacy`, `--pe-correct`. **Defaults re-priced 2026-10-23 (D-18):** `--min-len 0.67L` (100 bp of a 150 bp read; the floor is also the trim budget) and a mercy clause that no longer charges a run's own bases, so a low-quality 4-colour polyG tail is trimmed whole instead of 37 bases deep. `--head-dropout` is **4** (D-16's 7:1 price; earlier revisions of this row said 0). The report now closes at base level (`bases_out`/`bases_dropped`), and six exit-0 data-loss paths are closed (`--adapter-scored-retry`, `--json`/{`-o`} collisions, `.bz2`/`.xz` outputs, a swallowed final flush, the `--pe-correct` hang) | `docs/AUTO-PARAMS.md` — the ranker is still the biggest win (the default is the per-dataset winner on 1 of 101 real libraries) |
 | fastsim | 0.1.0 | 93 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`), and **all four (plane × artefact) pairs deconvolved on the consumer side** (`7631292`, the g_frac fix order's step 1(b)) — DRR083326's R1 terminal moved 0.5292 → 0.4140 against a real 0.4245. The insert ceiling (`2L − 12 = 288 bp`) is now stated in `--help` too | — |
 | fastmaps | 0.1.0 | 96 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads`; **previews streamed instead of held resident** (`90573ea`: defaults 202.6 → 141.2 MB, `--buffer-mb 8` 100.5 → 36.1 MB, outputs verified byte-identical) | — |
 | fastcheck | 0.1.0 | 143 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), **per-tile quality modules** (`--tiles`, opt-in, `93ed54a`), harness green | `plans/2026-10-12_fastcheck-exactness.md` — **tasks 5–14 all landed**; the ground-truth recovery claim is a gate now, not a session: `pixi run ground-truth` |
 | fasthelper | 0.1.0 | 70 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — **every item is landed** (`run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on`, `-P/--jobs`, `install --prefix`, and `--from`/resume, which `runner.rs` implements via the per-step `ResumeEntry` re-run rule) |
 
-**679 cargo tests, 0 failures** (143/122/187/89/77/60), plus the **pathology
-corpus: 9 assertions passed, 0 failed**. Note that `scripts/test.sh` counts the
-pathology suite as one aggregate line, so its own `GRAND` reads **680**
-(679 + the one aggregate line);
-the 9 is the number of individual assertions inside it. `pixi run ci` asserts
-every per-tool count against `scripts/expected-test-counts.txt` and refuses a
-rustc outside the pinned `>=1.99,<2`; **run it after any change** (the laptop's
-ambient cargo is 1.95 while the desktop's is 1.99, and an unasserted total is
-what let a stale test binary report 463 against 471 unnoticed). `pixi run doctor`
-lists all six binaries; `bash
+**830 cargo tests, 0 failures** (143/135/288/93/96/74 + the pathology aggregate
+line), plus the **pathology corpus: 9 assertions passed, 0 failed**.
+`scripts/expected-test-counts.txt` is the manifest and `pixi run ci` asserts
+every per-tool count against it and refuses a rustc outside the pinned
+`>=1.99,<2`; **run it after any change** (the laptop's ambient cargo is 1.95
+while the desktop's is 1.99, and an unasserted total is what let a stale test
+binary report 463 against 471 unnoticed). fastprep's 288 was measured on the
+2026-10-23 build (`pixi run cargo test`, 213 lib + 75 integration); the other
+rows are the 2026-10-19 counts. `pixi run doctor` lists all six binaries; `bash
 examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 `examples/runs/demo/report.html`, mtime 2026-10-15 21:40).
 
@@ -41,17 +43,20 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
   fastsim `--force`/`-q`, `FASTSUITE_THREADS` in fastmaps + fastsim).
 * `fastsuite.report.v1` from every tool, **fastprep included** — verified by
   running the built binary in both its single and paired modes and reading the
-  schema field. fastprep's `--dry-run` still correctly writes nothing, and the
-  `--auto-params` path is a refusal stub today (no model trained yet), so there
-  is no third report path to cover.
-  * **Stale string found:** the `--auto-params` refusal doc-comment in
-    `tools/fastprep/src/cli.rs` (`mod` ~line 139) still asserts the shipped
-    default "is already the swept winner on the current corpus". It is wrong:
-    `docs/AUTO-PARAMS.md` records that on Phase D's 101 real libraries the
-    shipped default is the per-dataset winner on **1 of 101** (the 90/90,
-    median-0.969 figure is from the older 90-dataset corpus). The string is a
-    doc-comment, not a runtime message, but it is the source of the claim;
-    fixing it is a one-line edit.
+  schema field. fastprep's `--dry-run` writes the REPORT (flagged
+  `"dry_run": true`) and no FASTQ; the `--auto-params` path is a refusal stub
+  today (no model trained yet), so there is no third report path to cover.
+  * ~~**Stale string found:** the `--auto-params` refusal doc-comment asserted
+    the shipped default "is already the swept winner on the current corpus".~~
+    **Fixed**: `cli.rs` now records the Phase D result (1 of 101) and points at
+    `docs/AUTO-PARAMS.md`. Remaining, and noted because it is the same claim in
+    a test doc-comment: `cli.rs`'s `shipped_defaults_are_the_swept_winner`
+    header now states that the configuration is central, not universal.
+  * **Reporting gap closed 2026-10-23**: `bases_out` is a recommended shared
+    key (REPORT-SCHEMA rule 3) that no tool emitted; fastprep now
+    emits `bases_out` and `bases_dropped` and satisfies
+    `bases_in == bases_out + bases_trimmed + bases_dropped`. The other five
+    tools still do not emit `bases_out`.
 * The closed loop in Rust: `fastcheck --insert-hist --profile p.json <fq>`
   writes the profile `fastsim --profile p.json` consumes — no Python fit
   step.

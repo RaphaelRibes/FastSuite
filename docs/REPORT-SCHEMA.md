@@ -42,7 +42,13 @@ fasthelper schema
    ambiguous across tools (`r2_polyG_frac`, not `fastmaps_r2_polyG_frac`).
 3. Recommended shared keys — tools emit whatever they can compute, none are
    mandatory: `reads_in`, `reads_out`, `reads_dropped`, `bases_in`, `bases_out`,
-   `bases_trimmed`. `elapsed_s` is top-level, not a metric.
+   `bases_dropped`, `bases_trimmed`. `elapsed_s` is top-level, not a metric.
+   `fastprep` emits all of these except the drop-cause split's siblings, and
+   satisfies `bases_in == bases_out + bases_trimmed + bases_dropped` (a
+   dropped read can still have been trimmed first). Its `reads_out` counts
+   RECORDS written, not trim decisions. No other tool emits `bases_out` yet;
+   nothing checks the presence of a key, because `fasthelper check` validates
+   run configs, not reports (see `docs/PLAN.md` on the missing report gate).
 4. Wall-clock `elapsed_s` is measured by the tool itself; `fasthelper` keeps its
    own measurement in `manifest.json` for cross-checking.
 5. `command` is the exact argv, space-joined: enough to reproduce the run

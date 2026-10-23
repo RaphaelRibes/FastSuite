@@ -13,10 +13,10 @@ explicitly marked as a gap with the phase that closes it.
 | polyX with error tolerance | `--match-leniency μ`, `--mismatch-strength ν`, `--mercy Δ_m`, `--gate-shape`, `--phred-sat` | ✅ |
 | quality filtering | `--mean-q` | ✅ |
 | hard trimming | `--trim-5`, `--trim-3` | ✅ |
-| length filtering | `--min-len N|0.6L` | ✅ |
+| length filtering | `--min-len N|0.67L` (the floor is also the trim budget: 0.67L keeps 100 bp of a 150 bp read and drops a read that would need more trim) | ✅ |
 | PCR deduplication | `fastprep --dedup` (native, shipped ON) **or** the standalone `fastdedup` — same fingerprint model (64/128-bit, deterministic, ~4.6 GB at 3e8 reads, no Bloom-filter false positives — `prinseq++` loses >90% of reads at that depth). Use `fastprep --dedup` for the one-pass chain; use `fastdedup` when you need dedup as a separate, pipeable step | ✅ **two entry points, one implementation model** — fastprep's is the integrated one; fastdedup (v1.3.0, published) is the standalone one |
 | per-read metadata/traceability | `fastprep --metadata` (binary PXMT) + `fastprep-meta` reader | ✅ fastp has nothing equivalent |
-| PE overlap correction / merge | **not implemented** | ⚠ gap — deliberately removed from the polyx lineage (it doubled memory for <1% gain). Sequence-merging users are not served yet; phase 4 decides re-add vs. declare out of scope |
+| PE overlap correction / merge | `--pe-correct [GATE]` (opt-in) corrects base errors in the doubly-retained mate overlap by posterior consensus at a measured margin over `fastp --correction` (5.2% fewer residual base errors at gate 2.0 on the 20k-pair truth corpus); `--pe-overlap` infers the adapter boundary from the mate pair's own overlap. **No sequence MERGER** (no `--merge`, no merged-output mode) | ⚠ partial — correction shipped, merging still a gap (deliberately removed from the polyx lineage: it doubled memory for <1% gain). Sequence-merging users are not served |
 | `-`/pipe in and out | not yet | ⚠ gap, phase 3 |
 | HTML report per run | `fastprep --json` + `fasthelper` | ✅ different shape (one aggregate report for N samples) |
 | UMI handling | no | ⚠ out of scope for now |

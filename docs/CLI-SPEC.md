@@ -20,7 +20,7 @@ survives as an alias for one release.** Nothing breaks, everything converges.
 | output format on a stream | `--out-format fastq\|fasta` | enum | `-o -` only; named paths use the extension (D-4) |
 | output compression on a stream | `--out-compression none\|gz` | enum | `-o -` only; default `none` (D-4) |
 | overwrite | `--force` / `-f` | flag | without it, refuse to clobber |
-| dry run | `--dry-run` | flag | report only, write nothing |
+| dry run | `--dry-run` | flag | no FASTQ/metadata written; the report is emitted with `"dry_run": true` |
 | report | `--json <PATH>` | path | `fastsuite.report.v1` |
 | quiet | `-q, --quiet` | flag | suppress the summary line |
 | verbose | `-v, --verbose` | flag | per-step detail on stderr |
@@ -112,9 +112,10 @@ Legend: **✓** already conforms · **+** added in this reorganisation ·
 |---|---|---|
 | `-1 -2 -o -p` | ✓ | already `--in1/--in2/--out1/--out2` |
 | `-j --threads` | ✓ | `1` = serial; `0` not yet accepted |
-| `--gz-level` | → | added `--compression` alias |
+| `--gz-level` | → | `--compression` and `-c` aliases |
 | `--json` | ✓ | writes the legacy stats object; wrapper pending (§4) |
 | `--temp-dir` | gap | uses its own chunking, no spill flag |
+| `-v --verbose` | gap | fastprep has no `-v`: `-q` exists and warnings/errors always print, but there is no per-step verbosity level. Listed as a suite-wide gap rather than claimed. |
 | `--force -f` | ✓ | refuses to clobber an existing `-o`/`-p` (and `--metadata`/`--json`/`--singletons*`), naming the file |
 | `--dry-run` | ✓ | every counter computed, nothing written; the report is still emitted |
 | `-q --quiet` | ✓ | suppresses the summary stream; warnings and errors still print |

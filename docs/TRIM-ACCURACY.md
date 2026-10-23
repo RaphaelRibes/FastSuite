@@ -25,9 +25,19 @@ This is a **configuration finding, not an algorithmic one**. The loss is
 entirely attributable to one shipped default: `--head-dropout 4`, a rule that
 trims any leading G-run of length 1..=4 exactly, with no quality gate and no
 test of artefact versus biology. Turn the rule off and fastprep matches or
-beats fastp on every aggregate axis. The shipped default was 4 when this was
-written; it is now **0** (commit `3d76a31`), so the `fastprep-hd-off` column is
-what a build from current `main` does by default.
+beats fastp on every aggregate axis. That default was **0** between `3d76a31`
+and the 0.4.1 release and is **4** again since D-16 (the 7:1 price), so a build
+from current `main` runs the `fastprep-hd4` column — the `fastprep-hd-off`
+column is `--head-dropout 0`.
+
+**Every number below was measured at `--min-len 0.9L`.** As of D-18 the shipped
+floor is **0.67L** (100 bp retained of a 150 bp read), which allows two and a
+half times as much trim per read and therefore drops fewer reads. The tables are
+NOT comparable across that change: the `dropped` column is scaled by a different
+budget and the exact-rate denominator moves with it. Re-run
+`bench/scripts/overtrim_vs_fastp.py` on the desktop before quoting any of these
+numbers against a 0.67L build; the ordering of the tools at a fixed floor is
+what this document established, and that ordering is expected to hold.
 
 `bench/scripts/overtrim_vs_fastp.py` produces these numbers from
 `bench/results/phase-d/overtrim-vs-fastp.tsv` (817 lines: header + 816 rows,

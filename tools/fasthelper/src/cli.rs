@@ -209,8 +209,14 @@ pub struct DoctorArgs {
 #[derive(Args, Debug)]
 pub struct CheckArgs {
     /// Path to the run config (TOML).
-    #[arg(short = 'c', long)]
-    pub config: PathBuf,
+    #[arg(short = 'c', long, required_unless_present = "report")]
+    pub config: Option<PathBuf>,
+    /// Validate a `--json` report instead of a run config: schema tag, the
+    /// required keys, every metric numeric, and the base identity when the
+    /// tool emits it. This is the gate that was missing — the suite's shared
+    /// report contract had no consumer that could reject a report.
+    #[arg(long, value_name = "JSON", required_unless_present = "config")]
+    pub report: Option<PathBuf>,
     /// Directory holding the tool checkouts (default: this crate's parent, then $FASTSUITE_TOOLS_DIR).
     #[arg(long, env = "FASTSUITE_TOOLS_DIR")]
     pub tools_dir: Option<PathBuf>,
