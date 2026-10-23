@@ -445,3 +445,23 @@ injected 3′ tail is 20 bp (below the old cap), its 5′ artefact is a single G
 (`HEAD2 = {0: 8154, 1: 1846}`), and `bench/results/exactness/undertrim-decomp.tsv`
 attributes 0.95 % of undertrim to 3′ runs ≥ 6. A bench arm with long low-quality
 tails is required before any number is quoted about either.
+
+### Measured on the desktop, 2026-10-23 (15-dataset subset, `--stride 7`)
+
+`overtrim_vs_fastp.py --tools fastprep` on the GT corpus, each dataset at its own
+swept winner and with the swept `--min-len` PINNED, so the numbers isolate the
+scan change from the floor change. Binary md5 `7b27b2af204181ce10982deb5fb7bb88`
+(desktop release build of `6763a4f`), rows in `/tmp/trim-regress-20261023.tsv`,
+compared against the committed `bench/results/phase-d/overtrim-vs-fastp.tsv` for
+the same 15 datasets.
+
+| arm | exact (was → now) | overtrim | dropped |
+|---|---|---|---|
+| fastprep-hd4 (shipped) | 76.92 % → **79.19 %** (+2.27 pp) | 21.70 % → **19.39 %** | 9.08 % → 8.86 % |
+| fastprep-hd0 | 89.86 % → 89.81 % (−0.05 pp) | 0.02 % → 0.03 % | 8.98 % → 8.86 % |
+
+So the change is a large win on the shipped arm and a wash on `hd0` (two datasets
+move 0.2–0.3 pp down, `DRR015180` and `DRR015431`). Every dataset's `scored`
+denominator is within 0.1 % of the old one, so this is not a denominator effect.
+The floor change (0.67L) is NOT in these numbers — the harness pins the swept
+`--min-len` — and still needs its own arm.

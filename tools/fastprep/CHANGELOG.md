@@ -28,9 +28,13 @@ tails all cut at 37; Q5 at 43, Q10 at 64, Q20 uncapped). A match now costs
 nothing until the first mismatch; after it the walk is charged as before, so the
 overshoot window is unchanged (still the ~2 flanking bases the mercy walk
 absorbs). Measured after: every tail length cuts tail + 2 at Q0…Q37. The corpus
-cannot see this (its longest injected 3′ tail is 20 bp and `undertrim-decomp.tsv`
-attributes 0.95 % of undertrim to 3′ runs ≥ 6), so it needs a long-tail bench
-arm before any number is quoted from it.
+cannot see the tail case (its longest injected 3′ tail is 20 bp and
+`undertrim-decomp.tsv` attributes 0.95 % of undertrim to 3′ runs ≥ 6), so it
+needs a long-tail arm. It does see the rest: on a 15-dataset subset of the GT
+corpus, each at its own swept winner with `--min-len` pinned, the shipped arm
+moved **76.92 % → 79.19 % exact** and **21.70 % → 19.39 % overtrim**, with the
+`scored` denominator within 0.1 % (D-18 has the table); `--head-dropout 0` moved
+−0.05 pp. Desktop, 2026-10-23, binary md5 `7b27b2af…`.
 
 **The report closes at base level.** `bases_trimmed` counted only reads that
 were emitted, so a run that removed 1 M bases from reads it then dropped
