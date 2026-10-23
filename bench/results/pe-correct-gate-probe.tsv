@@ -1,0 +1,4 @@
+gate	pairs	seed	profile	fastprep	bases_corrected
+0.0	50000	11	mandrill_E358.json	fastprep 0.4.1	3315
+0.5	50000	11	mandrill_E358.json	fastprep 0.4.1	556
+2.0	50000	11	mandrill_E358.json	fastprep 0.4.1	0

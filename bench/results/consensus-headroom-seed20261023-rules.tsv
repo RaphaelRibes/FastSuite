@@ -1,0 +1,8 @@
+rule	fired	fixed	corrupted	after_err	precision
+fastp-rule	12660	12640	19	4070	99.85
+posterior@0.5	15952	15808	124	1007	99.22
+posterior@1.0	15952	15808	124	1007	99.22
+posterior@2.0	13844	13812	27	2906	99.80
+posterior@3.0	8836	8833	2	7860	99.98
+posterior@5.0	0	0	0	16691	0.00
+posterior@10.0	0	0	0	16691	0.00
