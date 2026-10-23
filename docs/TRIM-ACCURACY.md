@@ -76,8 +76,9 @@ truth, one read-keying scheme:
 - **fastp-tuned** — fastp with `--cut_front`/`--cut_tail` (window 5, mean
   quality 20), `--qualified_quality_phred 20`, `--length_required 30`,
   `--low_complexity_filter`.
-- **fastprep-shipped** — fastprep with the then-shipped default
-  `--head-dropout 4` (the shipped default is now 0): any leading G-run of
+- **fastprep-shipped** — fastprep with the shipped default
+  `--head-dropout 4` (it was 0 for a while after `3d76a31` and D-16 re-priced it
+  back to 4, which is what ships from the 0.4.1 release): any leading G-run of
   length 1..=4 is trimmed exactly, unconditionally.
 
 fastp reports no trim positions, so its cuts are recovered by aligning the

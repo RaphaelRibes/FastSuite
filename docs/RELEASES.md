@@ -13,6 +13,25 @@ fasthelper) is Raphaël Ribes' own work. See each tool's `CITATION.cff`.
 
 ---
 
+## Current state (no FastSuite 2 cut yet)
+
+Suites are cut by hand; the tool versions below are what `main` carries on
+2026-10-23 and no tarball has been made since FastSuite 1.
+
+| tool | version | since | what moved |
+|---|---|---|---|
+| fastdedup | 1.3.0 | FastSuite 1 | unchanged |
+| fastprep | **0.5.0** | 0.4.1 → `--pe-correct`; 0.5.0 → `--auto-params`, `--min-len 0.67L`, the D-18 mercy clause | see `tools/fastprep/CHANGELOG.md` |
+| fastsim, fastcheck, fastmaps, fasthelper | 0.1.0 | FastSuite 1 | unchanged |
+
+`--auto-params` makes fastprep the first tool in the suite whose default
+behaviour can depend on a model file; that file is versioned with the binary
+(`tools/fastprep/models/auto-params.v1.json`) and its measured limits are in
+`docs/MODEL-CARD-auto-params.md`, so a future suite release should ship the two
+together.
+
+---
+
 ## FastSuite 1 (2026-10-12)
 
 | tool | version | maturity | notes |

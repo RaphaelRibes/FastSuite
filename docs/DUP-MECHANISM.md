@@ -2,8 +2,9 @@
 
 > **Superseded (2026-10-16).** This is a point-in-time record from 2026-10-15.
 > The closed loop later reached **167/306 = 54.6%** (52 of 102 datasets passing
-> every variant), not the 113/306 recorded below, and the suite is now **471**
-> on the `scripts/test.sh` GRAND line (not 461). Authoritative closed-loop
+> every variant), not the 113/306 recorded below, and the suite is now **852**
+> on the `scripts/test.sh` GRAND line (not 461) — see
+> `scripts/expected-test-counts.txt` for the authoritative per-tool split. Authoritative closed-loop
 > figure: `bench/results/phase-d/closed_loop.tsv`. Current state:
 > `docs/STATUS.md`.
 >

@@ -216,7 +216,9 @@ Rules that follow:
   `-perdomain` and `-dropreason`), `docs/TRIM-ACCURACY.md` §Read retention.
 
 **Corollary (decision taken with it): `--min-len` keeps its shipped `0.9L`
-default.** The ladder showed no rung buying anything (15/0.5L: +0.15 pp
+default.** *(Superseded 2026-10-23 by D-18, which re-priced the floor to `0.67L`
+for the artefact case; the ladder below is still why no rung within the 0.9L
+family was adopted.)* The ladder showed no rung buying anything (15/0.5L: +0.15 pp
 retention, +0.07 pp exact, i.e. noise; 30 neutral; 50 and uniform 0.9L cost
 2.7–2.9 pp of both), so the retention question is answered by D-13, not by the
 length floor.

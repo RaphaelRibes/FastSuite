@@ -193,9 +193,11 @@ phase 2.5 — the replacement map is written to survive scrutiny.
 
 ## Current state (what is already true, verified)
 
-* The six binaries build in this tree; `cargo test` green: fastprep 110,
-  fastdedup 87, fastsim 54, fastcheck 54, fastmaps 27, fasthelper 13 —
-  436 tests, 0 failures.
+* The six binaries build in this tree; `cargo test` green: fastcheck 143,
+  fastdedup 135, fastprep 306, fastsim 93, fastmaps 96, fasthelper 78, plus the
+  pathology bundle — 852 tests, 0 failures (2026-10-23; the per-tool manifest
+  `scripts/expected-test-counts.txt` is authoritative and `pixi run ci` asserts
+  it). The 436 this bullet used to quote was the 2026-10 figure.
 * `fasthelper run -c examples/fastsuite.toml` executes
   `fastsim → fastdedup → fastprep → fastmaps`, records a manifest with argv,
   exit codes and wall times, and aggregates four reports into

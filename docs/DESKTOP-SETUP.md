@@ -46,7 +46,7 @@ Six release binaries land in `tools/<tool>/target/release/`.
 ## 4. Verify (must be green before any bench)
 
 ```fish
-pixi run test          # 393 tests, 0 failures
+pixi run test          # 852 tests, 0 failures (2026-10-23)
 pixi run doctor        # all six tools found + versions
 bash examples/demo.sh 20000
 # the differential harness (fastcheck's correctness gate):

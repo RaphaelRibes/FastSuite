@@ -317,7 +317,10 @@ it; the commands and the before/after output are in
 
 **Consequences for the campaign numbers.** The `--min-len` change alters integer
 floors only (`30`, `50` on short-read datasets); the shipped `0.9L` rows behave as
-before, and the shipped-default trim-accuracy rows are unaffected. The grid should
+before, and the shipped-default trim-accuracy rows are unaffected. *(Written when
+`0.9L` was the shipped floor — D-18 later moved it to `0.67L`, so the
+shipped-default rows now describe a different budget and the campaign grid needs
+re-deriving before it is quoted against a current build.)* The grid should
 still be re-derived before the sweep numbers are quoted again.
 
 ## Known defects (measured, not guessed)
@@ -454,13 +457,17 @@ New and open (not defects of a measured component, but unresolved):
   the harness charges a dropped read to the kept-set; with `--no-dedup` the
   aggregate retention is 98.47% against fastp's 97.23%. So the win is not
   apples-to-apples *because the two tools are configured differently*, and the
-  honest comparison quotes both configurations (decision D-13). The
-  `--min-len 0.9L` default was measured and kept.
-* **The `head_dropout` default is now 0** (committed `3d76a31`), which is the
-  measured right default on this corpus (100/101 datasets; `1` on the remaining
-  one; `4` on none). No version bump, so this is committed-but-unreleased: a
-  binary built from `main` trims at 0, a released 0.1.0 tarball still trims
-  at 4.
+  honest comparison quotes both configurations (decision D-13). The floor moved
+  after this measurement: `0.9L` was measured and kept here, and D-18 later
+  re-priced it to `0.67L` for the artefact case above, so a re-run of this
+  comparison would describe a different budget.
+* **The `head_dropout` default is 4, not 0** — this bullet said the opposite
+  until 2026-10-23. `3d76a31` did set it to 0 (100/101 datasets on this corpus),
+  and D-16 then re-priced it: an artefact left in the output costs 7x a base
+  trimmed, which puts the break-even at 2.6 and makes 4 the shipped default
+  again from the 0.4.1 release. The 1:1 total-error reading still prefers 0, and
+  `--head-dropout 0` is the flag for it. `docs/TRIM-ACCURACY.md` has the two
+  columns.
 * **`--pe-overlap` is a measured null and ships opt-in** (2026-10-19). Exact
   matches identical (347,171) with and without it on a synthetic cohort built to
   be scorable, overtrim +106, +0.000 pp against a pre-registered 0.5 pp threshold.
