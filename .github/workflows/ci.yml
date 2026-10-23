@@ -12,6 +12,17 @@ jobs:
       - uses: prefix-dev/setup-pixi@v0.8.1
         with:
           cache: true
+      # The suite runs `cargo test --offline` (a test run must not hit the
+      # network mid-suite), so the registry has to be primed FIRST. On a fresh
+      # runner ~/.cargo is empty and the very first command fails at resolution
+      # — "error: no matching package named `clap` found" — which is why this
+      # step exists ahead of the tests rather than inside them.
+      - name: Fetch crates
+        run: |
+          set -e
+          for t in fastdedup fastprep fastcheck fastmaps fastsim fasthelper; do
+            (cd tools/$t && pixi run cargo fetch)
+          done
       # The test-count manifest is a staleness detector: a short count means a
       # stale test binary, so ci.sh fails rather than lowering the number.
       - run: pixi run ci
