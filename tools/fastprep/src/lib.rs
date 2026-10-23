@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod algorithm;
 pub mod cli;
+pub mod correct;
 pub mod io;
 pub mod metadata;
 pub mod pe_overlap;

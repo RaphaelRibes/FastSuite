@@ -262,6 +262,8 @@ fn runtime(pe_overlap: PeOverlapMode) -> Runtime {
         pe_overlap,
         adapter_evidence: fastprep::adapter::AdapterEvidence::Floor,
         pe_ambiguous_smallest: false,
+        pe_correct: None,
+        pe_correct_min_overlap: 30,
         dedup: None,
         thread_pool: None,
     }
@@ -996,5 +998,220 @@ fn the_floor_policy_is_byte_identical_to_no_policy_at_all() {
         &in1, &in2, &outs[0].0, &outs[0].1, &outs[1].0, &outs[1].1,
     ] {
         std::fs::remove_file(p).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --pe-correct: posterior consensus correction over the doubly-retained mate
+// overlap (src/correct.rs). At overlap disagreements the two-hypothesis
+// posterior decides: when |log10 odds| >= gate the LOSING mate's base and Q
+// are rewritten (the winner is untouched), the written Q becoming the
+// posterior Q capped at 40. The pipeline contract pinned here: flag-off is
+// byte-identical, a decisive disagreement flips exactly one base, a base one
+// mate trimmed away can never reach (nor corrupt) its mate, and an insert the
+// unique verifier refuses leaves everything exactly as sequenced.
+// ---------------------------------------------------------------------------
+
+/// FASTQ text with explicit per-base qualities: the rule acts on quality, so
+/// the fixtures need to control it (`pair_fastq` writes Q40 throughout).
+fn pair_fastq_q(p1: &[u8], q1: &[u8], p2: &[u8], q2: &[u8], name: &str) -> (String, String) {
+    let rec = |id: &str, s: &[u8], q: &[u8]| {
+        assert_eq!(s.len(), q.len(), "seq/qual length mismatch in fixture");
+        format!(
+            "@{id}\n{}\n+\n{}\n",
+            String::from_utf8_lossy(s),
+            String::from_utf8_lossy(q)
+        )
+    };
+    (rec(name, p1, q1), rec(name, p2, q2))
+}
+
+/// One FASTQ record body back to its `(seq, qual)` halves.
+fn seq_qual(body: &str) -> (Vec<u8>, Vec<u8>) {
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), 4, "one FASTQ record expected, got: {body:?}");
+    (lines[1].as_bytes().to_vec(), lines[3].as_bytes().to_vec())
+}
+
+#[test]
+fn pe_correct_rewrites_the_low_q_error_and_rescores_it() {
+    // insert 100 on 150-base mates: the shared fragment window is [0, 100).
+    // At fragment position 50 R1 reports the WRONG base at Q2 ('#') while R2
+    // reports the correct one at Q40 ('I') -- the posterior is decisive for
+    // R2, so R1's base is rewritten and its Q rescored to the capped posterior
+    // Q ('I' = Phred 40). Everything else must be untouched. The posterior
+    // acts on QUALITY, not truth: the wrong call must be the low-Q one.
+    let (mut r1, r2) = pair(150, 100, 77);
+    let fpos = 50usize;
+    let j2 = 100 - 1 - fpos; // 49: R2's read-orientation partner of fpos
+    let truth = r1[fpos];
+    r1[fpos] = if truth == b'A' { b'C' } else { b'A' };
+    assert_eq!(comp(r2[j2]), truth, "fixture: R2 must carry the true base");
+    let mut q1 = vec![b'I'; 150];
+    q1[fpos] = b'#'; // Phred 2: confidently wrong
+    let q2 = vec![b'I'; 150]; // R2 correct at Phred 40
+
+    let in1 = tmp_path("pc_r1.fq");
+    let in2 = tmp_path("pc_r2.fq");
+    let (a, b) = pair_fastq_q(&r1, &q1, &r2, &q2, "pc");
+    write_plain(&in1, &a);
+    write_plain(&in2, &b);
+    let p = params();
+
+    // Flag OFF: byte-identical to the input (nothing trims on this fixture).
+    let off1 = tmp_path("pc_off_1.fq");
+    let off2 = tmp_path("pc_off_2.fq");
+    run_paired(
+        &in1, &in2, &off1, &off2, None, None, &p, &p,
+        &runtime(PeOverlapMode::Never),
+    )
+    .expect("paired run must succeed");
+    assert_eq!(read_plain(&off1), a, "flag off: R1 must be byte-identical");
+    assert_eq!(read_plain(&off2), b, "flag off: R2 must be byte-identical");
+
+    // Flag ON: exactly one base + one quality byte change, on R1 only.
+    let mut rt = runtime(PeOverlapMode::Never);
+    rt.pe_correct = Some(2.0);
+    rt.pe_correct_min_overlap = 30;
+    let on1 = tmp_path("pc_on_1.fq");
+    let on2 = tmp_path("pc_on_2.fq");
+    let st = run_paired(&in1, &in2, &on1, &on2, None, None, &p, &p, &rt)
+        .expect("paired run must succeed");
+    assert_eq!(st.pairs_out, 1, "the pair survives");
+    assert_eq!(st.bases_corrected, 1, "exactly one base was rewritten");
+
+    let (o1s, o1q) = seq_qual(&read_plain(&on1));
+    let (o2s, o2q) = seq_qual(&read_plain(&on2));
+    assert_eq!(o1s[fpos], truth, "the low-Q error must become the true base");
+    assert_eq!(
+        o1q[fpos], b'I',
+        "the rewritten Q is the capped posterior Q (Phred 40 -> 'I')"
+    );
+    let mut r1_exp = r1.clone();
+    r1_exp[fpos] = truth;
+    let mut q1_exp = q1.clone();
+    q1_exp[fpos] = b'I';
+    assert_eq!(o1s, r1_exp, "no other R1 base may move");
+    assert_eq!(o1q, q1_exp, "no other R1 quality may move");
+    assert_eq!(o2s, r2, "the winning mate's bases are untouched");
+    assert_eq!(o2q, q2, "the winning mate's qualities are untouched");
+
+    for f in [&in1, &in2, &off1, &off2, &on1, &on2] {
+        std::fs::remove_file(f).ok();
+    }
+}
+
+#[test]
+fn a_base_one_mate_trims_away_must_not_rewrite_its_mate() {
+    // Both mates hard-trim their 3' 60 bases (trim_3 = 60), so with insert 100
+    // the doubly-retained overlap is fragment positions 10..90. Position 95 is
+    // SHARED but only R2 keeps its partner (R2 index 4): R1's base there is
+    // trimmed-away junk. Give that junk the WRONG call and the HIGHER quality
+    // -- unmasked it would win the posterior and corrupt R2's kept base. The
+    // masking contract: output is byte-identical to the flag-off run.
+    let (mut r1, r2) = pair(150, 100, 91);
+    let fpos = 95usize;
+    let j2 = 100 - 1 - fpos; // 4
+    let truth = r1[fpos];
+    assert_eq!(
+        comp(r2[j2]),
+        truth,
+        "fixture: R2's kept base must be the true call"
+    );
+    r1[fpos] = if truth == b'A' { b'C' } else { b'A' }; // wrong, and trimmed away on R1
+    let q1 = vec![b'I'; 150]; // Q40 junk: would win the posterior if it counted
+    let mut q2 = vec![b'I'; 150];
+    q2[j2] = b'+'; // '+' = Phred 10: R2's correct call is the weaker voice
+
+    let p = fastprep::algorithm::Params {
+        trim_3: Some(60),
+        ..params()
+    };
+    let in1 = tmp_path("pc2_r1.fq");
+    let in2 = tmp_path("pc2_r2.fq");
+    let (a, b) = pair_fastq_q(&r1, &q1, &r2, &q2, "pc2");
+    write_plain(&in1, &a);
+    write_plain(&in2, &b);
+
+    let mut rt = runtime(PeOverlapMode::Never);
+    rt.pe_correct = Some(2.0);
+    let on1 = tmp_path("pc2_on_1.fq");
+    let on2 = tmp_path("pc2_on_2.fq");
+    let st = run_paired(&in1, &in2, &on1, &on2, None, None, &p, &p, &rt)
+        .expect("paired run must succeed");
+    assert_eq!(st.bases_corrected, 0, "nothing may be rewritten here");
+
+    let off1 = tmp_path("pc2_off_1.fq");
+    let off2 = tmp_path("pc2_off_2.fq");
+    run_paired(
+        &in1, &in2, &off1, &off2, None, None, &p, &p,
+        &runtime(PeOverlapMode::Never),
+    )
+    .expect("paired run must succeed");
+
+    // Self-check the fixture geometry before the real assertions.
+    assert_eq!(
+        read_plain(&off1).lines().nth(1).unwrap().len(),
+        90,
+        "fixture: trim_3 = 60 must leave 90 bases"
+    );
+    assert_eq!(
+        read_plain(&on1),
+        read_plain(&off1),
+        "R1: nothing to correct inside its kept window"
+    );
+    assert_eq!(
+        read_plain(&on2),
+        read_plain(&off2),
+        "R2: the trimmed mate's base must never reach it"
+    );
+    let (o2s, o2q) = seq_qual(&read_plain(&on2));
+    assert_eq!(o2s[j2], comp(truth), "R2's kept base stays the true call");
+    assert_eq!(o2q[j2], b'+', "and keeps its honest quality");
+
+    for f in [&in1, &in2, &on1, &on2, &off1, &off2] {
+        std::fs::remove_file(f).ok();
+    }
+}
+
+#[test]
+fn an_uninferrable_insert_is_left_untouched() {
+    // A period-3 fragment fits MANY inserts (every candidate whose shift is a
+    // multiple of 3 verifies on this geometry), so the unique verifier refuses
+    // rather than guessing. Even a decisive disagreement must then stay
+    // exactly as sequenced -- censoring beats fabrication.
+    let unit = b"ACG";
+    let r1_clean: Vec<u8> = (0..60).map(|i| unit[i % 3]).collect();
+    let r2: Vec<u8> = r1_clean.iter().rev().map(|&b| comp(b)).collect();
+    let mut r1 = r1_clean;
+    let truth = r1[30];
+    assert_eq!(truth, b'A', "fixture: position 30 is unit[0]");
+    r1[30] = b'T'; // decisive: wrong call, and no new homopolymer run
+    let mut q1 = vec![b'I'; 60];
+    q1[30] = b'#'; // Phred 2: would lose the posterior outright
+    let q2 = vec![b'I'; 60];
+
+    let in1 = tmp_path("pc3_r1.fq");
+    let in2 = tmp_path("pc3_r2.fq");
+    let (a, b) = pair_fastq_q(&r1, &q1, &r2, &q2, "pc3");
+    write_plain(&in1, &a);
+    write_plain(&in2, &b);
+
+    let mut rt = runtime(PeOverlapMode::Never);
+    rt.pe_correct = Some(2.0);
+    rt.pe_correct_min_overlap = 30;
+    let on1 = tmp_path("pc3_on_1.fq");
+    let on2 = tmp_path("pc3_on_2.fq");
+    let st = run_paired(&in1, &in2, &on1, &on2, None, None, &params(), &params(), &rt)
+        .expect("paired run must succeed");
+    assert_eq!(
+        st.bases_corrected, 0,
+        "an ambiguous insert must never be corrected"
+    );
+    assert_eq!(read_plain(&on1), a, "R1 stays exactly as sequenced");
+    assert_eq!(read_plain(&on2), b, "R2 stays exactly as sequenced");
+
+    for f in [&in1, &in2, &on1, &on2] {
+        std::fs::remove_file(f).ok();
     }
 }

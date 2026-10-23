@@ -296,6 +296,48 @@ pub struct Cli {
     #[arg(long, help_heading = "Adapter Trimming")]
     pub pe_ambiguous_smallest: bool,
 
+    // --------------------------------------- PE overlap consensus correction
+
+    /// Correct base errors in the mate overlap by posterior consensus
+    /// (opt-in; paired-end FASTQ only).
+    ///
+    /// Where the mates cover the same fragment position and disagree, the
+    /// lower-posterior base is rewritten to match the higher one. The action is
+    /// gated on two-hypothesis posterior odds: a disagreement is corrected only
+    /// when |log10 odds| ≥ GATE, and a tie is never resolved by fiat. The
+    /// rewritten base's Q becomes the posterior Q of the agreement (capped at
+    /// 40) — an evidence-based rescore, so a corrected base never claims more
+    /// confidence than the pair supports.
+    ///
+    /// Only doubly-retained bases participate: positions trimmed away from
+    /// either mate are masked before correction and can never rewrite a kept
+    /// base. Correction runs after trim decisions and never touches trim
+    /// coordinates or read counts — with the flag off (the default) output is
+    /// byte-identical, and with it on, trimming is exactly as before.
+    ///
+    /// GATE is the minimum |log10 odds| to act. `--pe-correct` bare means 2.0,
+    /// the measured default arm; 0.5 is the aggressive arm (more errors fixed,
+    /// more correct bases touched); 3.0 is the conservative arm. On the
+    /// 20 000-pair truth corpus with per-base ground truth
+    /// (bench/results/consensus-headroom*.tsv), gate 2.0 fixes more residual
+    /// base errors than `fastp --correction` at comparable corruption, and the
+    /// margin holds when the quality strings are miscalibrated 2× in either
+    /// direction. Pairs whose overlap is too short (or too ambiguous) to infer
+    /// a unique insert are left untouched.
+    #[arg(long, value_name = "GATE", num_args = 0..=1, default_missing_value = "2.0",
+          help_heading = "Quality Filtering")]
+    pub pe_correct: Option<f64>,
+
+    /// Minimum shared overlap for `--pe-correct` to act (default 30).
+    ///
+    /// The insert is inferred from the pair and accepted only when exactly one
+    /// candidate verifies (a repeated fragment fitting several inserts is
+    /// refused rather than guessed), so this bounds both the reach of the
+    /// correction and the confidence in the geometry. 30 matches the overlap
+    /// floor `fastp --correction` applies to its own rule.
+    #[arg(long, default_value_t = 30, value_name = "N", help_heading = "Quality Filtering")]
+    pub pe_correct_min_overlap: usize,
+
     /// Retry the adapter match before a terminal no-signal G-run.
     ///
     /// NovaSeq's two-colour overprint replaces the last bases of a read with
@@ -752,6 +794,12 @@ pub struct Runtime {
     /// alignment to the smallest verifying insert, when the boundary guard
     /// confirms adapter behind it. `false` (the default) keeps the refusal.
     pub pe_ambiguous_smallest: bool,
+    /// `--pe-correct [GATE]`: PE-overlap consensus correction. `Some(gate)`
+    /// rewrites the losing mate at overlap disagreements under a posterior-odds
+    /// gate; `None` (the default) leaves output byte-identical to uncorrected.
+    pub pe_correct: Option<f64>,
+    /// `--pe-correct-min-overlap`: minimum shared overlap for `--pe-correct`.
+    pub pe_correct_min_overlap: usize,
 
     /// Deduplication settings; `None` when `--dedup` was not given.
     pub dedup: Option<DedupConfig>,
@@ -931,9 +979,10 @@ impl Cli {
         if !paired && (self.singletons1.is_some() || self.singletons2.is_some()
             || self.r1_scan_reverse || self.r2_scan_reverse
             || self.pe_ambiguous_smallest
+            || self.pe_correct.is_some()
             || self.pe_overlap != PeOverlapMode::Auto)
         {
-            bail!("--singletons*, --r1-scan-reverse, --r2-scan-reverse, --pe-overlap and --pe-ambiguous-smallest apply to paired-end mode only");
+            bail!("--singletons*, --r1-scan-reverse, --r2-scan-reverse, --pe-overlap, --pe-ambiguous-smallest and --pe-correct apply to paired-end mode only");
         }
 
         // Numeric ranges.
@@ -972,6 +1021,14 @@ impl Cli {
         if let Some(mq) = self.mean_q { if mq < 0.0 { bail!("--mean-q must be ≥ 0"); } }
         if !(0.0..=1.0).contains(&self.adapter_error_rate) { bail!("--adapter-error-rate must be in [0, 1]"); }
         if self.min_adapter_overlap == 0 { bail!("--min-adapter-overlap must be ≥ 1"); }
+        if let Some(g) = self.pe_correct {
+            if g < 0.0 || !g.is_finite() {
+                bail!("--pe-correct gate must be finite and ≥ 0 (got {g})");
+            }
+        }
+        if self.pe_correct_min_overlap == 0 {
+            bail!("--pe-correct-min-overlap must be ≥ 1");
+        }
 
         if self.target.len() > 5 { bail!("--target may be given at most 5 times"); }
         let rule = build_match_rule(&self.target)?;
@@ -1316,6 +1373,8 @@ impl Cli {
             pe_overlap,
             adapter_evidence: self.adapter_evidence,
             pe_ambiguous_smallest: self.pe_ambiguous_smallest,
+            pe_correct: self.pe_correct,
+            pe_correct_min_overlap: self.pe_correct_min_overlap,
             dedup,
             adapter_error_rate: self.adapter_error_rate,
             min_adapter_overlap_se: self.min_adapter_overlap,
@@ -1766,6 +1825,85 @@ mod tests {
             rt.pe_ambiguous_smallest,
             "--pe-ambiguous-smallest must reach the Runtime"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--pe-correct` is opt-in, paired-only, and must reach the `Runtime`
+    /// exactly as parsed: the bare flag is the measured default gate 2.0, an
+    /// explicit gate passes through verbatim, and the refusal cases (single
+    /// end, bad gate, zero min-overlap) must fail `finalize()` rather than
+    /// silently clamp.
+    #[test]
+    fn pe_correct_reaches_the_runtime_and_refuses_bad_input() {
+        use clap::Parser;
+        let dir = std::env::temp_dir().join(format!("fastprep-pe-correct-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inp = dir.join("in.fq");
+        let inp2 = dir.join("in2.fq");
+        let out = dir.join("out.fq");
+        let out2 = dir.join("out2.fq");
+        let body = "@r0\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+        std::fs::write(&inp, body).unwrap();
+        std::fs::write(&inp2, body).unwrap();
+
+        let paired_vec = |extra: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = vec![
+                "fastprep".into(),
+                "-1".into(), inp.to_string_lossy().into_owned(),
+                "-2".into(), inp2.to_string_lossy().into_owned(),
+                "-o".into(), out.to_string_lossy().into_owned(),
+                "-p".into(), out2.to_string_lossy().into_owned(),
+                "--no-dedup".into(), "--no-auto-phred".into(), "--no-adapter".into(), "-q".into(),
+            ];
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+        let paired = |extra: &[&str]| Cli::parse_from(paired_vec(extra)).finalize();
+
+        // Opt-in: off unless asked for; min-overlap defaults to 30 (fastp's
+        // own overlap floor, so the comparison is fair).
+        let (_, rt) = paired(&[]).unwrap();
+        assert_eq!(rt.pe_correct, None, "--pe-correct is opt-in");
+        assert_eq!(
+            rt.pe_correct_min_overlap, 30,
+            "--pe-correct-min-overlap defaults to 30"
+        );
+
+        // The bare flag is the measured default gate (clap default_missing_value).
+        let (_, rt) = paired(&["--pe-correct"]).unwrap();
+        assert_eq!(rt.pe_correct, Some(2.0), "bare --pe-correct means gate 2.0");
+
+        // An explicit gate and min-overlap reach the Runtime verbatim.
+        let (_, rt) = paired(&["--pe-correct", "0.5", "--pe-correct-min-overlap", "15"]).unwrap();
+        assert_eq!(rt.pe_correct, Some(0.5), "an explicit gate is taken verbatim");
+        assert_eq!(rt.pe_correct_min_overlap, 15);
+
+        // Paired-only: with no mate there is nothing to consult.
+        let single = Cli::parse_from([
+            "fastprep", "-1", inp.to_str().unwrap(), "-o", out.to_str().unwrap(),
+            "--no-dedup", "--no-auto-phred", "--no-adapter", "-q", "--pe-correct",
+        ]);
+        let err = match single.finalize() {
+            Ok(_) => panic!("--pe-correct must be refused in single-end mode"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("--pe-correct"),
+            "the refusal must name the flag: {err}"
+        );
+
+        // Bad gates and a zero min-overlap are refused, never silently clamped.
+        for bad in ["--pe-correct=-1", "--pe-correct=nan", "--pe-correct=inf"] {
+            match Cli::try_parse_from(paired_vec(&[bad])) {
+                Ok(cli) => assert!(cli.finalize().is_err(), "{bad} must be refused"),
+                Err(_) => {} // a clap-level rejection is a refusal too
+            }
+        }
+        match Cli::try_parse_from(paired_vec(&["--pe-correct-min-overlap", "0"])) {
+            Ok(cli) => assert!(cli.finalize().is_err(), "a zero min-overlap must be refused"),
+            Err(_) => {}
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

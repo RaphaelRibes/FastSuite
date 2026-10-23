@@ -158,6 +158,11 @@ impl ScanInput {
 struct Processed {
     input: ScanInput,
     output: TrimOutput,
+    /// Consensus-corrected `(seq, qual)` in FULL-read coordinates, present
+    /// only when `--pe-correct` rewrote at least one retained base. `emit_to`
+    /// slices the same trim window out of these as out of the buffer, so trim
+    /// coordinates never move and the no-edit path is byte-identical.
+    corrected: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Processed {
@@ -167,20 +172,29 @@ impl Processed {
             TrimResult::Emit { .. } => {
                 let t_5 = self.output.result.t5();
                 let t_3 = self.output.result.t3();
-                let seq = &buf.seq[self.input.seq.clone()];
+                // With `--pe-correct` edits the full-read corrected copy stands
+                // in for the buffer slices; the trim window is taken the same
+                // way either way, so flag-off output is byte-identical.
+                let seq_all: &[u8] = match &self.corrected {
+                    Some((c_seq, _)) => c_seq.as_slice(),
+                    None => &buf.seq[self.input.seq.clone()],
+                };
                 debug_assert!(
-                    t_5 + t_3 <= seq.len(),
+                    t_5 + t_3 <= seq_all.len(),
                     "trim exceeds read length: t_5={} t_3={} L={}",
                     t_5,
                     t_3,
-                    seq.len()
+                    seq_all.len()
                 );
-                let seq = &seq[t_5..seq.len() - t_3];
+                let seq = &seq_all[t_5..seq_all.len() - t_3];
                 let id = &buf.id[self.input.id.clone()];
                 match self.input.format {
                     RecordFormat::Fastq => {
-                        let qual = &buf.qual[self.input.qual.clone()];
-                        let raw_qual = &qual[t_5..qual.len() - t_3];
+                        let qual_all: &[u8] = match &self.corrected {
+                            Some((_, c_qual)) => c_qual.as_slice(),
+                            None => &buf.qual[self.input.qual.clone()],
+                        };
+                        let raw_qual = &qual_all[t_5..qual_all.len() - t_3];
                         w.fastq(id, seq, raw_qual)
                     }
                     RecordFormat::Fasta => w.fasta(id, seq),
@@ -261,7 +275,11 @@ fn process_chunk(
         let seq = &buf.seq[input.seq.clone()];
         let qual = &buf.qual[input.qual.clone()];
         let output = trim(seq, qual, params_for(params, &fasta, input.format));
-        Processed { input, output }
+        Processed {
+            input,
+            output,
+            corrected: None,
+        }
     };
     if parallel {
         chunk.into_par_iter().map(work).collect()
@@ -766,6 +784,9 @@ pub struct PairedStats {
     /// corresponding --singletons* path was not provided.
     pub discarded_singletons_r1: u64,
     pub discarded_singletons_r2: u64,
+    /// Retained bases rewritten by `--pe-correct` consensus correction, both
+    /// mates summed. 0 whenever the flag is off (the default).
+    pub bases_corrected: u64,
 }
 
 enum PairOutcome {
@@ -778,6 +799,10 @@ enum PairOutcome {
 struct ProcessedPair {
     p1: Processed,
     p2: Processed,
+    /// Retained bases rewritten by `--pe-correct` on this pair (both mates).
+    /// Carried from the work closure so `write_pairs` sums it without
+    /// re-deriving anything from the emitted buffers.
+    corrected_bases: usize,
 }
 
 pub fn run_paired(
@@ -867,6 +892,7 @@ pub fn run_paired(
         singletons_r2: 0,
         discarded_singletons_r1: 0,
         discarded_singletons_r2: 0,
+        bases_corrected: 0,
     };
 
     let parallel = rt.threads > 1;
@@ -907,6 +933,8 @@ pub fn run_paired(
     let pe_overlap = rt.pe_overlap;
     let adapter_evidence = rt.adapter_evidence;
     let pe_ambiguous_smallest = rt.pe_ambiguous_smallest;
+    // (gate, min_ovl) for `--pe-correct`; `None` = flag off = untouched path.
+    let pe_correct = rt.pe_correct.map(|g| (g, rt.pe_correct_min_overlap));
     let compute = std::thread::spawn(move || {
         while let Ok(((b1, c1), (b2, c2))) = raw_rx.recv() {
             let results = match thread_pool.as_ref() {
@@ -923,6 +951,7 @@ pub fn run_paired(
                         pe_anchor,
                         adapter_evidence,
                         pe_ambiguous_smallest,
+                        pe_correct,
                     )
                 }),
                 None => pair_chunks(
@@ -937,6 +966,7 @@ pub fn run_paired(
                     pe_anchor,
                     adapter_evidence,
                     pe_ambiguous_smallest,
+                    pe_correct,
                 ),
             };
             if res_tx.send(((b1, b2), results)).is_err() {
@@ -1158,6 +1188,9 @@ fn write_pairs(
             stats
                 .r2
                 .record_margin(pp.p2.output.margin_5, pp.p2.output.margin_3);
+            // Only emitted bases count: a duplicate pair's corrected copies
+            // never reach the output.
+            stats.bases_corrected += pp.corrected_bases as u64;
         }
         if let Some(mw) = meta.as_deref_mut() {
             metadata::write_record(
@@ -1235,6 +1268,7 @@ fn outcome(r1: &TrimResult, r2: &TrimResult) -> PairOutcome {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pair_chunks(
     buf1: &ChunkBuf,
     buf2: &ChunkBuf,
@@ -1247,6 +1281,7 @@ fn pair_chunks(
     pe_anchor: usize,
     adapter_evidence: crate::adapter::AdapterEvidence,
     pe_ambiguous_smallest: bool,
+    pe_correct: Option<(f64, usize)>,
 ) -> Vec<ProcessedPair> {
     debug_assert_eq!(c1.len(), c2.len());
     // Mates are trimmed independently, except for the one cross-mate inference
@@ -1293,15 +1328,65 @@ fn pair_chunks(
 
         let out1 = trim(s1, q1, &p1);
         let out2 = trim(s2, q2, &p2);
+
+        // Opt-in posterior PE correction (`--pe-correct`), run strictly AFTER
+        // the trim decisions so trimming is byte-identical with the flag off.
+        // Full raw reads go in — `infer_insert` and the kernel both map
+        // fragment position fpos to s1[fpos] / s2[insert-1-fpos], i.e. 5'-anchored
+        // — and only the doubly-retained overlap is editable: positions a mate
+        // trimmed away are masked first, so a discarded base can never rewrite a
+        // kept one. `corrected` stays `None` (no allocation retained) unless an
+        // edit actually fired, and inference refusal leaves output untouched.
+        let (corr1, corr2, corrected_bases) = match pe_correct {
+            Some((gate, min_ovl))
+                if i1.format == RecordFormat::Fastq
+                    && i2.format == RecordFormat::Fastq
+                    && matches!(out1.result, TrimResult::Emit { .. })
+                    && matches!(out2.result, TrimResult::Emit { .. }) =>
+            {
+                match crate::correct::infer_insert(s1, s2, min_ovl) {
+                    Some(ins) => {
+                        let keep1 = out1.result.t5()..s1.len().saturating_sub(out1.result.t3());
+                        let keep2 = out2.result.t5()..s2.len().saturating_sub(out2.result.t3());
+                        let mut c1s = s1.to_vec();
+                        let mut c1q = q1.to_vec();
+                        let mut c2s = s2.to_vec();
+                        let mut c2q = q2.to_vec();
+                        let edits = crate::correct::correct_overlap_retained(
+                            &mut c1s,
+                            &mut c1q,
+                            &mut c2s,
+                            &mut c2q,
+                            keep1,
+                            keep2,
+                            p1.phred_offset,
+                            ins,
+                            gate,
+                            min_ovl,
+                        );
+                        if edits > 0 {
+                            (Some((c1s, c1q)), Some((c2s, c2q)), edits)
+                        } else {
+                            (None, None, 0)
+                        }
+                    }
+                    None => (None, None, 0),
+                }
+            }
+            _ => (None, None, 0),
+        };
         ProcessedPair {
             p1: Processed {
                 input: i1,
                 output: out1,
+                corrected: corr1,
             },
             p2: Processed {
                 input: i2,
                 output: out2,
+                corrected: corr2,
             },
+            corrected_bases,
         }
     };
     if parallel {
@@ -1374,6 +1459,8 @@ mod tests {
             pe_overlap: PeOverlapMode::Never,
             adapter_evidence: crate::adapter::AdapterEvidence::Floor,
             pe_ambiguous_smallest: false,
+            pe_correct: None,
+            pe_correct_min_overlap: 30,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1766,6 +1853,8 @@ mod tests {
             pe_overlap: PeOverlapMode::Never,
             adapter_evidence: crate::adapter::AdapterEvidence::Floor,
             pe_ambiguous_smallest: false,
+            pe_correct: None,
+            pe_correct_min_overlap: 30,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,
@@ -1794,6 +1883,8 @@ mod tests {
             pe_overlap: PeOverlapMode::Never,
             adapter_evidence: crate::adapter::AdapterEvidence::Floor,
             pe_ambiguous_smallest: false,
+            pe_correct: None,
+            pe_correct_min_overlap: 30,
             adapter_error_rate: 0.1,
             min_adapter_overlap_se: 4,
             dedup: None,

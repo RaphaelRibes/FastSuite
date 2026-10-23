@@ -415,6 +415,10 @@ pub fn to_report_paired_v1(
     metrics.insert("pairs_dropped".into(), serde_json::json!(p.pairs_dropped));
     metrics.insert("singletons_r1".into(), serde_json::json!(p.singletons_r1));
     metrics.insert("singletons_r2".into(), serde_json::json!(p.singletons_r2));
+    // Consensus correction counter: retained bases rewritten by --pe-correct
+    // (both mates summed). 0 whenever the flag is off, so an uncorrected run
+    // reports exactly the pre-feature key set plus one zero.
+    metrics.insert("bases_corrected".into(), serde_json::json!(p.bases_corrected));
 
     let mut doc = serde_json::json!({
         "schema":       REPORT_SCHEMA,

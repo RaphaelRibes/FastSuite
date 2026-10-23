@@ -3,6 +3,29 @@
 Newest first. Default-behaviour changes are marked **DEFAULT** and always carry
 the measurement that justified them.
 
+## Unreleased
+
+* `--pe-correct [GATE]` (opt-in; paired-end FASTQ only): posterior consensus
+  correction of base errors in the doubly-retained mate overlap. At overlap
+  disagreements a two-hypothesis posterior over the mates' quality strings
+  picks the call (`|log10 odds| >= GATE`, default 2.0; ties never resolved by
+  fiat) and rewrites only the losing mate's base and its Q, rescored to the
+  capped posterior Q (max 40). The insert is inferred from the pair and
+  accepted only when exactly one candidate verifies — a repeated fragment
+  fitting several inserts is refused, not guessed; `--pe-correct-min-overlap`
+  (default 30) matches `fastp --correction`'s own overlap floor. Trim
+  decisions run before correction and are never revisited, so the flag cannot
+  move a trim boundary (flag-off output is byte-identical to 0.4.1 on a
+  50k-pair corpus, both mates, sha256-checked). Measured on the 20k-pair
+  truth corpus at matched retention (40k reads out, fragment-only
+  denominators; `bench/results/consensus-headroom*.tsv`): `--pe-correct=2.0`
+  leaves **5.2% fewer residual base errors than `fastp 1.4.0 --correction`**
+  (22,190 vs 23,405 fragment errors; 3.93 vs 4.15 per kb) at comparable
+  corruption (13 vs 10 correct bases broken); `=0.5` leaves 13.0% fewer
+  (20,355) at 104 corrupted. The margin holds when quality strings are
+  miscalibrated 2× in either direction (5.3% and 5.0% fewer, corruption 5 vs 3
+  and 15 vs 15). Both axes reported; this is not a default change.
+
 ## 0.4.1
 
 * **DEFAULT — `--head-dropout` is back to 4.** The rule trims a 1..=4 bp

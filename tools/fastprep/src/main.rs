@@ -174,6 +174,12 @@ fn main() -> Result<()> {
                         s.discarded_singletons_r2
                     );
                 }
+                if s.bases_corrected > 0 {
+                    eprintln!(
+                        "    bases corrected:        {:>12}  (--pe-correct)",
+                        s.bases_corrected
+                    );
+                }
                 report_runtime(elapsed, s.r1.reads_in + s.r2.reads_in);
             }
             if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {

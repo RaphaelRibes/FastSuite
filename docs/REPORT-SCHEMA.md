@@ -93,6 +93,7 @@ and keeps its raw object under `legacy`.
 | `reads_adapter_trimmed` | `r1.adapter.reads_trimmed + r2.adapter.reads_trimmed` |
 | `read_retention` | `reads_out / reads_in` |
 | `pairs_out`, `pairs_dropped`, `singletons_r1/r2` | top-level, paired runs |
+| `bases_corrected` | paired runs with `--pe-correct`: retained bases rewritten by the posterior consensus correction, both mates summed (0 when the flag is off). Mirrored in `legacy` with the rest of the raw `PairedStats` object |
 | `margin_bases_5p`, `margin_bases_3p`, `reads_with_margin` | aggregate-only `--overtrim-margin` counters: bases the deliberate overtrim extension added at each end, and reads that received at least one (a read with no margin is not counted). Emitted in **both** `metrics` and `legacy`, mirrored, so a v1 consumer and the pre-v1 adapter read the same numbers |
 
 There is deliberately **no per-read margin record and no PXMT field**. PXMT v3 is
