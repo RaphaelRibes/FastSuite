@@ -126,7 +126,8 @@ pub struct Cli {
     pub singletons2: Option<PathBuf>,
 
     /// Write per-read trim metadata to PATH (binary PXMT format).
-    /// One record per touched read (trimmed or dropped).
+    /// One record per read — not per touched read — with its drop cause when
+    /// it was dropped.
     #[arg(long, value_name = "PATH", help_heading = "Input / Output")]
     pub metadata: Option<PathBuf>,
 
@@ -156,8 +157,12 @@ pub struct Cli {
     )]
     pub adapters: Option<PathBuf>,
 
-    /// Disable adapter trimming entirely.
-    #[arg(long = "no-adapter", help_heading = "Adapter Trimming")]
+    /// Disable adapter trimming entirely. Conflicts with an explicit set:
+    /// silently ignoring `--adapter-preset` because `--no-adapter` also
+    /// appeared is how a script that adds the flag "to be safe" disables the
+    /// adapters it asked for.
+    #[arg(long = "no-adapter", conflicts_with_all = ["adapter_preset", "adapters"],
+          help_heading = "Adapter Trimming")]
     pub no_adapter: bool,
 
     /// Treat an assumption as fatal. By default, when a detection returns
@@ -431,13 +436,18 @@ pub struct Cli {
 
 
     // -------------------------------------------------------- PolyX trimming
-    /// Minimum post-trim read length. Integer N (bases) or fraction FL of the
-    /// INSERT length (the read after adapter readthrough is removed; the
-    /// original read length when no adapter is trimmed). A read whose
-    /// post-trim length is below this floor is dropped; a read that would need
-    /// more trim than the floor allows is dropped rather than trimmed past it.
-    /// Integer floors are absolute: `--min-len 100` drops a 40 bp read.
-    #[arg(long, value_name = "N|FL", default_value = "0.9L", help_heading = "PolyX Trimming")]
+    /// Minimum length a read must RETAIN, as bases (N) or as a fraction FL of
+    /// the insert (the read after adapter readthrough, which is the original
+    /// length when no adapter is trimmed).
+    ///
+    /// Two things follow from one number, and both are deliberate: a read whose
+    /// post-trim length is below the floor is dropped, and a read that would
+    /// need more trim than the floor allows is dropped rather than trimmed
+    /// past it. So the floor is also the TRIM BUDGET: `0.67L` allows a third of
+    /// the read to be trimmed away (100 bases on a 150 bp read) and drops a
+    /// read that needs more. Integer floors are absolute: `--min-len 100`
+    /// drops a 40 bp read.
+    #[arg(long, value_name = "N|FL", default_value = "0.67L", help_heading = "PolyX Trimming")]
     pub min_len: MinLen,
 
     /// Mercy budget Δ_m: cumulative gap tolerated before declaring end-of-run.
@@ -563,11 +573,12 @@ pub struct Cli {
 
     // ------------------------------------------------------- Quality filtering
     /// Minimum whole-read mean Phred quality (raw, not ASCII offset).
-    #[arg(long, value_name = "FLOAT", default_value = "25", help_heading = "Quality Filtering")]
+    #[arg(long, value_name = "FLOAT", default_value = "25",
+          overrides_with = "no_mean_q", help_heading = "Quality Filtering")]
     pub mean_q: Option<f64>,
 
     /// Disable the mean-quality filter (the shipped default is 25).
-    #[arg(long = "no-mean-q", help_heading = "Quality Filtering")]
+    #[arg(long = "no-mean-q", overrides_with = "mean_q", help_heading = "Quality Filtering")]
     pub no_mean_q: bool,
 
     /// Succeed even when the run drops every read.
@@ -594,11 +605,12 @@ pub struct Cli {
     /// at 33 and the report records that as an assumption, with the census as
     /// its basis. Mutually exclusive with --phred-offset.
     #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
-          action = clap::ArgAction::Set, help_heading = "Quality Filtering")]
+          action = clap::ArgAction::Set, overrides_with = "no_auto_phred",
+          help_heading = "Quality Filtering")]
     pub auto_phred: bool,
 
     /// Disable the Phred-offset census (the shipped default is on).
-    #[arg(long = "no-auto-phred", help_heading = "Quality Filtering")]
+    #[arg(long = "no-auto-phred", overrides_with = "auto_phred", help_heading = "Quality Filtering")]
     pub no_auto_phred: bool,
 
     // -----------------------------------------------------------------Runtime
@@ -635,6 +647,7 @@ pub struct Cli {
     /// has no level floor, so level 1 keeps full parallel compression.
     #[arg(
         long = "gz-level",
+        short = 'c',
         visible_alias = "compression",
         default_value_t = 6,
         value_name = "N",
@@ -1070,7 +1083,12 @@ impl Cli {
         }
         if let Some(n) = self.gz_threads { if n == 0 { bail!("--gz-threads must be ≥ 1"); } }
         if let Some(mq) = self.mean_q { if mq < 0.0 { bail!("--mean-q must be ≥ 0"); } }
-        if !(0.0..=1.0).contains(&self.adapter_error_rate) { bail!("--adapter-error-rate must be in [0, 1]"); }
+        if !(0.0..1.0).contains(&self.adapter_error_rate) {
+            // 1.0 is not a rate: `max_mismatches(k, 1.0) == k`, so every
+            // window matches every adapter and every read is trimmed from
+            // position 0 (measured: 1 read in, 1 record out at length 0).
+            bail!("--adapter-error-rate must be in [0, 1), got {}", self.adapter_error_rate);
+        }
         if self.min_adapter_overlap == 0 { bail!("--min-adapter-overlap must be ≥ 1"); }
         if let Some(g) = self.pe_correct {
             if g < 0.0 || !g.is_finite() {
@@ -1134,6 +1152,31 @@ impl Cli {
             }
         } else if let Some(path) = self.adapters {
             let adapters = adapter::load_fasta(&path)?;
+            // 255 is not arbitrary: the adapter index is carried as a u8 and
+            // 255 is reserved for the PE-overlap boundary, so a 256-entry
+            // FASTA silently attributed its last adapter to "pe-overlap" and
+            // stopped matching it.
+            if adapters.len() > u8::MAX as usize {
+                bail!(
+                    "{} defines {} adapters; at most {} are supported (the adapter index is a u8 \
+                     and 255 is reserved for the PE-overlap boundary)",
+                    path.display(),
+                    adapters.len(),
+                    u8::MAX
+                );
+            }
+            if let Some(a) = adapters
+                .iter()
+                .find(|a| a.seq.len() < self.min_adapter_overlap)
+            {
+                eprintln!(
+                    "fastprep: warning: adapter '{}' is {} bp, shorter than \
+                     --min-adapter-overlap {}; it can never match",
+                    a.name,
+                    a.seq.len(),
+                    self.min_adapter_overlap
+                );
+            }
             AdapterSource::Fixed {
                 set: Arc::new(AdapterSet::new(
                     adapters,
@@ -1322,6 +1365,29 @@ impl Cli {
                 .chain(limit.as_ref().map(|l| l.bytes))
                 .min();
 
+            // The flag is a REFUSAL threshold — its help text promises
+            // "refuse to start if the projected fingerprint table exceeds
+            // this many megabytes" — as well as the runtime saturation
+            // ceiling. It used to reach only the ceiling, so `--dedup-max-mem
+            // 1` started, saturated the table and carried on instead of
+            // refusing.
+            if let Some(cap) = self.dedup_max_mem.map(|mb| mb.saturating_mul(1024 * 1024)) {
+                if proj.bytes > cap {
+                    bail!(
+                        "deduplication's fingerprint table is projected at {:.1} MB ({} buckets x {} B, {}-bit fingerprints), \
+                         above --dedup-max-mem {} MB\n\n  \
+                         --dedup-bits 64      narrower fingerprints, half the memory\n  \
+                         --dedup-max-mem 0    no explicit cap\n  \
+                         --no-dedup           run without deduplication",
+                        crate::memory::mib(proj.bytes) / 1024.0,
+                        proj.buckets,
+                        bits / 8 + 1,
+                        bits,
+                        self.dedup_max_mem.unwrap_or(0),
+                    );
+                }
+            }
+
             match crate::memory::admit(proj.bytes, limit.as_ref()) {
                 crate::memory::Admission::Refuse { projected, limit, source } => bail!(
                     "deduplication needs ~{:.1} GB ({} buckets x {} B, {}-bit fingerprints)\n\
@@ -1348,7 +1414,18 @@ impl Cli {
 
             let anchor = crate::dedup::AnchorSpec::new(&base, read_len, base.adapter.is_some());
             if !self.quiet {
-                if anchor.degenerate() {
+                if !anchor.is_usable() {
+                    eprintln!(
+                        "fastprep: deduplication on, {}-bit fingerprints, table pre-sized for \
+                         {} reads ({} buckets, {:.0} MB); the read is too short for an \
+                         interior window, so the fingerprint is the whole read ({} bases)",
+                        bits,
+                        capacity,
+                        proj.buckets,
+                        crate::memory::mib(proj.bytes),
+                        read_len,
+                    );
+                } else if anchor.degenerate() {
                     eprintln!(
                         "fastprep: deduplication on, {}-bit fingerprints, table pre-sized for \
                          {} reads ({} buckets, {:.0} MB); both read ends are trimmed, so the \
@@ -1578,9 +1655,11 @@ mod tests {
 
     #[test]
     fn shipped_defaults_are_the_swept_winner() {
-        // The 90-dataset campaign found one configuration best everywhere; it
-        // is what a bare invocation must do. Lock it so a future edit cannot
-        // silently drift the default away from the validated configuration.
+        // The grid's verdict, locked so a future edit cannot silently drift the
+        // defaults away from the validated configuration. NOTE: on Phase D's
+        // 101 real libraries this configuration is the per-dataset winner on
+        // only 1 of 101 (a per-dataset winner beats it on 100), so it is a good
+        // central configuration, not a universal one — see docs/AUTO-PARAMS.md.
         use clap::Parser;
         let cli = Cli::parse_from(["fastprep", "-1", "in.fq", "-o", "out.fq"]);
         assert_eq!(cli.adapter_error_rate, 0.2, "--adapter-error-rate");
@@ -1592,7 +1671,17 @@ mod tests {
         // reachable with an explicit flag.
         assert_eq!(cli.head_dropout, Some(4), "--head-dropout");
         assert_eq!(cli.mean_q, Some(25.0), "--mean-q");
-        assert!(matches!(cli.min_len, MinLen::Frac(f) if (f - 0.9).abs() < 1e-9), "--min-len");
+        // 0.67L, NOT the grid's 0.9L: the floor is also the trim budget, and
+        // 0.9L allowed only 10% of a read to be trimmed, so a 150 bp read with
+        // a 30 bp 5' polyG artefact was DROPPED rather than trimmed. 0.67L
+        // keeps 100 bp of a 150 bp read (a third trimable) and was chosen by
+        // the pipeline's owner, not by the sweep — re-benchmark before
+        // quoting it against the old grid.
+        assert!(
+            matches!(cli.min_len, MinLen::Frac(f) if (f - 0.67).abs() < 1e-9),
+            "--min-len"
+        );
+        assert_eq!(cli.min_len.resolve(150), 100, "100 bp of a 150 bp read");
         assert!(cli.dedup, "--dedup ships on");
         assert!(cli.auto_phred, "--auto-phred ships on");
         assert!(cli.no_interior, "the interior scan ships OFF");

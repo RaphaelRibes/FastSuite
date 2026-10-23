@@ -136,10 +136,17 @@ pub fn scored_mismatches(
     let mut soft_mm = 0usize;
     let mut unambig = 0usize;
     for i in 0..a.len() {
+        // Case-folded for the same reason as `mismatches_upto`: the seed
+        // table is case-insensitive, so the verification must be too.
+        let (ca, cb, cn) = (
+            a[i].to_ascii_uppercase(),
+            b[i].to_ascii_uppercase(),
+            b'N',
+        );
         // `N` matches `N` byte-wise, but two uncalled bases are not two
         // agreeing calls: only a called base that agrees is evidence.
-        let ambiguous_base = a[i] == b'N' || b[i] == b'N';
-        if a[i] == b[i] && !ambiguous_base {
+        let ambiguous_base = ca == cn || cb == cn;
+        if ca == cb && !ambiguous_base {
             unambig += 1;
             continue;
         }
@@ -372,11 +379,21 @@ pub fn exact_prefix_candidates(
     for (ai, a) in set.adapters.iter().enumerate() {
         let hi = max_len.min(a.seq.len()).min(l);
         for t in min_len..=hi {
-            if seq[l - t..] == a.seq[..t] {
+            // Case-folded, like the rest of the matcher.
+            let hit = seq[l - t..]
+                .iter()
+                .zip(&a.seq[..t])
+                .all(|(x, y)| x.eq_ignore_ascii_case(y));
+            if hit {
                 out.push((ai as u8, t));
             }
         }
     }
+    // The docstring promises shortest-first: `short_tail_trim` returns the
+    // FIRST corroborated candidate when `longest_wins == false`, and the
+    // adapter-major order above let adapter 0's longer candidate win over
+    // adapter 1's shorter one (up to `max_len - min_len` extra bases cut).
+    out.sort_unstable_by_key(|&(ai, t)| (t, ai));
     out
 }
 
@@ -1246,8 +1263,11 @@ fn mismatches_upto(a: &[u8], b: &[u8], cap: usize) -> usize {
         for i in 0..ca.len() {
             // Branchless compare: a differing byte adds 1. The compiler
             // turns this into a compare + pcmpeqb/pmovmskb-style popcount
-            // over the 32-byte block.
-            mm += (ca[i] != cb[i]) as usize;
+            // over the 32-byte block. Case-folded: the seed table matches a
+            // soft-masked read (a lowercase tail is seeded and then failed
+            // every verification compare here, so adapter trimming silently
+            // did nothing on masked FASTQ).
+            mm += (!ca[i].eq_ignore_ascii_case(&cb[i])) as usize;
         }
         if mm > cap {
             return mm;

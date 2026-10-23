@@ -202,14 +202,20 @@ fn paired_json_wrapper_sums_mates_and_prefixes_ambiguous_metrics() {
     std::fs::remove_dir_all(&d).unwrap();
 }
 
-/// `--dry-run` writes nothing at all, including the report (CLI-SPEC §1).
+/// `--dry-run` writes no FASTQ, and the report IS emitted with
+/// `"dry_run": true` (CLI-SPEC §1: "every counter computed, nothing written;
+/// the report is still emitted"). Leaving a previous report in place was the
+/// silent alternative: a consumer read stale counters as this run's.
 #[test]
-fn dry_run_still_writes_no_json() {
+fn dry_run_emits_the_report_flagged_as_a_dry_run() {
     let d = tmpdir("dryrun");
     let fq = d.join("in.fastq");
     std::fs::write(&fq, four_reads()).unwrap();
     let json = d.join("report.json");
     let out = d.join("out.fastq");
+    // A report from an earlier run must be REPLACED, not left to be mistaken
+    // for this run's numbers.
+    std::fs::write(&json, "{\"schema\":\"stale\"}").unwrap();
 
     let (_, stderr, code) = run(&[
         "-1",
@@ -222,12 +228,17 @@ fn dry_run_still_writes_no_json() {
         "--min-len",
         "0",
         "--no-adapter",
+        "--force",
     ]);
     assert_eq!(code, 0, "--dry-run must succeed: {stderr}");
     assert!(
-        !json.exists(),
-        "--dry-run must not write the --json report"
+        json.exists(),
+        "--dry-run must emit the --json report"
     );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    assert_eq!(doc["dry_run"], true, "the report must say it was a dry run");
+    assert_eq!(doc["schema"], "fastsuite.report.v1");
     assert!(!out.exists(), "--dry-run must not write the output");
 
     std::fs::remove_dir_all(&d).unwrap();

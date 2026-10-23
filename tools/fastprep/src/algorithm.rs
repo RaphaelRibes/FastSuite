@@ -483,6 +483,7 @@ pub fn scan(
 
     let n = bases.len();
     let mut gamma = 0.0f64;
+    let mut seen_mismatch = false;
     let mut k = 0usize;
     let mut matches = 0usize;
     let mut run_span = 0usize;
@@ -518,7 +519,19 @@ pub fn scan(
             params,
             &params.rule,
         );
-        gamma += gap;
+        if !is_match {
+            seen_mismatch = true;
+        }
+        // Charge the run's OWN bases nothing: Δ_m bounds how far the cut walks
+        // past the run's end (the overshoot window, where a chance match in the
+        // flanking biology can extend the run span), not how long a run may be.
+        // Charging matches made the budget a length cap: at Q2 a match costs
+        // 0.09, so 30 bases exhausted Δ_m = 3 and a 4-colour polyG tail (low
+        // quality, the normal case) was trimmed only 37 bases deep however long
+        // it was.
+        if !is_match || seen_mismatch {
+            gamma += gap;
+        }
         if is_match {
             matches += 1;
             // The matching pair (start+k, start+k+1) confirms the run reaches
@@ -761,6 +774,7 @@ fn streaming_walk<const FORWARD: bool>(
 
     let mut quality_sum: u64 = 0;
     let mut gamma = 0.0f64;
+    let mut seen_mismatch = false;
     let mut k_curr: usize = 0;
     let mut m_curr: usize = 0;
     let mut run_span_curr: usize = 0;
@@ -833,7 +847,15 @@ fn streaming_walk<const FORWARD: bool>(
             &params.rule,
         );
 
-        gamma += gap;
+        if !is_match {
+            seen_mismatch = true;
+        }
+        // Same rule as `scan`: the run's own bases do not fill Δ_m. See the
+        // comment there — this is what lets a low-quality (4-colour) polyG tail
+        // be trimmed whole instead of only ~37 bases deep.
+        if !is_match || seen_mismatch {
+            gamma += gap;
+        }
         if is_match {
             m_curr += 1;
             // Run reaches the pair's far base `i_logical`; extent from the

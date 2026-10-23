@@ -1,6 +1,10 @@
-//! `--dry-run` (CLI-SPEC §1): read the input, compute every counter, write
-//! nothing — no output FASTQ, no metadata, no --json file. The summary still
-//! goes to stderr, and the counters must match a real run exactly.
+//! `--dry-run` (CLI-SPEC §1): read the input, compute every counter, write no
+//! FASTQ and no metadata file. The REPORT is written with `"dry_run": true`
+//! (CLI-SPEC: "every counter computed, nothing written; the report is still
+//! emitted") — a dry run exists to produce those numbers, and leaving a
+//! previous report in place let a consumer read stale counters as this run's.
+//! The summary still goes to stderr, and the counters must match a real run
+//! exactly.
 //!
 //! fastprep had no stats-only mode (CLI-SPEC §4, gap 2), so there was no way
 //! to check what a trimming configuration would do to a sample before
@@ -110,10 +114,21 @@ fn dry_run_writes_nothing_but_reports_the_same_counters() {
     };
     assert_eq!(code, 0, "--dry-run must succeed: {dry_err}");
 
-    // Nothing was written. Not the FASTQ, not the metadata, not the report.
-    for p in [&dry_out, &dry_meta, &dry_json] {
+    // The FASTQ and the metadata file are not written. The REPORT is: a dry
+    // run exists to produce the numbers, and leaving a previous report in
+    // place made a consumer read stale counters as this run's (CLI-SPEC:
+    // "every counter computed, nothing written; the report is still emitted").
+    for p in [&dry_out, &dry_meta] {
         assert!(!p.exists(), "--dry-run must not write {}", p.display());
     }
+    assert!(dry_json.exists(), "--dry-run must emit the report");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&dry_json).unwrap()).unwrap();
+    assert_eq!(doc["dry_run"], true, "the report must say it was a dry run");
+    assert_eq!(
+        doc["metrics"]["reads_in"], doc["metrics"]["reads_out"],
+        "a dry run's counters are the real run's"
+    );
 
     // The summary is still printed, and every counter matches the real run.
     assert!(

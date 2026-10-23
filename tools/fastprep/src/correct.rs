@@ -104,9 +104,7 @@ pub fn infer_insert(r1: &[u8], r2: &[u8], min_ovl: usize) -> Option<usize> {
     // above only rejects zero: when it exceeds `l1 + l2` this subtraction
     // wrapped to ~1.8e19 in release (the loop then spun forever on the first
     // pair) and panicked under `overflow-checks` in debug.
-    let Some(max_i) = (l1 + l2).checked_sub(min_ovl) else {
-        return None;
-    };
+    let max_i = (l1 + l2).checked_sub(min_ovl)?;
     let mut found: Option<usize> = None;
     for i in min_ovl..=max_i {
         let lo = i.saturating_sub(l2);
@@ -219,8 +217,15 @@ pub fn correct_overlap_posterior(
             continue; // agreement is left untouched
         }
 
-        let p1 = 10f64.powf(-((q1[j1].saturating_sub(phred_offset)) as f64) / 10.0);
-        let p2 = 10f64.powf(-((q2[j2].saturating_sub(phred_offset)) as f64) / 10.0);
+        // Q0 means "no confidence", not "certain to be right": at Q0 the
+        // decoded probability is 1.0, which makes num or den zero and the
+        // position is skipped — the most decisive disagreement (a Q0 loser
+        // against a high-Q winner) was the one never corrected. Clamp the
+        // decoded Q at 1 so the posterior stays positive.
+        let dq1 = q1[j1].saturating_sub(phred_offset).max(1);
+        let dq2 = q2[j2].saturating_sub(phred_offset).max(1);
+        let p1 = 10f64.powf(-(dq1 as f64) / 10.0);
+        let p2 = 10f64.powf(-(dq2 as f64) / 10.0);
         let num = (1.0 - p1) * p2;
         let den = (1.0 - p2) * p1;
         if num <= 0.0 || den <= 0.0 {
@@ -292,6 +297,23 @@ pub fn correct_overlap_retained(
     gate: f64,
     min_ovl: usize,
 ) -> usize {
+    // The floor belongs on the DOUBLY-RETAINED evidence, not on the geometric
+    // overlap. With a 32-base geometric window but one retained base on each
+    // side, `min_ovl = 30` still rewrote that base's mate — a single retained
+    // base cannot outvote anything, and the caller passed 30 because it wanted
+    // 30 bases of evidence.
+    let lo = insert.saturating_sub(s2.len());
+    let hi = std::cmp::min(insert, s1.len());
+    let retained = (lo..hi)
+        .filter(|&fpos| {
+            let j1 = fpos;
+            let j2 = insert - 1 - fpos;
+            j2 < s2.len() && keep1.contains(&j1) && keep2.contains(&j2)
+        })
+        .count();
+    if retained < min_ovl {
+        return 0;
+    }
     mask_outside(s1, q1, &keep1);
     mask_outside(s2, q2, &keep2);
     correct_overlap_posterior(s1, q1, s2, q2, phred_offset, insert, gate, min_ovl)

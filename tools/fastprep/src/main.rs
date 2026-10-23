@@ -68,10 +68,36 @@ fn dedup_report(rt: &fastprep::cli::Runtime, params: &fastprep::algorithm::Param
     let spec = fastprep::dedup::AnchorSpec::new(params, cfg.read_len, params.adapter.is_some());
     Some(serde_json::json!({
         "anchor_end": spec.end.label(),
-        "anchor_len": spec.len,
+        // The length of the window that was ACTUALLY fingerprinted. When no
+        // window is usable `slice()` falls back to the whole read, and the
+        // report used to keep printing the nominal (unused) width.
+        "anchor_len": if spec.is_usable() { spec.len } else { cfg.read_len },
         "usable": spec.is_usable(),
+        "whole_read": !spec.is_usable(),
         "degenerate": spec.degenerate(),
     }))
+}
+
+/// The `--min-len` floor in bases, for the read length the run actually saw.
+///
+/// The floor and the trim budget are one number: everything the floor does not
+/// reserve is trimmable, and a read needing more trim than that is dropped
+/// rather than trimmed. Printing it in bases is the difference between
+/// "0.67L" and a user discovering after the run that a 30 bp artefact on a
+/// 150 bp read cost every read in the file.
+fn length_floor_line(params: &fastprep::algorithm::Params, s: &fastprep::stats::Stats) -> String {
+    if s.reads_in == 0 {
+        return String::new();
+    }
+    let mean_len = (s.bases_in / s.reads_in) as usize;
+    let floor = params.min_len.resolve(mean_len);
+    format!(
+        "    length floor:            {:>12}  ({} bp of a {} bp mean read; {} bp of trim allowed)",
+        floor,
+        floor,
+        mean_len,
+        mean_len.saturating_sub(floor),
+    )
 }
 
 fn main() -> Result<()> {
@@ -100,9 +126,13 @@ fn main() -> Result<()> {
             if !quiet {
                 eprintln!("fastprep: single-end complete");
                 report("R1", &s);
+                let floor_line = length_floor_line(&params, &s);
+                if !floor_line.is_empty() {
+                    eprintln!("{floor_line}");
+                }
                 report_runtime(elapsed, s.reads_in);
             }
-            if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
+            if let Some(path) = rt.json.as_ref() {
                 let ctx = ReportContext {
                     mode: "single",
                     dry_run: rt.dry_run,
@@ -149,6 +179,10 @@ fn main() -> Result<()> {
                 eprintln!("fastprep: paired-end complete");
                 report("R1", &s.r1);
                 report("R2", &s.r2);
+                let floor_line = length_floor_line(&params_r1, &s.r1);
+                if !floor_line.is_empty() {
+                    eprintln!("{floor_line}");
+                }
                 eprintln!("  [pairs]");
                 eprintln!(
                     "    both kept:              {:>12}  ({})",
@@ -182,7 +216,7 @@ fn main() -> Result<()> {
                 }
                 report_runtime(elapsed, s.r1.reads_in + s.r2.reads_in);
             }
-            if let Some(path) = rt.json.as_ref().filter(|_| !rt.dry_run) {
+            if let Some(path) = rt.json.as_ref() {
                 let ctx = ReportContext {
                     mode: "paired",
                     dry_run: rt.dry_run,
