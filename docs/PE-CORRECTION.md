@@ -60,7 +60,10 @@ injected errors (`consensus-headroom-sweep.tsv`).
 
 ## Scope and caveats
 
-* Opt-in; default behaviour is unchanged and byte-identical to 0.4.1.
+* Opt-in; a run without `--pe-correct` is byte-identical to the same run on
+  the same build. (Not to 0.4.1: D-18 changed the default polyX scan and the
+  length floor, so cross-version byte equality is no longer a claim either
+  stage can make.)
 * Paired-end FASTQ only (the flag is refused in single-end mode; on FASTA
   input the pipeline silently no-ops — nothing reads qualities there). The Q written on edited bases is a posterior
   estimate, not a measurement: at gate 2.0 the mean written Q is 33.9

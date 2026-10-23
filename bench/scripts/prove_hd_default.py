@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove the 0.4.1 default is the measured configuration, on a dataset where the
+"""Prove the shipped `--head-dropout` default is the measured configuration, on a dataset where the
 knob actually bites.
 
 Runs the same dataset/winnner config three ways -- no flag, `--head-dropout 4`,

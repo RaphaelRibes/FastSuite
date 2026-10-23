@@ -100,6 +100,20 @@ differ by more than run-to-run noise, and averaging that difference away would
 hide the only question a prospective user has, which is what happens without
 calibration.
 
+Two provenance facts bound these numbers, and neither is a defect of the
+harness. First, the run used the build predating the 2026-10 scan change, which
+charged a run's own matching steps against $Delta_m$; the current scan frees
+them (see the
+specification's remark on the mercy budget), so the `fastprep-hd4` decomposition
+below is a *lower bound* on accuracy. A 15-library re-measure with the same
+harness and the same pinned parameters moved the shipped arm from 76.92 % to
+79.19 % exact and from 21.70 % to 19.39 % overtrim; the 101-library table is the
+pre-change measurement and was not re-run, so the direction, not the magnitude,
+is what a reader should take from that comparison. Second, every arm ran at its
+swept length floor — a relative 0.9$L$ across most of the grid — not at the
+0.67$L$ floor the tool now ships, so the retention and drop columns describe the
+sweep's floors. The 0.67$L$ budget has not been re-measured on the full corpus.
+
 == Cost per library
 
 #figure(

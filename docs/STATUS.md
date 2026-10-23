@@ -44,8 +44,11 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 * `fastsuite.report.v1` from every tool, **fastprep included** — verified by
   running the built binary in both its single and paired modes and reading the
   schema field. fastprep's `--dry-run` writes the REPORT (flagged
-  `"dry_run": true`) and no FASTQ; the `--auto-params` path is a refusal stub
-  today (no model trained yet), so there is no third report path to cover.
+  `"dry_run": true`) and no FASTQ. `--auto-params` is now a third path that
+  writes nothing at all: `--print-args` prints the argv to stdout and the
+  explanation to stderr and exits 0 without touching the report (verified on the
+  desktop), and in apply mode the recommendation is a patch on the same run, so
+  there is still exactly one report writer.
   * ~~**Stale string found:** the `--auto-params` refusal doc-comment asserted
     the shipped default "is already the swept winner on the current corpus".~~
     **Fixed**: `cli.rs` now records the Phase D result (1 of 101) and points at

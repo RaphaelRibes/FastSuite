@@ -402,28 +402,49 @@ shown in @tab:asymmetry.
     by high-quality basecalls.],
 ) <tab:asymmetry>
 
-== Cumulative score and cumulative gap
+== Cumulative score and cumulative gap <sec:cumgap>
 
 #Def (cumulative score). For $K in NN_(>=1)$ with $s + K <= L - 1$,
 $ cal(P)_s (K) := sum_(k=0)^(K-1) sigma_s (k). $
 
-#Def (cumulative gap). Equivalently, the _cumulative gap_ is
-$ Gamma_s (K) := K - cal(P)_s (K) = sum_(k=0)^(K-1) (1 - sigma_s (k)). $
+#Def (cumulative gap). The _cumulative gap_ is the evidence accumulated
+against the run:
+$ Gamma_s (K) := sum_(k=0)^(K-1) gamma_s (k), quad quad
+  gamma_s (k) := cases(
+    0 &"if " M_s (k) = +1 " and no mismatch precedes step " k,
+    1 - sigma_s (k) &"otherwise",
+  ) $
 
-Per-step gap contributions are
-$ 1 - sigma_s (k) = cases(
-  mu (1 - W_s (k)) quad &"match",
-  1 + nu dot W_s (k) &"mismatch",
-) $
-hence in $[0, mu]$ for matches and in $[1, 1 + nu]$ for mismatches.
+Matches therefore contribute nothing until the run has been broken, after
+which they contribute $mu (1 - W_s (k)) in [0, mu]$ per step. Mismatches
+always contribute $1 + nu dot W_s (k) in [1, 1 + nu]$. In particular
+$Gamma_s (K)$ is no longer the complement $K - cal(P)_s (K)$: the difference
+is exactly the credit granted to the run's own bases, and it is deliberate
+(the mercy-budget remark in @sec:cumgap).
+
+#Rem (why a run's own bases are free).
+$Delta_m$ prices how far the walk may travel *past* the end of a run — the
+overshoot window, in which a chance match in the flanking biology may extend
+the run span — and not how long a run may be. Charging every match turns
+$Delta_m$ into a length cap in disguise: at $W = 0$ a match costs $mu$, so with
+$mu = 0.1$ and $Delta_m = 3$ the budget is exhausted after 30 matching steps.
+Measured on a low-quality (Q2) homopolymer tail, the cut then sits at 37 bases
+whatever the tail's length — 50, 70 and 100 base tails all trimmed to 37 —
+because the tail is exactly the regime that exhausts the budget. Freeing the
+run's own bases removes the cap and leaves the overshoot window unchanged (two
+flanking bases at the default parameters), so one $Delta_m$ is meaningful
+across base qualities, which it was not before.
+
 
 #Prop (bounds). For every admissible $s$ and $K >= 1$,
 $ -nu K <= cal(P)_s (K) <= K, quad quad 0 <= Gamma_s (K) <= (1 + nu) K. $
 Equality $cal(P)_s (K) = K$ holds iff every pair is a high-quality
 match; equality $cal(P)_s (K) = -nu K$ holds iff every pair is a
-high-quality mismatch.
+high-quality mismatch; and $Gamma_s (K) = 0$ holds iff every pair is a
+match, of any quality.
 
-_Proof._ Immediate from $sigma_s (k) in [-nu, 1]$, and the equality
+_Proof._ Immediate from $sigma_s (k) in [-nu, 1]$ and
+$gamma_s (k) in [0, 1 + nu]$, and the equality
 conditions follow from the definitions of $M_s$ and $W_s$. $qed$
 
 #Rem. The cumulative gap is monotonically non-decreasing, which is
@@ -632,20 +653,33 @@ are reasonable starting points.
     table.header(
       [*Parameter*], [*Default value*],
     ),
-    [$L_min$ — minimum post-trim length],  [$0.6 L$],
+    [$L_min$ — minimum post-trim length],  [$0.67 L$],
     [$Delta_m$ — mercy budget],            [$3.0$],
     [$t$ — Phred saturation],              [$20$],
     [$x$ — gate shape],                    [$1.0$],
     [$mu$ — match leniency],               [$0.1$],
     [$nu$ — mismatch strength],            [$0.5$],
-    [$m_h$ — minimum run length],          [$6$],
+    [$m_h$ — minimum run length],          [$12$],
   ),
   caption: [Default parameter values for typical Illumina short-read
     input. $nu$ and $Delta_m$ trade off: halving $nu$ roughly doubles
     the number of mismatches absorbed before the mercy clause fires.
     $mu$ has a much weaker effect, since match gaps are bounded by
-    $mu$ per step.],
+    $mu$ per step — and only from the first mismatch onward, after
+    which a run's own bases are free (the mercy-budget remark in @sec:cumgap). $L_min$ is a
+    fraction of the insert and doubles as the trim budget: a read that
+    would need more than $(1 - L_min) L$ removed is dropped rather than
+    trimmed past the floor.],
 ) <tab:defaults>
+
+The reference implementation can also choose these values per library: given a
+QC report of the input (mean read length, GC, mean quality, quality quantiles,
+3′ and 5′ homopolymer prevalence, duplication), `--auto-params` walks a
+decision list distilled from a sweep over 101 real libraries and prints the
+rule it fired, its support and its measured regret before applying it. The
+accuracy of that model on held-out libraries, and the regimes it was not
+trained on (150 bp reads, two-colour chemistry, long low-quality tails), are
+recorded with the model rather than claimed here.
 
 = Implementation optimisations
 
@@ -701,9 +735,10 @@ a fallback.
 == Gap-only accumulation
 
 The stopping rule and trim lengths depend only on $Gamma$, not on
-$cal(P)$. Operating directly on $Gamma$ avoids carrying both
-quantities and removes the algebraic subtraction $K - cal(P)_s (K)$
-at every step. Analogously, a _gap-increment_ table $Delta Gamma$
+$cal(P)$. Operating directly on $Gamma$ dispenses with the second
+accumulator entirely, and since a run's own bases are charged nothing
+(the mercy-budget remark in @sec:cumgap) there is no algebraic subtraction $K - cal(P)_s (K)$
+to perform either. Analogously, a _gap-increment_ table $Delta Gamma$
 indexed by the same quadruple as above allows
 
 $ Gamma <- Gamma + Delta Gamma[b_(s+k), b_(s+k+1), q_(s+k), q_(s+k+1)] $
@@ -849,7 +884,8 @@ and consequently $K^*_s <= l_"max"$, where $l_"max"$ is the largest
 $K$ satisfying $"mm"(K) <= floor(Delta_m)$.
 
 _Proof._ By the per-step gap contributions of @sec:algorithm, a
-matching step contributes $mu(1 - W_s (k)) >= 0$ and a mismatching
+matching step contributes $mu(1 - W_s (k)) >= 0$ (and $0$ while the run is
+still intact, the mercy-budget remark in @sec:cumgap) and a mismatching
 step contributes $1 + nu W_s (k) >= 1$. Summing,
 $Gamma_s (K) >= "mm"(K)$ for every admissible $K$. If
 $"mm"(K) > floor(Delta_m)$ then, $"mm"(K)$ being an integer,
@@ -889,7 +925,7 @@ the rejection test sound, since a wider window can only increase
 $c_X$ while the mismatch bound $w' - c_X > floor(Delta_m)$ still
 holds. Implementations may therefore round $w$ up to a machine word
 or SIMD register width. For the defaults of @tab:defaults
-($m_h = 6$, $Delta_m = 3$) the required width is $w = 8$, so a
+($m_h = 12$, $Delta_m = 3$) the required width is $w = 14$, so a
 single 32-byte comparison covers it with margin.
 
 #Rem (SIMD realisation). Unlike the gather-based strategy of
@@ -2162,7 +2198,7 @@ impl MinLen {
 }
 ```
 
-`FromStr` accepts strings like `"100"` (absolute) or `"0.6L"` (fractional).
+`FromStr` accepts strings like `"100"` (absolute) or `"0.67L"` (fractional).
 
 === `MatchRule`: encodes the choice between $M_s$ and $M_s^X$
 
@@ -2355,6 +2391,11 @@ The per-step gap function $1 - sigma_s (k)$ from §1.6 reads as:
 
 - match branch: $1 - sigma = mu (1 - W) in [0, mu]$
 - mismatch branch: $1 - sigma = 1 + nu W in [1, 1 + nu]$
+
+with one qualification from the mercy-budget remark in @sec:cumgap: while the run is still intact
+(no mismatch yet at index $k$), a matching step is charged $0$ rather than
+$1 - sigma$. The function below returns the uncharged value and the match flag;
+the accumulation loop decides whether to add it.
 
 Implementation:
 
