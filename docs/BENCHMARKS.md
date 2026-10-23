@@ -166,9 +166,15 @@ fastp's 0 % is a *length-filter-off* default, not a better trimmer; cutadapt's
   fastprep exits 1 with instructions rather than trimming on a guess — a
   deliberate difference from fastp, and a reason a chain that "worked with
   fastp" can stop. Documented, with `--adapter-preset` as the escape hatch.
-* **Not measured here:** PE overlap correction / merge (deliberately out of
-  scope), UMI handling (out of scope), and stdin/stdout streaming (phase 3 —
-  landed in the tree since, per `docs/PLAN.md` §3.1 and the D-4 commits).
+* **PE overlap correction is now measured** (opt-in `--pe-correct`, off by
+  default): posterior consensus over the mate overlap leaves 5.2% fewer
+  residual fragment base errors than `fastp` 1.4.0 `--correction` on the
+  20 000-pair truth corpus (22 190 vs 23 405; 13 vs 10 corrupted bases),
+  per `bench/results/consensus-headroom*.tsv` and `docs/PE-CORRECTION.md`.
+  **Not measured here:** read merging (`fastp`'s `-m/--merge` exists;
+  merging is a different output object, not a comparison axis), UMI
+  handling (out of scope), and stdin/stdout streaming (phase 3 --- landed
+  in the tree since, per `docs/PLAN.md` §3.1 and the D-4 commits).
 
 ---
 

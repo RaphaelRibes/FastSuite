@@ -273,6 +273,14 @@ Each read $(R, Q)$ passes through the following stages, in order:
   $Delta_L = L - L_min$ is the trim budget. Otherwise, emit the kept slice
   $R[T_5 : L - T_3]$ with its qualities.
 
+*Scope.* The stages above are the trimming pipeline in full. One optional
+paired-end stage follows them: with `--pe-correct`, mate-overlap
+disagreements are resolved by posterior odds over the doubly-retained slice
+$R[T_5 : L - T_3]$, with the trimmed flanks masked to `N`/Q0 so that none of
+the boundaries above can move. Its rule and its measurement live in
+`docs/PE-CORRECTION.md` and the companion evaluation paper; it is outside
+this specification's scope.
+
 == Document structure
 
 The remainder of this document is structured in two parts. Part I (§2--§7)
