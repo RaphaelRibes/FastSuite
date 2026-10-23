@@ -82,7 +82,11 @@ impl AdapterStats {
         let mut m = HashMap::new();
         for (idx, &n) in self.counts.iter().enumerate() {
             if n > 0 {
-                m.insert(self.name(idx).to_string(), n);
+                // Accumulate: a `--adapters` FASTA may reuse an ID for two
+                // sequences (`>adapter` twice is common in vendor files), and
+                // `insert` reported only the last index's count — 20 trims
+                // across two adapters named "dup" came out as {"dup": 10}.
+                *m.entry(self.name(idx).to_string()).or_insert(0) += n;
             }
         }
         m
@@ -128,6 +132,16 @@ pub struct Stats {
     pub reads_kept: u64,
     pub reads_dropped: u64,
     pub bases_in: u64,
+    /// Bases actually written for this mate. With `bases_trimmed` it closes
+    /// the identity `bases_in == bases_out + bases_trimmed` for every run,
+    /// dropped reads included — `bases_out` was in REPORT-SCHEMA.md's
+    /// mandatory list and emitted by no tool, so a consumer could not
+    /// reconcile a run at base level.
+    pub bases_out: u64,
+    /// Bases of DROPPED reads that survived their trim (the remainder that was
+    /// thrown away with the read). With `bases_out` and `bases_trimmed` it
+    /// closes `bases_in == bases_out + bases_trimmed + bases_dropped`.
+    pub bases_dropped: u64,
     pub bases_trimmed_5: u64,
     pub bases_trimmed_3: u64,
     pub bases_interior_mass: u64,
@@ -163,10 +177,21 @@ impl Stats {
         self.reads_in += 1;
         self.bases_in += original_len as u64;
         match res {
-            TrimResult::Drop { reason, t5_adapter, t3_adapter, .. } => {
+            TrimResult::Drop { reason, t5_adapter, t3_adapter, t5_poly, t3_poly, .. } => {
                 // Match ergonomics: res is &TrimResult, so fields are &T.
                 let (t5a, t3a) = (*t5_adapter, *t3_adapter);
+                let (t5p, t3p) = (*t5_poly, *t3_poly);
                 self.reads_dropped += 1;
+                // A dropped read can still have been TRIMMED: the drop reason
+                // is resolved after the cut (a 50 bp polyG tail on a 150 bp
+                // read loses its budget and is dropped, having removed 50
+                // bases). Counting trims only on `Emit` reported "0 bases
+                // trimmed (0.00%)" for a run that removed 1 M bases, and left
+                // `bases_in` unreconcilable. Every base removed is counted.
+                self.bases_trimmed_5 += (t5a + t5p) as u64;
+                self.bases_trimmed_3 += (t3a + t3p) as u64;
+                self.bases_dropped +=
+                    original_len.saturating_sub(t5a + t5p + t3a + t3p) as u64;
                 match reason {
                     DropReason::Poly5    => self.reads_dropped_poly5 += 1,
                     DropReason::Poly3    => self.reads_dropped_poly3 += 1,
@@ -188,6 +213,7 @@ impl Stats {
                 self.reads_kept += 1;
                 self.bases_trimmed_5 += (t5a + t5p) as u64;
                 self.bases_trimmed_3 += (t3a + t3p) as u64;
+                self.bases_out += original_len.saturating_sub(t5a + t5p + t3a + t3p) as u64;
                 let h_int: usize = runs.iter().map(|(_, l)| l).sum();
                 self.bases_interior_mass += h_int as u64;
                 if (t5a + t3a) > 0 {
@@ -217,6 +243,17 @@ impl Stats {
         }
     }
 
+    /// A mate the trimmer kept but the writer discarded (a surviving R1 whose
+    /// R2 died, with no `--singletons1`). `reads_kept` counts trim decisions,
+    /// and the report's `reads_out` must count RECORDS: the discarded
+    /// singleton used to inflate both it and the retention rate.
+    pub fn unkeep(&mut self, out_len: usize) {
+        debug_assert!(self.reads_kept > 0);
+        self.reads_kept = self.reads_kept.saturating_sub(1);
+        self.bases_out = self.bases_out.saturating_sub(out_len as u64);
+        self.bases_dropped += out_len as u64;
+    }
+
     /// The flat `metrics` block for one mate (single-end, or one side of a
     /// paired run). Nothing structured goes in here: the per-adapter counts
     /// stay under the `legacy` block, per REPORT-SCHEMA.md rule 1.
@@ -226,9 +263,12 @@ impl Stats {
             "reads_out":       self.reads_kept,
             "reads_dropped":   self.reads_dropped,
             "bases_in":        self.bases_in,
+            "bases_out":       self.bases_out,
+            "bases_dropped":   self.bases_dropped,
             "bases_trimmed":   self.bases_trimmed_total(),
             "bases_trimmed_5": self.bases_trimmed_5,
             "bases_trimmed_3": self.bases_trimmed_3,
+            "bases_interior_mass": self.bases_interior_mass,
             "reads_dropped_poly5":  self.reads_dropped_poly5,
             "reads_dropped_poly3":  self.reads_dropped_poly3,
             "reads_dropped_poly_int": self.reads_dropped_poly_int,
@@ -501,6 +541,8 @@ pub fn report(label: &str, s: &Stats) {
     }
 
     eprintln!("    bases in:                {:>12}", s.bases_in);
+    eprintln!("    bases out:               {:>12}", s.bases_out);
+    eprintln!("    bases dropped:           {:>12}", s.bases_dropped);
     eprintln!("    bases trimmed (5′):      {:>12}", s.bases_trimmed_5);
     eprintln!("    bases trimmed (3′):      {:>12}", s.bases_trimmed_3);
     eprintln!("    interior poly mass (budget contrib):{:>12}", s.bases_interior_mass);
@@ -556,6 +598,57 @@ mod tests {
         assert_eq!(s.bases_trimmed_3, 2);
         assert_eq!(s.bases_interior_mass, 5);
         assert_eq!(s.bases_trimmed_total(), 12);
+    }
+
+    /// A dropped read can still lose bases to trimming, and the report has to
+    /// say so: `bases_in == bases_out + bases_trimmed` is the identity a
+    /// consumer reconciles a run with. The pre-fix code counted trims only on
+    /// `Emit`, so a run that removed 1 M bases from reads it then dropped
+    /// reported `bases_trimmed: 0 (0.00%)`.
+    #[test]
+    fn bases_reconcile_including_dropped_reads() {
+        let mut s = Stats::default();
+        // A 150 bp read with a 10 bp 5' cut, kept.
+        s.record(
+            150,
+            &TrimResult::Emit { t5_adapter: 0, t3_adapter: 0, t5_poly: 10, t3_poly: 0, runs: vec![] },
+            None,
+        );
+        // A 200 bp read whose 50 bp 3' tail blew the budget: dropped as
+        // polyX 3', but it removed 50 bases on the way.
+        s.record(
+            200,
+            &TrimResult::Drop {
+                reason: DropReason::Poly3,
+                t5_adapter: 0,
+                t3_adapter: 0,
+                t5_poly: 0,
+                t3_poly: 50,
+                runs: vec![],
+            },
+            None,
+        );
+        assert_eq!(s.bases_in, 350);
+        assert_eq!(s.bases_out, 140, "only the kept read contributes output bases");
+        assert_eq!(s.bases_trimmed_total(), 60, "the dropped read's 50 count too");
+        assert_eq!(s.bases_dropped, 150, "the dropped read's surviving remainder");
+        assert_eq!(
+            s.bases_in,
+            s.bases_out + s.bases_trimmed_total() + s.bases_dropped,
+            "the report must close at base level"
+        );
+    }
+
+    /// Two adapters sharing an ID must add up, not overwrite.
+    #[test]
+    fn by_name_accumulates_duplicate_adapter_ids() {
+        let mut s = Stats::default();
+        s.adapter.set_names(vec!["dup".to_string(), "dup".to_string()]);
+        for idx in [0u8, 1u8] {
+            s.adapter.record(idx, 1, 0);
+            s.adapter.record(idx, 1, 0);
+        }
+        assert_eq!(s.adapter.by_name().get("dup"), Some(&4), "counts must sum");
     }
 
     #[test]

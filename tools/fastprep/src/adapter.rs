@@ -2010,19 +2010,35 @@ mod tests {
             seq[off..off + n].copy_from_slice(&adapter[..n]);
             let tail = 60 - off;
             let q = vec![40u8; 60];
-            let (t5, t3) = match crate::algorithm::trim(&seq, &q, &p).result {
+            let res = crate::algorithm::trim(&seq, &q, &p).result;
+            // The cut must be exact whether or not the remainder survives.
+            // At off = 0 the adapter starts at base 0, so the whole read is
+            // readthrough and the insert is empty: that is a Drop(Length), not
+            // an Emit of a zero-length record (the pre-fix code emitted
+            // `@id\n\n+\n\n` for it, exit 0).
+            let (t5, t3) = match &res {
                 crate::algorithm::TrimResult::Emit {
                     t5_adapter,
                     t3_adapter,
                     ..
-                } => (t5_adapter, t3_adapter),
-                r => panic!("off={off}: unexpected {:?}", r),
+                } => (*t5_adapter, *t3_adapter),
+                crate::algorithm::TrimResult::Drop {
+                    t5_adapter,
+                    t3_adapter,
+                    ..
+                } => (*t5_adapter, *t3_adapter),
             };
             assert_eq!(
                 (t5, t3),
                 (0, tail),
-                "off={off}: the cut must be the adapter's own start"
+                "off={off}: the cut must be the adapter's own start ({res:?})"
             );
+            if off == 0 {
+                assert!(
+                    matches!(res, crate::algorithm::TrimResult::Drop { .. }),
+                    "a read with no insert left must not be emitted empty"
+                );
+            }
         }
     }
 

@@ -1232,6 +1232,11 @@ fn write_pairs(
                     stats.singletons_r1 += 1;
                 } else {
                     stats.discarded_singletons_r1 += 1;
+                    // The mate was kept by the trimmer and thrown away here;
+                    // `reads_out` must count records, not trim decisions.
+                    stats
+                        .r1
+                        .unkeep(s1.len().saturating_sub(res1.t5() + res1.t3()));
                     if !warn_r1_once.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "fastprep: warning: R1 survived while R2 was dropped, but \
@@ -1247,6 +1252,9 @@ fn write_pairs(
                     stats.singletons_r2 += 1;
                 } else {
                     stats.discarded_singletons_r2 += 1;
+                    stats
+                        .r2
+                        .unkeep(s2.len().saturating_sub(res2.t5() + res2.t3()));
                     if !warn_r2_once.swap(true, Ordering::Relaxed) {
                         eprintln!(
                             "fastprep: warning: R2 survived while R1 was dropped, but \

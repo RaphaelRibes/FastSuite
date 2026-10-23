@@ -922,6 +922,12 @@ impl Cli {
                 if named[i].1 == named[j].1 {
                     let (fa, fb) = (named[i].0, named[j].0);
                     let is_input = |f: &str| f.starts_with("-1") || f.starts_with("-2");
+                    // Two inputs may be one file (a test fixture feeds both
+                    // mates from one FASTQ); two handles on a read-only file
+                    // cannot corrupt anything. Only writes matter.
+                    if is_input(fa) && is_input(fb) {
+                        continue;
+                    }
                     if is_input(fa) || is_input(fb) {
                         bail!(
                             "{} and {} name the same file ({}); fastprep would overwrite its own input",

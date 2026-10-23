@@ -709,9 +709,31 @@ struct StreamOut {
     first_trim: usize,
     h_int: usize,
     runs: Vec<(usize, usize)>,
-    /// True if the streaming pass exhausted the trim budget on the
-    /// first sub-scan (5′ short-circuit equivalent of `StopMode::Budget`).
-    dropped_by_budget: bool,
+    /// `Some(reason)` when the streaming pass exhausted the trim budget, and
+    /// WHICH cause did it: the 5′/3′ short-circuit or an interior run. The
+    /// bool this replaces reported every budget drop as Poly5/Poly3, so a read
+    /// whose whole mass was interior was attributed to the wrong end — the
+    /// table the paper's attribution figure plots.
+    dropped_by_budget: Option<DropReason>,
+}
+
+/// Record one interior run and say whether it blew the budget.
+///
+/// Extracted so the first sub-scan (when the streaming pass does NOT own the
+/// end scan: `--no-5 --interior`) and every later sub-scan keep exactly the
+/// same accounting.
+#[inline]
+fn record_interior_run(
+    runs: &mut Vec<(usize, usize)>,
+    h_int: &mut usize,
+    first_trim: usize,
+    rem_budget: usize,
+    sub_pos: usize,
+    sub_trim: usize,
+) -> bool {
+    *h_int += sub_trim;
+    runs.push((sub_pos, sub_trim));
+    first_trim + *h_int > rem_budget
 }
 
 /// Inner streaming walk over `[0, l)`. Monomorphized on direction so
@@ -730,6 +752,10 @@ fn streaming_walk<const FORWARD: bool>(
     win_start: usize,
     win_end: usize,
     rem_budget: usize,
+    // Whether this pass owns an END scan (5' in Forward, 3' in Reverse). With
+    // `--no-5 --interior` the pass runs only for the interior: the first
+    // sub-scan must not become `first_trim`, it is an interior run.
+    end_scan: bool,
 ) -> StreamOut {
     let l = bases.len();
 
@@ -841,7 +867,11 @@ fn streaming_walk<const FORWARD: bool>(
                 first_trim: 0,
                 h_int: 0,
                 runs: Vec::new(),
-                dropped_by_budget: true,
+                dropped_by_budget: Some(if FORWARD {
+                    DropReason::Poly5
+                } else {
+                    DropReason::Poly3
+                }),
             };
         }
 
@@ -854,14 +884,22 @@ fn streaming_walk<const FORWARD: bool>(
                 run_span_curr,
                 params.boundary_anchored,
             );
+            let sub_pos = sub_start_logical - win_start;
             if first_subscan {
-                first_trim = sub_trim;
                 first_subscan = false;
-            } else if sub_trim > 0 && params.scan_interior {
-                let sub_pos = sub_start_logical - win_start;
-                h_int += sub_trim;
-                runs.push((sub_pos, sub_trim));
-                if first_trim + h_int > rem_budget {
+                if end_scan {
+                    first_trim = sub_trim;
+                } else if sub_trim > 0
+                    && params.scan_interior
+                    && record_interior_run(
+                        &mut runs,
+                        &mut h_int,
+                        first_trim,
+                        rem_budget,
+                        sub_pos,
+                        sub_trim,
+                    )
+                {
                     return StreamOut {
                         quality_sum: decode_quality_sum(
                             quality_sum,
@@ -871,15 +909,41 @@ fn streaming_walk<const FORWARD: bool>(
                         first_trim,
                         h_int,
                         runs,
-                        dropped_by_budget: true,
+                        dropped_by_budget: Some(DropReason::PolyInt),
                     };
                 }
+            } else if sub_trim > 0
+                && params.scan_interior
+                && record_interior_run(
+                    &mut runs,
+                    &mut h_int,
+                    first_trim,
+                    rem_budget,
+                    sub_pos,
+                    sub_trim,
+                )
+            {
+                return StreamOut {
+                    quality_sum: decode_quality_sum(
+                        quality_sum,
+                        i_logical + 1,
+                        params.phred_offset,
+                    ),
+                    first_trim,
+                    h_int,
+                    runs,
+                    dropped_by_budget: Some(DropReason::PolyInt),
+                };
             }
             gamma = 0.0;
             k_curr = 0;
             m_curr = 0;
             run_span_curr = 0;
-            sub_start_logical = i_logical + 1;
+            // The next sub-scan's first pair is (i_logical, i_logical + 1) —
+            // the pair spanning this mercy exit — so its anchor is
+            // `i_logical`, not `i_logical + 1`. With `+ 1` every interior
+            // run's recorded start, length and mass were off by one base.
+            sub_start_logical = i_logical;
         }
     }
 
@@ -902,7 +966,7 @@ fn streaming_walk<const FORWARD: bool>(
         first_trim,
         h_int,
         runs,
-        dropped_by_budget: false,
+        dropped_by_budget: None,
     }
 }
 
@@ -1031,6 +1095,9 @@ pub fn polyx_trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimResult {
         params,
         params.extra_committed,
         params.original_len,
+        // The public entry point is handed the whole read: the slice IS the
+        // whole-read measure, so no override is needed.
+        None,
     )
     .0
 }
@@ -1048,6 +1115,12 @@ fn polyx_trim_inner(
     params: &Params,
     extra_committed: usize,
     original_len: Option<usize>,
+    // Decoded quality sum and length of the WHOLE read when `bases`/`quals`
+    // are an adapter-trimmed sub-slice. `--mean-q` is documented as a
+    // whole-read mean; measuring the post-adapter insert instead made a read's
+    // fate depend on whether adapter trimming fired (same read, same flag:
+    // kept with `--adapters`, dropped with `--no-adapter`).
+    whole_quality: Option<(u64, usize)>,
 ) -> (TrimResult, MarginBases) {
     assert_eq!(bases.len(), quals.len());
     let l = bases.len();
@@ -1087,7 +1160,10 @@ fn polyx_trim_inner(
     let head_trim = if params.scan_5 {
         match params.head_dropout {
             Some(n) => {
-                let run = bases[..l].iter().take_while(|&&b| b == b'G').count();
+                let run = bases[..l]
+                    .iter()
+                    .take_while(|&&b| b.eq_ignore_ascii_case(&b'G'))
+                    .count();
                 if (1..=n).contains(&run) {
                     run
                 } else {
@@ -1151,14 +1227,19 @@ fn polyx_trim_inner(
         .saturating_sub(1);
     let scan_range_lo = t_front;
     let scan_range_hi = l - t_tail;
-    let five_end_rejects = params.scan_5
-        && prefilter_enabled()
-        && prefilter_end_rejects(bases, scan_range_lo, scan_range_hi, w, params.min_run);
+    // Tier 1 compares adjacent bases for equality, which is the homopolymer
+    // predicate only. Under `--target` (`MatchRule::Anchored`) a pair counts
+    // when its second base is in the mask, so the prefilter would reject
+    // windows the scan accepts: an 11 bp terminal G-run with `--target G
+    // --min-run 12` is a qualifying run (11 matches + the anchor) and came
+    // back with 0 bases trimmed. Sound and cheap: no prefilter in that mode.
+    let pf = prefilter_enabled() && matches!(params.rule, MatchRule::Homopolymer);
+    let five_end_rejects =
+        params.scan_5 && pf && prefilter_end_rejects(bases, scan_range_lo, scan_range_hi, w, params.min_run);
     let interior_rejects = !params.scan_interior
-        || prefilter_enabled()
-            && prefilter_interior_rejects(bases, scan_range_lo, scan_range_hi, w, params.min_run);
+        || pf && prefilter_interior_rejects(bases, scan_range_lo, scan_range_hi, w, params.min_run);
     let three_end_rejects = params.scan_3
-        && prefilter_enabled()
+        && pf
         && prefilter_end_rejects(
             bases,
             scan_range_hi.saturating_sub(w + 1),
@@ -1170,10 +1251,16 @@ fn polyx_trim_inner(
     // Direction::Forward  — streaming pass = physical 5′,  reverse pass = physical 3′
     // Direction::Reverse  — streaming pass = physical 3′,  reverse pass = physical 5′
     let dir = params.direction;
-    let (stream_enabled, reverse_enabled) = match dir {
+    let (stream_end, reverse_enabled) = match dir {
         Direction::Forward => (params.scan_5, params.scan_3),
         Direction::Reverse => (params.scan_3, params.scan_5),
     };
+    // The interior scan lives INSIDE the streaming walk, so the walk must run
+    // whenever any scan is enabled. Gating it on the 5′ (or 3′) end scan made
+    // `--no-5 --interior` silently disable the interior scan — interior poly
+    // mass 12 became 0 — while `--interior`'s help says it re-enables an
+    // independent switch.
+    let stream_enabled = stream_end || params.scan_interior;
 
     // Which end each pass actually scans, resolved against the physical
     // frame: the streaming pass's terminal window is the 5′ end in
@@ -1212,7 +1299,7 @@ fn polyx_trim_inner(
             first_trim: 0,
             h_int: 0,
             runs: Vec::new(),
-            dropped_by_budget: false,
+            dropped_by_budget: None,
         }
     } else if !stream_enabled {
         // Quality-only walk (no scan). Still cheap; one path with no
@@ -1222,19 +1309,31 @@ fn polyx_trim_inner(
             first_trim: 0,
             h_int: 0,
             runs: Vec::new(),
-            dropped_by_budget: false,
+            dropped_by_budget: None,
         }
     } else if matches!(dir, Direction::Forward) {
-        streaming_walk::<true>(bases, quals, params, t_front, l - t_tail, rem_budget)
+        streaming_walk::<true>(
+            bases,
+            quals,
+            params,
+            t_front,
+            l - t_tail,
+            rem_budget,
+            params.scan_5,
+        )
     } else {
-        streaming_walk::<false>(bases, quals, params, t_front, l - t_tail, rem_budget)
+        streaming_walk::<false>(
+            bases,
+            quals,
+            params,
+            t_front,
+            l - t_tail,
+            rem_budget,
+            params.scan_3,
+        )
     };
 
-    if stream_out.dropped_by_budget {
-        let reason = match dir {
-            Direction::Forward => DropReason::Poly5,
-            Direction::Reverse => DropReason::Poly3,
-        };
+    if let Some(reason) = stream_out.dropped_by_budget {
         return (
             TrimResult::Drop {
                 reason,
@@ -1281,7 +1380,8 @@ fn polyx_trim_inner(
     // scan work on a soon-to-be-dropped read, but mean-q failure rates
     // are typically 1-5% on Illumina data so this is comfortably a win.
     if let Some(threshold) = params.mean_q {
-        let mean = quality_sum as f64 / l as f64;
+        let (sum, n) = whole_quality.unwrap_or((quality_sum, l));
+        let mean = sum as f64 / n as f64;
         if mean < threshold {
             return (
                 TrimResult::Drop {
@@ -1598,7 +1698,20 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
 
     // Call the inner implementation directly, passing `Some(insert_len)` so the
     // polyX budget is enforced against the insert — no Params clone.
-    let (poly_result, margin) = polyx_trim_inner(sub_bases, sub_quals, params, 0, Some(insert_len));
+    // Called with the adapter-trimmed sub-slice, but `--mean-q` is a
+    // WHOLE-READ mean: hand it the original slice's quality sum.
+    let whole_quality = (
+        quality_sum_raw(quals, params.phred_offset),
+        quals.len(),
+    );
+    let (poly_result, margin) = polyx_trim_inner(
+        sub_bases,
+        sub_quals,
+        params,
+        0,
+        Some(insert_len),
+        Some(whole_quality),
+    );
 
     // --- Step 4: reconstruct absolute coordinates ---
     let result = match poly_result {
@@ -1651,7 +1764,10 @@ pub fn trim(bases: &[u8], quals: &[u8], params: &Params) -> TrimOutput {
             let out_len = l.saturating_sub(
                 t5_adapter + t5_poly + t3_adapter + t3_poly,
             );
-            if out_len < params.min_len.floor(insert_len) {
+            // A 0-length remainder is not a FASTQ record: with `--min-len 0`
+            // the `<` above is false for both sides and the read was emitted
+            // as `@id\n\n+\n\n`, exit 0.
+            if out_len == 0 || out_len < params.min_len.floor(insert_len) {
                 TrimResult::Drop {
                     reason: DropReason::Length,
                     t5_adapter,
