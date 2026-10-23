@@ -10,6 +10,12 @@
 //!   * `.zst` / `.zstd` → zstd
 //!   * anything else    → plain
 //!
+//! `.bz2` and `.xz` OUTPUT are refused rather than silently written as plain
+//! text: input in those formats is decoded (needletail handles it), but a run
+//! that asked for `-o out.fq.bz2` and got an uncompressed file under that name
+//! broke every downstream `bzcat` after the expensive step. Plain fastq piped
+//! through `bzip2` is the supported route.
+//!
 //! Gzip output is BGZF, which is multi-member gzip with a block-size field.
 //! That is ordinary `.gz`: `zcat`, `gzip -d`, `pigz` and htslib all read it,
 //! needletail decodes input with `MultiGzDecoder`, and tabix can index it.
@@ -133,6 +139,15 @@ fn encode_output(
                 .context("initialising zstd encoder")?
                 .auto_finish();
             Ok(Box::new(enc))
+        }
+        "bz2" | "xz" => {
+            // Refused, not silently ignored: the writer used to fall through
+            // to the plain arm, so `-o out.fq.bz2` produced an UNCOMPRESSED
+            // file under a compressed name and exited 0.
+            anyhow::bail!(
+                "output compression .{ext} is not supported (fastprep writes .gz, .zst \
+                 or plain); write plain FASTQ and pipe it through {ext} instead"
+            )
         }
         _ => Ok(Box::new(buf)),
     }

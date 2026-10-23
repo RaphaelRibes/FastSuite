@@ -450,7 +450,13 @@ pub fn match_adapters_scored(
     // Preference matches the general matcher exactly: leftmost match wins,
     // ties broken by adapter index. The retry must be a strict superset of
     // the general matcher's decisions, so it scans in the same order.
+    //
+    // `t5` is ALWAYS 0 here: this is a 3'-anchored window, so nothing is
+    // removed from the 5' end. Writing `t5: p` (the window's offset) made
+    // `t5 + t3 == l` for every hit and emitted zero-length records — the
+    // whole read trimmed away, exit 0. `t3 = l - p` is the readthrough.
     let mut best: Option<AdapterMatch> = None;
+    let mut best_p = usize::MAX;
     for (ai, adapter) in set.adapters.iter().enumerate() {
         let a = adapter.seq.len();
         if a == 0 {
@@ -465,20 +471,21 @@ pub fn match_adapters_scored(
             if scored_mismatches(&seq[p..p + k], &adapter.seq[..k], Some(quals), low_q)
                 <= budget
             {
-                // leftmost for this adapter; the outer loop's adapter order
-                // breaks ties the same way the general matcher does.
-                best = Some(AdapterMatch {
-                    adapter: ai as u8,
-                    t5: p,
-                    t3: l - p,
-                });
+                // Leftmost wins; an equal offset keeps the earlier adapter,
+                // which is the general matcher's index tie-break.
+                if p < best_p {
+                    best = Some(AdapterMatch {
+                        adapter: ai as u8,
+                        t5: 0,
+                        t3: l - p,
+                    });
+                    best_p = p;
+                }
                 break;
             }
         }
-        if let Some(b) = best {
-            if b.t5 == 0 {
-                break; // cannot do better than leftmost
-            }
+        if best_p == 0 {
+            break; // cannot do better than leftmost
         }
     }
     best
@@ -1282,6 +1289,68 @@ mod tests {
             0.1,
             4,
         )
+    }
+
+    fn set_of(seqs: &[&[u8]], error_rate: f64) -> AdapterSet {
+        AdapterSet::new(
+            seqs.iter()
+                .enumerate()
+                .map(|(i, s)| Adapter {
+                    name: format!("a{i}"),
+                    seq: s.to_vec(),
+                })
+                .collect(),
+            error_rate,
+            4,
+        )
+    }
+
+    /// The scored retry is a 3'-anchored window: it may only trim from the 3'
+    /// end. `t5` used to be the window offset, so `t5 + t3 == l` and every
+    /// read the retry rescued was emitted at length 0 (exit 0).
+    #[test]
+    fn scored_retry_trims_only_the_3_prime_end() {
+        let adapter = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC";
+        let mut ad = adapter.to_vec();
+        // Eight ambiguous calls: the ordinary matcher spends a full mismatch
+        // on each (8 > floor(34 * 0.2) = 6) and rejects; the retry charges
+        // half (4 <= 6) and accepts.
+        for j in (3..32).step_by(4) {
+            ad[j] = b'N';
+        }
+        let ins = 64usize;
+        let mut seq = b"TTTTCCCCAAAAGGGG".repeat(4).to_vec();
+        seq.truncate(ins);
+        seq.extend_from_slice(&ad);
+        let q = vec![b'F'; seq.len()];
+        let set = set_of(&[adapter], 0.2);
+
+        assert!(
+            match_adapters(&seq, &set).is_none(),
+            "the ordinary matcher must reject an N-rich adapter tail"
+        );
+        let m = match_adapters_scored(&seq, &q, &set, 2).expect("the retry matches");
+        assert_eq!(m.t5, 0, "a 3'-anchored match never trims the 5' end");
+        assert_eq!(m.t3, seq.len() - ins, "the readthrough is the 3' trim");
+        assert!(m.t5 + m.t3 < seq.len(), "the insert must survive");
+    }
+
+    /// Leftmost wins, ties by adapter index — including across adapters, where
+    /// the retry used to let the LAST adapter's larger offset overwrite an
+    /// earlier adapter's smaller one (a shorter trim, on the wrong adapter).
+    #[test]
+    fn scored_retry_prefers_the_leftmost_window_across_adapters() {
+        let x = b"ACGTGCAATTCGACCTAGGCTAACGTTGCA"; // 30 bases
+        let a0 = &x[0..16]; // matches at offset 50
+        let a1 = &x[10..26]; // matches at offset 60
+        let mut seq = vec![b'T'; 50];
+        seq.extend_from_slice(x);
+        let q = vec![b'F'; seq.len()];
+        let set = set_of(&[a0, a1], 0.2);
+
+        let m = match_adapters_scored(&seq, &q, &set, 2).expect("the retry matches");
+        assert_eq!(m.t3, seq.len() - 50, "the leftmost window wins");
+        assert_eq!(m.adapter, 0, "ties keep the earlier adapter");
     }
 
     #[test]

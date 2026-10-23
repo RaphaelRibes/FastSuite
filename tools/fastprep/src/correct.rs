@@ -100,7 +100,13 @@ pub fn infer_insert(r1: &[u8], r2: &[u8], min_ovl: usize) -> Option<usize> {
     if l1 == 0 || l2 == 0 || min_ovl == 0 {
         return None;
     }
-    let max_i = l1 + l2 - min_ovl; // beyond this the shared window is < min_ovl
+    // `min_ovl` is user-controlled (`--pe-correct-min-overlap`) and the guard
+    // above only rejects zero: when it exceeds `l1 + l2` this subtraction
+    // wrapped to ~1.8e19 in release (the loop then spun forever on the first
+    // pair) and panicked under `overflow-checks` in debug.
+    let Some(max_i) = (l1 + l2).checked_sub(min_ovl) else {
+        return None;
+    };
     let mut found: Option<usize> = None;
     for i in min_ovl..=max_i {
         let lo = i.saturating_sub(l2);

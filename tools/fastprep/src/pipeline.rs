@@ -719,7 +719,8 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
             stats.record_margin(p.output.margin_5, p.output.margin_3);
             if io_result.is_ok() {
                 if let Some(w) = writer.as_mut() {
-                    let _ = p.emit_to(&res_buf, w);
+                    p.emit_to(&res_buf, w)
+                        .context("writing output after the compute thread finished")?;
                 }
             }
         }
@@ -741,7 +742,11 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
     // Flush and drop writers before rename (zstd auto_finish finalises the
     // frame on drop; rename must happen after the frame is closed).
     if let Some(mut w) = writer.take() {
-        w.flush().ok();
+        // A flush error means the last staged block never reached the file.
+        // This used to be `.ok()`: the truncated file was then renamed into
+        // place and the run exited 0 (reproduced with `ulimit -f 1`: 1024 of
+        // 6440 bytes kept, empty stderr, exit 0).
+        w.flush().context("flushing output")?;
     }
     if let Some(mut mw) = meta.take() {
         // D-6: a metadata file that cannot be flushed is truncated, not
@@ -1087,16 +1092,16 @@ pub fn run_paired(
     }
 
     if let Some(mut w) = w1.take() {
-        w.flush().ok();
+        w.flush().context("flushing R1 output")?;
     }
     if let Some(mut w) = w2.take() {
-        w.flush().ok();
+        w.flush().context("flushing R2 output")?;
     }
     if let Some(mut w) = ws1.take() {
-        w.flush().ok();
+        w.flush().context("flushing R1 singletons")?;
     }
     if let Some(mut w) = ws2.take() {
-        w.flush().ok();
+        w.flush().context("flushing R2 singletons")?;
     }
     if let Some(mut mw) = meta.take() {
         // D-6: a metadata file that cannot be flushed is truncated, not

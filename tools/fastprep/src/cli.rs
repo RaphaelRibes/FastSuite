@@ -893,6 +893,51 @@ impl Cli {
         v
     }
 
+    /// Refuse two flags naming one file, or an output naming an input.
+    ///
+    /// Compared after [`std::path::absolute`], so `./x.fq`, `x.fq` and the
+    /// absolute spelling collide. No `canonicalize`: the outputs do not exist
+    /// yet (and a symlinked parent would resolve the same way for both
+    /// entries anyway), and this is exactly the path `File::create` will use.
+    fn validate_distinct_paths(&self) -> Result<()> {
+        let mut named: Vec<(&'static str, PathBuf)> = Vec::new();
+        let mut add = |flag: &'static str, p: &Option<PathBuf>| {
+            if let Some(p) = p {
+                if let Ok(abs) = std::path::absolute(p) {
+                    named.push((flag, abs));
+                }
+            }
+        };
+        add("-1/--in1", &self.in1);
+        add("-2/--in2", &self.in2);
+        add("-o/--out1", &self.out1);
+        add("-p/--out2", &self.out2);
+        add("--singletons1", &self.singletons1);
+        add("--singletons2", &self.singletons2);
+        add("--metadata", &self.metadata);
+        add("--json", &self.json);
+
+        for i in 0..named.len() {
+            for j in i + 1..named.len() {
+                if named[i].1 == named[j].1 {
+                    let (fa, fb) = (named[i].0, named[j].0);
+                    let is_input = |f: &str| f.starts_with("-1") || f.starts_with("-2");
+                    if is_input(fa) || is_input(fb) {
+                        bail!(
+                            "{} and {} name the same file ({}); fastprep would overwrite its own input",
+                            fa, fb, named[i].1.display()
+                        );
+                    }
+                    bail!(
+                        "{} and {} name the same file ({}); two streams cannot write one path",
+                        fa, fb, named[i].1.display()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// --auto-params: the honest refusal, checked before anything else runs.
     ///
     /// The model does not exist yet (docs/AUTO-PARAMS.md), so the flag cannot
@@ -1032,6 +1077,18 @@ impl Cli {
 
         if self.target.len() > 5 { bail!("--target may be given at most 5 times"); }
         let rule = build_match_rule(&self.target)?;
+
+        // Distinctness: every path this run writes, plus its inputs, must be
+        // a different file. Nothing checked this, and the failures were all
+        // silent or misleading:
+        //   * `-o x.fq --json x.fq` wrote the FASTQ, then overwrote it with
+        //     the JSON report and exited 0;
+        //   * `-o x.fq --metadata x.fq` and `-o z.fq -p z.fq` both mapped two
+        //     streams onto one `.part`, so the second rename failed AFTER the
+        //     first commit and left a committed, corrupt output;
+        //   * `-o x.fq` with `-1 x.fq` would replace its own input.
+        // `--force` cannot catch any of them: nothing exists when the check runs.
+        self.validate_distinct_paths()?;
 
         // --force: refuse to clobber any existing output. A dry run writes
         // nothing, so it never has to refuse (CLI-SPEC §1). The first existing
