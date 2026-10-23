@@ -54,7 +54,14 @@ fn require_tools(tools: &[&str]) {
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("fh_ag_{}_{}", std::process::id(), tag));
+    // Two tests in this file used the same tag ("clean"), which put them in one
+    // directory; `remove_dir_all` in the second wiped the first's fixtures while
+    // it was running. That passed locally by scheduling luck and failed on CI
+    // with "reading config .../fh_ag_<pid>_clean/fastsuite.toml". The counter
+    // makes a collision impossible whatever the tags say.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("fh_ag_{}_{}_{n}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
