@@ -465,3 +465,45 @@ move 0.2–0.3 pp down, `DRR015180` and `DRR015431`). Every dataset's `scored`
 denominator is within 0.1 % of the old one, so this is not a denominator effect.
 The floor change (0.67L) is NOT in these numbers — the harness pins the swept
 `--min-len` — and still needs its own arm.
+
+## D-19: `--auto-params` ships a decision list, not a ranker (2026-10-23)
+
+**Decision.** The recommendation is a depth-3 decision list over fastcheck's
+input-side metrics, exported to JSON, walked in-tree, and **embedded in the
+binary** with the same bytes committed at `tools/fastprep/models/`.
+`--print-args` prints the argv (stdout) and the rule that fired with its
+training coverage and mean regret (stderr). Explicit flags beat the model.
+
+**Why a decision list.** The tool's failure mode is silently wrong reads, so a
+recommendation has to be auditable and overridable. A boosted ranker would score
+better and be unexplainable; the 8 KB JSON can be read in a minute, and
+`--print-args` names the evidence. Depth 3 with ≥ 10 datasets per leaf is the
+shape that a 101-dataset corpus can support without producing one-dataset rules.
+
+**Measured acceptance** (group 5-fold by dataset, stratified by domain; the
+script refuses to write a model that loses): mean regret vs the per-dataset
+oracle **0.0331** against the default's **0.0721**; delta vs the default
+**+0.0389**; beats the default on **70.9 %** of held-out datasets; top-5
+**0.533** against the default's **0.020**. Leave-one-domain-out is positive on
+all six domains. **One of five folds loses to the default** (regret 0.1180,
+delta −0.0462) — an average improvement, not a per-library guarantee, and the
+reason the printed explanation exists.
+
+**The action space is 39 of 52 configs.** The 13 excluded set `r2_reverse`, a
+bench-side revcomp of R2 that is not a fastprep flag; recommending one would
+recommend an effect the tool cannot produce. 23 datasets' oracle winner needed
+one of those, which is a permanent ceiling on the model's regret.
+
+**Train/serve aliasing is part of the contract.** The training matrix's
+`read_len` and `bases_non_acgt_frac` are DERIVED from `mean_len` and
+`bases_non_acgt / bases`; the derivation lives in `auto_params::Profile`. Two of
+the seven rules test `read_len`, so without it they would parse, never fire, and
+fall through to the default without saying so. Verified by walking all 102 real
+QC reports in Rust and in the trainer's Python reference: **102/102
+byte-identical argv**.
+
+**Known-bad regimes** (documented in `docs/MODEL-CARD-auto-params.md`): 101 bp
+reads only (no 150 bp library in the corpus), no 2-colour chemistry, no 3′ tail
+longer than 20 bp, six study types. The model's `min_len` values come from the
+Phase D grid and therefore REPLACE D-18's 0.67L floor when applied; pass
+`--min-len` explicitly to keep it.

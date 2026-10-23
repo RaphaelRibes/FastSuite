@@ -6,6 +6,7 @@
 
 pub mod adapter;
 pub mod algorithm;
+pub mod auto_params;
 pub mod cli;
 pub mod correct;
 pub mod io;

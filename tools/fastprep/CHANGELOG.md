@@ -3,7 +3,42 @@
 Newest first. Default-behaviour changes are marked **DEFAULT** and always carry
 the measurement that justified them.
 
-## Unreleased
+## 0.5.0 — 2026-10-23
+
+### Added — `--auto-params`: the model recommendation is real
+
+`fastprep --auto-params qc.json [--print-args] [--model PATH]` recommends the
+trimming configuration for a library from a `fastcheck --json` report of its
+input, and `--print-args` prints the argv (stdout) plus the rule that fired,
+its training coverage and the measured acceptance (stderr).
+
+* **What it is:** a decision list walked in-tree — ordered `(field, op, value)`
+  rules over fastcheck's input-side metrics, each producing a patch of knobs.
+  First match wins; no inference runtime, no new dependency (PLAN-ML-STEPS F1).
+  An explicitly-passed flag always wins over the model (`ValueSource` is
+  checked, so "typed 12" is distinguishable from "default 12").
+* **Where it comes from:** `bench/scripts/train_auto_params.py`, trained on
+  Phase D's 101 real ENA libraries (6 domains) and 39 expressible configs of
+  the 55-config grid; 13 configs are excluded because they need the bench-only
+  `r2_reverse` transform, which is not a fastprep flag.
+* **Measured (group 5-fold by dataset, stratified by domain):** mean regret vs
+  the per-dataset oracle **0.0331** against the shipped default's **0.0721**;
+  delta vs the default **+0.0389**, beating it on **70.9 %** of held-out
+  datasets; top-5 agreement **0.533** against the default's **0.020**. Leave-
+  one-domain-out stays positive on all six domains (+0.0004 metagenomics …
+  +0.130 generalised) — see `docs/MODEL-CARD-auto-params.md`, which also states
+  the one fold that loses to the default and the regimes the corpus does not
+  cover (150 bp reads, 2-colour chemistry, long 3′ tails).
+* **The model is embedded in the binary** (`models/auto-params.v1.json`, 8 KB,
+  `include_str!`) and still shipped as a file, so `--auto-params` works with no
+  setup and the rules can be read without a build. `--model` or
+  `$FASTPREP_MODEL` override the discovery order.
+* **Refusals that remain:** a `--print-args` without a report, a report whose
+  `metrics` are not numeric, a model with an unknown schema tag, an unknown
+  feature name (a typo would otherwise be a rule that never fires), an
+  unconditional rule before the last one, and any out-of-range knob value.
+* Verified by walking all 102 real QC reports in Rust and in the trainer's
+  Python reference: **102/102 byte-identical argv** (`/tmp/parity.py`).
 
 **DEFAULT — `--min-len` is `0.67L`, not `0.9L`.** The floor is also the trim
 budget (a read needing more trim than the floor allows is dropped, not trimmed),

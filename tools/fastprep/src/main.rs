@@ -1,7 +1,6 @@
 //! CLI entry point.
 
 use anyhow::{Context, Result};
-use clap::Parser;
 use std::time::Instant;
 
 use fastprep::cli::{Cli, Mode};
@@ -101,7 +100,26 @@ fn length_floor_line(params: &fastprep::algorithm::Params, s: &fastprep::stats::
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Keep clap's matches alongside the parsed struct: `--auto-params` must
+    // know which knobs the user actually typed (ValueSource::CommandLine) so
+    // the recommendation cannot overwrite an explicit choice.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let mut cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
+
+    // --auto-params is resolved BEFORE finalize(): it either prints the argv
+    // and exits (a query) or patches the knobs the run will use.
+    if cli.auto_params.is_some() {
+        cli.validate_auto_params()?;
+        let (model_path, model, rec) = cli.recommend()?;
+        if cli.print_args {
+            cli.print_recommendation(&model_path, &model, &rec, true)?;
+            return Ok(());
+        }
+        let explicit = fastprep::cli::Explicit::from_matches(&matches);
+        cli.print_recommendation(&model_path, &model, &rec, false)?;
+        cli.apply_recommendation(&rec, &explicit);
+    }
+
     let (mode, rt) = cli.finalize()?;
 
     // Configure rayon's global thread pool.

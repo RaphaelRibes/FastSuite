@@ -1,170 +1,200 @@
-# `fastprep --auto-params`: what it would do, what it cannot do yet
+# `fastprep --auto-params`: the recommendation, and where it can be trusted
 
-**Status: the flag exists and refuses.** `fastprep --auto-params <qc.json>
---print-args` is implemented as a stub: it validates the path, prints the
-refusal below, and exits non-zero. No model is trained, no model file exists,
-and nothing in the repo produces the argv `--print-args` would emit. This
-document is the honest record of what would have to be true before it does.
-
----
-
-## What `--auto-params` would do
-
-Given a **fastcheck QC report of the real input** (`fastcheck --json qc.json
-R1 R2`), recommend the fastprep configuration for that dataset, then print the
-argv a run would take:
+**Status: implemented, trained and evaluated (fastprep 0.5.0).**
+`fastprep --auto-params qc.json --print-args` prints the recommended argv and the
+rule that produced it; without `--print-args` the recommendation is applied to
+the run. The model is a decision list walked in-tree, embedded in the binary and
+shipped as a readable file at `tools/fastprep/models/auto-params.v1.json`. Its
+measured card is `docs/MODEL-CARD-auto-params.md`.
 
 ```
-fastprep --auto-params qc.json --print-args
-# -> --min-run 12 --mercy 3 --phred-sat 20 --gate-shape 1.0 --min-len 0.9L \
-#    --mean-q 25 --adapter-error-rate 0.2 --min-adapter-overlap 14 ...
+$ fastcheck --json qc.json R1.fq.gz R2.fq.gz
+$ fastprep --auto-params qc.json --print-args
+--min-run 12 --mercy 1 --phred-sat 20 --gate-shape 1 --min-len 0.9L \
+  --mean-q 25 --adapter-error-rate 0.2 --min-adapter-overlap 14
+auto-params: model <built-in>
+  trained on {"corpus":"phase-d (real ENA libraries, GT-free features)", ...}
+  profile   12 of 12 feature(s) present
+  rule 4/7: polyx5_frac_gt_1 > 0.25125 && kmer_top_frac <= 0.0433 &&
+            read_len > 95 [n=12, regret 0.0001]
+  measured  CV delta vs the default +0.0389 (beats it on 71 % of held-out
+            datasets), top-5 0.533
 ```
 
-The input is exactly the fields `fastcheck` measures on the reads **before**
-trimming (its `metrics` block: `mean_len`, `gc_fraction`,
-`mean_read_mean_q`, `reads_q20_frac`, `polyx5_frac_gt_1`, `head_g_frac`,
-`duplication_level`, …). The output is the ten config knobs the sweep
-explored. The model in between is the Phase E ranker: one decision list per
-domain, distilled from the label table `bench/scripts/labels.py` builds.
+The argv goes to **stdout** (pipe it, or paste it); the explanation goes to
+stderr, so `--print-args` composes with a shell. In apply mode nothing goes to
+stdout. An **explicit flag always wins** over the model: `--auto-params qc.json
+--min-run 14` keeps 14 (`ValueSource` is checked, so "typed 12" is
+distinguishable from "default 12").
 
-**The design constraint (Phase F): Rust tree-walking, no new dependency.**
-The trained model is exported to a compact per-domain decision list — a small
-JSON file of ordered `(field, threshold) → params` rules — and fastprep walks
-it in-tree. No ONNX runtime, no tract, no inference crate: the whole
-recommendation is a sequence of comparisons against the QC report's measured
-fields. The shipped default is the fallback for every dataset whose QC report
-is missing a field or falls outside every rule.
+## What the model is
 
-## What it CANNOT do today — the honest part
+A decision list: ordered rules, each a conjunction of `(field, op, value)` tests
+over the fields `fastcheck` measures **on the input before trimming**, each
+producing a patch of trimming knobs. First matching rule wins; if none matches,
+the model's `default` patch applies; a knob no patch sets keeps its shipped
+default. Walking it is a handful of float comparisons — no ONNX, no tract, no
+inference crate (PLAN-ML-STEPS F1) — and the whole model is 8 KB of JSON a user
+can read.
 
-**The shipped default is the swept winner on the old corpus, and no longer on
-the real one.** The 90-dataset corpus campaign (the `FastSuite-bench` repo,
-the earlier campaign) swept the config grid over 90 datasets and found **one
-configuration best everywhere** (winner score median 0.969, 90/90 datasets).
-That configuration **is fastprep's default** — it is locked by the
-`shipped_defaults_are_the_swept_winner` test in `tools/fastprep/src/cli.rs`
-(min-run 12, mercy 3, phred-sat 20, gate-shape 1.0, min-len 0.9L, mean-q 25,
-adapter-error-rate 0.2, min-adapter-overlap 14, dedup on, interior scan off).
+Why a decision list and not a boosted ranker: a recommendation you cannot audit
+is not usable on a trimming tool whose failure mode is silently wrong reads.
+`--print-args` names the rule, its training coverage and its mean regret, so the
+user can see the evidence and disagree with it.
+
+The features are `QC_FEATURES` from `bench/scripts/labels.py` — the same list the
+training matrix uses, and nothing measured on the trimmed output. Two are
+**derived**, and the derivation lives in `auto_params::Profile` so training and
+serving cannot drift: `read_len ← mean_len`, `bases_non_acgt_frac ←
+bases_non_acgt / bases`. Without that alias the model's `read_len` rules would
+parse, never fire, and fall through to the default without saying so.
+
+## Why the default is not good enough (the Phase D correction)
+
+The 90-dataset corpus campaign (the earlier `FastSuite-bench` campaign) swept the
+config grid over 90 datasets and found **one configuration best everywhere**
+(winner score median 0.969, 90/90 datasets). That configuration **is**
+fastprep's default, locked by `shipped_defaults_are_the_swept_winner` in
+`tools/fastprep/src/cli.rs`.
 
 Phase D's real-library sweep does **not** reproduce that verdict, and this
-document records the correction rather than the original framing. Over 101
-real ENA datasets in six domains the shipped default (config 0) is the
-per-dataset winner on **1 of 101**; a per-dataset winner from the 55-config
-grid beats it on **100 of 101** (median winner score 0.9643, median gap vs
-default 0.0049 — 66 of 101 datasets sit inside a 0.01 margin, 12 above 0.1).
-So the default is a good *central* configuration, not a universal one.
+document records the correction rather than the original framing. Over 101 real
+ENA datasets in six domains the shipped default (config 0) is the per-dataset
+winner on **1 of 101**; a per-dataset winner from the grid beats it on **100 of
+101** (median winner score 0.9643, median gap vs default 0.0049 — 66 of 101
+datasets sit inside a 0.01 margin, 12 above 0.1). The default is a good *central*
+configuration, not a universal one, which is why the model has to beat it on
+held-out libraries before shipping.
 
-What Phase D settles, and what it does not:
+What Phase D settles: the winners are not all one configuration (16 distinct
+configs win somewhere, led by config 6 on 33 datasets, 44 on 16, 52 on 10, 45 on
+9); the knobs that vary most are `mercy` (76 of the 100 non-default winners
+differ), `min_run` (45) and `min_len` (46); `r2_reverse` is on in 32 winners.
+It also **confirms two defaults**: `adapter-error-rate 0.2` and
+`min-adapter-overlap 14` hold in **all 101** winners, and the interior scan stays
+off in 100 of 101.
 
-* It **does** give `--auto-params` something to switch on. The winners are not
-  all the same configuration: 16 distinct configs win somewhere, led by
-  config 6 (33 datasets), 44 (16), 52 (10) and 45 (9). The knobs that vary
-  most are `mercy` (76 of the 100 non-default winners differ), `min_run` (45)
-  and `min_len` (46); the effective length floor is *relative* in 99 of 101
-  winners (0.9L on 55, 0.85L on 22), against fastprep's shipped relative 0.9L
-  and `fastp`'s absolute 30 bp floor. `r2_reverse` is on in 32 winners, so
-  read orientation is genuinely dataset-dependent.
-* It **confirms two defaults**: `adapter-error-rate 0.2` and
-  `min-adapter-overlap 14` hold in **all 101** winners, and the interior scan
-  stays off in 100 of 101 — the one point where the old campaign's verdict
-  survives intact.
-* `head-dropout` is **not one of the knobs the Phase D grid swept** — the
-  campaign's grid did not author it, so this campaign says nothing about it
-  either way. It was a default carried from the earlier campaign, not a
-  validated one. (The axis was added to the grid afterwards — `c53dbd6` — and
-  `0` then won 100/101 datasets; see `docs/OVERTRIM-SWEEP.md`. `0` is now the
-  shipped default, `3d76a31`.)
+Phase D's head-to-head is the measured context: each dataset also ran through
+`fastp` at its shipped defaults and at a tuned best, all tools at 4 threads with
+gzip level 6. The per-dataset winners are faster than default `fastp` on 100 of
+101 libraries (median wall-time ratio 0.500, i.e. 2.00x) and use 33x less peak
+memory on 101 of 101; tuning `fastp` moves neither axis. The one axis where they
+lose is retention — a median −5.1 pp — and that is an artefact of the floors
+being compared (83 of the 101 winners carry a relative floor above 0.5L while
+`fastp`'s default floor is an absolute 30 bp), not of trimming quality.
 
-Shipping the flag wired to the default would still be **dishonest**: on this
-corpus the default is not the winner, so a ranker that merely reproduces it
-would be recommending a losing configuration on 100 of 101 libraries. The
-flag keeps refusing until a model trained on a *larger, more diverse* corpus
-exists and beats the default on **held-out studies** — the acceptance
-criterion in `docs/PLAN-ML-STEPS.md` E5: regret vs the sweep's best, top-5
-agreement, and a fastp comparison on held-out real datasets.
+## How it was trained
 
-**Phase D's real-library head-to-head is the measured context for that test.**
-Each of the 101 datasets was also run through `fastp` at its shipped defaults
-and at a tuned best (`--cut_front --cut_tail` window 5 / mean-quality 20,
-`--qualified_quality_phred 20 --length_required 30 --low_complexity_filter`),
-all tools at 4 threads with gzip level 6 output. The per-dataset winners are
-faster than default `fastp` on 100 of 101 libraries (median wall-time ratio
-0.500, i.e. 2.00x) and use 33x less peak memory on 101 of 101; tuning `fastp`
-moves neither axis (0.444 against the tuned configuration, same memory). The
-one axis where they lose is retention — a median −5.1 pp — and that is an
-artefact of the floors being compared, not of trimming quality: 83 of the 101
-winners carry a relative floor above 0.5L while `fastp`'s default floor is an
-absolute 30 bp. Any ranker must therefore be scored on the same
-floor-normalised axis, or it will learn to recommend looser floors purely to
-win a retention number.
+`bench/scripts/train_auto_params.py` reads the label table (`labels.py` output,
+15 847 rows over 101 datasets) and grows a depth-3 tree whose leaves are configs,
+then flattens it into the ordered list. Leaves hold ≥ 10 datasets and a split
+must gain ≥ 0.0005 in mean score, which is what keeps a 101-dataset corpus from
+producing 55 one-dataset rules.
 
-**Phase D's corpus is 101 datasets, not 500 — the sweep as run is narrower
-than planned.** The committed Phase D results are 101 real ENA datasets × 55
-configs × 3 variants (`bench/results/phase-d/winners.tsv`, 101 rows;
-`closed_loop.tsv`, 306 rows over 102 datasets), with the closed loop at
-**167/306 = 54.6%** and the per-position G-fraction gate the dominant failure
-(120 of 139 failing rows, against duplicate-ratio 18 of 139). That is enough to establish the correction above — the default is
-not the universal winner, and per-domain signal exists — but it is **not**
-enough to train and honestly evaluate a per-domain ranker: 101 datasets
-across six domains is roughly 17 per domain, and a group k-fold over that
-leaves a handful of held-out studies per fold. The 500-dataset corpus
-originally scoped for Phase D remains the prerequisite for the acceptance
-test, not something Phase D has already delivered.
+* **Action space:** 39 of the sweep's 52 distinct knob sets. The 13 excluded
+  configs set `r2_reverse`, a **bench-side** transform (the sweep revcomp'd R2 to
+  simulate the other strand convention); it is not a fastprep flag, so
+  recommending one would recommend an effect the tool cannot produce. **23
+  datasets' oracle winner needed one of those** — a permanent ceiling on this
+  model's regret, not a tuning problem.
+* **Score:** the sweep's score (keep precision/recall, trim MAE, over/under-trim
+  and drop accuracy combined). A config's score for a dataset is the mean over
+  variants, the same rule `aggregate.py` uses to name winners.
+* **No GT in the features:** the label side needs ground truth; the feature side
+  must be available before running, which `labels.py` enforces and
+  `bench/scripts/leak_test.py` checks.
 
-## What Phase D's results changed
+## How it was evaluated
 
-The label table (`bench/scripts/labels.py`) turns sweep rows into the training
-matrix, and the leak test (`bench/scripts/leak_test.py`) guarantees the
-held-out evaluation is honest. What Phase D delivered, and what it did not:
+Group 5-fold **by dataset**, stratified by domain, so every score is a library
+the model has never seen, and all rows of a dataset stay in one fold.
 
-* **Delivered — the correction**: 101 real datasets × 55 configs, each scored
-  against simulator ground truth for the same run. This is what overturned the
-  "one configuration best everywhere" framing (1 of 101 for the default) and
-  what makes the ranker a question worth asking.
-* **Delivered — the head-to-head**: the 101-dataset `fastp` comparison
-  (`bench/results/phase-d/fastp-comparison.tsv`, 303 rows) is the E5
-  "fastp comparison on held-out real datasets", already measured for the
-  *winners*. It is not yet measured for a *model's picks* — that is the part
-  that still needs the ranker.
-* **Not delivered — training scale**: ~500 datasets × 200 configs was the
-  original scope; 101 × 55 × 3 variants is what ran. Six domains at ~17
-  datasets each is too thin for a group k-fold to leave a meaningful held-out
-  set per fold, so the ranker cannot be evaluated honestly on this corpus
-  alone.
-* **The honest acceptance test, still open**: on a corpus large enough for it,
-  does the model's pick beat the shipped default? If yes, the flag ships a
-  model file and this document records which domains it was trained on and
-  where it must not be trusted (E5/F3). If no, `--auto-params` stays a refusal
-  — and on the current corpus that is the *likely* outcome, since the default
-  already loses to the per-dataset winners by only a median 0.0049, a margin
-  a ranker must clear on held-out studies to be worth shipping at all.
-
-## The label side of the machinery (already built, tested on the pilot)
-
-Phase E's components exist and run green on the pilot's results — they are
-waiting on Phase D's sweep rows, which have the identical schema:
-
-| file | what it does | pilot status |
+| metric | model | shipped default |
 |---|---|---|
-| `bench/scripts/labels.py` | sweep_rows.tsv + pilot.tsv + fastcheck reports → `labels.tsv` (one row per dataset × config; 22 QC-side features + the winner/quantile label) | 4614 rows / 28 datasets, green |
-| `bench/scripts/leak_test.py` | (1) no study in two splits, (2) no feature is an outcome column or uncomputable at predict time | green; verified to FAIL on a broken split, a leaked `score` feature, and a ghost feature |
-| `bench/scripts/splits.py` | study-level group k-fold by `run_accession`, stratified by domain, seeded (default seed 7), byte-deterministic | 28 studies, k=5, green; same seed → identical output |
+| mean regret vs the per-dataset oracle | **0.0331** | 0.0721 |
+| delta vs the default (positive = model better) | **+0.0389** | — |
+| datasets where it beats the default | **70.9 %** | — |
+| top-5 agreement | **0.533** | 0.020 |
 
-The features are exactly the QC fields `fastcheck` measures on the input plus
-the config knobs. The label is the sweep's own winner (from pilot.tsv) or the
-score quantile — never a re-derivation. No GT-derived field is a feature;
-`seconds` is not one either (it is a property of the run, not the input).
+Per-domain top-5 (CV): metagenomics 0.765, bacterial_isolate 0.600, rna_seq
+0.588, human_gut 0.529, generalised 0.375, virome 0.294.
 
-## The stub's contract
+Leave-one-domain-out — train on five study types, test on the sixth — stays
+positive everywhere: generalised **+0.130**, bacterial_isolate **+0.088**,
+virome **+0.053**, human_gut **+0.005**, rna_seq **+0.005**, metagenomics
+**+0.0004** (no transfer at all there).
 
-`fastprep --auto-params <qc.json> --print-args` today:
+**The failure it does have:** one of the five CV folds loses to the default —
+fold 1, regret 0.1180 against the default's mean 0.0721, delta −0.0462. The fold
+is dominated by the `generalised` domain, where a leaf recommends `min_len 30` on
+libraries the default would have left alone. A mean of +0.0389 with one fold at
+−0.046 is a real improvement on average and not a guarantee per library, which is
+why `--print-args` exists.
 
-* validates that `<qc.json>` exists and parses as a fastcheck report;
-* prints, on stderr, the refusal: no model trained yet, pointing here;
-* exits non-zero (CLI-SPEC §1 rule 4: a correct refusal is non-zero with a
-  message saying what to do).
+The corpus is 101 datasets, not the 500 originally scoped. Six domains at ~17
+datasets each leaves 15–17 held-out studies per fold, and the fold-to-fold spread
+above (0.0010 to 0.1180) is the width of the uncertainty. The closed loop that
+produced the corpus scored **167/306 = 54.6 %**, with the per-position G-fraction
+gate the dominant failure (120 of 139 failing rows, against duplicate-ratio 18 of
+139) — that is a limit on the *labels*, and it does not go away with more
+modelling.
 
-It never emits an argv, never falls back to the default silently, and never
-claims to recommend anything. When Phase D's model ships, the stub is replaced
-by the tree-walk over the model file — the CLI surface and the refusal message
-are the only things that change.
+## Where it must not be trusted
+
+These are properties of the corpus, not of the model file, and none of them is
+fixed by training harder on the same data:
+
+* **Read length.** The sweep ran on **101 bp reads**. No corpus dataset is 150
+  bp, so `read_len` splits were fitted on a range that excludes common modern
+  libraries; two of the seven rules test `read_len` and extrapolate there.
+* **Chemistry.** No 2-colour (NovaSeq/NextSeq) library is in the corpus, so the
+  high-quality 5′ polyG head — the case `--head-dropout` exists for — is not
+  represented at all. `--head-dropout` is not an axis of this model.
+* **Long low-quality 3′ tails.** The longest injected 3′ tail in the corpus is
+  20 bp; D-18's unbounded low-Q run trimming is exactly the regime the sweep
+  cannot score.
+* **The floor.** Every rule's `min_len` comes from the Phase D grid, which ran at
+  0.9L-era floors. D-18 moved the shipped floor to **0.67L** after the sweep, so
+  applying a recommendation **replaces** that floor. Pass `--min-len` explicitly
+  (explicit flags win) to keep the 0.67L budget.
+* **Domain coverage.** Six study types. The LODO table above is the measurement
+  of how well it transfers to a seventh — from none (metagenomics) to a lot
+  (generalised) — and it is the number to look at before using this on a study
+  type the corpus has never seen.
+
+## Retraining
+
+```
+bench/scripts/labels.py --rows bench/results/phase-d/sweep_rows.tsv \
+    --pilot bench/results/phase-d/pilot.tsv --qc-dir qc/ \
+    --out labels.tsv --features features.txt
+bench/scripts/train_auto_params.py --labels labels.tsv \
+    --out tools/fastprep/models/auto-params.v1.json \
+    --card docs/MODEL-CARD-auto-params.md --leave-one-domain-out
+```
+
+The QC directory is `<domain>/<acc>.json`, each the `fastcheck --json` report of
+the **real** reads the dataset's profile was fitted from (on the desktop corpus:
+`work-gt2026/<domain>/<acc>/v0/real.report.json`). The trainer **exits non-zero
+if the model does not beat the default** on held-out datasets; `--force` writes
+it anyway and the card has to say so. Re-running on the same inputs is
+deterministic (`--seed`), which is how the committed model was verified.
+
+## How the walk is verified
+
+* `the_embedded_model_is_the_file_on_disk` — the bytes compiled in are the bytes
+  committed, and every rule is satisfiable and not shadowed by a later rule.
+* Rust unit tests cover each operator, first-match order, "a missing field is not
+  agreement", `mean_q: null` vs absent, range validation, and the fact that an
+  explicitly-passed knob survives `apply_recommendation`.
+* **Cross-language parity:** walking all 102 real QC reports in Rust and in a
+  Python re-implementation of the same rules gives **102/102 byte-identical
+  argv**, so the trainer's view of the model and the binary's cannot drift.
+
+## What is still missing
+
+* `fasthelper recommend runs/` — the batch case (one recommendation per QC report
+  in a directory). The walk is a library function; only the CLI front is missing.
+* The held-out **fastp** comparison on the model's *picks* (E5's third
+  criterion). The Phase D head-to-head measured the per-dataset winners, not the
+  model's choices, and the two differ on the 23 datasets above.

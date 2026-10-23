@@ -1,0 +1,348 @@
+{
+  "schema": "fastsuite.auto-params.v1",
+  "trained_on": {
+    "corpus": "phase-d (real ENA libraries, GT-free features)",
+    "datasets": 101,
+    "domains": [
+      "bacterial_isolate",
+      "generalised",
+      "human_gut",
+      "metagenomics",
+      "rna_seq",
+      "virome"
+    ],
+    "configs_in_space": 39,
+    "configs_dropped_r2_reverse": 13,
+    "created": "2026-10-23",
+    "trainer": "bench/scripts/train_auto_params.py"
+  },
+  "features": [
+    "read_len",
+    "gc_fraction",
+    "mean_read_mean_q",
+    "reads_q20_frac",
+    "reads_q30_frac",
+    "polyx5_frac_gt_1",
+    "polyx3_frac_gt_5",
+    "head_g_frac",
+    "head_dropout",
+    "duplication_level",
+    "kmer_top_frac",
+    "bases_non_acgt_frac"
+  ],
+  "rules": [
+    {
+      "when": [
+        {
+          "field": "polyx5_frac_gt_1",
+          "op": ">",
+          "value": 0.25125
+        },
+        {
+          "field": "kmer_top_frac",
+          "op": ">",
+          "value": 0.0433
+        },
+        {
+          "field": "reads_q30_frac",
+          "op": "<=",
+          "value": 0.96601
+        }
+      ],
+      "params": {
+        "min_run": 10,
+        "mercy": 2.0,
+        "phred_sat": 25,
+        "gate_shape": 1.0,
+        "min_len": "0.9L",
+        "mean_q": 22.0,
+        "adapter_error_rate": 0.2,
+        "min_adapter_overlap": 14,
+        "interior": false
+      },
+      "coverage": 25,
+      "regret": 0.001879,
+      "note": "mr10/m2/s25/g1/l0.9L/q22 (rule best on 25 dataset(s))"
+    },
+    {
+      "when": [
+        {
+          "field": "polyx5_frac_gt_1",
+          "op": "<=",
+          "value": 0.25125
+        },
+        {
+          "field": "reads_q20_frac",
+          "op": ">",
+          "value": 0.969658
+        },
+        {
+          "field": "polyx3_frac_gt_5",
+          "op": "<=",
+          "value": 0.0105
+        }
+      ],
+      "params": {
+        "min_run": 12,
+        "mercy": 3.0,
+        "phred_sat": 20,
+        "gate_shape": 1.0,
+        "min_len": 50,
+        "mean_q": 25.0,
+        "adapter_error_rate": 0.2,
+        "min_adapter_overlap": 14,
+        "interior": false
+      },
+      "coverage": 18,
+      "regret": 0.001767,
+      "note": "mr12/m3/s20/g1/l50/q25 (rule best on 18 dataset(s))"
+    },
+    {
+      "when": [
+        {
+          "field": "polyx5_frac_gt_1",
+          "op": "<=",
+          "value": 0.25125
+        },
+        {
+          "field": "reads_q20_frac",
+          "op": ">",
+          "value": 0.969658
+        },
+        {
+          "field": "polyx3_frac_gt_5",
+          "op": ">",
+          "value": 0.0105
+        }
+      ],
+      "params": {
+        "min_run": 12,
+        "mercy": 1.0,
+        "phred_sat": 20,
+        "gate_shape": 1.0,
+        "min_len": "0.9L",
+        "mean_q": 25.0,
+        "adapter_error_rate": 0.2,
+        "min_adapter_overlap": 14,
+        "interior": false
+      },
+      "coverage": 12,
+      "regret": 0.000108,
+      "note": "mr12/m1/s20/g1/l0.9L/q25 (rule best on 12 dataset(s))"
+    },
+    {
+      "when": [
+        {
+          "field": "polyx5_frac_gt_1",
+          "op": ">",
+          "value": 0.25125
+        },
+        {
+          "field": "kmer_top_frac",
+          "op": "<=",
+          "value": 0.0433
+        },
+        {
+          "field": "read_len",
+          "op": ">",
+          "value": 95.0
+        }
+      ],
+      "params": {
+        "min_run": 12,
+        "mercy": 1.0,
+        "phred_sat": 20,
+        "gate_shape": 1.0,
+        "min_len": "0.9L",
+        "mean_q": 25.0,
+        "adapter_error_rate": 0.2,
+        "min_adapter_overlap": 14,
+        "interior": false
+      },
+      "coverage": 12,
+      "regret": 0.000108,
+      "note": "mr12/m1/s20/g1/l0.9L/q25 (rule best on 12 dataset(s))"
+    },
+    {
+      "when": [
+        {
+          "field": "polyx5_frac_gt_1",
+          "op": ">",
+          "value": 0.25125
+        },
+        {
+          "field": "kmer_top_frac",
+          "op": ">",
+          "value": 0.0433
+        },
+        {
+          "field": "reads_q30_frac",
+          "op": ">",
+          "value": 0.96601
+        }
+      ],
+      "params": {
+        "min_run": 12,
+        "mercy": 3.0,
+        "phred_sat": 20,
+        "gate_shape": 1.0,
+        "min_len": "0.9L",
+        "mean_q": 25.0,
+        "adapter_error_rate": 0.2,
+        "min_adapter_overlap": 8,
+        "interior": false
+      },
+      "coverage": 12,
+      "regret": 0.000483,
+      "note": "mr12/m3/s20/g1/l0.9L/q25 (rule best on 12 dataset(s))"
+    },
+    {
+      "when": [
+        {
+          "field": "polyx5_frac_gt_1",
+          "op": "<=",
+          "value": 0.25125
+        },
+        {
+          "field": "reads_q20_frac",
+          "op": "<=",
+          "value": 0.969658
+        }
+      ],
+      "params": {
+        "min_run": 8,
+        "mercy": 3.0,
+        "phred_sat": 20,
+        "gate_shape": 1.0,
+        "min_len": 50,
+        "mean_q": 20.0,
+        "adapter_error_rate": 0.2,
+        "min_adapter_overlap": 14,
+        "interior": false
+      },
+      "coverage": 11,
+      "regret": 0.005668,
+      "note": "mr8/m3/s20/g1/l50/q20 (rule best on 11 dataset(s))"
+    },
+    {
+      "when": [
+        {
+          "field": "polyx5_frac_gt_1",
+          "op": ">",
+          "value": 0.25125
+        },
+        {
+          "field": "kmer_top_frac",
+          "op": "<=",
+          "value": 0.0433
+        },
+        {
+          "field": "read_len",
+          "op": "<=",
+          "value": 95.0
+        }
+      ],
+      "params": {
+        "min_run": 16,
+        "mercy": 8.0,
+        "phred_sat": 30,
+        "gate_shape": 1.0,
+        "min_len": 30,
+        "mean_q": 25.0,
+        "adapter_error_rate": 0.2,
+        "min_adapter_overlap": 14,
+        "interior": false
+      },
+      "coverage": 11,
+      "regret": 6e-06,
+      "note": "mr16/m8/s30/g1/l30/q25 (rule best on 11 dataset(s))"
+    }
+  ],
+  "default": {
+    "params": {
+      "min_run": 12,
+      "mercy": 3.0,
+      "phred_sat": 20,
+      "gate_shape": 1.0,
+      "min_len": "0.9L",
+      "mean_q": 25.0,
+      "adapter_error_rate": 0.2,
+      "min_adapter_overlap": 14,
+      "interior": false
+    }
+  },
+  "acceptance": {
+    "method": "group 5-fold by dataset, stratified by domain",
+    "cv_mean_regret": 0.033117,
+    "cv_delta_vs_default": 0.038887,
+    "cv_beats_default_frac": 0.7085,
+    "cv_top5": 0.5329,
+    "cv_per_domain_top5": {
+      "bacterial_isolate": {
+        "n": 15,
+        "top5": 0.6
+      },
+      "generalised": {
+        "n": 16,
+        "top5": 0.375
+      },
+      "human_gut": {
+        "n": 17,
+        "top5": 0.5294117647058824
+      },
+      "metagenomics": {
+        "n": 17,
+        "top5": 0.7647058823529411
+      },
+      "rna_seq": {
+        "n": 17,
+        "top5": 0.5882352941176471
+      },
+      "virome": {
+        "n": 17,
+        "top5": 0.29411764705882354
+      }
+    },
+    "baseline_default_mean_regret": 0.072058,
+    "baseline_default_top5": 0.0202,
+    "leave_one_domain_out": {
+      "bacterial_isolate": {
+        "n": 15,
+        "mean_regret": 0.030617777777777775,
+        "mean_delta_vs_default": 0.08804222222222219,
+        "top5": 0.5333333333333333
+      },
+      "generalised": {
+        "n": 16,
+        "mean_regret": 0.11795520833333333,
+        "mean_delta_vs_default": 0.13046145833333334,
+        "top5": 0.6875
+      },
+      "human_gut": {
+        "n": 17,
+        "mean_regret": 0.0009950980392156943,
+        "mean_delta_vs_default": 0.005239583333333346,
+        "top5": 0.47058823529411764
+      },
+      "metagenomics": {
+        "n": 17,
+        "mean_regret": 0.004723529411764721,
+        "mean_delta_vs_default": 0.0003705882352941095,
+        "top5": 0.29411764705882354
+      },
+      "rna_seq": {
+        "n": 17,
+        "mean_regret": 0.003798039215686281,
+        "mean_delta_vs_default": 0.005249019607843153,
+        "top5": 0.29411764705882354
+      },
+      "virome": {
+        "n": 17,
+        "mean_regret": 0.007990196078431374,
+        "mean_delta_vs_default": 0.05296078431372548,
+        "top5": 0.5294117647058824
+      }
+    },
+    "datasets_losing_to_r2_reverse_drop": 23
+  }
+}

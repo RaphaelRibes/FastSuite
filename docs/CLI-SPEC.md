@@ -114,6 +114,7 @@ Legend: **✓** already conforms · **+** added in this reorganisation ·
 | `-j --threads` | ✓ | `1` = serial; `0` not yet accepted |
 | `--gz-level` | → | `--compression` and `-c` aliases |
 | `--json` | ✓ | writes the legacy stats object; wrapper pending (§4) |
+| `--auto-params` | ✓ | recommends the trimming config from a `fastcheck --json` report of the input, then applies it (an explicit knob always wins) or, with `--print-args`, prints the argv to **stdout** and the rule + measured acceptance to stderr. The model is a decision list (`fastsuite.auto-params.v1`) embedded in the binary; `--model PATH` / `$FASTPREP_MODEL` override it. Refuses: a model with an unknown schema tag, an unknown feature name, an unconditional rule before the last one, an out-of-range knob, a QC report with no numeric metrics. Measured in `docs/MODEL-CARD-auto-params.md`; the walk is byte-identical to the trainer's Python reference on all 102 real QC reports. |
 | `--temp-dir` | gap | uses its own chunking, no spill flag |
 | `-v --verbose` | gap | fastprep has no `-v`: `-q` exists and warnings/errors always print, but there is no per-step verbosity level. Listed as a suite-wide gap rather than claimed. |
 | `--force -f` | ✓ | refuses to clobber an existing `-o`/`-p` (and `--metadata`/`--json`/`--singletons*`), naming the file |

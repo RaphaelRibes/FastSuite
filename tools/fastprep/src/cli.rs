@@ -15,6 +15,46 @@ use crate::adapter::{self, Adapter, AdapterSet};
 use crate::algorithm::{Direction, MatchRule, MinLen, Params};
 
 // ---------------------------------------------------------------------------
+// Explicit-flag tracking (for --auto-params).
+// ---------------------------------------------------------------------------
+
+/// The flags the user actually typed, as clap ids.
+///
+/// `--auto-params` must not silently overwrite a knob the user passed: the
+/// recommendation is a suggestion, and a command line that says
+/// `--min-run 14` has already decided. Comparing against the default value
+/// cannot tell "typed 12" from "did not type it", so the source of every
+/// argument is read from clap ([`clap::parser::ValueSource::CommandLine`]).
+#[derive(Debug, Default, Clone)]
+pub struct Explicit(std::collections::HashSet<String>);
+
+impl Explicit {
+    /// Nothing was typed: the recommendation may set every knob. Used by unit
+    /// tests that build a [`Cli`] without going through clap's matches.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn from_matches(m: &clap::ArgMatches) -> Self {
+        let mut set = std::collections::HashSet::new();
+        for id in m.ids() {
+            if m.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine) {
+                set.insert(id.as_str().to_string());
+            }
+        }
+        Self(set)
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.0.contains(id)
+    }
+
+    pub fn insert(&mut self, id: &str) {
+        self.0.insert(id.to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adapter source enum (mutually exclusive on the CLI).
 // ---------------------------------------------------------------------------
 
@@ -192,25 +232,34 @@ pub struct Cli {
 
     // --------------------------------------------------- Model recommendation
     /// Recommend the trimming config from a fastcheck QC report of the input
-    /// (`fastcheck --json qc.json R1 R2`). Requires --print-args.
+    /// (`fastcheck --json qc.json R1 R2`), then either print the argv
+    /// (`--print-args`) or apply it to this run.
     ///
-    /// REFUSES until a Phase D model file exists. The shipped default is
-    /// NOT the swept winner on the current corpus: over 101 real ENA
-    /// datasets it is the per-dataset winner on 1 of 101, and a per-dataset
-    /// winner from the 55-config grid beats it on the other 100, so there
-    /// is real signal to switch on but no model trained on a corpus large
-    /// enough to beat the default on held-out studies (docs/AUTO-PARAMS.md).
-    /// `fastprep --auto-params <qc.json> --print-args` — the flag parses,
-    /// validates the QC path, and refuses with a message pointing at the
-    /// doc, exactly as CLI-SPEC §1 rule 4 requires of a correct refusal.
+    /// The recommendation is a decision list walked in-tree
+    /// ([`crate::auto_params`]): no inference runtime, and the rule that fired
+    /// is printed so the recommendation can be inspected and overridden. An
+    /// explicitly-passed knob always wins over the model's suggestion.
+    ///
+    /// The model is trained on Phase D's 101 real ENA libraries; the shipped
+    /// default is the per-dataset winner on 1 of 101 of them, so there is real
+    /// signal to switch on, and `docs/MODEL-CARD-auto-params.md` states where
+    /// the model must not be trusted (read length, chemistry, long tails).
     #[arg(long, value_name = "QC.json", help_heading = "Model Recommendation")]
     pub auto_params: Option<PathBuf>,
 
     /// With --auto-params: print the recommended argv instead of running.
-    /// The only mode --auto-params supports today, and the mode it will
-    /// always support: the recommendation is inspectable before it is used.
+    /// The argv goes to stdout (so it can be piped), the explanation to
+    /// stderr. Without it the recommendation is APPLIED to the run.
     #[arg(long, requires = "auto_params", help_heading = "Model Recommendation")]
     pub print_args: bool,
+
+    /// Model file for --auto-params. Defaults to $FASTPREP_MODEL, then
+    /// `models/auto-params.v1.json` beside the binary, then the same name in
+    /// the working directory. The walk is a decision list, so the file is
+    /// meant to be read: `--print-args` says which rule fired.
+    #[arg(long, value_name = "PATH", requires = "auto_params",
+          help_heading = "Model Recommendation")]
+    pub model: Option<PathBuf>,
 
 
     /// Maximum mismatch rate for adapter sequence matching [0, 1].
@@ -957,17 +1006,14 @@ impl Cli {
         Ok(())
     }
 
-    /// --auto-params: the honest refusal, checked before anything else runs.
+    /// --auto-params: the structural checks, run before anything else.
     ///
-    /// The model does not exist yet (docs/AUTO-PARAMS.md), so the flag cannot
-    /// recommend anything. What it CAN do is fail correctly and early: refuse
-    /// when the QC report is missing or unparseable, and refuse with a
-    /// message that names the reason and points at the doc. CLI-SPEC §1 rule
-    /// 4: a correct refusal is a non-zero exit with a message saying what to
-    /// do. When a Phase D model file ships, this becomes the tree-walk over
-    /// it — the checks above (path exists, parses, has `metrics`) are the same
-    /// ones the walk needs, so they stay.
-    fn validate_auto_params(&self) -> Result<()> {
+    /// The recommendation itself lives in [`Cli::recommend`]; this only
+    /// refuses the flag combinations that cannot work (a `--print-args`
+    /// without a report) and validates the QC report early, so a broken path
+    /// fails with a message naming the file instead of surfacing later as a
+    /// model-walk that quietly matched nothing.
+    pub fn validate_auto_params(&self) -> Result<()> {
         let Some(qc) = self.auto_params.as_ref() else {
             // --print-args without --auto-params: clap's `requires` already
             // catches this; the guard is for safety in case that changes.
@@ -976,51 +1022,184 @@ impl Cli {
             }
             return Ok(());
         };
-        if !self.print_args {
+        if !qc.is_file() {
             bail!(
-                "--auto-params requires --print-args: the recommendation is \\
-                 inspectable before it is used, so there is no silent-apply mode"
-            );
-        }
-        let text = std::fs::read_to_string(qc)
-            .with_context(|| format!("reading QC report {}", qc.display()))?;
-        let doc: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("{} is not valid JSON", qc.display()))?;
-        let metrics = doc.get("metrics").and_then(|m| m.as_object());
-        if metrics.is_none() {
-            bail!(
-                "{} has no `metrics` block — pass a fastcheck QC report \\
-                 (`fastcheck --json qc.json R1 R2`), not an arbitrary JSON",
+                "--auto-params: no such QC report {} — pass one made by \
+                 `fastcheck --json qc.json R1 R2`",
                 qc.display()
             );
         }
-        // The QC report parses and has the fields a model would read. The
-        // refusal is about the MODEL, not the input, so say so precisely.
-        bail!(
-            "--auto-params: no model is trained yet, so there is no \
-             recommendation to print.\n  \
-             The shipped default is a good CENTRAL configuration, not a \
-             validated universal one: on the 101 real ENA datasets the \
-             per-dataset winner beats it on 100 of 101, though the median \
-             gap is only 0.0049 and 66 of 101 sit inside a 0.01 margin. \
-             There is nothing to switch on until a Phase D model trained \
-             on a larger corpus exists and beats the default on held-out \
-             studies.\n  \
-             See docs/AUTO-PARAMS.md for what the flag would do and what \
-             Phase D would change. Until then: run with the default, or \
-             pass the ten knobs explicitly."
+        let profile = crate::auto_params::Profile::from_file(qc)?;
+        if profile.is_empty() {
+            bail!(
+                "{} has no field this build's model can read ({}). Pass a \
+                 fastcheck QC report, not an arbitrary JSON.",
+                qc.display(),
+                crate::auto_params::KNOWN_FEATURES.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Load the model, load the QC profile, and walk the decision list.
+    ///
+    /// Returns the model path too: the caller prints it, because which model
+    /// produced a recommendation is part of the recommendation.
+    pub fn recommend(
+        &self,
+    ) -> Result<(PathBuf, crate::auto_params::Model, crate::auto_params::Recommendation)> {
+        let qc = self
+            .auto_params
+            .as_ref()
+            .context("--auto-params: no QC report given")?;
+        let (path, model) = match self.model.as_ref() {
+            Some(p) => (p.clone(), crate::auto_params::Model::load(p)?),
+            None => crate::auto_params::find_model()?,
+        };
+        let profile = crate::auto_params::Profile::from_file(qc)?;
+        let rec = model.walk(&profile);
+        Ok((path, model, rec))
+    }
+
+    /// Apply a recommendation, leaving every knob the user passed explicitly
+    /// untouched. `explicit` comes from clap's `ValueSource`, so "explicit"
+    /// means "typed on this command line", not "different from the default".
+    pub fn apply_recommendation(
+        &mut self,
+        rec: &crate::auto_params::Recommendation,
+        explicit: &Explicit,
+    ) {
+        let p = &rec.patch;
+        if let Some(v) = p.min_run {
+            if !explicit.contains("min_run") {
+                self.min_run = v;
+            }
+        }
+        if let Some(v) = p.mercy {
+            if !explicit.contains("mercy") {
+                self.mercy = v;
+            }
+        }
+        if let Some(v) = p.phred_sat {
+            if !explicit.contains("phred_sat") {
+                self.phred_sat = v;
+            }
+        }
+        if let Some(v) = p.gate_shape {
+            if !explicit.contains("gate_shape") {
+                self.gate_shape = v;
+            }
+        }
+        if let Some(v) = p.min_adapter_overlap {
+            if !explicit.contains("min_adapter_overlap") {
+                self.min_adapter_overlap = v;
+            }
+        }
+        if let Some(v) = p.adapter_error_rate {
+            if !explicit.contains("adapter_error_rate") {
+                self.adapter_error_rate = v;
+            }
+        }
+        if let Some(v) = p.head_dropout {
+            if !explicit.contains("head_dropout") {
+                self.head_dropout = Some(v);
+            }
+        }
+        if let Ok(Some(ml)) = p.min_len_value() {
+            if !explicit.contains("min_len") {
+                self.min_len = ml;
+            }
+        }
+        match p.mean_q {
+            Some(Some(q)) if !explicit.contains("mean_q") && !explicit.contains("no_mean_q") => {
+                self.mean_q = Some(q);
+                self.no_mean_q = false;
+            }
+            Some(None) if !explicit.contains("mean_q") && !explicit.contains("no_mean_q") => {
+                self.mean_q = None;
+                self.no_mean_q = true;
+            }
+            _ => {}
+        }
+        if let Some(v) = p.interior {
+            if !explicit.contains("interior") && !explicit.contains("no_interior") {
+                self.interior = v;
+            }
+        }
+    }
+
+    /// Print the recommendation: the fixed explanation to stderr, the argv to
+    /// stdout so `--print-args` can be piped into a shell.
+    pub fn print_recommendation(
+        &self,
+        path: &Path,
+        model: &crate::auto_params::Model,
+        rec: &crate::auto_params::Recommendation,
+        to_stdout: bool,
+    ) -> Result<()> {
+        let profile = crate::auto_params::Profile::from_file(
+            self.auto_params.as_ref().expect("checked by validate_auto_params"),
+        )?;
+        eprintln!("auto-params: model {}", path.display());
+        eprintln!("  trained on {}", model.provenance());
+        let missing: Vec<&str> = crate::auto_params::KNOWN_FEATURES
+            .iter()
+            .copied()
+            .filter(|f| profile.get(f).is_none())
+            .collect();
+        eprintln!(
+            "  profile   {} of {} feature(s) present{}",
+            profile.len(),
+            crate::auto_params::KNOWN_FEATURES.len(),
+            if missing.is_empty() {
+                String::new()
+            } else {
+                format!(" — missing: {}", missing.join(", "))
+            }
         );
+        eprintln!("  {}", rec.explain(model.rules.len()));
+        if let Some(acc) = &model.acceptance {
+            let d = acc.get("cv_delta_vs_default").and_then(|v| v.as_f64());
+            let t5 = acc.get("cv_top5").and_then(|v| v.as_f64());
+            let n = acc
+                .get("cv_beats_default_frac")
+                .and_then(|v| v.as_f64());
+            if let (Some(d), Some(t5)) = (d, t5) {
+                eprintln!(
+                    "  measured  CV delta vs the default {:+.4}{}, top-5 {:.3}",
+                    d,
+                    match n {
+                        Some(n) => format!(" (beats it on {:.0} % of held-out datasets)", 100.0 * n),
+                        None => String::new(),
+                    },
+                    t5
+                );
+            }
+        }
+        if rec.patch.is_empty() {
+            eprintln!(
+                "  note      the chosen rule recommends the shipped defaults: nothing to pass"
+            );
+        }
+        // The argv is the ANSWER of a query, so it goes to stdout only when
+        // the user asked for the query. In apply mode stdout stays clean (it is
+        // the tool's normal output channel) and everything goes to stderr.
+        if to_stdout {
+            println!("{}", rec.patch.to_argv().join(" "));
+        }
+        Ok(())
     }
 
     pub fn finalize(self) -> Result<(Mode, Runtime)> {
-        // The recommendation refusal runs first: --auto-params is a query,
-        // not a run, and it must refuse before any output-path or adapter
-        // logic can fail for an unrelated reason.
+        // The recommendation checks run first: --auto-params is either a query
+        // (--print-args) or a patch applied before the run is validated, and
+        // either way it must fail before any output-path or adapter logic can
+        // fail for an unrelated reason.
         self.validate_auto_params()?;
 
-        // --auto-params refused above when no model exists, so reaching here
-        // without it means a real run: in1/out1 are then mandatory, and the
-        // error names them the way the rest of the suite does.
+        // --auto-params is now a patch on the existing knobs (applied by the
+        // caller), not a mode: reaching here without -1/-o means a real run,
+        // so in1/out1 are mandatory and the error names them.
         let (in1, out1) = match (self.in1.clone(), self.out1.clone()) {
             (Some(i), Some(o)) => (i, o),
             (None, _) => bail!("missing required argument -1/--in1 (a run needs an input)"),
@@ -1569,21 +1748,96 @@ mod tests {
         Cli::parse_from(argv)
     }
 
-    #[test]
-    fn auto_params_refuses_without_a_model() {
-        // A valid fastcheck QC report: the refusal is about the missing
-        // MODEL, not the input, so a good report must still refuse.
-        let dir = std::env::temp_dir().join("fastprep_autoparams_test");
+    /// A QC report + model pair in a temp dir, for the --auto-params tests.
+    fn auto_params_fixture() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "fastprep_autoparams_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let qc = dir.join("qc.json");
-        std::fs::write(&qc, r#"{"tool":"fastcheck","metrics":{"mean_len":150,"gc_fraction":0.5}}"#)
-            .unwrap();
-        let cli = base_cli(&["--auto-params", qc.to_str().unwrap(), "--print-args"]);
-        let err = cli.validate_auto_params().unwrap_err().to_string();
-        assert!(err.contains("no model is trained yet"),
-                "the refusal must name the missing model, got: {err}");
-        assert!(err.contains("docs/AUTO-PARAMS.md"),
-                "the refusal must point at the doc, got: {err}");
+        std::fs::write(
+            &qc,
+            r#"{"schema":"fastsuite.report.v1","tool":"fastcheck",
+                "metrics":{"mean_read_mean_q":26.0,"polyx3_frac_gt_5":0.2,"read_len":101}}"#,
+        )
+        .unwrap();
+        let model = dir.join("auto-params.v1.json");
+        std::fs::write(
+            &model,
+            r#"{"schema":"fastsuite.auto-params.v1",
+                "trained_on":{"corpus":"unit-test"},
+                "features":["mean_read_mean_q","polyx3_frac_gt_5"],
+                "rules":[{"when":[{"field":"mean_read_mean_q","op":"<","value":28.0}],
+                          "params":{"min_run":16,"mercy":5.0,"min_len":"0.85L"},
+                          "coverage":12,"regret":0.003}],
+                "default":{"params":{}},
+                "acceptance":{"cv_delta_vs_default":0.0123,"cv_top5":0.62,
+                              "cv_beats_default_frac":0.55}}"#,
+        )
+        .unwrap();
+        (qc, model)
+    }
+
+    #[test]
+    fn auto_params_walks_the_model_and_an_explicit_flag_still_wins() {
+        let (qc, model) = auto_params_fixture();
+        let mut cli = base_cli(&[
+            "--auto-params",
+            qc.to_str().unwrap(),
+            "--model",
+            model.to_str().unwrap(),
+            "--min-run",
+            "14",
+        ]);
+        let (path, loaded, rec) = cli.recommend().expect("the fixture must walk");
+        assert_eq!(path, model);
+        assert_eq!(loaded.rules.len(), 1);
+        assert_eq!(rec.fired, Some(0), "the only rule must fire");
+        assert_eq!(rec.patch.min_run, Some(16));
+        assert_eq!(rec.patch.mercy, Some(5.0));
+
+        // `--min-run 14` was typed: the recommendation must not overwrite it.
+        let mut explicit = Explicit::none();
+        explicit.insert("min_run");
+        cli.apply_recommendation(&rec, &explicit);
+        assert_eq!(cli.min_run, 14, "an explicit --min-run must survive the model");
+        assert_eq!(cli.mercy, 5.0, "an untouched knob takes the model's value");
+        assert_eq!(cli.min_len, MinLen::Frac(0.85));
+    }
+
+    #[test]
+    fn auto_params_refuses_a_model_path_that_does_not_exist() {
+        let (qc, _) = auto_params_fixture();
+        let cli = base_cli(&[
+            "--auto-params",
+            qc.to_str().unwrap(),
+            "--model",
+            "/nonexistent/auto-params.v1.json",
+        ]);
+        let err = cli.recommend().unwrap_err().to_string();
+        assert!(err.contains("nonexistent"), "the error must name the path, got: {err}");
+    }
+
+    #[test]
+    fn auto_params_without_a_model_file_uses_the_built_in_one() {
+        std::env::remove_var(crate::auto_params::MODEL_ENV);
+        let (qc, _) = auto_params_fixture();
+        let cli = base_cli(&["--auto-params", qc.to_str().unwrap()]);
+        let (p, m, rec) = cli.recommend().expect("the embedded model is always there");
+        assert!(
+            p.is_file() || p == std::path::PathBuf::from(crate::auto_params::EMBEDDED_LABEL),
+            "got {}",
+            p.display()
+        );
+        assert!(!m.rules.is_empty());
+        // The fixture profile is a degraded library; the shipped model must
+        // still produce a usable recommendation for it.
+        assert!(!rec.patch.is_empty(), "a recommendation with no knobs is useless");
     }
 
     #[test]
@@ -1600,16 +1854,28 @@ mod tests {
         let qc = dir.join("notqc.json");
         std::fs::write(&qc, r#"{"hello":"world"}"#).unwrap();
         let cli = base_cli(&["--auto-params", qc.to_str().unwrap(), "--print-args"]);
-        let err = cli.validate_auto_params().unwrap_err().to_string();
+        // `{:#}` walks the anyhow chain: the context names the file, the
+        // cause names the missing block. Both are what a user needs.
+        let err = format!("{:#}", cli.validate_auto_params().unwrap_err());
         assert!(err.contains("metrics"),
                 "must name the missing metrics block, got: {err}");
     }
 
     #[test]
-    fn auto_params_requires_print_args() {
-        let cli = base_cli(&["--auto-params", "qc.json"]);
-        assert!(cli.validate_auto_params().is_err(),
-                "--auto-params without --print-args must refuse");
+    fn auto_params_without_print_args_is_apply_mode() {
+        // Not a refusal any more: without --print-args the recommendation is
+        // APPLIED to the run. The QC report must still validate.
+        let (qc, model) = auto_params_fixture();
+        let cli = base_cli(&[
+            "--auto-params",
+            qc.to_str().unwrap(),
+            "--model",
+            model.to_str().unwrap(),
+        ]);
+        assert!(cli.validate_auto_params().is_ok());
+        assert!(!cli.print_args, "apply mode prints nothing to stdout");
+        let (_, _, rec) = cli.recommend().expect("apply mode must still walk");
+        assert_eq!(rec.fired, Some(0));
     }
 
     #[test]

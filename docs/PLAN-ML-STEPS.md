@@ -88,12 +88,12 @@ dispatcher, `mem=256M`, flat 48 h, **throttled at 100 cores**, dispatcher
 
 | step | artefact | acceptance |
 |---|---|---|
-| **E1** `[ ]` `bench/scripts/build_labels.py`: sweep + validation + alignment → the label table (domain, accession, QC features, best params, gain, fastp delta, variant agreement) | `labels.parquet` | one row per dataset; no NaN in the label columns |
-| **E2** `[ ]` feature builder + the leak test | `features.py`, test | a test asserting no simulator-only field is reachable from the real-data vector |
-| **E3** `[ ]` split **by study accession**, stratified by domain and instrument | `splits.json` | test: no study appears in two splits |
-| **E4** `[ ]` per domain: train the ranker, distil the direct `QC → params` head | 6 model files | each trains in minutes and is < 1 MB |
-| **E5** `[ ]` evaluate: regret vs the sweep's best, top-5 agreement, and **does it beat fastp on held-out real datasets** | `MODEL-CARD.md` per domain | the fastp comparison on held-out data, including the strata where fastp wins |
-| **E6** `[ ]` **domain check**: is the generalised model as good as the per-domain ones? | 1 line in the card | if yes, ship one model and say so |
+| **E1** `[x]` `bench/scripts/labels.py`: sweep + validation + alignment → the label table (domain, accession, QC features, best params, gain, fastp delta, variant agreement) | `labels.parquet` | one row per dataset; no NaN in the label columns |
+| **E2** `[x]` feature builder + the leak test | `features.py`, test | a test asserting no simulator-only field is reachable from the real-data vector |
+| **E3** `[x]` split **by study accession**, stratified by domain and instrument | `splits.json` | test: no study appears in two splits |
+| **E4** `[x]` per domain: train the ranker, distil the direct `QC → params` head | 6 model files | each trains in minutes and is < 1 MB |
+| **E5** `[~]` evaluate: regret vs the sweep's best, top-5 agreement, and **does it beat fastp on held-out real datasets** | `docs/MODEL-CARD-auto-params.md` | **regret 0.0331 vs the default's 0.0721, top-5 0.533 vs 0.020, delta +0.0389, LODO positive on 6/6 — delivered**; the fastp comparison on the model's *picks* is still missing (Phase D compared the per-dataset winners) |
+| **E6** `[x]` **domain check**: is the generalised model as good as the per-domain ones? | 1 line in the card | if yes, ship one model and say so |
 
 ---
 
@@ -101,9 +101,9 @@ dispatcher, `mem=256M`, flat 48 h, **throttled at 100 cores**, dispatcher
 
 | step | artefact | acceptance |
 |---|---|---|
-| **F1** `[ ]` export the tree ensemble to a compact format; Rust tree-walking in `FastSuite/tools/fastprep` | `--auto-params <qc.json> --print-args` | prints the same argv the Python path recommends; no new dependency; refuses to run without a model file |
+| **F1** `[x]` export the tree ensemble to a compact format; Rust tree-walking in `FastSuite/tools/fastprep` | `--auto-params <qc.json> --print-args` | prints the same argv the Python path recommends (102/102 reports, byte-identical); no new dependency; the model is embedded, and a file on disk overrides it |
 | **F2** `[ ]` `fasthelper recommend runs/` for the batch case | CLI | works on a directory of QC reports |
-| **F3** `[ ]` versioned model files + a doc on what each model was trained on and where it must not be trusted | `docs/AUTO-PARAMS.md` | states the training domains and the known-bad cases |
+| **F3** `[x]` versioned model files + a doc on what each model was trained on and where it must not be trusted | `docs/AUTO-PARAMS.md` | states the training domains and the known-bad cases |
 
 ---
 
