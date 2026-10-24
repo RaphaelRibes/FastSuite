@@ -425,6 +425,15 @@ still be re-derived before the sweep numbers are quoted again.
 
 New and open after the review round:
 
+* **The paper's read-count scaling figure disagrees with its own pinned cell.**
+  At 5 M pairs the figure's one-thread series has fastp at 23.7 s and fastprep at
+  59.0 s, while the pinned single-core measurement in the benchmark section has
+  fastprep ahead (73.99 s against 80.03 s). The figure's series therefore cannot
+  be one-core data — 23.7 s is faster than fastp's properly pinned 5 M cell —
+  and the two runs were not taken on the same harness. `scaling-section.typ` now
+  says so instead of claiming "fastprep is faster at every thread count", which
+  its own arrays contradicted. Resolving it means re-running the 6 × 2 × 3 grid
+  pinned; until then the pinned cell is the number the cost claims rest on.
 * **gzip level 6 costs ~7x the compressed output in peak memory.** The
   multi-threaded gzippy writer buffers the stream: on 5 M pairs (888 MB compressed)
   fastdedup peaks at 4.37 GB, against 153 MB at `--gz-level 1` on the single-threaded

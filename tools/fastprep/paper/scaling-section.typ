@@ -88,8 +88,13 @@ one-thread run costs #fixed(time-fastprep-1t.at(0), n: 1) s against fastp's
 #fixed(time-fastp-1t.at(0), n: 1) s, and the four-thread runs are indistinguishable
 at #fixed(time-fastprep-4t.at(0), n: 1) s and #fixed(time-fastp-4t.at(0), n: 1) s.
 Startup and gzip dominate at that size and the algorithm underneath is not yet
-visible. From one million pairs upward fastprep is faster at every thread count,
-and the margin grows with size.
+visible. Above it, what separates the two tools is *scaling*, not absolute time:
+four threads buy fastprep 2.75–3.64× against fastp's 1.38–2.38×, while the wall
+times in this figure stay behind fastp's at every size and thread count. That
+contradicts the pinned single-core cell of @sec:bench, where fastprep leads
+(73.99 s against 80.03 s at 5 M pairs); the two runs were not taken on the same
+harness and this section does not reconcile them — the pinned measurement is the
+one the cost claims rest on.
 
 === Read-count scaling
 
@@ -106,8 +111,10 @@ and the margin grows with size.
     fmt: v => fixed(v, n: 1),
   ),
   caption: [Wall time against read count, both tools at one and four threads.
-    fastprep is slower at 500 thousand pairs and faster at one million and above;
-    the margin widens with size.],
+    fastp is ahead on absolute time at every size in this run; what fastprep
+    gains is the wider four-thread speedup of @fig:thread-scaling. The
+    one-thread series disagrees with the pinned 5 M cell of @sec:bench, where
+    fastprep leads — see the text.],
 ) <fig:read-scaling>
 
 Both tools are linear in input size, so the curves are straight lines once the
