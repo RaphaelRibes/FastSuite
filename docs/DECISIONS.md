@@ -39,8 +39,8 @@ containerised with **pixitainer**.
 
 Consequences to implement:
 
-* every tool gets a `pixi.toml` (fastcheck is missing one) and the suite root
-  `pixi.toml` is the dev environment;
+* every tool gets a `pixi.toml` (fastcheck was missing one and now has it) and
+  the suite root `pixi.toml` is the dev environment;
 * one bioconda recipe per tool (`meta.yaml`, license file, `run`/`test`
   sections invoking the binary's `--version` and a tiny fixture run);
 * one pixitainer recipe per tool for the container images;
@@ -73,6 +73,11 @@ Consequences:
 * **`fastmaps` is file-only.** It exists to take *many* files and classify
   R1/R2 by filename; a stream removes that information, so a pipe there would
   cost capability instead of saving I/O. The other four tools take `-`.
+
+*Corrected 2026-10-23:* the streaming mode is not universal yet — `fastdedup`
+implements `-` on `-1/-2/-o/-p`, `fastcheck` reads a `-` input and writes
+`--json -` to stdout, and `fastprep` is still file-only (`fastmaps` by design,
+above). CLI-SPEC §4 item 7 tracks the rest.
 
 Reference implementation: `fastcheck`. fastprep and fastdedup follow.
 
@@ -141,6 +146,8 @@ fasthelper for one release, then dropped with a changelog entry.
   own work**, credited to Raphaël Ribes alone.
 * Still to fix: the license text per tool (MIT proposed, fastdedup already is)
   and a `CITATION.cff` per tool so each is independently citable.
+  *(Done — all six now carry an MIT `LICENSE` and a `CITATION.cff`; verified
+  2026-10-16, see the checklist in `docs/RELEASES.md`.)*
 
 ---
 
@@ -184,6 +191,13 @@ Planned list, one line each in the README with the reason: PE overlap/merge
 UMI handling, alignment-based QC, workflow-engine semantics (arrays, resume — that
 is Snakemake/Nextflow's job), per-tile modules (planned, plan Task 11), long reads
 (D-7).
+
+*Corrected 2026-10-23:* two entries on that list have since shipped without
+reversing the decision — `--pe-overlap` is the opt-in tri-state of D-14, and
+`--pe-correct` is an opt-in base correction over the retained mate overlap;
+`fastcheck --tiles` is the per-tile module, off by default. What the suite still
+refuses is sequence **merging** (no `--merge`, no merged-output mode), UMI
+handling, alignment-based QC, workflow-engine semantics and long reads.
 
 ---
 
@@ -333,8 +347,8 @@ because both decay at ±2.
 
 ## D-16: `--head-dropout` ships at 4, chosen by the 7:1 price (2026-10-22)
 
-**Decision.** The default is `4` again, from `0`. The knob stays exposed; `0`
-disables the rule and `1`-`3` shorten it.
+**Decision.** The default is `4` again, from `0` (shipped in the 0.4.1 release).
+The knob stays exposed; `0` disables the rule and `1`-`3` shorten it.
 
 **Why the default moved twice.** The rule trims a 1..=4 bp leading G-run
 exactly. It is a prior, not a detector, so it is wrong on roughly three of every

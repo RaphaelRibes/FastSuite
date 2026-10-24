@@ -1,6 +1,6 @@
 # fastmaps — optimisation propositions
 
-Scope: `tools/fastmaps/src` (2 397 lines, all 10 files read). Nothing here is implemented.
+Scope: `tools/fastmaps/src` (2 397 lines, all 10 files read). What landed is listed under Status of this round.
 
 ## Status of this round
 

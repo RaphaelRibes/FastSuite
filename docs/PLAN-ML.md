@@ -6,6 +6,14 @@ dataset**, simulates the matching data, sweeps it, then validates the winner
 against **fastp** on the real reads and records the pair as a label. The measured
 appendices (cost model, scoring tiers, schema, storage) still apply.
 
+> **Outcome (2026-10-23).** Rev 3's pipeline ran, at a fifth of the scoped size:
+> **101 datasets** (not 500), **52 configurations** (not 200), and **one** model —
+> a 7-rule decision list, not a per-domain LightGBM ranker — shipped in fastprep
+> 0.5.0 as `--auto-params` (CV regret 0.0331 against the default's 0.0721, top-5
+> 0.533 against 0.020, leave-one-domain-out positive on all six domains). The
+> steps below are kept as written; `PLAN-ML-STEPS.md` carries the per-step
+> outcome and `docs/AUTO-PARAMS.md` the model's limits.
+
 ## Why rev 2 was wrong about synthetic data
 
 Rev 2 randomised artefact parameters to guarantee that datasets differed in the
@@ -31,12 +39,13 @@ than the whole design.
 | 1 | **download** a real dataset | a 100 k-pair work unit + its manifest entry |
 | 2 | **fastcheck** | the QC profile: per-position base composition, quality plane, GC, length and duplication estimates. This is the model INPUT |
 | 3 | **fastsim** on a profile *fitted to that QC* | a matching dataset **with exact ground truth** |
-| 4 | **sweep fastprep** — 200 configurations | the exact best configuration for that dataset |
+| 4 | **sweep fastprep** — 200 configurations (the campaign ran **52**) | the exact best configuration for that dataset |
 | 5 | **validate the winner against fastp on the REAL reads** | the benchmark: quality, speed, memory |
 | 6 | **record the label** | (QC profile -> best parameters, achieved gain, fastp delta) |
 
 Then: one **small model per domain** — generalised, metagenomics, human gut,
-virome, and the others the metadata supports.
+virome, and the others the metadata supports. *(Delivered as **one** model for
+all six domains — see falsifier 4 and `docs/AUTO-PARAMS.md`.)*
 
 ### Step 1 — datasets, by domain
 
@@ -67,7 +76,8 @@ certainty), duplication, N rate.
 
 ### Step 3 — the profile fitted to that QC (the new hard part)
 
-`qc_to_profile.py`: fastcheck report -> fastsim profile.
+`fastcheck --profile` (the `qc_to_profile.py` step, delivered in Rust instead):
+fastcheck report -> fastsim profile.
 
 | profile field | where it comes from in QC | reliable? |
 |---|---|---|
@@ -124,23 +134,31 @@ don't bother" instead of getting a confident bad recommendation.
 
 ## The models
 
-One small model per domain, trained on ~100 datasets each — small by necessity,
-which is what we want: deployable and explainable, not general-purpose.
+**As delivered:** ONE model for all six domains — a depth-3 decision list
+(7 rules, 8 KB) trained by `bench/scripts/train_auto_params.py` on the 101-dataset
+label table, shipped in fastprep 0.5.0 and readable at
+`tools/fastprep/models/auto-params.v1.json`. The per-domain split below was not
+needed: leave-one-domain-out stays positive on every domain, which is exactly
+what falsifier 4 asked for.
 
-* **Primary: a small LightGBM ranker** (`f(QC, config) -> score`), because it
-  consumes every sweep row (including the ensemble variants) and answers "which
-  config, and how much better".
-* **Product head: direct `QC -> params`**, distilled from the ranker. Rev 2
-  avoided this because the argmax is multimodal — but per domain, with ~100
-  datasets and a narrow space, it is what a user wants, and the ranker stays
-  available to score the recommendation and report confidence.
-* **Export:** tree ensemble -> ~150 lines of Rust tree-walking in `fastprep`, no C
-  dependency, so `--auto-params` stays offline and static-binary friendly.
+The original plan, kept for the reasoning:
+
+* **Primary: a small LightGBM ranker** (`f(QC, config) -> score`) — **not built**.
+  A ranker cannot be audited by a user reading the model; a decision list can
+  (`docs/AUTO-PARAMS.md`, "Why a decision list and not a boosted ranker").
+* **Product head: direct `QC -> params`**, distilled from the ranker — **not
+  built**: the decision list *is* the direct head, trained on the sweep rows
+  rather than distilled.
+* **Export:** tree ensemble -> Rust tree-walking in `fastprep`, no C dependency,
+  so `--auto-params` stays offline and static-binary friendly — **done**, as a
+  decision-list walk with no new crate.
 
 **Evaluation, per domain:** held-out *studies* (never reads within a study);
 regret vs the sweep's best; agreement with the sweep's top-5; and the headline
 number — **does the recommended configuration beat fastp on quality, speed and
-memory on held-out real datasets of that domain**.
+memory on held-out real datasets of that domain**. *(Delivered for regret,
+top-5 and delta; the fastp comparison on the model's **picks** is still open —
+Phase D compared the per-dataset winners.)*
 
 ## Cost
 
@@ -151,27 +169,39 @@ memory on held-out real datasets of that domain**.
 | **sweep: 500 datasets x 3 profile variants x 200 configs = 300 k exact evaluations** | Io | **~131 core-h** (~1.3 h wall at 100 cores) |
 | fastp + fastprep validation on real reads | Io | ~10 core-h |
 | alignment subset (50 datasets) | Io | ~12 core-h |
-| training 6 small models | **local** | ~2 core-h |
+| training the model (**1**, not 6) | **local** | ~2 core-h |
 | **total** | | **~160 core-h** (rev 2 wanted ~537 for a weaker premise) |
+
+**Actual cost:** 101 datasets x 55 config ids (52 distinct knob sets) x 3
+variants = **15 847 scored evaluations on the desktop**, not 300 000 on Io — the
+table above prices the plan as scoped, and `PLAN-ML-LOCAL.md` is the execution
+that replaced it.
 
 **Pilot first:** 3 domains x 10 datasets = 30 datasets, ~1 core-h of sweep plus
 downloads. It validates step 3 — does a QC-fitted profile actually reproduce the
 dataset's QC? — which is the one genuinely new component and the likeliest to
-surprise us.
+surprise us. *(Ran on **24 datasets**; verdict SCALE WITH CAVEATS —
+`bench/PILOT.md`.)*
 
 ## Falsifiers — what would kill this plan
 
 1. **A QC-fitted profile does not reproduce the dataset's QC.** Then step 3 is
    broken, the sweep optimises the wrong data, and nothing below it can be
-   trusted. The pilot tests exactly this.
+   trusted. The pilot tests exactly this. **Measured, not all-or-nothing:** the
+   pilot's closed loop passed **36/69 = 52 %** and the current build **183/306 =
+   59.8 %** — the fitter reproduces the QC on most libraries, not all, and the
+   per-position G fraction is the known residue (`docs/CLOSED-LOOP-RERUN.md`).
 2. **The simulated winner does not win on the real reads** (step 5 shows no gain
    over fastp). Then simulated ground truth is the wrong training signal, and
    labels must come from alignment-scored real data at ~30x the cost.
 3. **One configuration wins for every dataset in a domain.** Then ship that
    configuration as the domain default and skip the model — a good outcome,
-   measured rather than guessed.
+   measured rather than guessed. **Did not fire:** 16 distinct configs win
+   somewhere, led by config 6 on 33 of 101 datasets.
 4. **The domains do not separate** (generalised as good as per-domain). Then ship
-   one model, not six, and say so.
+   one model, not six, and say so. **Fired:** leave-one-domain-out stays positive
+   on all six domains (+0.1305 generalised down to +0.0004 metagenomics), so
+   **one** model shipped.
 
 ---
 

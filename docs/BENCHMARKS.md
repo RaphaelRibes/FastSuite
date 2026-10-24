@@ -44,9 +44,9 @@ is derived, not measured directly.
 |---|---|---|
 | fastp | 1.3.7 | `FastPrep-Bench/pixi.lock` |
 | cutadapt | 5.2 | `FastPrep-Bench/pixi.lock` |
-| FastQC | 0.12.1 | `FastMaps-Bench`, `FastCheck-Bench` |
+| FastQC | 0.13.0 (`FastMaps-Bench`), 0.12.1 (`FastCheck-Bench`) | `FastMaps-Bench/pixi.lock`, `FastCheck-Bench/pixi.lock` |
 | Falco | 2.0.2 | `FastCheck-Bench/pixi.lock` |
-| MultiQC | 1.35 | `docs/STATUS.md` (not pinned in `FastHelper-Bench/pixi.toml`, which declares only `python`) |
+| MultiQC | 1.35 | `FastHelper-Bench/pixi.lock` (`pixi.toml` declares `multiqc = ">=1.35, <2"`) |
 
 **Core counts.** Both pinning modes are measured so a parallel tool cannot win a
 single-core comparison by spending more cores: *pinned* is `taskset -c 0` with
@@ -141,6 +141,10 @@ the rest.
 | fastp | 0.0 % | 4.7–4.8 % |
 | cutadapt | 1.4 % | 4.7–4.8 % |
 
+*Measured on the pre-D-18 build at the `0.9L` floor. The shipped floor is now
+`0.67L`, which trims reads the `0.9L` floor dropped (D-18), so today's drop rate
+is lower and these figures are a historical measurement.*
+
 fastprep is the only tool that enforces a meaningful minimum read length by
 default. Its excess over ground truth is **deliberate conservative behaviour**,
 not error — the drop-reason attribution makes this auditable rather than
@@ -161,7 +165,9 @@ fastp's 0 % is a *length-filter-off* default, not a better trimmer; cutadapt's
 
 ### Caveats
 
-* **fastp wins the 5 M one-core cell.** Not hidden, not re-framed.
+* **fastp does not win the 5 M one-core cell.** fastprep leads it 73.99 s
+  against 80.03 s; the earlier claim that fastp led came from the unpinned
+  harness above and is withdrawn.
 * **Auto-detection refuses to guess.** Where sampled reads carry no adapter,
   fastprep exits 1 with instructions rather than trimming on a guess — a
   deliberate difference from fastp, and a reason a chain that "worked with
@@ -190,7 +196,7 @@ defaults and pinned single core. **There is no accuracy axis** — this is a
 timing and memory comparison on identical inputs.
 
 **Conditions.** fastmaps at shipped defaults (all cores) and pinned
-(`taskset -c 0`, `-j 1`). FastQC 0.12.1 and Falco 2.0.2 are single-threaded.
+(`taskset -c 0`, `-j 1`). FastQC 0.13.0 and Falco 2.0.2 are single-threaded.
 **Every fastmaps cell must name its `--buffer-mb`**: the 512 MB figure was the
 default until 2026-10-18 and is 4× the peak of the 8 MB default, so a row that
 omits it is unreadable and looks like a 9× memory gap against FastQC that the
@@ -229,10 +235,11 @@ equivalence on the image axis.
 
 ### Caveats
 
-* **Falco is faster than fastmaps at both ends of this range** (0.18 s vs
-  0.22 s at 100 k; 8.27 s vs 9.17 s at 5 M), and fastmaps is not the fastest
-  tool in this table. The claim is the plane and the per-mate view, not raw
-  speed.
+* **fastmaps' win at shipped defaults is thread scaling, not a faster tool.**
+  It is ahead of Falco at both ends of the table above, but that is an all-core
+  comparison on both sides. Pinned to one core at 5 M it takes 17.91 s against
+  5.78 s on all cores, and Falco has no one-core cell in this harness, so the
+  honest claim is the plane and the per-mate view, not raw speed.
 * **fastmaps' 145 MB peak RSS is decomposed and bounded, and it is not the
   grid.** Measured on a real 5 M-pair library (50 corpus datasets concatenated,
   10 M reads, 22 064 grid pixels; peak RSS read from `wait4(rusage)` of the
@@ -280,8 +287,9 @@ equivalence on the image axis.
   reads. That is already 22x below FastQC's measured 479 MB; the PLAN-QC
   rewrite is only needed for a sub-10 MB target, not for parity. Costed in
   `docs/PLAN-QC.md` §1.
-* **Pinned fastmaps is 1.95× slower than shipped-default** at 5 M (17.91 vs
-  9.17 s): the win is thread scaling, and it is real, but the comparison is
+* **Pinned fastmaps is 1.95× slower than shipped-default** at 5 M in the
+  earlier run (17.91 vs 9.17 s; the all-core cell in the table above is
+  5.78 s): the win is thread scaling, and it is real, but the comparison is
   only honest with both modes shown.
 
 ---
@@ -345,8 +353,8 @@ Full matrix in `FastCheck-Paper/benchmark/results.csv` (identical to
 The exactness tasks **have landed and are committed** — the replacement claim
 may now be made, in the replacement map's words:
 
-> **FastQC's modules, replaced and extended, minus per-tile and exact
-> over-representation** — not "all of FastQC".
+> **FastQC's modules, replaced and extended, minus per-position k-mer
+> content** — not "all of FastQC".
 
 What that wording now means, task by task:
 
@@ -364,12 +372,13 @@ What that wording now means, task by task:
 * **`--max-mem` admission refusal** shipped (commit `2587371`).
 * **The insert-measurement defects the ground truth exposed are fixed**
   (commit `98296e3`) — see §5.
-* **Per-tile quality modules are the one remaining FastQC gap** (plan Task 11).
-  `--tiles` is not in the built binary's `--help`, so the residual gap in the
-  replacement map's wording is **per-tile only**; "exact over-representation"
-  has since closed. The ground-truth recovery test (Task 13) is also still
-  outstanding as an automated gate, though the recovery numbers it would assert
-  are measured and committed in §5.
+* **Per-tile quality modules shipped** as `--tiles` (opt-in, commit `93ed54a`),
+  so the residual gap in the replacement map's wording is **per-position k-mer
+  content**, not per-tile; "exact over-representation" closed earlier. The
+  per-tile module is not exercised by any benchmark in this document. The
+  ground-truth recovery test (Task 13) is a pixi task now
+  (`pixi run ground-truth`, `tools/fastcheck/tests/ground_truth.py`), not an
+  outstanding session, though its numbers are not wired into `scripts/ci.sh`.
 
 ### Caveats
 
@@ -519,6 +528,10 @@ streams one pair at a time.
 
 ### Profile recovery — 10 of 10 parameters within tolerance
 
+*The `fragment GC` row is a **false pass** on this campaign build: `profile.gc`
+was inert, so the fitter measured the `--gc` default back. The field is honoured
+since 2026-10-21 and the row was re-run then (`docs/STATUS.md`).*
+
 | parameter | injected | recovered | abs. error | tolerance | pass |
 |---|---|---|---|---|---|
 | fragment GC | 0.48 | 0.4952 | 0.0152 | 0.02 | ✅ |
@@ -651,7 +664,7 @@ propagated.
 | fastmaps vs FastQC, 5 M pairs | `docs/STATUS.md` "Measured this week" | 12.25 s / 143 MB vs 72.22 s / 375 MB | **5.78 s / 22.2 MB vs 20.31 s / 479.1 MB**, tree-summed RSS (`FastMaps-Paper/benchmark/results.csv`); the old comparison paired a 512 MB-buffer cell with FastQC's launcher-only 16.4 MB |
 | fastqc at 100 k | `FastMaps-Bench/.bench_run.log` | 4.36 s | 2.1 s (`FastMaps-Paper/benchmark/results.csv`) |
 | fastprep vs fastp, 5 M pairs | `docs/STATUS.md` | 32.9 s vs 84.7 s (2.58×) | **73.99 s vs 80.03 s on one properly pinned core** — fastprep leads, 1.08× (`FastPrep-Paper/benchmark/results.csv`; the `pinned` rows of `results_gz6.csv` are NOT pinned, they burn 2.4 cores) |
-| fastsim recovery | `docs/STATUS.md` | 7 / 10 parameters | 9 / 10 — the GC row is a **false pass** on the campaign build (`profile.gc` was inert); the field is honoured since 2026-10-21 but the row is unverified until the recovery is re-run (`FastSim-Paper/benchmark/recovery.csv`) |
+| fastsim recovery | `docs/STATUS.md` | 7 / 10 parameters | **10 / 10** — re-run 2026-10-21 on the build that honours `profile.gc`; the campaign's GC row was a **false pass** (`profile.gc` was inert), so §5's table shows a pass that did not test the field (`FastSim-Paper/benchmark/recovery.csv`, `docs/STATUS.md`) |
 | fasthelper orchestration | `FastHelper-Paper` abstract | "0.69 s vs 0.69 s" | 1.125 s vs 1.124 s (guard off); 4.437 s with the adapter guard |
 | fasthelper aggregation peak | `FastHelper-Paper` abstract | "~50 MB" | 17.18–18.43 MB, of which 17.2 MB is the harness floor (multiqc 137–139 MB) |
 
@@ -672,12 +685,15 @@ rule above.
 ## What is explicitly *not* claimed
 
 * **Not "replaces all of FastQC."** The claim is the replacement map's wording:
-  FastQC's modules, replaced and extended, **minus per-tile**. Per-tile quality
-  modules are the remaining gap.
-* **Not "faster than everything."** Falco beats fastmaps and fastcheck on wall
-  time at every size measured, and fastp beats fastprep in the 5 M one-core
-  cell. The claims are about memory shape, exactness, the schema, the
-  composition plane and the provenance record — not a clean speed sweep.
+  FastQC's modules, replaced and extended, **minus per-position k-mer
+  content**. Per-tile modules shipped as opt-in `--tiles`; per-position k-mer
+  content is the remaining gap.
+* **Not "faster than everything."** Falco beats fastcheck on wall time at every
+  size measured, and beats fastmaps once fastmaps is pinned to one core; at
+  shipped defaults fastmaps is ahead. fastp does not beat fastprep in the 5 M
+  one-core cell (73.99 s against 80.03 s). The claims are about memory shape,
+  exactness, the schema, the composition plane and the provenance record — not
+  a clean speed sweep.
 * **Not "MultiQC's aggregation is faster at the same task."** MultiQC produces
   zero output on this schema. The claim is that the slot is filled by a tool
   that owns the schema, not that the same work is done quicker.

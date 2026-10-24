@@ -20,13 +20,14 @@ cli.rs ──► Config ──► main.rs loop  │
 
 ## Data flow per pair
 
-1. **Insert** — `biology.rs`: length `I ~ N(insert_mean, insert_sd)` (floor
-   `insert_min`); sequence = random DNA at GC% or a slice of a reference
-   FASTA contig. The insert is the true double-stranded fragment; R1 reads
-   its 5′ end, R2 the reverse complement of its 3′ end. With probability
-   `dup_rate` the pair is a **PCR duplicate**: it re-sequences a fragment
-   stored in the `History` ring buffer (only fresh inserts enter the pool),
-   so the template is real and earlier in the file. With probability
+1. **Insert** — `biology.rs`: length `I` from the profile's measured `insert`
+   CDF when it carries one, else `I ~ N(insert_mean, insert_sd)` (floor
+   `insert_min`); sequence = random DNA at the profile's GC (or `--gc`) or a
+   slice of a reference FASTA contig. The insert is the true double-stranded
+   fragment; R1 reads its 5′ end, R2 the reverse complement of its 3′ end.
+   With probability `dup_rate` the pair is a **PCR duplicate**: it re-sequences
+   a fragment stored in the `History` ring buffer (only fresh inserts enter the
+   pool), so the template is real and earlier in the file. With probability
    `drop_rate` (mutually exclusive with dup) the pair is a **must-drop**:
    `I ~ U[1, drop_min_len)` — a fragment too short to survive trimming.
    Reads stay exactly `read_len` bases in every class (adapter readthrough
@@ -34,8 +35,11 @@ cli.rs ──► Config ──► main.rs loop  │
 2. **Artefact decision** — `artefact.rs::decide`:
    - sample `(t1, t2)` from the **joint** R1×R2 tail CDF (correlated tails —
      the key finding), then `h1`, `h2` from the head CDFs.
-   - if `h + t >= read_len` on either mate, the pair is entirely artefact →
-     `full_flag=1` (the correct answer is to drop it). Full-length reads are
+   - if `h + t >= read_len` the mate is entirely artefact → `r1_full` /
+     `r2_full = 1`; `full_flag` is 1 only when **both** mates are
+     (`r1_full & r2_full`), because a pair with one full mate still carries
+     usable biology in the other — that mate is dropped, not the pair.
+     Full-length reads are
      NOT sampled from a separate pair-level spike: the profile's head AND
      tail histograms already contain them (an all-G read has both a 150 bp
      head and a 150 bp tail), so the marginal CDFs reproduce them
@@ -69,11 +73,12 @@ cli.rs ──► Config ──► main.rs loop  │
 
 ## Ground-truth semantics
 
-The GT row `(insert, h1, t1, h2, t2, full_flag)` fully determines the correct
-trimmer output per mate; `r1_n`/`r2_n` additionally record how many ambiguous
-(`N`) bases the sequencing overlay injected into each mate (an instrument
-no-call, not fragment biology — it sits inside the keep window and never moves
-`h`/`t`).
+The GT row `(insert, h1, t1, h2, t2, r1_adapter, r2_adapter, full_flag,
+r1_full, r2_full)` fully determines the correct trimmer output per mate;
+`r1_adapter`/`r2_adapter` are the readthrough lengths actually emitted, and
+`r1_n`/`r2_n` additionally record how many ambiguous (`N`) bases the sequencing
+overlay injected into each mate (an instrument no-call, not fragment biology —
+it sits inside the keep window and never moves `h`/`t`).
 
 ```
 [0, h)                5′ G-run            → trim
@@ -82,7 +87,8 @@ no-call, not fragment biology — it sits inside the keep window and never moves
 [L−t, L)              3′ G-run            → trim
 ```
 
-`full_flag=1` → drop the pair. A scorer compares any trimmer's output window
+`full_flag=1` → drop the pair; `r1_full=1` or `r2_full=1` alone → drop that
+mate only. A scorer compares any trimmer's output window
 to `[h, min(I, L−t))`; length-only scoring is insufficient (a tool can remove
 the right number of bases from the wrong end).
 

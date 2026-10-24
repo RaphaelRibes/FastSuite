@@ -1,7 +1,7 @@
 # fastdedup — optimisation propositions
 
 Scope: `tools/fastdedup/src` (3 376 lines, all files read) + the three integration suites.
-Nothing here is implemented: this is a proposition file, not a change log.
+The propositions below are Round 1's analysis; what landed is listed under Status of this round.
 
 ## Status of this round
 
@@ -76,7 +76,7 @@ per-byte work parallel. New floor is the commit thread: parse + one table probe.
 **Measure.** `taskset -c 0-3`, `-j {1,2,4}`, wall + VmHWM + `perf stat -e cycles,cache-misses,
 context-switches`; a debug counter on `hash_tx.send` must fall from 2/pair to 0.
 
-**Risk.** 104 tests pin this path; the ordered-commit form keeps `tests/cli.rs:858`
+**Risk.** 135 tests pin this path; the ordered-commit form keeps `tests/cli.rs:858`
 (`contenu_ser == contenu_par`) green by construction.
 
 ---
@@ -314,7 +314,7 @@ density — ~10.7 B/entry at 64-bit against ~9 B/entry for hashbrown `[E]`.
 `perf stat -e cache-misses,LLC-load-misses,cycles` per record.
 
 **Risk.** A hand-rolled table is where a dedup tool gets silent wrong answers: property-test it
-against `FxHashSet` on random keys, keep the 104 tests, and report the memory regression honestly.
+against `FxHashSet` on random keys, keep the 135 tests, and report the memory regression honestly.
 
 ---
 

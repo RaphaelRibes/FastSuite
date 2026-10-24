@@ -3,8 +3,13 @@
 Bench: strict-tolerance (tol 0) overtrim of 29.5% for `fastprep-winner`
 against fastsim's exact ground truth. fastp-default: 0.2%; fastp-tuned: 8.6%.
 (This 29.5% is the *published* cross-generation figure, since shown invalid —
-the corrected overtrim is 23.4%; see `docs/TRIM-ACCURACY-DISCREPANCY.md`. The
-mechanism below was re-verified on fresh measurements, so the analysis stands.)
+the corrected 0.9L-era overtrim is 23.4%; see `docs/TRIM-ACCURACY-DISCREPANCY.md`.
+The mechanism below was re-verified on fresh measurements, so the analysis stands.
+The measurements below were taken 2026-10-16, before D-18: `0.9L` floor, the old
+mercy clause, and `--boundary-anchored` not yet the default. On the D-18
+scan-change re-measure (15 datasets, `--min-len` pinned, so the floor change is
+not in it) the `head-dropout 4` arm is 79.19% exact / 19.39% overtrim; the
+`0.67L` floor has no arm of its own yet.)
 
 ## The cause, established by controlled experiment
 
@@ -19,9 +24,13 @@ the cut it actually made back from its PXMT metadata.
 | biology begins with exactly 2 G's | **21 / 63 (33.3%)** | every one exactly **+2** |
 | random ACGT biology (~25% G) | 3 / 22 | +1 |
 
-When the base after the run is not a G, fastprep's cut is **exact** — no
-off-by-one, no mercy overshoot, nothing. The `resolve_subscan` `k_star + 1`
-and the `mercy` mass threshold are both correct.
+When the base after the run is not a G, the 5' head-dropout path's cut is
+**exact** — no off-by-one, nothing. This probe only exercised that path (head
+runs of 1..4 bp); the 3' scan path overshoots a run at `min_run` even on a clean
+boundary (`docs/OVERTRIM-ALGORITHM.md`, `docs/OVERTRIM-PAIRED.md` §4.3). The
+`resolve_subscan` `k_star + 1` is correct. The `mercy` mass threshold bounds the
+overshoot correctly, but until D-18 it also charged a run's own matching bases,
+which turned it into a length cap at low quality.
 
 When the base after the run **is** a G, fastprep trims it. It always trims
 exactly the number of extra G's, never more.
@@ -34,15 +43,16 @@ alone. There is no algorithm that reads only the bases and gets this right,
 because the input does not determine the answer.
 
 This matches the measured magnitude. With a ~25% per-base G rate, biology
-begins with at least one G about 25% of the time; fastprep measures 29.5%
-overtrim. The excess over 25% is the 3' side plus the boundary rule's
-contribution. The agreement between the predicted 25% and the measured 29.5%
-is the confirmation that the experiment found the whole effect.
+begins with at least one G about 25% of the time; the 0.9L-era default measured
+23.4% overtrim. The near-agreement between the predicted 25% and the measured
+23.4% is the confirmation that the experiment found the dominant effect (the
+retired 29.5% figure came from the defective cross-generation pairing).
 
 ## What this rules out
 
-- Tightening `mercy` does not help: the overshoot is zero when the boundary
-  is unambiguous.
+- Tightening `mercy` does not help: on the 5' head path the cut is already
+  exact when the boundary is unambiguous, and the ~2 bp 3' mercy overshoot is
+  a boundary-placement error that the anchored cut fixes instead.
 - Changing the `k_star + 1` to `k_star` would introduce **undertrim** of
   exactly the same magnitude, because when the boundary is unambiguous the
   current code is already exact.
@@ -64,14 +74,15 @@ is the confirmation that the experiment found the whole effect.
 2. **Accept the trade deliberately.** A read whose biology begins with a G is
    ambiguous; trimming the G is the conservative choice for artefact removal
    and costs one biology base. Note the tolerance-2 measurement already
-   tells us this: overtrim falls from 29.5% to **1.3%** when ±2 is allowed,
+   tells us this: in the published round overtrim fell from 29.5% to **1.3%**
+   when ±2 was allowed,
    so the vast majority of these overtrims are 1-2 bases.
 3. **Report it as a known, bounded limitation** with the ±2 number, which is
    what the paper now does.
 
 ## Recommendation
 
-Do **not** chase the 29.5% with algorithm changes. It is the correct answer
+Do **not** chase this overtrim with algorithm changes. It is the correct answer
 to an ambiguous question. The one thing worth measuring is whether quality
 at the boundary separates injected from biological G strongly enough to be
 worth a rule — and fastsim's first-base-normal-quality detail says the
@@ -79,5 +90,7 @@ answer is probably no.
 
 The honest statement is: *fastprep trims the whole observed G run. When
 biology begins with a G, that G is indistinguishable from artefact and is
-trimmed. This costs 1-2 biological bases on ~25-30% of mates and is the
-entire strict-tolerance overtrim.*
+trimmed. At the 0.9L-era default this cost 1-2 biological bases on ~23% of
+mates and was the bulk of the strict-tolerance overtrim; with the D-18 scan
+clause and the swept floor pinned, the `head-dropout 4` arm measures 19.39%
+overtrim (15 datasets).*

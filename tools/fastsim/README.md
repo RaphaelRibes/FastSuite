@@ -15,7 +15,9 @@ not relative to another tool.
 ```
 PREFIX_R1.fastq[.gz]   simulated R1 reads (150 bp, NovaSeq-style headers)
 PREFIX_R2.fastq[.gz]   simulated R2 reads
-PREFIX.gt.tsv          ground truth:  pair_id  insert  r1_h  r1_t  r2_h  r2_t  full_flag  is_dup
+PREFIX.gt.tsv          ground truth:  pair_id  insert  r1_h  r1_t  r2_h  r2_t
+                                      r1_adapter  r2_adapter  full_flag  is_dup
+                                      r1_n  r2_n  r1_full  r2_full
 ```
 
 `is_dup` marks PCR duplicates: a re-sequencing of a previously emitted
@@ -32,8 +34,11 @@ so a correct trimmer must drop the pair.
 The correct trimmed window per mate is `[h, min(I, L−t))`:
 `[0, h)` = 5′ G-run (artefact), `[h, min(I, L−t))` = biology (keep),
 `[min(I, L−t), L−t)` = adapter readthrough (artefact, only when `I < L−t`),
-`[L−t, L)` = 3′ G-run (artefact). `full_flag=1` means the pair is entirely
-artefact — the correct answer is to **drop** it.
+`[L−t, L)` = 3′ G-run (artefact). `r1_full`/`r2_full` mark a single mate as
+entirely artefact (`h + t >= L`); `full_flag=1` means **both** mates are, so
+the pair is entirely artefact — the correct answer is to **drop** it. A pair
+with one full mate still carries usable biology in the other, which is why the
+per-mate columns exist.
 
 ## What it reproduces (measured from 82.3B reads)
 
@@ -84,21 +89,25 @@ fastsim --pairs 20_000_000 --profile profiles/mandril_E.json \
 | `--profile FILE` | required | measured profile JSON |
 | `--out PREFIX` | required | output prefix |
 | `--seed S` | 42 | RNG seed (deterministic output) |
-| `--read-len L` | 150 | read length (must match profile) |
+| `--read-len L` | profile's `read_len` | read length (an explicit value must match the profile) |
 | `--insert-mean M` | 300 | insert length mean (bp) |
 | `--insert-sd S` | 50 | insert length sd |
 | `--insert-min M` | min(150, read_len) | insert length floor |
-| `--gc G` | 0.49 | GC fraction for random DNA |
+| `--gc G` | profile's `gc` (0.49 if absent) | GC fraction for random DNA |
 | `--reference FILE` | — | sample inserts from a FASTA instead of random DNA |
 | `--adapter-seq SEQ` | profile | override adapter sequence |
 | `--no-adapter` | — | disable adapter readthrough |
 | `--no-gzip` | — | write uncompressed FASTQ |
 | `--gz-level L` | 6 | DEFLATE level for the gzip outputs, 1..=9 (see below) |
-| `--dup-rate R` | 0.02 | PCR duplicate fraction (mandril measures 1–4%) |
+| `--dup-rate R` | 0.02 | PCR duplicate fraction (mandril measures 1–4%; a profile's measured `dup_rate` overrides it) |
 | `--dup-pool N` | 131072 | ring-buffer capacity for the duplicate pool |
 | `--drop-rate R` | 0.05 | fraction of pairs whose fragment is too short to survive trimming (must-drop class) |
 | `--drop-min-len L` | 100 | insert ceiling for the forced-drop class (bench `min_length`) |
 | `--stats` | — | add the instrument counters (RNG words drawn, substitutions, mean Q, gzip bytes) to `--json` |
+
+`--insert-mean`/`--insert-sd`/`--insert-min` are used only when the profile has
+no measured `insert` CDF; `--gc` and `--dup-rate` likewise defer to the
+profile's measured `gc`/`dup_rate` when present.
 
 ### `--gz-level`: the compression trade
 
@@ -130,7 +139,7 @@ level it used (`metrics.gz_level`) next to the files it shaped.
 
 ```bash
 pixi install -e build
-pixi run -e build test      # 89 tests (65 unit + 24 integration)
+pixi run -e build test      # 93 tests (65 unit + 28 integration)
 pixi run -e build build     # release binary at target/release/fastsim
 ```
 
@@ -157,7 +166,9 @@ src/quality.rs    position curve + per-read baseline + collapse + errors
 src/fastq.rs      FASTQ writer (plain/gzip, NovaSeq headers)
 src/truth.rs      ground-truth TSV writer
 scripts/          build_profile.py, validate_sim.py, plot_heads_tails.py
-profiles/         mandril_E.json (measured), test_small.json
+profiles/         test_small.json, synthetic_novaseq.json, cellB-pe-overlap.json
+                  (hand-written); mandrill_E358.json (measured, not shipped —
+                  the golden-stream tests skip when it is absent)
 ```
 
 See `docs/ARCHITECTURE.md`, `docs/ALGORITHMS.md`, `docs/CLI.md`.

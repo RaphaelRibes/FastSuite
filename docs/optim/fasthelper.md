@@ -1,7 +1,8 @@
 # fasthelper — optimisation propositions
 
 Scope: `tools/fasthelper/src` (3 420 lines, all 11 files read) and the pre-built
-`target/release/fasthelper` run against scratch trees. Nothing here is implemented.
+`target/release/fasthelper` run against scratch trees. What landed is listed under
+Status of this round.
 
 ## Status of this round
 

@@ -7,6 +7,10 @@ outcome. Measurement harness: `bench/scripts/overtrim_impl.py`. Candidate-rule
 model: `bench/scripts/overtrim_rulesim.py`. Diagnostics: `bench/scripts/overtrim_poly.py`
 (poly-only scoring), `bench/scripts/overtrim_diagnose.py` (per-read geometry).
 
+All measurements here were taken 2026-10-16, before D-18: the floor was `0.9L`
+and the mercy clause still charged a run's own bases. The numbers describe that
+build; the shipped default today is `0.67L` with the anchored cut on.
+
 ## TL;DR
 
 * The task framed the overtrim as **run continuation** (biology continuing with
@@ -30,7 +34,7 @@ model: `bench/scripts/overtrim_rulesim.py`. Diagnostics: `bench/scripts/overtrim
      rule can recover it. It is prior-driven (which is why the sweep's
      `head_dropout` knob moves it).
 
-## The change: `--boundary-anchored` (opt-in, default off)
+## The change: `--boundary-anchored` (shipped opt-in; on by default since 0.4.0)
 
 A new `Params::boundary_anchored` (CLI `--boundary-anchored`). When set, a polyX
 scan that terminates by mercy cuts the **homopolymer run extent** — from the scan
@@ -43,9 +47,10 @@ boundary. It still keeps substitution-error bases *inside* the run (the last
 match sits past an internal mismatch), so error-containing runs are not
 short-changed — verified by a unit test.
 
-Default (`boundary_anchored = false`) is byte-for-byte the shipped whole-run/mercy
-cut. The `run_span` bookkeeping is gated on the flag, so the default path does no
-extra work.
+At the time, the default (`boundary_anchored = false`) was byte-for-byte the
+pre-change whole-run/mercy cut. The `run_span` bookkeeping is gated on the flag,
+so the off path does no extra work. `boundary_anchored` is `true` in the shipped
+default since 0.4.0; `--no-boundary-anchored` restores the pre-0.4.0 cut.
 
 ## Measurements (fastsim profiles, exact GT, poly-only scoring)
 
@@ -98,8 +103,9 @@ own `/proc` VmHWM polled every 20 ms — `ru_maxrss` cannot isolate one child, s
 | new, `--boundary-anchored` | 0.363 s       | ~275k pairs/s    | 34.3 MB  | 21133 |
 
 All three are identical: **no throughput regression, no memory regression.** The
-default path is unchanged from `git HEAD` (the `run_span` bookkeeping is gated on
-the flag). The flag itself is free. Drops are identical across all three.
+path that was the default then (whole-run) is unchanged from `git HEAD` (the
+`run_span` bookkeeping is gated on the flag). The flag itself is free. Drops are
+identical across all three.
 
 ## Candidates evaluated (the four proposed ideas)
 
@@ -143,9 +149,10 @@ the flag). The flag itself is free. Drops are identical across all three.
 
 ## Recommendation
 
-Ship `--boundary-anchored` as an opt-in boundary-placement fix: it removes the
-mercy-overshoot (measured −2.1 pp overtrim / +2.1 pp exact on the heavy-tail
-regime, no undertrim/drop cost) at zero speed and memory cost, and is default-off.
+Ship `--boundary-anchored` as a boundary-placement fix (delivered: it is on by
+default since 0.4.0, with `--no-boundary-anchored` restoring the old cut): it
+removes the mercy-overshoot (measured −2.1 pp overtrim / +2.1 pp exact on the
+heavy-tail regime, no undertrim/drop cost) at zero speed and memory cost.
 Report the 1 bp `head_dropout` lead as the known, irreducible overtrim with the
 ±2 tolerance number (overtrim falls to ~0.4–1.6% at tol 2), which is what the
 paper already does. Do **not** expect a boundary rule to recover the 1 bp

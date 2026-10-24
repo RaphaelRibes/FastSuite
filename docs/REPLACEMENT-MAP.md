@@ -8,8 +8,8 @@ explicitly marked as a gap with the phase that closes it.
 
 | fastp capability | FastSuite | status |
 |---|---|---|
-| Illumina adapter trimming (auto-detect + presets) | `fastprep --adapter-preset illumina\|nextera\|small-rna`, `--adapters FASTA`, catalogue auto-detection | ✅ implemented; **auto-detection refuses to guess** (exit 1 with instructions) when the sampled reads carry no adapter — a deliberate difference from fastp, which trims on a guess |
-| polyX / polyG trimming at 3′ | `fastprep` (quality-weighted, 5′ **and** 3′ **and** interior) | ✅ superset: fastp cannot touch 5′ polyG, the NovaSeq R2 artefact this suite was written for |
+| Illumina adapter trimming (auto-detect + presets) | `fastprep --adapter-preset illumina\|nextera\|small-rna`, `--adapters FASTA`, catalogue auto-detection | ✅ implemented; when the sampled reads carry no adapter, auto-detection **takes the safe action instead of guessing** — no adapter trimming, the assumption recorded in the report and on stderr, exit 0 (D-6; `--strict` restores the refusal). Still a deliberate difference from fastp, which trims on a guess |
+| polyX / polyG trimming at 3′ | `fastprep` (quality-weighted, 5′ **and** 3′ **and** interior — interior is opt-in and off by default) | ✅ superset: fastp cannot touch 5′ polyG, the NovaSeq R2 artefact this suite was written for |
 | polyX with error tolerance | `--match-leniency μ`, `--mismatch-strength ν`, `--mercy Δ_m`, `--gate-shape`, `--phred-sat` | ✅ |
 | quality filtering | `--mean-q` | ✅ |
 | hard trimming | `--trim-5`, `--trim-3` | ✅ |
@@ -29,9 +29,9 @@ explicitly marked as a gap with the phase that closes it.
 | polyX/polyG contamination detection | `fastmaps` `polyG_frac`, `r2_polyG_frac` | ✅ arguably clearer than FastQC's per-base plot for this specific failure |
 | per-base quality | `fastcheck` — exact per-position quality matrices + quantiles from the histogram | ✅ implemented (`--positions-tsv`, `mean_q/q10/q50/q90` columns) |
 | per-sequence quality / GC distribution | `fastcheck` — `read_mean_q_hist`, `read_length_hist`, per-read GC (`gc_fraction`, `gc_hist`) | ✅ implemented |
-| adapter content module | implicit: `fastprep`'s adapter stats | partial |
+| adapter content module | `fastcheck --adapter-content` (opt-in) plus `fastprep`'s adapter stats | ✅ implemented; fastcheck's block is opt-in, fastprep's stats are on every run |
 | duplication levels | `fastdedup` exact rate (not FastQC's estimate) | ✅ better: exact, no sampling |
-| overrepresented sequences | `fastcheck` bounded counters (singleton eviction, top-20 above `max(10, 0.1%)`) | ⚠ **partial**: bounded approximate (a sequence whose first occurrence is evicted loses 1 count — documented). Exact modes (`--overrep-mode fingerprint|second-pass|table`) are planned — see `docs/plans/2026-10-12_fastcheck-exactness.md` |
+| overrepresented sequences | `fastcheck` bounded counters (singleton eviction, top-20 above `max(10, 0.1%)`) | ⚠ **approximate by default**: a sequence whose first occurrence is evicted loses 1 count (documented). Exact modes ship — `--overrep-mode none\|fingerprint\|second-pass\|table`, default `none` — see `docs/plans/2026-10-12_fastcheck-exactness.md` |
 | k-mer content | `fastcheck` bounded 12-mer spectrum (top-20) | ⚠ **partial**: bounded approximate for the same reason; per-position exact k-mer (`kmer_pos[p][kmer]`) is planned in the same fastcheck plan |
 | per-sample HTML/zip report | `fasthelper concatenate` → `report.html` | ✅ different shape (multi-sample, one file, no zip) |
 | multi-file / batch QC | `fasthelper run` | ✅ one config, N samples |
@@ -40,12 +40,12 @@ Honest summary: **fastmaps alone is not a drop-in FastQC replacement — but
 `fastcheck` is what closes the gap.** fastmaps replaces the composition
 modules (and beats FastQC on the polyX/R1-R2 view); fastcheck adds exact
 per-base quality, per-sequence quality, GC, length distributions and
-duplication levels. What is still missing from the FastQC slot: per-tile
-modules (planned, default off), exact (non-sampled) over-representation
-modes, and per-position k-mer content. The replacement claim is therefore
-"FastQC's modules, replaced and extended, minus per-tile and exact
-over-representation — see `docs/plans/2026-10-12_fastcheck-exactness.md`",
-not "all of FastQC".
+duplication levels. What is still missing from the FastQC slot: per-position
+k-mer content (the 12-mer spectrum is whole-read, top-20). Per-tile modules
+(`--tiles`, off by default) and exact over-representation modes
+(`--overrep-mode`) are no longer gaps. The replacement claim is therefore
+"FastQC's modules, replaced and extended, minus per-position k-mer content —
+see `docs/plans/2026-10-12_fastcheck-exactness.md`", not "all of FastQC".
 
 ## MultiQC → fasthelper
 

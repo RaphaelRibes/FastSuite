@@ -65,6 +65,13 @@ Not yet tagged or pushed. `recipes/bioconda/` carries the submission-ready
 recipes for all six; `recipes/bioconda/README.md` has the tagging and
 submission steps.
 
+**Superseded (2026-10-23).** This release was never cut. The `--head-dropout`
+4 → 0 default above did not survive: **D-16** restored `4` in the 0.4.1 release
+(it was 0 only briefly after `3d76a31`), and current `main` carries fastprep
+**0.5.0** (see Current state). The 101-library measurement quoted above is
+unchanged; only the shipped default reverted. `--pe-correct` landed in 0.4.1,
+and `--auto-params` plus `--min-len 0.67L` (D-18) in 0.5.0.
+
 ---
 
 ## Before the first bioconda publication (checklist)
@@ -89,5 +96,7 @@ submission steps.
       documented deviation from the no-downloads rule (see the pixi.toml
       container section); every Cargo.lock is committed so versions stay pinned.
 * [ ] The suite is only claimed to replace what `docs/REPLACEMENT-MAP.md`
-      grants: "FastQC's modules, replaced and extended, minus per-tile and
-      exact over-representation" and "MultiQC's aggregation, replaced".
+      grants: "FastQC's modules, replaced and extended, minus per-position
+      k-mer content" and "MultiQC's aggregation, replaced". (The earlier quote
+      said "minus per-tile and exact over-representation"; both now ship —
+      `fastcheck --tiles`, off by default, and `--overrep-mode`.)

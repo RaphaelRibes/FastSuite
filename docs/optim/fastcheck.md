@@ -1,6 +1,6 @@
 # fastcheck — optimisation propositions
 
-Scope: `tools/fastcheck/src` (8 321 lines, all files read). Nothing here is implemented.
+Scope: `tools/fastcheck/src` (8 321 lines, all files read). What landed is listed under Status of this round.
 
 ## Status of this round
 

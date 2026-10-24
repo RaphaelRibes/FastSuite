@@ -2,9 +2,12 @@
 
 **Question.** fastprep trims a poly-G artefact by cutting the entire observed run,
 `f(r) = r`. On the Phase D bench that rule overtrimmed 29.5% of mates at strict
-tolerance 0 (1.3% at tolerance ±2 — the errors are 1-2 bp). Is that overtrim
-fixable by *any* decision rule that reads only the observed run length `r`, or is
-`f(r) = r` already optimal given base identity alone?
+tolerance 0 (1.3% at tolerance ±2 — the errors are 1-2 bp). That 29.5% is the
+retired published cross-generation figure; the corrected 0.9L-era value is 23.4%,
+and the D-18 scan-change re-measure (15 datasets, `--min-len` pinned) puts the
+`head-dropout 4` arm at 19.39% overtrim. Is
+that overtrim fixable by *any* decision rule that reads only the observed run
+length `r`, or is `f(r) = r` already optimal given base identity alone?
 
 **Short answer.** Fixable in large part, not in full — and the current rule is
 *not* near the optimum. On the synthetic profiles that reproduce the mechanism
@@ -90,8 +93,9 @@ have different priors), the ceiling rises to 5' 92.45% (R1 100%, R2 84.89%),
 **How close is `f(r) = r`?** Not close. Per end: 5' 77.81% (gap 13.0 pp),
 3' 77.86% (gap 21.4 pp); mate-joint 60.59% (gap 29.6 pp). `f(r) = r` sits at the
 zero-undertrim corner of the achievable set and pays 39.40% overtrim for it. The
-real tool (fastprep default config, scored on its kept 357,645 mates) gets
-76.02% exact / 22.34% over / 1.64% under; its empirical policy is `cut = r` for
+real tool (the then-shipped default config, at the `0.9L` floor and before D-18,
+scored on its kept 357,645 mates) gets 76.02% exact / 22.34% over / 1.64% under;
+its empirical policy is `cut = r` for
 5' runs of 1-4 bp (0 for ≥5) and almost no 3' trimming (only runs ≥12 bp).
 
 **Can overtrim drop without an equal undertrim increase?** Yes — the exchange

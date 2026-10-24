@@ -28,8 +28,9 @@ adapter = window − bio         (> 0 only when I < window: readthrough)
 
 R1 biology = `insert[0..bio]`; R2 biology = reverse complement of
 `insert[I−bio..I]` (the fragment's far end). Adapter bases cycle the adapter
-sequence; tail Gs and head Gs are appended/prepended. `bio < 1` → near-full
-→ `full_flag=1`.
+sequence; tail Gs and head Gs are appended/prepended. `bio < 1` → that mate
+is near-full → entirely artefact (`r1_full` / `r2_full`); the pair-level
+`full_flag` is 1 only when both mates are.
 
 ## Quality model (`quality.rs`)
 

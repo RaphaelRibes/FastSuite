@@ -45,8 +45,9 @@ independently verifiable.
 
 * `--force`: refuse to overwrite an existing `-o/-p` unless set (today it
   clobbers silently). Errors name the file and suggest `--force`.
-* `--dry-run`: read, compute every counter, write nothing; with `--json` the
-  report is still emitted.
+* `--dry-run`: read, compute every counter, write no FASTQ and no metadata; the
+  JSON report is still emitted, flagged `dry_run: true` (delivered — see
+  `docs/CLI-SPEC.md` §1).
 * `--quiet`: suppress the progress/`eprintln!` stream, keep warnings and errors.
 * Tests: output path exists → exit 1 without `--force`, exit 0 with it;
   `--dry-run` leaves the directory byte-identical (`find -newer` check).
@@ -85,7 +86,7 @@ see docs/plans/2026-10-12_fastsim-cli-convergence.md]**
   `/scratch/users/$USER/FastSuite` fallback (Task 6/7 of the same plan).
 
 Verification for the whole phase: `cargo test --offline` in all five crates
-(378 tests today, see below) plus `fasthelper run -c examples/fastsuite.toml`
+(378 tests at the time; 852 today, see below) plus `fasthelper run -c examples/fastsuite.toml`
 on the synthetic control, plus `fasthelper doctor` showing every tool at the
 new version.
 
@@ -140,7 +141,7 @@ to `pigz` and the `--gz-level` semantics are identical everywhere.
 
 ## Phase 4 — FastQC/Falco module parity (3–4 days)
 
-> **Superseded by `docs/PLAN-QC.md`** (a full QC binary, `fastquality`, rather
+> **Superseded by `docs/PLAN-QC.md`** (a full QC binary, `fastcheck`, rather
 > than modules bolted onto fastmaps). The table below is the module checklist
 > that plan inherits; read PLAN-QC.md for the design, memory model and phases.
 

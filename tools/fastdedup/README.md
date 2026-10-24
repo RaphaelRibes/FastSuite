@@ -63,6 +63,8 @@ fdedup [OPTIONS] --input <INPUT>
 - `--abundance-sep <SEP>`: Separator for abundance annotation (default: `;size=`).
 - `--pre-count`: Pre-count sequences for exact hash table sizing (reduces peak RAM).
 - `--temp-dir <DIR>`: Directory for temp file in abundance mode (avoids re-reading gzip).
+- `--json <PATH>`: Write a machine-readable FastSuite report (report schema v1); `--dry-run` included, the report always carries the duplication statistics.
+- `-q, --quiet`: Suppress the end-of-run summary line.
 - `-` in place of `-1/--input`, `-2/--input-r2`, `-o/--output`, `-p/--output-r2`: read from stdin / write to stdout (D-4, standard streams).
 - `--out-format <fastq|fasta>`: record format when writing to a stream. Named paths keep inferring it from the extension. Default: `fastq`.
 - `--out-compression <none|gz>`: compression when writing to a stream. Named paths keep inferring it from the extension. Default: `none`.
@@ -176,7 +178,7 @@ budget in `parallel.rs`:
 
 ```rust
 // paired: two output writers, so the spare threads are split between them
-let gzip_threads = (num_workers - 2) / 2;   // j2->1, j4->1, j8->3
+let gzip_threads = (num_workers.saturating_sub(2) / 2).max(1);  // j2->1, j4->1, j8->3
 ```
 
 and the parallel compressor requires `num_threads > 1`. One spare thread per

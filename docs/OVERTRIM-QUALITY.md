@@ -12,6 +12,11 @@ quality drawn from **chosen constants** (my probe worlds).
 Reproduce: `python3 bench/scripts/overtrim_quality.py --part all`
 (parts: `model`, `probe`, `rule`, `cost`).
 
+Measured 2026-10-16, before D-18: the baseline pins `min_len 0.9L` and
+`head-dropout 1`, neither of which is the shipped default today (`0.67L`,
+`head-dropout 4`). The `fastprep now` columns describe that baseline, not a
+bare invocation.
+
 ## Verdict
 
 **Split by boundary class — and the split is a property of fastsim's quality
@@ -98,11 +103,12 @@ Results (binary built from this tree):
 * `--mercy 3`: cut = observed run + 1..20 bp overshoot into *non-G*
   biology (mean +2.56, sd 1.32). Quality moves only this overshoot, and
   perversely: low-q artefact runs overshoot *less* (+1.6..+2.3 at
-  q_art <= 10) than high-q runs (+2.8..+3.3 at q_art >= 20), because
-  low-quality matches accumulate mercy mass slightly faster. The boundary
+  q_art <= 10) than high-q runs (+2.8..+3.3 at q_art >= 20), because at the
+  time low-quality matches accumulated mercy mass slightly faster (D-18 no
+  longer charges a run's own bases). The boundary
   base's quality has no systematic effect. (The overshoot is a separate
-  overtrim source; the base-identity `--boundary-anchored` cut in this tree
-  removes it — orthogonal to the quality question.)
+  overtrim source; the base-identity `--boundary-anchored` cut, the default
+  since 0.4.0, removes it — orthogonal to the quality question.)
 
 ## 3. The quality-boundary rule
 
@@ -110,10 +116,11 @@ Trim at each end the **maximal G-run segment whose bases are all below a
 quality threshold `q_cut`** (walk inward while base == G and q < q_cut).
 Two semantics: `replace` (the rule owns the end cut) and `refine` (fall
 back to the scan's cut when the rule finds nothing). Implemented in
-fastprep as `--q-boundary <Q>` (default off, `replace` semantics,
+fastprep as a `--q-boundary <Q>` prototype (default off, `replace` semantics,
 budget-guarded; `head_dropout` subsumed) and offline in the analysis
-script. Needs **no look-ahead** beyond the run: the walk stops at the first
-non-G or high-quality base.
+script. The flag is not in the shipped 0.5.0 CLI, so the numbers below are the
+prototype's and the offline rule's. Needs **no look-ahead** beyond the run: the
+walk stops at the first non-G or high-quality base.
 
 ## 4. Evaluation — both settings
 
@@ -178,9 +185,11 @@ for overtrim removal with undertrim and vice versa.
 
 The Phase-D reference (desktop, 101 fitted real-library profiles,
 fastprep-winner: tol 0 = 66.5/29.5/4.0, tol 2 = 98.4/1.3/0.3 — the *published*
-cross-generation figures, since shown invalid; the corrected shipped-default
-figure is 75.4/23.4/1.0, see `docs/TRIM-ACCURACY-DISCREPANCY.md`) is quoted as
-external context only; those datasets are on the unreachable desktop. The
+cross-generation figures, since shown invalid; the corrected 0.9L-era
+shipped-default figure is 75.4/23.4/1.0, see `docs/TRIM-ACCURACY-DISCREPANCY.md`,
+and the D-18 scan-change re-measure puts the `head-dropout 4` arm at
+79.19/19.39 with `--min-len` pinned, 15 datasets) is quoted as external context
+only; those datasets are on the unreachable desktop. The
 local fixtures are regime-shifted: `high` puts 4–20 bp tails on ~90% of
 mates against `min_run 12` (hence 53.8% undertrim), `low`/`mid` land at
 81% exact / 17–18.5% overtrim. All before/after numbers above are measured
@@ -220,4 +229,4 @@ structure is unchanged.
   real-data test (Phase-D reads + GT) is the one missing experiment.
 * Recommendation: the rule is cheap (-1.4%) and correct in direction, but
   do not claim the fastsim-measured gains for real data. If adopted, gate
-  it behind a flag (as `--q-boundary` is) and settle `q_cut` on real data.
+  it behind a flag (as the `--q-boundary` prototype was) and settle `q_cut` on real data.

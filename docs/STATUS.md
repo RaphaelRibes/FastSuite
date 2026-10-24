@@ -16,12 +16,12 @@ production-ready** (see the README banner).
 
 | tool | version | tests | state | next plan |
 |---|---|---|---|---|
-| fastdedup | 1.3.0 | 134 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
+| fastdedup | 1.3.0 | 135 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
 | fastprep | 0.5.0 | 306 | working — `--force`/`--dry-run`/`-q`, `fastsuite.report.v1` with the raw stats under `legacy`, `--pe-correct`, and **`--auto-params` is real**: a decision-list model (trained on Phase D's 101 libraries, embedded in the binary, `docs/MODEL-CARD-auto-params.md`) recommends the config from a `fastcheck` report; CV regret 0.0331 vs the default's 0.0721, delta +0.0389, top-5 0.533 vs 0.020, with one of five folds losing. **Defaults re-priced 2026-10-23 (D-18):** `--min-len 0.67L` (100 bp of a 150 bp read; the floor is also the trim budget) and a mercy clause that no longer charges a run's own bases, so a low-quality 4-colour polyG tail is trimmed whole instead of 37 bases deep. `--head-dropout` is **4** (D-16's 7:1 price; earlier revisions of this row said 0). The report now closes at base level (`bases_out`/`bases_dropped`), and six exit-0 data-loss paths are closed (`--adapter-scored-retry`, `--json`/{`-o`} collisions, `.bz2`/`.xz` outputs, a swallowed final flush, the `--pe-correct` hang) | `bench/scripts/train_auto_params.py` on a 500-dataset corpus, then the held-out fastp comparison (E5's third criterion) |
 | fastsim | 0.1.0 | 93 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`), and **all four (plane × artefact) pairs deconvolved on the consumer side** (`7631292`, the g_frac fix order's step 1(b)) — DRR083326's R1 terminal moved 0.5292 → 0.4140 against a real 0.4245. The insert ceiling (`2L − 12 = 288 bp`) is now stated in `--help` too | — |
 | fastmaps | 0.1.0 | 96 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads`; **previews streamed instead of held resident** (`90573ea`: defaults 202.6 → 141.2 MB, `--buffer-mb 8` 100.5 → 36.1 MB, outputs verified byte-identical) | — |
 | fastcheck | 0.1.0 | 143 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), **per-tile quality modules** (`--tiles`, opt-in, `93ed54a`), harness green | `plans/2026-10-12_fastcheck-exactness.md` — **tasks 5–14 all landed**; the ground-truth recovery claim is a gate now, not a session: `pixi run ground-truth` |
-| fasthelper | 0.1.0 | 70 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — **every item is landed** (`run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on`, `-P/--jobs`, `install --prefix`, and `--from`/resume, which `runner.rs` implements via the per-step `ResumeEntry` re-run rule) |
+| fasthelper | 0.1.0 | 78 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — **every item is landed** (`run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on`, `-P/--jobs`, `install --prefix`, and `--from`/resume, which `runner.rs` implements via the per-step `ResumeEntry` re-run rule) |
 
 **852 cargo tests, 0 failures** (143/135/306/93/96/78 + the pathology aggregate
 line), plus the **pathology corpus: 9 assertions passed, 0 failed**.
@@ -125,6 +125,8 @@ The closed loop scores fastsim against each library's **fastcheck**-measured QC
 profile. It is **fastcheck-only** and independent of fastprep's trimming and of
 the sweep winners.
 
+Per domain, for that 142/306 run:
+
 | domain | pass rate | |
 |---|---|---|
 | human_gut | 94.1% (48/51) | |
@@ -134,9 +136,10 @@ the sweep winners.
 | rna_seq | 19.6% (10/51) | 3′-biased |
 | metagenomics | **5.9% (3/51)** | |
 
-**`g_frac` is now the sole blocker**: it appears in **all 164 failing rows**.
-Every other gate is noise by comparison (mean_q 8, gc 5), and the duplicate
-gate is clear.
+**`g_frac` is the sole blocker**: it appears in **all 164 failing rows** of that
+run (on the current 183/306 run: 121 of the 123 failing rows, mean_q 8, gc 4,
+duplicate 0). Every other gate is noise by comparison, and the duplicate gate is
+clear.
 
 ### The rate went *down* when the contamination was removed
 
@@ -417,7 +420,8 @@ still be re-derived before the sweep numbers are quoted again.
    independently re-verified it end to end. Two minor drifts worth noting: the
    committed `fastsuite.def` carries `Pixitainer_Version 0.9.0` while the
    installed tool now reports 1.0.0, and `pixi.toml`'s `test` task comment
-   still says "397 tests".
+   used to say "397 tests" (since corrected: it now restates no count, only
+   the assertion against `scripts/expected-test-counts.txt`).
 
 New and open after the review round:
 
@@ -524,7 +528,8 @@ The authoritative figure is now `bench/results/gt2026/closed_loop.tsv` —
 ## What the suite refuses to do (D-12)
 
 PE overlap/merge, UMI handling, alignment-based QC, workflow-engine
-semantics (arrays, resume), per-tile modules (until built), long reads (D-7).
+semantics (arrays, resume), per-tile modules (~~until built~~ **built since:
+`fastcheck --tiles`, opt-in**), long reads (D-7).
 
 ## Where the ML campaign stands
 

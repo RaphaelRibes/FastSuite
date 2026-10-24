@@ -3,11 +3,19 @@
 Bench reference: `fastprep-winner` over 101 real libraries, strict tolerance 0
 = 66.5% exact / 29.5% overtrim / 4.0% undertrim; tolerance ±2 = 98.4 / 1.3 /
 0.3. `fastp` default: 92.2 / 0.2 / 7.6 at tolerance 0. (The 66.5% is the
-published cross-generation number, later shown invalid; the valid
-shipped-default figure is **75.4%** — see `docs/TRIM-ACCURACY-DISCREPANCY.md`.)
+published cross-generation number, later shown invalid; the 0.9L-era
+shipped-default figure is **75.4%** — see `docs/TRIM-ACCURACY-DISCREPANCY.md`.
+The D-18 scan-change re-measure (15 datasets, `--min-len` pinned) puts the
+`head-dropout 4` arm at **79.19%** exact / **19.39%** overtrim; the `0.67L`
+floor change is not in those numbers.)
 
 Four independent investigations were run (ceiling, quality, paired-end,
 implementation). This is the consolidated answer to "fix the overtrim".
+
+All measurements below were taken 2026-10-16, before D-18: `0.9L` floor, the
+pre-D-18 mercy clause, and `--boundary-anchored` not yet the default. They
+describe that build; the shipped default today is `0.67L` with the anchored cut
+on.
 
 ## The mechanism, corrected
 
@@ -25,8 +33,8 @@ What the data actually shows is two separate errors:
    so a 12/16/20 bp run is cut at 14/18/22. This is a boundary-placement bug
    and it is fixable.
 2. **An unconditional leading-G hard trim.** `head_dropout` (the shipped
-   default 4 at the time; now 0) trims
-   any leading G-run of length 1..=4 exactly, with no quality gate and no
+   default 4 at the time; briefly 0 after `3d76a31`; 4 again since 0.4.1, D-16)
+   trims any leading G-run of length 1..=4 exactly, with no quality gate and no
    question of whether the G is artefact. On a library whose first base is often
    a real G, this removes real sequence.
 
@@ -65,7 +73,8 @@ length `1..=n` are hard-trimmed exactly as before. The fix only moved the
 
 ## Finding 3 — `--boundary-anchored` removes the overshoot, at zero cost
 
-Opt-in, default off (`fd52adb`). Cuts the homopolymer run extent (the last
+Shipped opt-in at `fd52adb`; on by default since 0.4.0 (`--no-boundary-anchored`
+restores the old cut). Cuts the homopolymer run extent (the last
 matching base) instead of the mercy walk's `k_star`, dropping the ~2 bp flanking
 overshoot. Keeps error bases inside the run (the last match sits past them).
 Measured: heavy-tail overtrim 0.2444 → 0.2233, exact 0.2181 → 0.2392, undertrim
@@ -107,12 +116,14 @@ error). See `docs/OVERTRIM-CEILING.md`.
 
 ## Recommendation
 
-1. Ship `--boundary-anchored` (done, opt-in) — fixes the overshoot, free.
-2. Change the default `--head-dropout 4` → `1`, or make it per-mate. This is a
-   strictly-better default: +5–6 pp exact, no cost. **Superseded** — on the
-   full-corpus evidence the shipped default was instead set to `0`
-   (`3d76a31`), where `0` wins 100/101 datasets (`docs/OVERTRIM-SWEEP.md`);
-   `1` remains the recommended compromise for long-read regimes.
+1. Ship `--boundary-anchored` (done; on by default since 0.4.0) — fixes the
+   overshoot, free.
+2. Change the default `--head-dropout 4` → `1`, or make it per-mate. At a 1:1
+   error price this is a strictly-better default: +5–6 pp exact, no cost.
+   **Superseded** — the default was set to `0` (`3d76a31`), then reverted to
+   `4` in 0.4.1 on D-16's 7:1 price, which is the shipped default today;
+   `1` remains the compromise for long-read regimes and `0` is still reachable
+   as `--head-dropout 0`.
 3. Allow `--head-dropout 0` (done) and document that the right value is
    library-dependent.
 4. Do not ship the 3' quality rule on fastsim evidence alone.

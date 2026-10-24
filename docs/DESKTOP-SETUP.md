@@ -22,7 +22,7 @@ git clone https://github.com/RaphaelRibes/FastSuite.git
 
 ## 2. Install the pixi env (once)
 
-The root `pixi.toml` is the dev environment: rust >= 1.85, pkg-config,
+The root `pixi.toml` is the dev environment: rust `>=1.99,<2`, pkg-config,
 cmake, a C compiler, zlib and zstd (flate2's zlib-ng builds from source).
 
 ```fish
@@ -54,7 +54,7 @@ cd tools/fastcheck && python3 tests/differential.py ../../examples/runs/demo/sim
 ```
 
 `doctor` must list: fastcheck 0.1.0, fastdedup 1.3.0, fasthelper 0.1.0,
-fastmaps 0.1.0, fastprep 0.1.0, fastsim 0.1.0.
+fastmaps 0.1.0, fastprep 0.5.0, fastsim 0.1.0.
 
 ## 5. The bench harnesses
 
@@ -101,8 +101,8 @@ for cell in campaign/queue/*.cell
 end
 ```
 
-**Do not start the campaign yet** — the fitter's insert defect (STATUS.md
-"Known defects" #1) is being fixed; the pilot waits for it.
+**The campaign has already run** — the fitter's short-insert defect was fixed in
+the 2026-10-21 review round; see STATUS.md "Where the ML campaign stands".
 
 ## Notes
 

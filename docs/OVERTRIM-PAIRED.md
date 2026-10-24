@@ -11,6 +11,12 @@ fragment.
 Reproduce: `python3 bench/scripts/overtrim_paired.py all --out summary.json`
 (probe / sim / bench subcommands). Findings below are its measured output.
 
+All measurements in sections 1–6 were taken 2026-10-16, before D-18: the
+production-default runs used the then-shipped `0.9L` floor (the probe cohorts
+pin their own `--min-len`), the mercy clause still charged a run's own bases,
+and the anchored cut was not yet the default. They describe that build, not the
+shipped `0.67L` default with `--boundary-anchored` on.
+
 ## Verdict
 
 **The rule works when it applies, but it barely applies.** On the controlled
@@ -86,7 +92,7 @@ verify. Consequently (fastsim datasets, 20k pairs each, production defaults,
 
 (The published figure in docs/OVERTRIM-DIAGNOSIS.md — 66.5 / 29.5 / 4.0 at
 tol 0 — is the winner config's number; it is the *published* cross-generation
-figure, since shown invalid — the corrected shipped-default figure is
+figure, since shown invalid — the corrected 0.9L-era shipped-default figure is
 75.4 / 23.4 / 1.0, see `docs/TRIM-ACCURACY-DISCREPANCY.md`; the closest reproduction here is
 mandril with production defaults: 67.8 / 30.8 / 1.4. Configs differ in
 head-dropout and dedup; the before/after comparison above is internally
@@ -152,13 +158,17 @@ is capped by the overlap, not by the tooling.
    inside adapter windows — fastprep already detects adapters, so the
    information is available. The probe cohorts are pad-free by construction
    for this reason.
-3. **The 3' scan overshoots runs ≥ min_run (12) by 2-5 bases**, even on a
-   clean boundary, and the overshoot depends on flank G content (uniform
-   Q40: a pure-C flank + 20 G run is not trimmed at all; a random flank +
-   12 G run is trimmed 14-17). This is *not* the boundary ambiguity — it is
-   the quality-weighted scan's own boundary placement — and it is what makes
-   `tail_abuts` 0% exact at tol 0. It is largely invisible in the sim stats
-   because profile tails are mostly < 12. The diagnosis doc's "exact when
+3. **On the build measured here (`--boundary-anchored` off, `0.9L` floor) the
+   3' scan overshoots runs ≥ min_run (12) by 2-5 bases**, even on a clean
+   boundary, and the overshoot depends on flank G content (uniform Q40: a
+   pure-C flank + 20 G run is not trimmed at all; a random flank + 12 G run is
+   trimmed 14-17). This is *not* the boundary ambiguity — it is the
+   quality-weighted scan's own boundary placement — and it is what makes
+   `tail_abuts` 0% exact at tol 0. The shipped default now cuts at the matched
+   run extent (`--boundary-anchored` on since 0.4.0), so this overshoot is no
+   longer default behaviour; D-18 also stopped charging a run's own bases,
+   which removes the low-quality length cap. It is largely invisible in the sim
+   stats because profile tails are mostly < 12. The diagnosis doc's "exact when
    the boundary is not a G" was established on the 5' head-dropout path
    (runs 1..4); the 3' scan path behaves differently and deserves its own
    investigation.
@@ -186,9 +196,10 @@ on the single-mate path**, which never runs the rule (it needs both mates).
 
 ## 6. Recommendation
 
-Do not sell the paired rule as a fix for the 29.5%. On realistic insert
-distributions it removes <1% of the strict-tolerance overtrim and adds a
-small undertrim tail (adapter pads, collapse slots). It *is* a complete,
+Do not sell the paired rule as a fix for the strict-tolerance overtrim (29.5%
+was the retired published figure; the 0.9L-era default measured 23.4%). On
+realistic insert distributions it removes <1% of that overtrim and adds a small
+undertrim tail (adapter pads, collapse slots). It *is* a complete,
 zero-breakage fix for the short-insert regime (I ≤ L on most pairs), where
 the whole overtrim class is reachable — worth having as a paired-mode option
 for small-RNA/cfDNA libraries if such libraries enter the corpus. The
@@ -208,7 +219,8 @@ building the mode behind a flag and measuring it, rather than reasoning about it
 
 ## What was built
 
-`fastprep --pe-overlap` (default off). Detection is anchored and verified
+`fastprep --pe-overlap` (default `auto`: it runs only when an explicit adapter
+set is configured). Detection is anchored and verified
 (`tools/fastprep/src/pe_overlap.rs`, 12-base anchor, full-window verification,
 ambiguity refused) and the boundary is applied only when the adapter **starts
 exactly at** it. That last condition is the whole safety property:
@@ -234,8 +246,9 @@ trim decision.
 The pre-fix detector applied the overlap boundary as an adapter trim
 unconditionally, so any mate whose fragment was shorter than its read was
 trimmed to the insert **even with nothing ligated past it**. That is the same
-class of failure as the 4-base-overlap false trim that `--min-adapter-overlap 8`
-exists to prevent (~10% of clean reads, per its own help text), which is why the
+class of failure as the 4-base-overlap false trim that `--min-adapter-overlap`
+exists to prevent (8 at the time; 14 at the shipped `--adapter-error-rate 0.2`;
+~10% of clean reads, per its own help text), which is why the
 guard is not thresholded: any firing on adapter-free data is disqualifying.
 
 **The corpus cannot answer the value question**, for two independent reasons:
@@ -270,7 +283,8 @@ Two bugs, both found by measuring rather than reasoning:
 
 ## Status
 
-The mode ships **default off** and is safe by construction. Whether it earns its
+The mode ships in **default `auto`** — it runs only when an explicit adapter set
+is configured — and is safe by construction. Whether it earns its
 place is answered by Cell B (a synthetic cohort whose ground truth carries both
 G-runs and readthrough, so the scorer is not confounded) — see
 `docs/plans/2026-10-19_004500-pe-overlap-with-without.md`.
@@ -313,8 +327,9 @@ below-window readthrough mates.
 
 ## Verdict
 
-**`--pe-overlap` does not improve trimming and is not restored as a default.** It
-ships opt-in, and it is safe by construction — the boundary applies only when
+**`--pe-overlap` does not improve trimming and is not restored as an always-on
+stage.** It ships in `auto` mode (explicit adapter sets only), and it is safe by
+construction — the boundary applies only when
 adapter starts exactly at it, so it can never trim what the ordinary adapter path
 could not itself confirm. That property is worth keeping even though the feature
 is not: the guard is what turned a silent biology-trimming bug into a measured

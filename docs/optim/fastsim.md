@@ -1,6 +1,6 @@
 # fastsim — optimisation propositions
 
-Scope: `tools/fastsim/src` (3 681 lines, every file read). Nothing here is implemented.
+Scope: `tools/fastsim/src` (3 681 lines, every file read). What landed is listed under Status of this round.
 
 ## Status of this round
 

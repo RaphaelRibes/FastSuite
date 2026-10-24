@@ -91,9 +91,15 @@ renamed.
 
 ### fasthelper (new)
 
-Four subcommands: `run` (chain from `fastsuite.toml`), `report` (aggregate
-existing JSON), `doctor` (install check), `schema` (print the report contract).
-Zero non-`cargo` dependencies beyond `anyhow`, `clap`, `serde_json`, `toml`.
+Eight subcommands today: `run` (chain from `fastsuite.toml`), `concatenate`
+(alias `report`; aggregate existing JSON), `compare` (two report sets side by
+side), `check` (validate a run config, or a single report with `--report
+<json>`), `doctor` (install check), `install` (symlink the suite binaries, legacy
+names included), `schema` (print the report contract), `guard` (adapter-residual
+check on a trimmed FASTQ). It shipped with four (`run`, `report`, `doctor`,
+`schema`); `compare`, `check`, `install` and `guard` followed.
+Zero non-`cargo` dependencies beyond `anyhow`, `clap`, `serde`, `serde_json`,
+`toml`.
 
 ## 4. Compatibility status
 
@@ -102,5 +108,5 @@ Zero non-`cargo` dependencies beyond `anyhow`, `clap`, `serde_json`, `toml`.
 | existing command lines (`rpolyx -1 …`, `fdedup -1 …`, `novaseq-sim --out …`) | **no** — every old spelling is still accepted, either unchanged or as an alias |
 | `--compression` | accepted (alias of `--gz-level`) |
 | binary names on `$PATH` | yes — `rpolyx`/`fdedup`/`novaseq-sim` no longer exist under those names; the suite ships `fastprep`/`fastdedup`/`fastsim`. Symlinks are the migration path |
-| `--json` payloads | fastdedup/fastsim now emit the v1 wrapper; fastprep/fastmaps still emit their legacy shapes (fasthelper adapts both) |
+| `--json` payloads | all five emitters now write the v1 wrapper; `fastprep` keeps its raw stats object under `legacy`, and `fastmaps` still writes the grid to `<output-dir>/heatmap.json`. The legacy reader remains for older files (fasthelper adapts both) |
 | pipelines/cron calling `rpolyx` | need the symlink or the flag rename; both are one-liners |

@@ -83,7 +83,7 @@ enfin réduire les constantes.
 #block(fill: luma(243), inset: 8pt, radius: 3pt, width: 100%)[
   *Ce que ce dossier était, et ce qu'il est devenu.* Il a été écrit en lecture seule : aucun code
   touché, aucune mesure de campagne, les chiffres de gain estimés avec leur mécanisme. Trente-neuf
-  des soixante et onze propositions ont depuis été implémentées, et la section « Ce qui a été
+  des soixante-douze propositions ont depuis été implémentées, et la section « Ce qui a été
   implémenté » rapporte ce que la mesure en dit — y compris deux chiffres de ce dossier que la mise
   en œuvre a démentis.
 ]
@@ -434,11 +434,11 @@ temps, c'est la mémoire, et deux défauts de sortie se cachent dans le même ch
 // ---------------------------------------------------------------------------
 = Ce qui a été implémenté, et ce que la mesure en dit
 
-Trente-neuf des soixante et onze propositions ont été implémentées en une journée, en six commits
+Trente-neuf des soixante-douze propositions ont été implémentées en une journée, en six commits
 séparés, un par outil. La suite passe de 577 à 658 tests, tous verts, sans qu'aucun test existant ne
 soit modifié : les nouveaux tests sont des tests de non-régression écrits avant le changement, et
 l'un d'eux reproduit une divergence de sortie que personne n'avait vue — `fastdedup` écrivait CRLF à
-un thread et LF à quatre.
+un thread et LF à quatre. Elle en compte 852 aujourd'hui, tous verts (`scripts/expected-test-counts.txt`).
 
 #v(0.3em)
 #block(fill: luma(243), inset: 8pt, radius: 3pt, width: 100%)[

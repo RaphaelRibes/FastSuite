@@ -1,4 +1,4 @@
-# rpolyx implementation plan
+# fastprep implementation plan
 
 Target: a FASTX preprocessor that deduplicates, adapter-trims, polyX-trims and
 quality-filters in a single pass, and is **not slower than fastp** on any
@@ -19,7 +19,8 @@ slowdown is a regression.
    they predate everything below.
 2. **Output-identical by default.** Every speed change is either provably
    semantics-preserving or lives behind a flag. The one deliberate exception
-   is deduplication, which is new behaviour and is opt-in.
+   is deduplication, which is new behaviour and ships on by default
+   (`--no-dedup` turns it off).
 3. **One golden-output test guards all of it.** Freeze the output of the
    current build on a fixed 100k-read input; every phase must reproduce it
    byte for byte unless it changes semantics on purpose.
@@ -41,10 +42,10 @@ estimates into numbers, and may reorder the phases.
   10M-read slice, driven by `hyperfine`, wired into the existing pixi task.
 - Isolation runs, in this order:
   ```
-  rpolyx -1 in.fq  -o /dev/null --no-adapter --no-scan-5 --no-scan-3 --no-scan-interior
-  rpolyx -1 in.fq  -o /dev/null --no-adapter
-  rpolyx -1 in.fq  -o /dev/null
-  rpolyx -1 in.fq.gz -o out.fq.gz
+  fastprep -1 in.fq  -o /dev/null --no-adapter --no-5 --no-3 --no-interior
+  fastprep -1 in.fq  -o /dev/null --no-adapter
+  fastprep -1 in.fq  -o /dev/null
+  fastprep -1 in.fq.gz -o out.fq.gz
   ```
 - `perf stat -e cycles,instructions,branch-misses,cache-misses,LLC-load-misses`
   on the scan-only configuration.
@@ -61,10 +62,16 @@ are near-worthless and Phase 1 is the entire project.
 
 **Expected: 3–5× wall clock. This is almost certainly the largest single win.**
 
-The current `run_single` does decompress, parse and three heap allocations per
-read on the main thread, then compresses and writes on the same thread. Only
-`trim` runs on rayon. If trimming is 20% of the work, adding threads buys
-almost nothing, which matches the observed "slower than fastp".
+*(Landed in part: `run_single` streams recycled `ChunkBuf` arenas from the
+reading thread to a compute thread that runs rayon, with dedup and writing on
+the ordered thread. The zstd default (1.2) and byte-sized chunks (1.4) were not
+adopted: output compression still follows the extension and `--chunk` still
+counts records.)*
+
+The pre-phase code did decompress, parse and three heap allocations per read on
+the main thread, then compress and write on the same thread. Only `trim` ran on
+rayon. If trimming is 20% of the work, adding threads buys almost nothing,
+which matches the observed "slower than fastp".
 
 **1.1 Chunk arena (memory + speed)**
 
@@ -81,7 +88,7 @@ At 10⁸ reads this removes ~3×10⁸ allocations. `mimalloc` currently reduces
 the cost of each; this removes the count. Arenas are recycled through the
 return channel rather than freed, so steady-state allocation is zero.
 
-- Files: `pipeline.rs`, new `chunk.rs`.
+- Files: `pipeline.rs` (`ChunkBuf`; no separate `chunk.rs`).
 - Verify: `valgrind --tool=dhat` or `heaptrack` shows allocation count flat in
   read count; golden output unchanged.
 
@@ -166,7 +173,7 @@ on the serial thread, so re-measure after Phase 1.
 **2.3 Semantics and plumbing**
 
 - `DropReason::Duplicate`; PXMT status byte 7; **format version bump to 3**;
-  `pxmt` viewer updated to read v2 and v3.
+  `fastprep-meta` viewer updated to read v2 and v3.
 - `Stats::reads_dropped_duplicate` plus a row in the `causes` array.
 - Pair-level decision: a duplicate pair drops both mates, produces no
   singleton. Singletons are not deduplicated against a SE fingerprint space.
@@ -176,7 +183,7 @@ on the serial thread, so re-measure after Phase 1.
 - Anchor invariance: appending polyG tails of differing length to two copies of
   one read still yields one survivor.
 - PE ordering: R1[i] pairs with R2[i] at `-j 1` and `-j 16`.
-- PXMT: a v3 file round-trips through `pxmt`, and v2 files still read.
+- PXMT: a v3 file round-trips through `fastprep-meta`, and v2 files still read.
 
 **2.4 Memory projection (this is the only unbounded stage)**
 
@@ -218,17 +225,17 @@ boundaries are at `7 * 2^k / 8`, not at powers of two** (verified numerically):
 - **It is a step function.** Capacity 469,762,048 costs 4608 MB; 469,762,049
   costs 9216 MB. Report the projected **bucket count**, not only the byte
   total, so a user marginally over a boundary can act on it.
-- **`MAX_PREALLOC_ENTRIES = 500_000_000` is badly placed.** It sits 6% above
-  the 2²⁹ boundary, so it rounds to 2³⁰ buckets and the clamp itself projects
-  9216 MB where 4608 MB would do. Set it to `469_762_048`. Rounding it to a
+- **`MAX_PREALLOC_ENTRIES` was `500_000_000`, badly placed.** It sat 6% above
+  the 2²⁹ boundary, so it rounded to 2³⁰ buckets and the clamp itself projected
+  9216 MB where 4608 MB would do. It is now `469_762_048`
+  (`memory.rs::capacity_ceiling(29)`). Rounding it to a
   power of two, which an earlier draft of this plan advised, is *worse*: 2²⁹
   as a capacity also rounds up to 2³⁰ buckets.
 
-Free win: `estimate_sequence_capacity` sizes for **all** reads, but the table
-only holds **unique** ones. Scale by `(1 - expected_dup_rate)`. That ~10%
-reduction will often cross a bucket boundary downwards and halve the
-allocation. Take the rate from a flag, or from the sampled prefix already read
-for adapter auto-detection.
+Free win: `estimate_records` sizes for **all** reads, but the table only holds
+**unique** ones. Scale by `(1 - expected_dup_rate)`. That ~10% reduction will
+often cross a bucket boundary downwards and halve the allocation. Take the rate
+from a flag, or from the sampled prefix already read for adapter auto-detection.
 
 - Verify: `table_bytes` matches measured RSS within 2% at 10⁷, 10⁸ and 3×10⁸.
 
@@ -480,9 +487,9 @@ compute still dominant, which would be surprising.
 | Compression buffers | `threads × 1 MiB` | zstd multithread internal |
 | Gate / score LUTs | < 1 MB | shared read-only, per-CCD replication optional |
 | `AdapterSet` + finders | < 100 kB | `Arc`, one per process |
-| Fingerprint set | **Θ(unique reads)** | only unbounded stage; opt-in, admission-checked against the enforced limit (2.5), saturating rather than OOM-ing (2.6) |
+| Fingerprint set | **Θ(unique reads)** | only unbounded stage; on by default (`--no-dedup` opts out), admission-checked against the enforced limit (2.5), saturating rather than OOM-ing (2.6) |
 
-**Invariant to assert in CI:** without `--dedup`, peak RSS is independent of
+**Invariant to assert in CI:** with `--no-dedup`, peak RSS is independent of
 input size. Run 1M and 100M reads, assert RSS ratio < 1.2.
 
 ---
@@ -490,7 +497,7 @@ input size. Run 1M and 100M reads, assert RSS ratio < 1.2.
 ## Non-goals
 
 - **Do not port FastDedup's resume machinery.** Hash preloading, corrupted-file
-  detection and `set_len` truncation contradict rpolyx's crash-safety model,
+  detection and `set_len` truncation contradict fastprep's crash-safety model,
   which writes to `.part` and deletes on any error path. The two designs answer
   the same question in opposite ways; gluing them together produces a tool that
   sometimes resumes and sometimes discards depending on which stage failed.
@@ -545,7 +552,7 @@ Phase 6  SIMD Γ                       deferred
 Phases 3, 4 and 5 are independent of each other and of Phase 2. Phase 1 gates
 everything, and Phase 0 gates Phase 1.
 
-**Definition of done:** rpolyx is not slower than fastp on any cell of the
-Phase 0 benchmark matrix, peak RSS without `--dedup` is independent of input
+**Definition of done:** fastprep is not slower than fastp on any cell of the
+Phase 0 benchmark matrix, peak RSS with `--no-dedup` is independent of input
 size, and the property test asserting cascade/plain equivalence passes on
 10⁵ generated cases.

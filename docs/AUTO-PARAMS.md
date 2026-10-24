@@ -53,13 +53,16 @@ parse, never fire, and fall through to the default without saying so.
 
 The 90-dataset corpus campaign (the earlier `FastSuite-bench` campaign) swept the
 config grid over 90 datasets and found **one configuration best everywhere**
-(winner score median 0.969, 90/90 datasets). That configuration **is**
-fastprep's default, locked by `shipped_defaults_are_the_swept_winner` in
-`tools/fastprep/src/cli.rs`.
+(winner score median 0.969, 90/90 datasets). That configuration **was**
+fastprep's default. `shipped_defaults_are_the_swept_winner` in
+`tools/fastprep/src/cli.rs` still pins the knobs it shares, but two moved after
+the sweep — D-18 took `--min-len` to **0.67L** and D-16 took `--head-dropout` to
+**4** — so config 0 is the default *the sweep measured*, not the one 0.5.0
+ships.
 
 Phase D's real-library sweep does **not** reproduce that verdict, and this
 document records the correction rather than the original framing. Over 101 real
-ENA datasets in six domains the shipped default (config 0) is the per-dataset
+ENA datasets in six domains the sweep's default (config 0) is the per-dataset
 winner on **1 of 101**; a per-dataset winner from the grid beats it on **100 of
 101** (median winner score 0.9643, median gap vs default 0.0049 — 66 of 101
 datasets sit inside a 0.01 margin, 12 above 0.1). The default is a good *central*
@@ -134,10 +137,14 @@ why `--print-args` exists.
 The corpus is 101 datasets, not the 500 originally scoped. Six domains at ~17
 datasets each leaves 15–17 held-out studies per fold, and the fold-to-fold spread
 above (0.0010 to 0.1180) is the width of the uncertainty. The closed loop that
-produced the corpus scored **167/306 = 54.6 %**, with the per-position G-fraction
-gate the dominant failure (120 of 139 failing rows, against duplicate-ratio 18 of
-139) — that is a limit on the *labels*, and it does not go away with more
-modelling.
+produced the corpus has been re-measured on the current build: **183/306 =
+59.8 %** (62 of the loop's 102 libraries passing every variant, median
+per-position G-fraction difference 0.0093 against the 0.02 bound). The
+167/306 = 54.6 % this document first carried is retracted — it was inflated by
+duplicated v1/v2 artefacts (`docs/CLOSED-LOOP-RERUN.md`) — and on the re-run the
+per-position G-fraction gate appears in **121 of 123** failing rows, against
+**zero** duplicate-rate failures. That is a limit on the *labels*, and it does
+not go away with more modelling.
 
 ## Where it must not be trusted
 

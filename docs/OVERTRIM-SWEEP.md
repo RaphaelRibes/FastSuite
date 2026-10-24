@@ -1,9 +1,10 @@
 # The head_dropout axis: the sweep could not express 0, and 0 wins everywhere
 
-**Question.** The shipped `fastprep` default at the time (4 — it is now 0,
-commit `3d76a31`) trims a fixed 5' dropout of `head_dropout=4` bases before the
-polyX scan. The config sweep never tested whether that default was right — so
-this phase measured it. Two bugs guaranteed the answer was invisible:
+**Question.** The shipped `fastprep` default at the time (4; it was briefly 0
+after `3d76a31` and is 4 again since 0.4.1, D-16) trims a fixed 5' dropout of
+`head_dropout=4` bases before the polyX scan. The config sweep never tested
+whether that default was right — so this phase measured it. Two bugs guaranteed
+the answer was invisible:
 
 1. `effective_head_dropout()` in `bench/scripts/sweep.py` floored the value at
    1 (`max(1, min(hd, min_run - 1))`), so the grid could **never** express
@@ -24,6 +25,12 @@ cap still applies (6 at `min_run=2` → 1), 0 survives the cap, every grid
 config emits the flag, and the emitted value equals the recorded value.
 
 ## What was measured
+
+Measured 2026-10-16, before D-18: every run used the winning config's own
+`min_len` (the then-shipped `0.9L` floor on most datasets; the short-read
+configs carry explicit 30/50 bp or `0.5882L` floors) and the pre-D-18 mercy
+clause, so the tables below are measurements of that build, not of the `0.67L`
+default.
 
 Not a re-run of the 57-config grid. For each of the **101 datasets with a
 winning config** (`bench/results/phase-d/winners.tsv`; 102 corpus dirs exist —
@@ -114,12 +121,13 @@ its accuracy by discarding data.
 ## What propagates
 
 - **The default question is settled by the corpus numbers, and now also by
-  per-dataset selection:** `head_dropout 0` is the right default on this
-  corpus (100/101 datasets, +17.2 pp exact at tol 0, 3.3x lower total error).
-  The paper's configuration table should record `head_dropout=0` for fastprep,
-  and the default it shipped at the time (4) is badly wrong for these artefact
-  regimes — it eats 23.4 % of kept windows. (`0` has since become the shipped
-  default, `3d76a31`.)
+  per-dataset selection:** `head_dropout 0` wins on this corpus (100/101
+  datasets, +17.2 pp exact at tol 0, 3.3x lower total error) *at a 1:1 error
+  price*. A paper reporting that price should record `head_dropout=0` for
+  fastprep; the default it shipped at the time (4) is badly wrong for these
+  artefact regimes — it eats 23.4 % of kept windows. **The shipped default did
+  not end up here:** `0` held only from `3d76a31` to 0.4.1; D-16 re-priced
+  undertrim at 7:1 and put `4` back, which is the default today.
 - The closed loop must treat `head_dropout` as a real axis from 0:
   `effective_head_dropout` now floors at 0, and any future sweep grid that
   authors 0 will actually run it. hd=1 is worth keeping as a candidate for

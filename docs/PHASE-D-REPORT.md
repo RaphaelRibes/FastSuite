@@ -2,7 +2,7 @@
 
 > **Superseded (2026-10-16).** This is a point-in-time record from 2026-10-15.
 > The closed loop later reached **167/306 = 54.6%** (52 of 102 datasets passing
-> every variant), not the 113/306 recorded here, and the suite is now **466** on
+> every variant), not the 113/306 recorded here, and the suite is now **852** on
 > the `scripts/test.sh` GRAND line (not 461). Authoritative closed-loop figure:
 > `bench/results/phase-d/closed_loop.tsv`. Current state: `docs/STATUS.md`.
 
@@ -185,7 +185,7 @@ Faster on **100/101** datasets (median 2.00×), less memory on **101/101** (33×
 
 **The honest counterweight:** fastprep keeps fewer reads on 98/101 (median −5.1 pp) because **81 of 101** winners carry a *relative* length floor above 0.5L while fastp's default is an *absolute* 30 bp. That is a difference of contracts, not of trimming quality, and it is stated as such in the FastPrep paper rather than buried.
 
-Also stated plainly in the FastPrep paper: the **shipped default wins on only 1 of 101** datasets (DRR455998), against the "90/90" the earlier corpus campaign suggested.
+Also stated plainly in the FastPrep paper: the **shipped default wins on only 1 of 101** datasets (DRR455998), against the "90/90" the earlier corpus campaign suggested. That comparison was measured against the 0.4.x default, before D-18 set `--min-len` to 0.67L.
 
 ---
 

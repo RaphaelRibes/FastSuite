@@ -2,7 +2,7 @@
 
 Scope: `tools/fastprep/src` (9 792 lines; `algorithm.rs`, `adapter.rs`, `pipeline.rs`, `io.rs`,
 `cli.rs`, `dedup.rs`, `pe_overlap.rs`, `memory.rs`, `stats.rs`, `main.rs` all read) plus the
-committed bench artifacts. Nothing here is implemented.
+committed bench artifacts. What landed is listed under Status of this round.
 
 ## Status of this round
 
@@ -418,9 +418,10 @@ removes the last heap allocation from the steady-state trim output.
 
 ## What is already good (do not break these)
 
-- **The two-tier cascade fires.** With `min_len 0.9 L` at L = 151, `rem_budget = 15 > w = 14`, so a
+- **The two-tier cascade fires.** With `min_len 0.67 L` at L = 151, `rem_budget = 50 > w = 14`, so a
   clean read skips the whole Γ walk (`algorithm.rs:971-996`) and pays two 14-pair window checks plus
-  one quality sum. Fragile by exactly one base: at `0.92 L` the guard fails and every read walks.
+  one quality sum. At the former `0.9 L` default the margin was a single base — `0.92 L` fails the
+  guard and every read walks.
 - **The quality gate is a LUT**, no `powf` in the loop (`algorithm.rs:301-325`), and direction is
   monomorphised (`streaming_walk::<FORWARD>`), replacing what the comment calls a 10 %-of-runtime
   branch.

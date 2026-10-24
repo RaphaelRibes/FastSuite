@@ -315,8 +315,8 @@ artefact's mass **at** each position, and `deconvolve_frame` then divides by
 `P(0)` **across** positions, so the correction is applied twice. This is the same
 double-subtraction failure class as attempt 1, reached from the other side.
 
-The work was reverted rather than committed: `tools/fastsim` is untouched at 67
-tests and the gate is unchanged at 3/51.
+The work was reverted rather than committed: `tools/fastsim` is untouched (93
+tests today) and the gate is unchanged at 3/51.
 
 ### What the obstacle actually is
 

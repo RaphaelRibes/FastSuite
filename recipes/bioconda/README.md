@@ -23,7 +23,7 @@ so bumping one tool does not force a release of the other five.
 one is a 404, including in `fill-sha256.sh`.
 
 ```fish
-for t in fastcheck-v0.1.0 fastdedup-v1.3.0 fastprep-v0.2.0 \
+for t in fastcheck-v0.1.0 fastdedup-v1.3.0 fastprep-v0.5.0 \
          fastsim-v0.1.0 fastmaps-v0.1.0 fasthelper-v0.1.0
     git tag $t
     git push origin $t
@@ -68,9 +68,9 @@ six usually draws a request to split anyway.
   Ribes' own work.
 - **No data ships.** Every `test:` section runs `--version` and a synthetic
   fixture built inline in the recipe (D-11).
-- `fastprep` is at **0.2.0**, not 0.1.0: changing a shipped default
-  (`--head-dropout` 4 → 0) is a behaviour change, so it is a minor bump. The
-  other five are unchanged.
+- `fastprep` is at **0.5.0**, not 0.1.0: changing a shipped default is a
+  behaviour change, so it is a minor bump (`--min-len` 0.9L → 0.67L, D-18), as
+  is a new flag (`--auto-params`, 0.5.0). The other five are unchanged.
 
 ## When a tool is bumped
 

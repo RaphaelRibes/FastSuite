@@ -306,9 +306,11 @@ paired-end boundary path:
     semantics], [correctness wart], [none],
   ),
   caption: [Ranked fixes. Deliberately rejected: global floor or `eps`
-  lowering (figure 2) and `--head-dropout` revival (it overtrimmed real
-  sequence; its default is correctly 0). Every fix ships with *both* axes
-  measured --- a proposition quoted on undertrim alone is not a measurement.],
+  lowering (figure 2), and `--head-dropout` as an undertrim remedy --- it
+  over-trims real sequence, and since D-16 (2026-10-22) the shipped default is
+  4, a priced 7:1 choice rather than a free lever. Every fix ships with *both*
+  axes measured --- a proposition quoted on undertrim alone is not a
+  measurement.],
 ) <fig-fixes>
 
 = Position against fastp

@@ -1,7 +1,8 @@
 # Reducing fastprep's undertrimming — measured mechanisms and ranked fixes
 
-Round 2 of the optimisation audit, 2026-10-21. **Proposals only: nothing here is
-implemented.** Every number is [M] measured on the built release binary with the
+Round 2 of the optimisation audit, 2026-10-21. **Proposals only: none of these
+became a default.** UT-1..UT-4 now exist behind opt-in flags (§5); none changed a
+default. Every number is [M] measured on the built release binary with the
 artifacts in `bench/results/undertrim-*.json` (reproduce with
 `bench/scripts/undertrim_{probe,probe_pe,probe_pe_detect,ab}.py`), [E] estimated
 with the pricing A/B named, or [V] verified by reading the cited line.
@@ -258,10 +259,10 @@ conservative and is the recommended operating point).
   sub-floor tails, not in N-heavy tails. It is a capability for N-heavy data.
 
 **What the measurement wave established, positively:**
-the shipped path is unchanged and green (`pixi run ci`: 762 passed, 0 failed);
-every new capability is opt-in; the one arm that fails the false-trim gate
-(factor 5) is recorded in the artifact next to the arms that pass, so the
-trade-off is visible rather than hidden.
+the default path is unchanged by these flags and the suite is green
+(`pixi run ci`: 852 passed, 0 failed); every new capability is opt-in; the one
+arm that fails the false-trim gate (factor 5) is recorded in the artifact next
+to the arms that pass, so the trade-off is visible rather than hidden.
 
 ### Cell A — the hard gate on the real corpus, for BOTH behaviour changes
 
@@ -438,8 +439,10 @@ contract bug.
 ### Deliberately not proposed
 
 * Global `min_overlap` / `eps` lowering (section 2).
-* Re-introducing `--head-dropout`-style recovery: it overtrimmed real sequence
-  and its default was correctly cut to 0 (see `docs/OVERTRIM-*`).
+* Re-introducing `--head-dropout`-style recovery: it overtrimmed real sequence.
+  The current default is **4** (D-16's 7:1 price) and has been since the 0.4.1
+  release, after a brief 0 at `3d76a31`; `--head-dropout 0` is the opt-out (see
+  `docs/OVERTRIM-*`, `docs/DECISIONS.md` D-16).
 * M4's eps raise.
 
 ## 4. Validation protocol

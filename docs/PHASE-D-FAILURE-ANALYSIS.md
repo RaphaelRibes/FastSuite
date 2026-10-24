@@ -2,7 +2,7 @@
 
 > **Superseded (2026-10-16).** This is a point-in-time record from 2026-10-15.
 > The closed loop later reached **167/306 = 54.6%** (52 of 102 datasets passing
-> every variant), not the 113/306 recorded here, and the suite is now **466** on
+> every variant), not the 113/306 recorded here, and the suite is now **852** on
 > the `scripts/test.sh` GRAND line (not 461). Authoritative closed-loop figure:
 > `bench/results/phase-d/closed_loop.tsv`. Current state: `docs/STATUS.md`.
 
@@ -77,6 +77,10 @@ Medians: `g_frac_max_diff` 0.0157 (tol 0.02), `mean_q_diff` 0.1494 (tol 0.50), `
 ---
 
 ## 3. The remaining duplicate-rate gap — diagnosed, not yet fixed
+
+> **Partly resolved (2026-10-16).** The detection shortfall (b) was fixed in
+> `781c396`: a duplicate copy is now sequence-identical to its original. The
+> numbers below are the 2026-10-15 diagnosis; see `docs/DUP-MECHANISM.md`.
 
 122 rows still fail `dup_ratio`. **The simulator is lower on all 122**, so this is a genuine model gap, not residue from the fixed bugs. Isolating it on DRR000466 with a freshly fitted profile:
 

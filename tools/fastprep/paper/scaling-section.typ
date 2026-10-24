@@ -73,14 +73,15 @@ threads, serially, on an otherwise idle host.
 ) <fig:thread-scaling>
 
 The two tools do not scale alike, and the difference is not a constant factor.
-fastprep's speedup rises monotonically with size and is still climbing at 100
-million pairs; fastp's flattens after 10 million and never exceeds 2.4×. The
-reason is where each tool's single-threaded time goes. fastp's trimming loop is
-already parallel, so its one-thread run is not proportionally slower; what four
-threads buy is output compression, which is capped by the gzip level and by the
-fact that a single writer thread remains. fastprep's one-thread run is the
-pessimistic case — its scan is chunked and its writer is per chunk — so the same
-four threads recover most of what the single thread lost.
+fastprep's speedup rises with size — 2.75× at 500 thousand pairs against 3.64× at
+100 million, with a dip at 5 million — and is still climbing at the largest size;
+fastp's never exceeds 2.4× and takes most of its ground between 10 and 50
+million. The reason is where each tool's single-threaded time goes. fastp's
+trimming loop is already parallel, so its one-thread run is not proportionally
+slower; what four threads buy is output compression, which is capped by the
+gzip level and by the fact that a single writer thread remains. fastprep's
+one-thread run is the pessimistic case — its scan is chunked and its writer is
+per chunk — so the same four threads recover most of what the single thread lost.
 
 The crossover is visible in the first row. At 500 thousand pairs fastprep's
 one-thread run costs #fixed(time-fastprep-1t.at(0), n: 1) s against fastp's
@@ -149,7 +150,7 @@ aggregate of those per-dataset rows, which is the number to compare against
 
 #figure(
   groupedbars(
-    ("fastp-default", "fastp-tuned", "fastprep-hd0", "fastprep-hd4"),
+    ("fastprep-hd0", "fastprep-hd4", "fastp-default", "fastp-tuned"),
     (
       ("exact", sc-exact, (dec3-hd0.at(0), dec3-hd4.at(0), dec3-def.at(0), dec3-tun.at(0))),
       ("overtrim", sc-over, (dec3-hd0.at(1), dec3-hd4.at(1), dec3-def.at(1), dec3-tun.at(1))),
@@ -169,9 +170,9 @@ This run is independent of the Phase D harness — different host, different
 invocation, per-dataset rather than corpus-wide posterior — and it reproduces the
 Phase D decomposition to within 0.02 points on every column of `fastprep-hd0`
 and to within 0.12 on `fastp-default`. That agreement is the point of running it:
-the decomposition is not an artefact of one harness. The two configurations that
-do not reproduce are the two that were deliberately misconfigured.
-`fastprep-hd4` over-trims #fixed(dec3-hd4.at(1), n: 1)% of mates and
-`fastp-tuned` #fixed(dec3-tun.at(1), n: 1)%, both far above their counterparts,
-and both at the cost of exactness — the same trade visible in @fig:trim-decomp
-and unchanged by the move to per-dataset scoring.
+the decomposition is not an artefact of one harness. The two aggressive
+configurations are where the two runs differ: `fastprep-hd4` over-trims
+#fixed(dec3-hd4.at(1), n: 1)% of mates and `fastp-tuned`
+#fixed(dec3-tun.at(1), n: 1)%, both far above their counterparts, and both at
+the cost of exactness — the same trade visible in @fig:trim-decomp and
+unchanged by the move to per-dataset scoring.

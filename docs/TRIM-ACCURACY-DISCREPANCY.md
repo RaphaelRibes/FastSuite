@@ -165,10 +165,14 @@ truth. Its fastp rows are valid.
 All four repairs below landed in commit `73c2385` ("bench: fix the three
 trim-accuracy defects; re-run the four-tool comparison"). `trim-accuracy.tsv`
 is left in place untouched as superseded; the authoritative table is
-`overtrim-vs-fastp.tsv`, regenerated over all 101 datasets at both tolerances.
-Its corrected tolerance-0 headline: **shipped default 75.35%** (was 75.59%
-before the `_minlen` repair), **fastprep-hd0 92.60%**, **fastp-default 92.19%**,
-**fastp-tuned 84.06%**.
+`overtrim-vs-fastp.tsv`, regenerated over all 101 datasets of that corpus at
+both tolerances (the current table covers 102).
+Its corrected tolerance-0 headline on that corpus: **shipped default 75.35%**
+(was 75.59% before the `_minlen` repair), **fastprep-hd0 92.60%**,
+**fastp-default 92.19%**, **fastp-tuned 84.06%**. These figures are
+**historical**: the corpus was regenerated again afterwards, and
+`docs/TRIM-ACCURACY.md` carries the current 102-dataset table (75.5 / 89.1 /
+88.6 / 80.4), measured at the pre-D-18 `0.9L` floor.
 
 1. **Staleness guard — applied.** `trim_accuracy.py` now refuses to score a
    PXMT older than the sim it is scored against (mtime guard), so a regenerated

@@ -12,7 +12,7 @@ zipped HTML bundle.
 ---
 
 
-## 0. Phase 1–2 status: implemented, measured (`tools/fastcheck`)
+## 0. Phase 1–5 status: implemented, measured (`tools/fastcheck`)
 
 **Update 2026-10-12 — what shipped after this plan was written:** the rich
 report (polyX run-length distributions per base, bounded repeated-sequence
@@ -21,18 +21,21 @@ side-by-side via `--processed-1/--processed-2`), the `--profile` fitter (a
 fastsim profile written directly from the run's measurements — the QC→sim
 coupling this plan's §6 anticipated, now in Rust with no Python fit step),
 and the MultiQC-style HTML report (inline SVG, no JS, accessible tabs).
-fastcheck now has 54 tests plus the Python differential harness below.
-**What remains is phases 3–5 of this document** — `--overrep-mode`,
-`--max-mem` admission, adapter-per-position, per-tile modules, `--only`
-gating and the ground-truth recovery test — now written up as TDD tasks in
-`docs/plans/2026-10-12_fastcheck-exactness.md`.
+fastcheck now has **143 tests** plus the Python differential harness below.
+**Phases 3–5 have since landed** — `--overrep-mode` (all four modes), `--max-mem`
+admission, `--adapter-content`, `--tiles` and `--only` all ship with integration
+tests (`docs/plans/2026-10-12_fastcheck-exactness.md`, tasks 5–14). The one gate
+that is not green is the ground-truth recovery test of §7.3: it exists
+(`tools/fastcheck/tests/ground_truth.py`, `pixi run ground-truth`) and stops
+before the first check when run today, because fastsim's `gt.tsv` carries 14
+columns (`r1_full`, `r2_full`) and the test still asserts a 12-column header.
 
 Built: one-pass reader (plain / `.gz` / BGZF block-parallel via `gzp`), exact
 integer counters, basic statistics, per-position base + N + quality matrices,
 per-read mean-Q and length histograms, exact quality-byte census with an
 explicit Phred-offset verdict, `--reads`/`--bytes` budgets with self-declared
 partial runs, `fastsuite.report.v1` JSON, per-position TSV, memory projection
-printed before the numbers. 23 tests, plus a differential harness against an
+printed before the numbers. **143 tests**, plus a differential harness against an
 independent Python implementation (`tests/reference_qc.py` +
 `tests/differential.py`) that compares **every** metric, both histograms and all
 150 per-position rows: identical on the 6-read fixture and on 20 000 real reads
@@ -67,9 +70,10 @@ What that says honestly:
 * Memory is flat in dataset size: 15.6 MB peak RSS regardless of file size, and
   the accumulator state is printed (0.3 MB per file at R=150).
 
-Still open from the phase list: duplication/over-representation/adapters/k-mers
-/ per-tile modules (phases 3-4), and the `fasthelper` step + HTML wiring
-(phase 5).
+Closed since: duplication/over-representation (`--overrep-mode`),
+adapter-per-position (`--adapter-content`), k-mers, per-tile modules (`--tiles`),
+and the phase-5 wiring (`fasthelper`'s `fastcheck` step + the inline-SVG HTML
+report).
 
 ---
 

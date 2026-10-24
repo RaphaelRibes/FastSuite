@@ -182,6 +182,9 @@ record per read; the dedup block reports the window actually used.
   `bench/scripts/prove_hd_default.py`, which refuses a dataset where the two
   agree because that would prove nothing.
 
+* **Correction:** `--pe-correct` shipped in this release; its description and
+  measurements sit at the end of the 0.5.0 section above.
+
 ## 0.4.0
 
 * **DEFAULT — `--boundary-anchored` is now on.** The polyX end cut trims exactly

@@ -69,10 +69,13 @@ Rules:
 2. Short flags are a scarce resource: `-1 -2 -o -p -j -q -v -f -V -h` are the
    suite's; anything else a tool uses for its own options (`fastdedup -t`
    threshold, `-H` hash, `-P` read length) stays tool-local.
-3. `--threads 0` means "all available cores" everywhere (fastdedup already does
-   this; fastprep/fastmaps treat 0 as 1 today — gap listed below).
-4. Success is exit 0; a correct refusal (e.g. fastprep declining to guess an
-   adapter) is a non-zero exit **with a message on stderr saying what to pass**.
+3. `--threads 0` means "all available cores" everywhere (fastdedup and fastmaps
+   already do this; fastprep treats 0 as 1 today — gap listed below).
+4. Success is exit 0; a correct refusal (e.g. fastprep under `--strict`
+   declining to guess an adapter) is a non-zero exit **with a message on
+   stderr saying what to pass**. Without `--strict`, a detection that returns
+   nothing is the safe action: exit 0, the assumption recorded in the report
+   and printed on stderr (D-6).
 5. Every tool prints its end-of-run summary as a single line starting with
    `<tool>: `, and `--quiet` suppresses it.
 
@@ -113,7 +116,7 @@ Legend: **✓** already conforms · **+** added in this reorganisation ·
 | `-1 -2 -o -p` | ✓ | already `--in1/--in2/--out1/--out2` |
 | `-j --threads` | ✓ | `1` = serial; `0` not yet accepted |
 | `--gz-level` | → | `--compression` and `-c` aliases |
-| `--json` | ✓ | writes the legacy stats object; wrapper pending (§4) |
+| `--json` | ✓ | emits the `fastsuite.report.v1` wrapper, with the legacy stats object preserved under `legacy` (§4 item 1) |
 | `--auto-params` | ✓ | recommends the trimming config from a `fastcheck --json` report of the input, then applies it (an explicit knob always wins) or, with `--print-args`, prints the argv to **stdout** and the rule + measured acceptance to stderr. The model is a decision list (`fastsuite.auto-params.v1`) embedded in the binary; `--model PATH` / `$FASTPREP_MODEL` override it. Refuses: a model with an unknown schema tag, an unknown feature name, an unconditional rule before the last one, an out-of-range knob, a QC report with no numeric metrics. Measured in `docs/MODEL-CARD-auto-params.md`; the walk is byte-identical to the trainer's Python reference on all 102 real QC reports. |
 | `--temp-dir` | gap | uses its own chunking, no spill flag |
 | `-v --verbose` | gap | fastprep has no `-v`: `-q` exists and warnings/errors always print, but there is no per-step verbosity level. Listed as a suite-wide gap rather than claimed. |
@@ -121,7 +124,7 @@ Legend: **✓** already conforms · **+** added in this reorganisation ·
 | `--dry-run` | ✓ | every counter computed, nothing written; the report is still emitted |
 | `-q --quiet` | ✓ | suppresses the summary stream; warnings and errors still print |
 | `--pe-overlap` | + | paired-end only, **default `auto`**: infer the adapter boundary from the mate pair's own overlap (R1's 3′ suffix vs the reverse-complement R2 prefix) and trim from there. Takes a mode — `never` (the mode never runs), `auto` (**the default**; runs only when an explicit adapter set is configured, i.e. `--adapter-preset` or `--adapters`; off with auto-detection or `--no-adapter`, because the safety guard needs a set to check the boundary against), `always` (runs whenever an overlap is detected, even with no adapter set — the caller explicitly opts in). The bare spelling `--pe-overlap` (no value) is accepted as an alias for `always`, so existing invocations that asked for the mode keep working. Byte-identical to the pre-flag behaviour on every pair where detection returns nothing — no overlap, no anchor, a chance anchor hit, or an ambiguous (more than one admissible) alignment — and on any run whose mode resolved to `never`. The detector anchors on a 12-base match and verifies the whole shared window. A boundary is applied **only if** the readthrough past it is adapter sequence from the configured set, starting exactly at the boundary; with no set configured the mode refuses a boundary outright, structurally, so even `--pe-overlap=always` cannot trim biology. Refuses in single-end mode. The value is unmeasured on real libraries: the 102-dataset corpus has no adapter readthrough at all (`adapter.mode: none`; 0.01–0.26% of mates carry adapter), so it is a guard, not a value test (`docs/plans/2026-10-19_004500-pe-overlap-with-without.md`). |
-| tool-local | `--metadata`, `--singletons1/2`, `--adapter-preset`, `--adapters`, `--no-adapter`, `--min-len`, `--mercy`, `--phred-sat`, `--gate-shape`, `--match-leniency`, `--mismatch-strength`, `--min-run`, `--head-dropout`, `--min-adapter-overlap`, `--adapter-error-rate`, `--mean-q`, `--phred-offset`, `--auto-phred`, `--trim-5/3`, `--chunk`, `--zst-level`, `--gz-threads`, `--dedup*`, `--boundary-anchored`, `--overtrim-margin`, `--short-tail-longest`, `--pe-ambiguous-smallest` | |
+| tool-local | `--metadata`, `--singletons1/2`, `--adapter-preset`, `--adapters`, `--no-adapter`, `--min-len`, `--mercy`, `--phred-sat`, `--gate-shape`, `--match-leniency`, `--mismatch-strength`, `--min-run`, `--head-dropout`, `--min-adapter-overlap`, `--adapter-error-rate`, `--mean-q`, `--phred-offset`, `--auto-phred`, `--trim-5/3`, `--chunk`, `--zst-level`, `--gz-threads`, `--dedup*`, `--boundary-anchored`, `--overtrim-margin`, `--short-tail-longest`, `--pe-ambiguous-smallest`, `--pe-correct [GATE]`, `--pe-correct-min-overlap`, `--auto-params <QC.json>`, `--print-args`, `--model <PATH>` | |
 
 ### fastsim (ex-novaseq-sim)
 
@@ -158,8 +161,10 @@ each writing its own report. This is intentional:
 * every step is restartable and its log/exit code is recorded by `fasthelper`;
 * the shared flags make the chain trivially scriptable without a runner.
 
-`fastprep --dedup` exists for the single-binary case; **when fasthelper runs the
-chain it uses `fastdedup` + `fastprep --no-dedup` semantics instead**, so the
+`fastprep --dedup` exists for the single-binary case; when `fasthelper` runs the
+chain, dedup is decided by the step args it forwards — the runner adds only the
+shared flags (and `--force` under `run --force`). Passing `[steps.fastprep] args
+= ["--no-dedup"]` gives the `fastdedup` + `fastprep --no-dedup` split, so the
 deduplication rate is reported by the tool that owns the fingerprint table.
 
 ## 4. Known gaps (conformance backlog)
@@ -177,7 +182,9 @@ Ordered by user-visible value:
 5. ~~`--quiet` in **fastprep**/**fastmaps**.~~ **Done** (fastmaps gained `-q`).
 6. `FASTSUITE_THREADS` honoured as a default by all four binaries. **fastsim
    done 2026-10-12** (read when `-j` is absent; the value is reported-and-ignored
-   because the simulator is single-threaded); fastprep/fastmaps/fastdedup to do.
+   because the simulator is single-threaded); **fastmaps done** (read when `-j`
+   is 0 or absent, clamped by the file count; `-j 0` is all cores); fastprep and
+   fastdedup to do.
 7. `-`/stdin-stdout support (streaming mode) — **fastdedup done** (2026-10-12:
    `-` on `-1/-2/-o/-p`, plus `--out-format`/`--out-compression`); fastprep and
    fastmaps remain, needed to compete with `fastp`'s pipe usage.
@@ -198,6 +205,11 @@ Ordered by user-visible value:
 * `--only <module>` gating — the parser materialises only what enabled
   modules need.
 * ground-truth recovery test (PLAN-QC §7.3) — the decisive correctness gate.
+
+Status (2026-10-23): the first five are no longer gaps — `--max-mem`,
+`--overrep-mode none|fingerprint|second-pass|table` (default `none`),
+`--adapter-content`, `--tiles` (off by default) and `--only <module>` all exist
+in `fastcheck --help` today.
 
 ## 5. Compatibility promises
 
