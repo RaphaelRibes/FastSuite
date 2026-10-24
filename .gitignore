@@ -29,7 +29,10 @@ fastp.html
 fastp.json
 
 # Snakemake run state (regenerated per sweep, machine-local)
-.snakemake/
+# `**/` so the per-workflow dirs (bench/optim/, bench/snakefile/) are covered
+# too: they hold locks, logs and metadata keyed by absolute paths, i.e. state
+# that is local to one machine and must never enter the repo or a sync diff.
+**/.snakemake/
 
 # built papers (generated from paper.typ, never committed)
 tools/*/paper/*.pdf
