@@ -536,11 +536,10 @@ pub fn scan(
             matches += 1;
             // The matching pair (start+k, start+k+1) confirms the run reaches
             // offset k+1; the run extent from `start` is therefore k+2 bases.
-            // Only tracked when the boundary-anchored cut will consume it, so
-            // the default whole-run path does no extra work.
-            if params.boundary_anchored {
-                run_span = k + 2;
-            }
+            // Tracked unconditionally: the budget stop below resolves a
+            // qualifying run to its extent, and that path is not only the
+            // boundary-anchored one.
+            run_span = k + 2;
         }
         k += 1;
         if gamma > params.mercy {
@@ -1477,8 +1476,21 @@ fn polyx_trim_inner(
         // deleted clean reads as polyX 3′ (the 5′ twin of this bug lives in
         // `streaming_walk`). Below `min_run` matches the run is not a run, so
         // it resolves to no trim and the read is kept on its merits.
+        //
+        // Above `min_run` the opposite mistake was just as expensive: when the
+        // walk spends the last of its budget on the flank instead of the run,
+        // the run is real, ends before the cap, and must be cut. Reproduced at
+        // the shipped defaults on a 151 bp read (0.67L => Δ_L = 50): a 48-base
+        // 3′ polyA artefact stopped at `matches = 47, mode = Budget` and was
+        // emitted whole, while a 47-base one was trimmed — non-monotone in
+        // artefact length. The cut is the run extent, never `k_star` (which at
+        // a budget stop includes the flanking walk).
         if res.mode == StopMode::Budget {
-            0
+            if res.matches + 1 >= params.min_run {
+                res.run_span
+            } else {
+                0
+            }
         } else {
             resolve_trim(res, params.min_run, params.boundary_anchored)
         }
@@ -3408,3 +3420,4 @@ mod tests {
         assert_eq!(cut, 14, "the default extends nothing");
     }
 }
+

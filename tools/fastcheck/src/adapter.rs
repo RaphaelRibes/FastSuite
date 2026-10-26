@@ -73,6 +73,13 @@ impl AdapterSet {
 }
 
 /// Result of a match: which adapter, and where it starts.
+///
+/// Test-only, like the seeded matcher below it: fastcheck's runtime path counts every
+/// match start (`all_matches`, for --adapter-content) and never asks for the leftmost
+/// one. The matcher is kept because it is the D-1 cross-tool reference the agreement
+/// tests hold fastprep's semantics to, and because `all_matches` shares its mismatch
+/// rule — but nothing in the shipped binary calls it, so it is compiled only for tests.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterMatch {
     pub name: String,
@@ -83,7 +90,9 @@ pub struct AdapterMatch {
 }
 
 /// Byte -> 2-bit base code (0=A, 1=C, 2=G, 3=T; anything else -> 3, a wildcard that may
-/// spuriously seed and is rejected by the mismatch count).
+/// spuriously seed and is rejected by the mismatch count). Test-only: the seed index is
+/// part of the matcher below, which no runtime path calls.
+#[cfg(test)]
 static BASE2: [u8; 256] = {
     let mut t = [3u8; 256];
     t[b'A' as usize] = 0;
@@ -97,6 +106,7 @@ static BASE2: [u8; 256] = {
 };
 
 /// 2-bit encoding of a 6-mer into a 12-bit code.
+#[cfg(test)]
 #[inline]
 fn seed_code(bases: &[u8]) -> u32 {
     let mut code: u32 = 0;
@@ -108,6 +118,7 @@ fn seed_code(bases: &[u8]) -> u32 {
 
 /// Smallest overlap length for which the 6-mer guarantee holds, per adapter.
 /// `usize::MAX` = never (e.g. a high error rate).
+#[cfg(test)]
 fn min_sound_k(adapter_len: usize, error_rate: f64) -> usize {
     for k in 1..=adapter_len {
         let max_mm = (k as f64 * error_rate).ceil() as usize;
@@ -138,6 +149,9 @@ fn mismatches_upto(a: &[u8], b: &[u8], cap: usize) -> usize {
 ///
 /// Returns `None` when no adapter matches anywhere under the set's thresholds — which is
 /// the common case for a clean read, and the reason the seed index exists.
+///
+/// Test-only: see `AdapterMatch`. The runtime path uses `all_matches`.
+#[cfg(test)]
 pub fn match_at(seq: &[u8], set: &AdapterSet) -> Option<AdapterMatch> {
     let l = seq.len();
     let max_p = l.saturating_sub(set.min_overlap_se);

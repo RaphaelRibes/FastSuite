@@ -15,31 +15,56 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use fastsim::artefact::{build_read, decide, PooledPair, Read};
+use fastsim::artefact::{build_read, decide, Artefact, PooledPair, Read};
 use fastsim::biology::{insert_from_reference, random_dna_bias, read_fasta, History};
 use fastsim::fastq::FastqWriter;
 use fastsim::profile::{AdapterMode, Mate, Profile};
 use fastsim::quality::{qualify_cached, MateRead, QCache};
 use fastsim::stats::TrackedRng;
-use fastsim::truth::GtWriter;
+use fastsim::truth::{mate_is_full, GtWriter};
 
 fn main() -> Result<()> {
     let cfg = cli::parse()?;
     run(&cfg)
 }
 
-/// Ambiguous (`N`) bases in one emitted mate: what the sequencing overlay
-/// (and, for the unreachable pad path, the adapter filler) put there. Counted
-/// from the emitted bytes so the GT records exactly what a scorer will see.
+/// Ambiguous (`N`) bases in one emitted mate: what the sequencing overlay and a
+/// template `N` put there. Counted from the emitted bytes so the GT records
+/// exactly what a scorer will see.
 fn n_bases(mr: &MateRead) -> u32 {
     mr.seq.iter().filter(|&&b| b == b'N').count() as u32
 }
 
-/// `N` bases the no-adapter length filler put in a constructed read. They are
-/// a padding artefact, not an instrument no-call, so the GT's `rN` columns
-/// exclude them (the run's `adapter_pad_bases` metric reports them instead).
-fn pad_n(read: &Read) -> u32 {
-    read.seq.iter().filter(|&&b| b == b'N').count() as u32
+/// `N` bases the no-adapter length filler put in one constructed read.
+///
+/// Only the filler's bases are padding, and they are exactly the adapter window
+/// `build_read` fills when the profile has no adapter sequence to read through
+/// (see `no_adapter_filler_is_exactly_the_adapter_window` in artefact.rs). A
+/// readthrough profile puts adapter bases there, not padding.
+///
+/// Counting every `N` of the constructed read instead treated a template `N` (a
+/// `--reference` contig's N-run) as padding: the GT's `rN` columns were then
+/// netted down to zero and `adapter_pad_bases` claimed bases no filler had
+/// written.
+fn pad_n(read: &Read, mode: AdapterMode) -> u32 {
+    if mode == AdapterMode::None {
+        read.adapter_len
+    } else {
+        0
+    }
+}
+
+/// The two full-pair tallies for one pair's artefact.
+///
+/// `either` is the historical "at least one mate is entirely artefact" count;
+/// `both` is the pair-level truth the GT's `full_flag` records (in `--single`
+/// the pair is R1, so the two coincide). They were one number, which made the
+/// report claim a drop rate the GT did not carry.
+fn full_tallies(a: &Artefact, read_len: u32, single: bool) -> (bool, bool) {
+    let f1 = mate_is_full(a, read_len, Mate::R1);
+    let f2 = !single && mate_is_full(a, read_len, Mate::R2);
+    let both = if single { f1 } else { f1 && f2 };
+    (f1 || f2, both)
 }
 
 /// Add one mate's emitted qualities to the running `mean_q` tally (FS-11).
@@ -97,19 +122,46 @@ fn run(cfg: &cli::Config) -> Result<()> {
     // above it is unrepresentable), so the default is min(150, read_len) —
     // the documented `fastcheck --profile p.json` -> `fastsim --profile p.json`
     // loop must work unmodified for a 100 bp or 75 bp library. An explicit
-    // --insert-min still wins, and is still validated against the read length.
+    // --insert-min still wins, and is still validated against the read length —
+    // unless the profile carries a measured insert CDF, in which case the flag
+    // is documented as ignored and cannot influence a single base, so a value
+    // above the read length is a no-op to warn about, not a run to refuse.
     let insert_min = cfg.insert_min.unwrap_or(profile.read_len.min(150));
     if insert_min > profile.read_len {
-        bail!(
-            "--insert-min ({}) should be <= the profile read_len ({})",
-            insert_min,
-            profile.read_len
-        );
+        if profile.insert.is_some() {
+            eprintln!(
+                "fastsim: warning: --insert-min {insert_min} ignored: the profile carries a \
+                 measured insert CDF, which sets the insert distribution"
+            );
+        } else {
+            bail!(
+                "--insert-min ({}) should be <= the profile read_len ({})",
+                insert_min,
+                profile.read_len
+            );
+        }
     }
-    // The profile's measured GC is the authority for random DNA; --gc exists
-    // only to override it. It used to be a hard 0.49 default that silently
-    // discarded a measured value (a gc=0.30 profile emitted 0.499).
-    let gc = cfg.gc.unwrap_or(profile.gc);
+    // Composition authority: a profile carrying a per-position base plane
+    // governs the emitted bases position by position, so --gc cannot change one
+    // of them (measured on mandrill_E358: `--gc 0.20` and `--gc 0.90` emit
+    // byte-identical reads). Say so instead of publishing a value the run never
+    // used, and report the gc the run ACHIEVED — the profile's own.
+    // A profile with no plane keeps the flag as the authority: it was a hard
+    // 0.49 default once that silently discarded a measured value (a gc=0.30
+    // profile emitted 0.499), so the profile is the default and --gc overrides.
+    let gc = if profile.has_base_plane() {
+        if let Some(requested) = cfg.gc {
+            eprintln!(
+                "fastsim: warning: --gc {requested} has no effect: the profile carries a \
+                 per-position base plane, which governs the emitted composition; reporting the \
+                 profile's gc {}",
+                profile.gc
+            );
+        }
+        profile.gc
+    } else {
+        cfg.gc.unwrap_or(profile.gc)
+    };
 
     // Reference contigs (optional).
     let contigs = match &cfg.reference {
@@ -117,7 +169,15 @@ fn run(cfg: &cli::Config) -> Result<()> {
         None => None,
     };
 
-    // Open outputs.
+    // Open outputs. `-o` is a prefix, not a file, so create the directory it
+    // lives in: a harness pointing at a fresh per-run path should not have to
+    // mkdir first.
+    if let Some(dir) = Path::new(&cfg.out).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create output directory {}", dir.display()))?;
+        }
+    }
     let (r1_path, r2_path) = if cfg.gzip {
         (
             format!("{}_R1.fastq.gz", cfg.out),
@@ -161,7 +221,8 @@ fn run(cfg: &cli::Config) -> Result<()> {
     // pair byte-for-byte — same template, artefact, errors and quality.
     let mut hist = History::new(cfg.dup_pool as usize);
 
-    let mut n_full = 0u64;
+    let mut n_full_both = 0u64; // pairs where BOTH mates are full (GT full_flag)
+    let mut n_full_either = 0u64; // pairs where at least one mate is full
     let mut n_adapter = 0u64;
     let mut n_dup = 0u64;
     let mut n_drop = 0u64;
@@ -216,6 +277,11 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 pad_total += (src.pad_n1 + src.pad_n2) as u64;
                 n_ambig += (d1 + d2) as u64;
                 n_ambig_reads += (d1 > 0) as u64 + (d2 > 0) as u64;
+                // The replayed row carries the STORED artefact, so the full
+                // tallies must see it: the GT row below is written from `a`.
+                let (either, both) = full_tallies(&a, profile.read_len, cfg.single);
+                n_full_either += u64::from(either);
+                n_full_both += u64::from(both);
                 gt.write_pair(pair_idx, src.insert_len, &a, true, d1, d2)?;
                 n_dup += 1;
                 continue;
@@ -260,9 +326,12 @@ fn run(cfg: &cli::Config) -> Result<()> {
         // non-duplicate pair; a duplicate never reaches here — it replays the
         // stored artefact verbatim in the is_dup branch above.
         let mut a = decide(&profile, &mut rng);
-        if a.full {
-            n_full += 1;
-        }
+        // Two full counts, because they answer two questions: "either mate
+        // wasted" (the historical report number) and "the pair is entirely
+        // artefact", which is what the GT's full_flag records.
+        let (either, both) = full_tallies(&a, profile.read_len, cfg.single);
+        n_full_either += u64::from(either);
+        n_full_both += u64::from(both);
 
         // 3. Build reads.
         let r1 = build_read(&profile, &insert, insert_len, Mate::R1, &a, &mut rng);
@@ -301,10 +370,12 @@ fn run(cfg: &cli::Config) -> Result<()> {
         if let Some(m2) = m2.as_ref() {
             tally_q(m2, &mut q_sum, &mut q_n);
         }
-        // The GT names the fragment truth: no-call overlay only in the N
-        // columns, h/t as drawn (a substitution inside an injected run is a
-        // trimmer-relevant observation, not a different truth).
-        let (pad1, pad2) = (pad_n(&r1), r2.as_ref().map_or(0, pad_n));
+        // The GT names the fragment truth: no-call overlay and any template N
+        // in the N columns, h/t as drawn (a substitution inside an injected run
+        // is a trimmer-relevant observation, not a different truth). Only the
+        // no-adapter filler is padding and stays out of the GT.
+        let mode = profile.adapter.mode;
+        let (pad1, pad2) = (pad_n(&r1, mode), r2.as_ref().map_or(0, |r| pad_n(r, mode)));
         pad_total += (pad1 + pad2) as u64;
         let n1 = n_bases(&m1).saturating_sub(pad1);
         let n2 = m2.as_ref().map_or(0, |m| n_bases(m)).saturating_sub(pad2);
@@ -361,11 +432,11 @@ fn run(cfg: &cli::Config) -> Result<()> {
     let mates = cfg.pairs * if cfg.single { 1 } else { 2 };
     if !cfg.quiet {
         eprintln!(
-            "fastsim: {} pairs, read_len {}, full-artefact {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%), ambiguous {} reads ({:.4}%) / {} N bases",
+            "fastsim: {} pairs, read_len {}, full-artefact pairs (GT full_flag) {} ({:.4}%), adapter-readthrough {} ({:.4}%), duplicates {} ({:.4}%), must-drop {} ({:.4}%), ambiguous {} reads ({:.4}%) / {} N bases",
             cfg.pairs,
             profile.read_len,
-            n_full,
-            n_full as f64 / cfg.pairs as f64 * 100.0,
+            n_full_both,
+            n_full_both as f64 / cfg.pairs as f64 * 100.0,
             n_adapter,
             n_adapter as f64 / cfg.pairs as f64 * 100.0,
             n_dup,
@@ -416,6 +487,11 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 // only: the decompressed FASTQ is identical at every level.
                 "gz_level": cfg.gz_level,
                 "gz_bytes": gz_bytes,
+                // The resolved thread count (flag, else FASTSUITE_THREADS). The
+                // simulator is single-threaded, but the value is what the caller
+                // asked for and belongs in the report next to the other run
+                // parameters.
+                "threads": cfg.threads,
                 // FS-11 instrument counters.
                 "substitutions": substitutions,
                 "mean_q": mean_q,
@@ -423,13 +499,22 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 "reads_in": mates,
                 "pairs_simulated": cfg.pairs,
                 "read_len": profile.read_len,
+                // The gc the run ACHIEVED: the profile's own when a base plane
+                // governs the composition (an explicit --gc then has no effect
+                // and is warned about), the resolved gc otherwise.
                 "gc": gc,
                 "seed": cfg.seed,
-                "full_artefact_pairs": n_full,
+                // The GT-consistent pair count: BOTH mates entirely artefact,
+                // i.e. the number of rows whose `full_flag` is 1. The historical
+                // either-mate count is published next to it, named for what it
+                // measures.
+                "full_artefact_pairs": n_full_both,
+                "full_artefact_pairs_either": n_full_either,
                 "adapter_readthrough_pairs": n_adapter,
                 "duplicate_pairs": n_dup,
                 "must_drop_pairs": n_drop,
-                "full_artefact_rate": n_full as f64 / cfg.pairs as f64,
+                "full_artefact_rate": n_full_both as f64 / cfg.pairs as f64,
+                "full_artefact_rate_either": n_full_either as f64 / cfg.pairs as f64,
                 "adapter_readthrough_rate": n_adapter as f64 / cfg.pairs as f64,
                 "duplicate_rate_observed": n_dup as f64 / cfg.pairs as f64,
                 "must_drop_rate": n_drop as f64 / cfg.pairs as f64,

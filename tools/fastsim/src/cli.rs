@@ -4,7 +4,7 @@
 //! ```text
 //! fastsim --pairs N --profile profiles/mandril_E.json -o prefix \
 //!   [--seed S] [--read-len 150] [--insert-mean 300 --insert-sd 50] \
-//!   [--gc 0.49] [--reference ref.fa] [--adapter-seq SEQ] [--no-adapter] \
+//!   [--gc G] [--reference ref.fa] [--adapter-seq SEQ] [--no-adapter] \
 //!   [--no-gzip] [--gz-level 6] [--insert-min M] [--dup-rate 0.02] \
 //!   [--drop-rate 0.05 --drop-min-len 100] [--json report.json] [--stats]
 //! ```
@@ -55,10 +55,15 @@ pub struct Cli {
     #[arg(long)]
     pub read_len: Option<u32>,
 
-    /// Insert length mean (default 300). Ignored when the profile carries a measured insert CDF.
+    /// Insert length mean (default 300). Ignored when the profile carries a
+    /// measured insert CDF.
+    ///
     /// Inserts are measurable only up to 2 x read-len - 12 bp (288 bp at the
-    /// default 150 bp read length); above that ceiling the mates share no 12-base
-    /// anchor and the pair is reported as censored.
+    /// default 150 bp read length): above that ceiling the mates share no
+    /// 12-base anchor, so those lengths all land in ONE saturated histogram bin.
+    /// There is no per-read censoring flag — a saturated bin is a measurement
+    /// limit, and every length in it produces the same read (no overlap, no
+    /// adapter).
     #[arg(long, default_value_t = 300.0)]
     pub insert_mean: f64,
 
@@ -72,8 +77,14 @@ pub struct Cli {
     #[arg(long)]
     pub insert_min: Option<u32>,
 
-    /// GC fraction for random DNA (default: the profile's measured `gc`,
-    /// falling back to 0.49). An explicit --gc overrides the profile.
+    /// GC fraction for random DNA (default: the profile's measured `gc`, a
+    /// required profile key — there is no built-in fallback). An explicit
+    /// --gc overrides the profile for a profile with no base plane.
+    ///
+    /// Ignored when the profile carries a per-position base plane, as every
+    /// fitted profile does: the plane governs the composition position by
+    /// position, so --gc has no effect, a warning says so, and the report
+    /// publishes the profile's gc.
     #[arg(long)]
     pub gc: Option<f64>,
 
@@ -140,11 +151,16 @@ pub struct Cli {
 
     /// Accepted for FastSuite CLI compatibility; the simulator is
     /// single-threaded, so any value is reported and ignored.
-    /// Falls back to the FASTSUITE_THREADS environment variable.
+    /// FASTSUITE_THREADS is used only when NO thread flag is given, in any
+    /// spelling (-j 4, -j4, --threads 4, --threads=4).
     #[arg(short = 'j', long, default_value_t = 1)]
     pub threads: usize,
 
     /// Optional FastSuite report (schema v1) destination.
+    ///
+    /// `full_artefact_pairs` counts pairs where BOTH mates are entirely
+    /// artefact — the number of GT rows whose `full_flag` is 1 — while
+    /// `full_artefact_pairs_either` counts pairs where EITHER mate is.
     #[arg(long, value_name = "PATH")]
     pub json: Option<String>,
 
@@ -264,24 +280,39 @@ impl Config {
                 fastsim::fastq::MAX_GZ_LEVEL
             );
         }
-        if let (Some(m), Some(l)) = (self.insert_min, self.read_len) {
-            if m > l {
-                bail!("--insert-min ({}) should be <= read-len ({})", m, l);
-            }
-        }
+        // --insert-min is validated in `main`, against the PROFILE's read_len:
+        // the flag is ignored when the profile carries a measured insert CDF, and
+        // only the profile can say whether it does. Checking it here as well would
+        // refuse a run the profile makes valid (`--read-len 150 --insert-min 200`
+        // with an insert CDF).
         Ok(())
     }
+}
+
+/// Is a thread-count flag present, in any spelling clap accepts?
+///
+/// `-j 4`, `-j4`, `-j=4`, `--threads 4` and `--threads=4` are the same request.
+/// Recognising only the detached spellings let FASTSUITE_THREADS silently
+/// override an explicit `-j4` / `--threads=4`.
+fn thread_flag(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| {
+        a == "--threads"
+            || a.starts_with("--threads=")
+            // A short flag or cluster: only `-j` takes a value, so any `j` in a
+            // short group is the thread flag (`-j4`, `-qj4`).
+            || (a.starts_with('-') && !a.starts_with("--") && a[1..].contains('j'))
+    })
 }
 
 /// Parse the process argv into a validated `Config`.
 /// `-V/--version` and `-h/--help` print and exit 0, clap-style.
 pub fn parse() -> Result<Config> {
     let mut cli = Cli::parse();
-    // FASTSUITE_THREADS is the suite-wide default when -j is absent
-    // (CLI-SPEC §1). clap's `env` attribute can't express "only when the
-    // flag is absent AND the value is valid", so resolve it manually.
-    let threads_given = std::env::args().any(|a| a == "-j" || a == "--threads");
-    if !threads_given {
+    // FASTSUITE_THREADS is the suite-wide default when NO thread flag is given
+    // (CLI-SPEC §1). clap's `env` attribute can't express "only when the flag
+    // is absent AND the value is valid", so resolve it manually.
+    let args: Vec<String> = std::env::args().collect();
+    if !thread_flag(&args) {
         if let Some(n) = std::env::var("FASTSUITE_THREADS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())

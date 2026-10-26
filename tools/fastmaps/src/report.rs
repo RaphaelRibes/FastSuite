@@ -85,18 +85,101 @@ pub fn corner_window(size: u32) -> u32 {
     (size / 50).max(2)
 }
 
+// ── 3' polyX tails ───────────────────────────────────────────────────────────
+//
+// The corner fractions describe *whole-read* composition, so a read with a
+// random 131 bp body and a 20 bp polyG tail encodes to roughly (65, 85) on a
+// 2048-wide plane — mid-plane, no corner, `polyG_frac` 0. The tail is real
+// contamination and the corners cannot see it (M3). The detector is the same
+// corner test applied to the last `POLY_TAIL_WINDOW` bases only: an all-G
+// window is the polyG corner of a local plane.
+
+/// Length of the 3' window the terminal-homopolymer detector inspects.
+pub const POLY_TAIL_WINDOW: usize = 20;
+
+/// Shortest 3' window the detector will judge. A read shorter than this has
+/// too few bases for "the read ends in a run of one base" to mean anything.
+pub const POLY_TAIL_MIN_WINDOW: usize = 8;
+
+/// Which base (index into `[A, C, G, T]`) the read ends in a run of, if any.
+///
+/// `None` for a read that does not end in a homopolymer, for a read shorter
+/// than `POLY_TAIL_MIN_WINDOW`, and for a run of non-ACGT bytes (an N-tail has
+/// no measurable composition either).
+pub fn tail_base(seq: &[u8]) -> Option<usize> {
+    let n = seq.len().min(POLY_TAIL_WINDOW);
+    if n < POLY_TAIL_MIN_WINDOW {
+        return None;
+    }
+    let win = &seq[seq.len() - n..];
+    let base = match win[0] {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => return None,
+    };
+    if win.iter().all(|&b| b == win[0]) {
+        Some(base)
+    } else {
+        None
+    }
+}
+
+/// Notes for 3'-end-concentrated libraries the corner fractions cannot see.
+///
+/// `tail` counts, for each of `[A, C, G, T]`, the reads that end in a run of at
+/// least `POLY_TAIL_WINDOW` copies of that base. A note is emitted when such
+/// reads exist and the matching whole-library corner fraction is 0 — the exact
+/// blind spot M3 reports: `r2_polyG_frac 0.0` on 200 reads that all end in
+/// 20 G. The corner definition is not changed; the run says what it cannot see.
+pub fn poly_tail_notes(
+    tail: &[u64; 4],
+    metrics: &BTreeMap<String, f64>,
+    total_reads: u64,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (base, name) in [(0usize, "A"), (1, "C"), (2, "G"), (3, "T")] {
+        let n = tail[base];
+        if n == 0 {
+            continue;
+        }
+        let key = format!("poly{name}_frac");
+        let frac = metrics.get(&key).copied().unwrap_or(0.0);
+        if frac > 0.0 {
+            continue;
+        }
+        let total = total_reads.max(1);
+        notes.push(format!(
+            "3' poly{name} tail: {n} of {total} reads ({pct:.1}%) end in a run of at least \
+             {POLY_TAIL_WINDOW} identical {name} bases, but {key} is 0 — the corner fractions \
+             measure whole-read composition, so a 3' tail on a random body lands mid-plane and \
+             never reaches a corner. The tail is contamination the corners cannot see: trim it \
+             upstream (fastprep) or inspect 3' ends directly.",
+            pct = 100.0 * n as f64 / total as f64,
+        ));
+    }
+    notes
+}
+
 /// Write the `fastsuite.report.v1` wrapper (docs/REPORT-SCHEMA.md) to `path`.
 ///
 /// This *is* the `--json PATH` file; the grid JSON keeps its own shape and its
 /// own home, `<output-dir>/heatmap.json`. `grid_name` is that file's name, so
 /// the `grid` block names a file the consumer can actually find (it used to
 /// hard-code `heatmap.json` while `--json` was redirecting the grid).
+///
+/// `notes` carries what the metrics cannot: a run-level caveat (a 3' polyX
+/// tail the corner fractions are blind to, M3) is a string, and `metrics` must
+/// stay a flat numeric namespace. Always emitted, empty or not, so a consumer
+/// can tell "no notes" from "notes not supported".
 pub fn write_report_v1(
     path: &std::path::Path,
     command: &str,
     elapsed_s: f64,
     files: &[String],
     metrics: &BTreeMap<String, f64>,
+    notes: &[String],
     grid_name: &str,
 ) -> std::io::Result<()> {
     use crate::encode::json_escape;
@@ -111,6 +194,11 @@ pub fn write_report_v1(
         .map(|f| json_escape(f))
         .collect::<Vec<_>>()
         .join(", ");
+    let notes_json = notes
+        .iter()
+        .map(|n| json_escape(n))
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let doc = format!(
         concat!(
@@ -123,6 +211,7 @@ pub fn write_report_v1(
             "  \"inputs\": {{\"files\": [{files}]}},\n",
             "  \"elapsed_s\": {},\n",
             "  \"metrics\": {{\n{metrics}\n  }},\n",
+            "  \"notes\": [{notes}],\n",
             "  \"grid\": {{\"format\": {}, \"see\": \"docs/PLAN-QC.md\"}}\n",
             "}}\n"
         ),
@@ -132,6 +221,7 @@ pub fn write_report_v1(
         grid = json_escape(grid_name),
         files = files_json,
         metrics = metrics_json,
+        notes = notes_json,
     );
 
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
@@ -251,6 +341,7 @@ mod tests {
             0.42,
             &["a_R1.fq.gz".into(), "a_R2.fastq.gz".into()],
             &metrics,
+            &[],
             "heatmap.json",
         )
         .unwrap();
@@ -292,10 +383,77 @@ mod tests {
         let path = dir.join("r.json");
         let mut metrics = std::collections::BTreeMap::new();
         metrics.insert("total_reads".into(), 1.0);
-        super::write_report_v1(&path, "fastmaps a.fq", 0.0, &["a.fq".into()], &metrics, "corner.json")
+        super::write_report_v1(&path, "fastmaps a.fq", 0.0, &["a.fq".into()], &metrics, &[], "corner.json")
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["grid"]["format"], "corner.json", "{v}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note is a string, so it goes in `notes` — `metrics` stays numeric.
+    #[test]
+    fn notes_are_emitted_as_a_string_array() {
+        let dir = std::env::temp_dir().join(format!("maps_notes_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.json");
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert("total_reads".into(), 1.0);
+        let notes = vec!["3' polyG tail: 1 of 1 reads ends in G".to_string()];
+        super::write_report_v1(&path, "fastmaps a.fq", 0.0, &["a.fq".into()], &metrics, &notes, "heatmap.json")
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["notes"][0], notes[0].as_str(), "{v}");
+        assert!(
+            v["metrics"]["total_reads"].is_number(),
+            "metrics must stay a flat numeric namespace: {v}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── M3: the 3' tail detector ────────────────────────────────────────────
+
+    #[test]
+    fn tail_base_finds_a_terminal_homopolymer() {
+        let mut seq = b"ACGTACGTACGTACGTACGT".to_vec(); // random-ish body
+        seq.extend(std::iter::repeat_n(b'G', POLY_TAIL_WINDOW));
+        assert_eq!(super::tail_base(&seq), Some(2), "G");
+
+        let mut seq = b"ACGTTGCAACGTTGCAACGT".to_vec();
+        seq.extend(std::iter::repeat_n(b'T', POLY_TAIL_WINDOW));
+        assert_eq!(super::tail_base(&seq), Some(3), "T");
+    }
+
+    #[test]
+    fn tail_base_ignores_reads_without_a_terminal_run() {
+        // Random 3' end: no run.
+        assert_eq!(super::tail_base(b"ACGTACGTACGTACGTACGTACGTACGTACGT"), None);
+        // A run that does not reach the 3' end.
+        assert_eq!(super::tail_base(b"GGGGGGGGGGGGGGGGGGGGACGT"), None);
+        // Too short to judge.
+        assert_eq!(super::tail_base(b"GGGGGGG"), None);
+        // A run of N: no measurable composition.
+        assert_eq!(super::tail_base(b"ACGTACGTACGTACGTACGTNNNNNNNNNNNNNNNNNNNN"), None);
+        // A read no longer than the minimum window, entirely one base, is
+        // judged: the whole read is the 3' end.
+        assert_eq!(super::tail_base(b"GGGGGGGG"), Some(2));
+    }
+
+    #[test]
+    fn tail_notes_fire_only_when_the_corner_is_blind() {
+        let tail = [0u64, 0, 200, 0];
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert("polyG_frac".into(), 0.0);
+        let notes = super::poly_tail_notes(&tail, &metrics, 200);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("polyG") && notes[0].contains("200") && notes[0].contains("3'"));
+
+        // The corner already sees them: nothing to add.
+        metrics.insert("polyG_frac".into(), 0.5);
+        assert!(super::poly_tail_notes(&tail, &metrics, 200).is_empty());
+
+        // No tails at all.
+        assert!(super::poly_tail_notes(&[0; 4], &metrics, 200).is_empty());
     }
 }

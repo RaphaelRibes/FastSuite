@@ -75,8 +75,12 @@ If the probability is higher than the specified threshold, FDedup will automatic
 ### Streaming (zero intermediate files)
 
 ```bash
-zcat in.fastq.gz | fastdedup -1 - -o - | fastprep -1 - -o clean.fastq.gz
+zcat in.fastq.gz | fastdedup -1 - -o - | gzip > deduped.fastq.gz
 ```
+
+`fastdedup` is the only tool with both input and output streaming today;
+`fastprep` is file-only (docs/CLI-SPEC.md §4 item 7), so chaining it onto the
+pipe does not run yet.
 
 - Input compression is detected from **magic bytes**, not the extension, so a stream and a mislabelled file behave identically.
 - Output format and compression are explicit (`--out-format`, `--out-compression`): a stream has no name to infer from, and the pipe's bytes must not silently depend on the producer's format.

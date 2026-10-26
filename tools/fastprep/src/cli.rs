@@ -680,8 +680,10 @@ pub struct Cli {
     /// The report's `busy_cores` metric (CPU-seconds per wall-second) shows
     /// where a run actually landed; a value near 1 means it ran effectively
     /// serial whatever `-j` said.
-    #[arg(short = 'j', long, default_value_t = 1, help_heading = "Runtime")]
-    pub threads: usize,
+    /// Threads. `FASTSUITE_THREADS` supplies the default when `-j` is not
+    /// given (the suite-wide convention; CLI-SPEC §4 item 6).
+    #[arg(short = 'j', long, help_heading = "Runtime")]
+    pub threads: Option<usize>,
 
     /// Records per chunk submitted to the worker pool.
     #[arg(long, default_value_t = 1024, help_heading = "Runtime")]
@@ -710,11 +712,11 @@ pub struct Cli {
 
     /// Remove exact duplicate reads before any trimming.
     ///
-    /// Off by default: this is the only stage whose memory is not bounded by
-    /// the chunk size. The fingerprint table grows with the number of UNIQUE
-    /// reads, roughly 4.6 GB at 3e8 reads with 64-bit fingerprints. The
+    /// On by default (this is the only stage whose memory is not bounded by
+    /// the chunk size: the fingerprint table grows with the number of UNIQUE
+    /// reads, roughly 4.6 GB at 3e8 reads with 64-bit fingerprints, and the
     /// projected size is checked against the enforced memory limit before
-    /// anything is allocated.
+    /// anything is allocated). `--no-dedup` turns it off.
     #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
           action = clap::ArgAction::Set, help_heading = "Deduplication")]
     pub dedup: bool,
@@ -1253,7 +1255,15 @@ impl Cli {
                 bail!("--head-dropout must be < --min-run (the scan owns runs ≥ min-run)");
             }
         }
-        if self.threads == 0 { bail!("--threads must be ≥ 1"); }
+        let threads = match self.threads {
+            Some(0) => bail!("--threads must be ≥ 1"),
+            Some(n) => n,
+            None => std::env::var("FASTSUITE_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1),
+        };
         if self.chunk == 0 { bail!("--chunk must be ≥ 1"); }
         if !(1..=9).contains(&self.gz_level) { bail!("--gz-level must be in [1, 9]"); }
         if !(1..=22).contains(&self.zst_level) { bail!("--zst-level must be in [1, 22]"); }
@@ -1669,14 +1679,14 @@ impl Cli {
         };
 
         let runtime = Runtime {
-            threads: self.threads,
+            threads,
             chunk: self.chunk,
             compression: crate::io::CompressionLevels {
                 gz: self.gz_level,
                 zst: self.zst_level,
                 // Half of --threads, so that a paired run's two compression
                 // pools plus the Rayon pool stay inside the allocation.
-                gz_threads: self.gz_threads.unwrap_or((self.threads / 2).max(1)),
+                gz_threads: self.gz_threads.unwrap_or((threads / 2).max(1)),
             },
             phred_offset,
             // An explicit --phred-offset is a decision, and auto-detection must

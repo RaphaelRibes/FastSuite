@@ -477,6 +477,40 @@ mod tests {
         }
     }
 
+    /// The no-adapter filler is exactly `adapter_len` `N`s, in the adapter
+    /// window, and it never disturbs a template `N` in the biology slice.
+    ///
+    /// `main`'s `pad_n` relies on this to tell padding from a template no-call:
+    /// it counts `adapter_len` as padding instead of scanning the read for `N`
+    /// (a `--reference` contig's N-run used to be subtracted from the GT's N
+    /// columns and reported as padding).
+    #[test]
+    fn no_adapter_filler_is_exactly_the_adapter_window() {
+        let p = fixed_joint_profile(&[(0, 0, 100)]); // h = t = 0, adapter mode none
+        let mut rng = rng();
+        // 40 template Ns then 60 A: a 100 bp insert in a 150 bp window.
+        let insert: Vec<u8> = [vec![b'N'; 40], vec![b'A'; 60]].concat();
+        let a = decide(&p, &mut rng);
+        let read = build_read(&p, &insert, 100, Mate::R1, &a, &mut rng);
+        assert_eq!(read.bio_len, 100);
+        assert_eq!(read.adapter_len, 50, "the filler covers the rest of the window");
+        let filler = read.h as usize + read.bio_len as usize;
+        assert!(
+            read.seq[filler..].iter().all(|&b| b == b'N'),
+            "the filler is all N"
+        );
+        assert_eq!(
+            read.seq[..filler].iter().filter(|&&b| b == b'N').count(),
+            40,
+            "template N stays in the biology slice, untouched"
+        );
+        assert_eq!(
+            read.seq.iter().filter(|&&b| b == b'N').count() as u32,
+            40 + read.adapter_len,
+            "constructed N = template N + filler (the split pad_n makes)"
+        );
+    }
+
     #[test]
     fn head5p_r2_geometry_from_profile() {
         // old paper regime: mass in R2's head CDF only -> 5′ R2 artefacts

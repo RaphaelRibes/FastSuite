@@ -66,6 +66,9 @@ pub enum SpillerMsg {
         no_call: u64,
         no_call_r1: u64,
         no_call_r2: u64,
+        /// Reads ending in a homopolymer run of `[A, C, G, T]` respectively
+        /// (M3): what the corner fractions are blind to.
+        poly_tail: [u64; 4],
         min_seq_len: Option<u32>,
         max_seq_len: u32,
         n_reads: u64,
@@ -109,6 +112,20 @@ const PREVIEW_FLUSH_MIN: usize = 32 * 1024;
 /// at encode time, so flush boundaries cannot change a byte of `heatmap.preview`.
 pub fn preview_flush_bytes(threshold_bytes: usize) -> usize {
     threshold_bytes.clamp(PREVIEW_FLUSH_MIN, PREVIEW_FLUSH_MAX)
+}
+
+/// Capacity of the worker→spiller message channel, derived from the buffer
+/// budget (M9).
+///
+/// The channel used to be unbounded: whenever the spiller fell behind, every
+/// worker kept sending, so the queue grew with the *file count* rather than
+/// with `--buffer-mb` (64 files x 100 k reads peaked at ~190 MB against the
+/// documented 22 MB for 2 files). One message carries at most the index
+/// threshold plus the preview flush threshold (`per_message_bytes`), so one
+/// budget's worth of messages is the queue's ceiling. Never zero: a
+/// zero-capacity channel is a rendezvous, i.e. one flush per round trip.
+pub fn channel_capacity(budget_bytes: usize, per_message_bytes: usize) -> usize {
+    (budget_bytes / per_message_bytes.max(1)).max(1)
 }
 
 /// A corner extraction region. Each instance writes matching reads to its
@@ -155,6 +172,11 @@ pub struct WorkerLocal {
     pub no_call: u64,
     pub no_call_r1: u64,
     pub no_call_r2: u64,
+    /// Reads ending in a homopolymer run of `[A, C, G, T]` respectively (M3).
+    /// The corner fractions measure whole-read composition, so a 3' tail on a
+    /// random body never reaches a corner; this is the count that lets the run
+    /// say so out loud.
+    pub poly_tail: [u64; 4],
     /// Per-file total read count.
     pub per_file_counts: Vec<u64>,
     /// Shortest read length seen (`None` until a read arrives).
@@ -182,6 +204,7 @@ impl WorkerLocal {
             no_call: 0,
             no_call_r1: 0,
             no_call_r2: 0,
+            poly_tail: [0; 4],
             per_file_counts: Vec::new(),
             min_seq_len: None,
             max_seq_len: 0,
@@ -234,7 +257,7 @@ impl WorkerLocal {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Move accumulated indices/previews into a `Chunk` and send to the spiller.
-pub fn flush_local(state: &mut WorkerLocal, tx: &mpsc::Sender<SpillerMsg>) {
+pub fn flush_local(state: &mut WorkerLocal, tx: &mpsc::SyncSender<SpillerMsg>) {
     if state.indices.is_empty() && state.previews.is_empty() {
         return;
     }
@@ -251,7 +274,7 @@ pub fn flush_local(state: &mut WorkerLocal, tx: &mpsc::Sender<SpillerMsg>) {
 /// Flush pending previews alone (indices stay buffered). Keeps the read
 /// payloads from accumulating: the spiller writes them straight to the row's
 /// preview temp file, so they never become `preview_n x pixels` resident.
-pub fn flush_previews(state: &mut WorkerLocal, tx: &mpsc::Sender<SpillerMsg>) {
+pub fn flush_previews(state: &mut WorkerLocal, tx: &mpsc::SyncSender<SpillerMsg>) {
     if state.previews.is_empty() {
         return;
     }
@@ -288,6 +311,33 @@ fn read_line(reader: &mut dyn BufRead, buf: &mut Vec<u8>) -> std::io::Result<usi
     Ok(n)
 }
 
+/// The error for a record that began and ran out of file.
+///
+/// `read_num` is the record's 0-based index; the message names it 1-based,
+/// like the qual/seq-mismatch error already does, plus which line was missing.
+fn truncated_record(read_num: u32, missing: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "read {}: truncated FASTQ record — the file ended after the header (no {} line). \
+             A .gz member cannot be truncated either; a plain FASTQ file must not be silently \
+             shorter than its record count.",
+            read_num as u64 + 1,
+            missing
+        ),
+    )
+}
+
+/// Next record number, or an error instead of a panic at 2^32 reads.
+fn bump_read_num(read_num: u32) -> std::io::Result<u32> {
+    read_num.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "read number overflowed u32 (2^32 reads in one file)",
+        )
+    })
+}
+
 // ── FASTQ processing ─────────────────────────────────────────────────────────
 
 /// Process one FASTQ file, updating `state` and writing corner extractions.
@@ -295,7 +345,7 @@ pub fn process_fastq(
     path: &str,
     file_id: u16,
     state: &mut WorkerLocal,
-    tx: &mpsc::Sender<SpillerMsg>,
+    tx: &mpsc::SyncSender<SpillerMsg>,
     cfg: &WorkerCfg,
     corners: &[CornerExtractor],
     file_kinds: &[FileKind],
@@ -313,21 +363,36 @@ pub fn process_fastq(
         .unwrap_or(FileKind::Unknown);
 
     loop {
-        // A truncated record ends the file exactly as `lines()` running dry did.
-        // A genuine I/O error, in contrast, used to end the loop silently
-        // (`lines()` yielded `Some(Err(_))`, the pattern did not match) and
-        // leave a plausible-looking partial heatmap; `?` now aborts loudly.
+        // A record that *starts* and does not finish is malformed input, not
+        // EOF: the plain reader used to end the loop on any short line, so 650
+        // headers with 649 complete records exited 0 and reported on 649
+        // reads, while the same truncation inside a `.gz` member exits 1 (M7).
         if read_line(&mut *reader, &mut header)? == 0 {
-            break;
+            break; // clean EOF at a record boundary
+        }
+        if header.is_empty() {
+            continue; // blank separator line: not a record
+        }
+        if header[0] == b'>' {
+            // DECISIONS.md D-4: fastmaps encodes base composition and needs
+            // the quality string, so FASTA is refused — the same clarity as
+            // fastcheck's "reads plain FASTQ and .gz FASTQ only" (M11). It
+            // used to be read as FASTQ (header / seq / `>next` as the `+`
+            // line / bases as the quality) and produce a full report.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "FASTA input is not supported by fastmaps (reads need their quality string); \
+                 convert it to FASTQ first",
+            ));
         }
         if read_line(&mut *reader, &mut seq)? == 0 {
-            break;
+            return Err(truncated_record(read_num, "sequence"));
         }
         if read_line(&mut *reader, &mut plus)? == 0 {
-            break;
+            return Err(truncated_record(read_num, "'+' separator"));
         }
         if read_line(&mut *reader, &mut qual)? == 0 {
-            break;
+            return Err(truncated_record(read_num, "quality"));
         }
 
         // A FASTQ record's qual string is exactly as long as its seq string.
@@ -361,6 +426,13 @@ pub fn process_fastq(
             std::process::exit(1);
         }
         if slen > state.max_seq_len {
+            // The plane is O(max_read_len²) and its cap used to be checked only
+            // in `write_format`, i.e. after the whole input had been read and
+            // spilled: a 3000 bp library burned a full pass and left an empty
+            // `-o` behind (M6). A read that pushes the maximum over the cap is
+            // refused right here, with the same explanation.
+            crate::format::plane_check(slen)
+                .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?;
             state.max_seq_len = slen;
         }
         state.min_seq_len = Some(state.min_seq_len.map_or(slen, |m| m.min(slen)));
@@ -392,6 +464,11 @@ pub fn process_fastq(
                 FileKind::R2 => state.no_call_r2 += 1,
                 FileKind::Unknown => {}
             }
+        }
+        // 3' homopolymer tail (M3): the corner fractions below cannot see it,
+        // so the run counts it here and says so in the report and on stderr.
+        if let Some(base) = crate::report::tail_base(&seq) {
+            state.poly_tail[base] += 1;
         }
         state.total_reads += 1;
         if state.per_file_counts.len() <= file_id as usize {
@@ -442,9 +519,7 @@ pub fn process_fastq(
             }
         }
 
-        read_num = read_num
-            .checked_add(1)
-            .expect("read_num overflowed u32");
+        read_num = bump_read_num(read_num)?;
 
         if state.bytes_estimate >= cfg.threshold_bytes {
             flush_local(state, tx);
@@ -512,7 +587,7 @@ mod tests {
     #[test]
     fn capped_counter_survives_a_flush() {
         let mut s = st();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(1);
         for rn in 0..3 {
             s.push_index((5, 5), 0, rn, DataMode::Capped(2));
         }
@@ -520,6 +595,37 @@ mod tests {
         assert!(s.indices.is_empty());
         assert!(!s.push_index((5, 5), 0, 3, DataMode::Capped(2)));
         assert!(s.data_count.contains_key(&((5, 5), 0)));
+    }
+
+    // ── M9: the channel is sized by the budget, not by the file count ───────
+
+    #[test]
+    fn channel_capacity_is_derived_from_the_budget() {
+        // One message per worker's share: a budget with room for N messages
+        // gives N, whatever the number of input files.
+        assert_eq!(channel_capacity(8 * 1024 * 1024, 1024 * 1024), 8);
+        assert_eq!(channel_capacity(1024 * 1024, 256 * 1024), 4);
+        // Never a rendezvous channel, and never a divide-by-zero.
+        assert_eq!(channel_capacity(0, 256 * 1024), 1);
+        assert_eq!(channel_capacity(1024, 0), 1024);
+        // Monotone in the budget: a bigger budget never shrinks the queue.
+        let mut prev = 0;
+        for mb in [1usize, 2, 8, 64, 512] {
+            let cap = channel_capacity(mb * 1024 * 1024, 256 * 1024);
+            assert!(cap >= prev, "{mb} MB gave {cap}, was {prev}");
+            prev = cap;
+        }
+    }
+
+    // ── M10: no panic at 2^32 reads ─────────────────────────────────────────
+
+    #[test]
+    fn read_number_overflow_is_an_error_not_a_panic() {
+        assert_eq!(bump_read_num(0).unwrap(), 1);
+        assert_eq!(bump_read_num(u32::MAX - 1).unwrap(), u32::MAX);
+        let e = bump_read_num(u32::MAX).expect_err("2^32 reads must be refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("overflowed u32"), "{e}");
     }
 
     // ── FM-2: the preview flush lives inside the budget ─────────────────────

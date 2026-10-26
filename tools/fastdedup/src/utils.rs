@@ -114,6 +114,27 @@ pub fn count_sequences(path: &str) -> Result<usize> {
     Ok(count)
 }
 
+/// The refusal for a paired-end read-count mismatch, naming the records consumed.
+///
+/// Both engines return this exact error. It carries the counts because
+/// `reads_in` must describe every record READ, not `pairs * 2`: a 3-record R1
+/// against a 2-record R2 consumed five records, and the serial engine used to
+/// consume that fifth one during the failing loop iteration, see EOF on the
+/// post-loop check and exit 0 — reporting "2 reads in" for a five-record input.
+pub fn read_count_mismatch(r1_records: usize, r2_records: usize) -> anyhow::Error {
+    let (more, less) = if r1_records > r2_records {
+        ("R1", "R2")
+    } else {
+        ("R2", "R1")
+    };
+    anyhow::anyhow!(
+        "Desynchronization: {more} has more records than {less} ({} records consumed: R1 {}, R2 {})",
+        r1_records + r2_records,
+        r1_records,
+        r2_records
+    )
+}
+
 /// Validates that the output format is compatible with the input data.
 /// FASTA input cannot be written as FASTQ (no quality scores).
 pub fn validate_format_compatibility(

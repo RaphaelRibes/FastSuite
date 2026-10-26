@@ -252,9 +252,15 @@ pub fn scan_file_gated(
             );
         }
 
-        read_line(&mut rdr, &mut seq)?;
-        read_line(&mut rdr, &mut plus)?;
-        read_line(&mut rdr, &mut qual)?;
+        // Every record line carries the same "reading <path>" context as the header: a
+        // truncated .gz used to report a bare "unexpected end of file" whenever the
+        // truncation fell on the sequence, '+' or quality line, naming no file at all.
+        read_line(&mut rdr, &mut seq)
+            .with_context(|| format!("reading {}", path.display()))?;
+        read_line(&mut rdr, &mut plus)
+            .with_context(|| format!("reading {}", path.display()))?;
+        read_line(&mut rdr, &mut qual)
+            .with_context(|| format!("reading {}", path.display()))?;
         if seq.is_empty() {
             bail!(
                 "{}: empty sequence line for record {:?}",
@@ -477,5 +483,54 @@ mod tests {
         let mut acc = Accum::new(64);
         let err = scan_file_gated(&bad, 1, Limits::default(), &mut acc, Some(m)).unwrap_err();
         assert!(err.to_string().contains("quality length"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// C11: every record-line read carries the "reading <path>" context, not only the
+    /// header. A truncated .gz used to report a bare "unexpected end of file" whenever the
+    /// cut fell inside a record, naming no file at all.
+    ///
+    /// The fixture makes WHICH line fails deterministic: the first gzip member ends after
+    /// 0, 1, 2 and 3 lines of a record (so the header, sequence, '+' and quality read
+    /// respectively is the next one), and a truncated second member makes that read fail.
+    #[test]
+    fn a_truncated_gzip_names_the_file_on_every_record_line() {
+        let d = std::env::temp_dir().join(format!("fastcheck_reader_trunc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("t.fastq.gz");
+
+        let cut_tail = &gz(b"@r2\nACGTACGT\n+\nIIIIIIII\n")[..12];
+        let prefixes: [&[u8]; 4] = [
+            b"",                       // the header read fails
+            b"@r1\n",                  // the sequence read fails
+            b"@r1\nACGTACGT\n",        // the '+' read fails
+            b"@r1\nACGTACGT\n+\n",    // the quality read fails
+        ];
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let mut data = gz(prefix);
+            data.extend_from_slice(cut_tail);
+            std::fs::write(&path, &data).unwrap();
+            let mut acc = Accum::new(64);
+            let err = scan_file_gated(&path, 1, Limits::default(), &mut acc, None)
+                .expect_err("a truncated member must be an error, not a short read");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("reading") && msg.contains("t.fastq.gz"),
+                "case {i}: the error must name the file it was reading: {msg:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

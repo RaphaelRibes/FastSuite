@@ -34,6 +34,10 @@ pub fn cmd_install(args: &InstallArgs) -> Result<()> {
     }
     let ts: ToolSet = runner::toolset(args.tools_dir.clone());
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
+    // The suite a prefix is supposed to hold. `fasthelper` is this binary, so it
+    // always resolves; the other five may not, and leaving them out silently is
+    // what made an install of 1 of 6 look like success.
+    let mut missing: Vec<&str> = Vec::new();
     for tool in [
         "fastcheck",
         "fastdedup",
@@ -47,8 +51,9 @@ pub fn cmd_install(args: &InstallArgs) -> Result<()> {
         } else {
             ts.get(tool).cloned()
         };
-        if let Some(b) = bin {
-            targets.push((tool.to_string(), b));
+        match bin {
+            Some(b) => targets.push((tool.to_string(), b)),
+            None => missing.push(tool),
         }
     }
     if targets.is_empty() {
@@ -72,6 +77,14 @@ pub fn cmd_install(args: &InstallArgs) -> Result<()> {
     println!("fasthelper install: {} symlink(s) in {}", made.len(), bin.display());
     for m in &made {
         println!("  {m}");
+    }
+    if !missing.is_empty() {
+        bail!(
+            "{} tool(s) not found, so they were not linked: {} — build them (cargo build \
+             --release in tools/<tool>) or pass --tools-dir",
+            missing.len(),
+            missing.join(", ")
+        );
     }
     Ok(())
 }

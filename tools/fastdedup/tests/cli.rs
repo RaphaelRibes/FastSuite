@@ -1392,6 +1392,13 @@ fn test_paire_entetes_pre_casava_desync_reelle_bloquee() {
 }
 
 /// Vérifie la détection de désynchronisation de fin de fichier quand R1 > R2.
+///
+/// REVERSAL (2026-10-26) : l'attente était « Desynchronization detected at the
+/// end », message d'un contrôle post-boucle qui ne voyait le déséquilibre qu'à
+/// partir de DEUX enregistrements excédentaires — la première itération en
+/// échec consommait et jetait le premier, puis la boucle relisait EOF. Le
+/// chemin sérial refuse maintenant dès le premier excédent, avec le message du
+/// moteur parallèle, et nomme les enregistrements consommés.
 #[test]
 fn test_paire_desync_fin_fichier_r1_plus_long() {
     let temp_dir = assert_fs::TempDir::new().unwrap();
@@ -1410,12 +1417,15 @@ fn test_paire_desync_fin_fichier_r1_plus_long() {
         .arg("--force")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "Desynchronization detected at the end",
-        ));
+        .stderr(predicate::str::contains("R1 has more records than R2"))
+        .stderr(predicate::str::contains("21 records consumed"));
 }
 
 /// Vérifie la détection de désynchronisation de fin de fichier quand R2 > R1.
+///
+/// REVERSAL (2026-10-26) : même renversement que le test R1 > R2 ci-dessus —
+/// le message attendu est celui du moteur parallèle, et le refus tombe au
+/// premier enregistrement excédentaire.
 #[test]
 fn test_paire_desync_fin_fichier_r2_plus_long() {
     let temp_dir = assert_fs::TempDir::new().unwrap();
@@ -1434,9 +1444,8 @@ fn test_paire_desync_fin_fichier_r2_plus_long() {
         .arg("--force")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "Desynchronization detected at the end",
-        ));
+        .stderr(predicate::str::contains("R2 has more records than R1"))
+        .stderr(predicate::str::contains("21 records consumed"));
 }
 
 #[test]

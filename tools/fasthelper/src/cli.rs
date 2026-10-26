@@ -12,6 +12,11 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+/// The aggregate formats `concatenate` writes. Also the flag's default, so
+/// `--positions` can tell "the value the user asked for" from the default and
+/// refuse a flag it would otherwise ignore.
+pub const DEFAULT_FORMAT: &str = "json,tsv,md,html";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "fasthelper",
@@ -153,7 +158,7 @@ pub struct ReportArgs {
     pub outdir: PathBuf,
 
     /// Comma-separated formats to write (json,tsv,md,html).
-    #[arg(long, default_value = "json,tsv,md,html")]
+    #[arg(long, default_value = DEFAULT_FORMAT)]
     pub format: String,
 
     /// Sample name to use for a single file input (default: file stem).

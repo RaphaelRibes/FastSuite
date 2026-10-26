@@ -369,6 +369,11 @@ impl Profile {
     }
 
     pub fn from_raw(raw: RawProfile) -> Result<Self> {
+        // A zero-length read is not a library: it emitted empty sequence and
+        // quality lines, which is not valid FASTQ, and exited 0.
+        if raw.read_len == 0 {
+            bail!("profile read_len must be >= 1");
+        }
         // SE profiles omit R2: mirror R1 so the parser accepts them (in --single
         // mode the simulator only ever reads R1).
         let r2_head = if raw.head.R2.is_empty() { &raw.head.R1 } else { &raw.head.R2 };
@@ -619,6 +624,17 @@ impl Profile {
     /// every read.
     pub fn read_meanq_mean(&self, mate: Mate) -> f64 {
         self.read_meanq_mean[Self::mate_idx(mate)]
+    }
+
+    /// Does the profile carry a measured per-position base composition?
+    ///
+    /// When it does, that plane governs the emitted bases position by position;
+    /// the single `gc` fraction only reaches an interior the plane does not
+    /// cover, so for a read whose two plane windows meet (`insert <=
+    /// 2 x read_len`) `--gc` cannot move a single base. `main` warns and reports
+    /// the profile's own gc instead of a value the run never used.
+    pub fn has_base_plane(&self) -> bool {
+        !self.head_bias.is_empty() || !self.tail_bias.is_empty()
     }
 }
 

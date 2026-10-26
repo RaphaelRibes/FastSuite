@@ -352,7 +352,9 @@ table.files tbody tr:hover { background:#fff8e1; }
 
 /// Write the report. `insert` is present when `--insert-hist` ran, and `partial`
 /// carries the reason a budget stopped the scan (`None` on a complete run), the
-/// same value the JSON report publishes as `partial.reason`.
+/// same value the JSON report publishes as `partial.reason`. `overrep_min_count` is
+/// the resolved over-representation threshold, so the repeated-sequence section uses
+/// the same one the `overrep` block does.
 pub fn write_html(
     path: &Path,
     files: &[FileReport],
@@ -362,6 +364,7 @@ pub fn write_html(
     insert: Option<&InsertHist>,
     partial: Option<&str>,
     processed: Option<(&[FileReport], &Accum)>,
+    overrep_min_count: u32,
 ) -> Result<()> {
     let n_pos = total.covered_positions();
     let gc = gc_fraction(total);
@@ -587,10 +590,12 @@ pub fn write_html(
     };
 
     // ---- repeated sequences: full sequences + 12-mer spectrum ----------------
-    fn repeats_for(acc: &Accum) -> String {
+    fn repeats_for(acc: &Accum, overrep_min_count: u32) -> String {
         let reads = acc.reads.max(1) as f64;
-        let min_count = (reads * 0.001).max(10.0) as u32;
-        let seqs = acc.seq_counts.at_least(min_count);
+        // One threshold for over-represented SEQUENCES: the flag the caller resolved.
+        // The k-mer spectrum keeps its own 0.1%-of-reads floor, exactly as the JSON
+        // `kmer_spectrum` block computes it.
+        let seqs = acc.seq_counts.at_least(overrep_min_count);
         let mut rep_rows = String::new();
         for (fp, c) in seqs.iter().take(20) {
             let _ = write!(
@@ -601,12 +606,17 @@ pub fn write_html(
             );
         }
         let rep_table = if seqs.is_empty() {
-            "<p class=\"note\">No sequence appears more than 0.1% of reads — the library is not dominated by a repeated sequence.</p>".to_string()
+            format!(
+                "<p class=\"note\">No sequence appears at least {overrep_min_count} times (the \
+                 over-representation threshold) — the library is not dominated by a repeated \
+                 sequence.</p>"
+            )
         } else {
             format!(
                 "<table class=\"rep\"><tr><th>fingerprint</th><th>count</th><th>% of reads</th></tr>{rep_rows}</table>"
             )
         };
+        let min_count = (reads * 0.001).max(10.0) as u32;
         let kmers = acc.kmer_counts.report(min_count);
         let kmer_bars: Vec<(String, f64)> = kmers.iter().take(20)
             .map(|(k, c)| (crate::repeated::unpack_kmer(*k, 12), *c as f64)).collect();
@@ -623,11 +633,11 @@ pub fn write_html(
             acc.seq_counts.distinct(), dup * 100.0
         )
     }
-    let repeats_before = repeats_for(total);
+    let repeats_before = repeats_for(total, overrep_min_count);
     let repeats_section = if let Some(pt) = p_total {
         tabs("repba", &[
             ("before", repeats_before),
-            ("after", repeats_for(pt)),
+            ("after", repeats_for(pt, overrep_min_count)),
         ])
     } else {
         repeats_before

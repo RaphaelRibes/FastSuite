@@ -1,5 +1,7 @@
 use crate::hasher::{AbundanceTracker, HashVerifier, SequenceHasher};
-use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
+use crate::utils::{
+    base_read_id, compute_write_buffer_size, read_count_mismatch, validate_format_compatibility,
+};
 use crate::writer::{
     OutputFormat, preload_existing_hashes, preload_existing_paired_hashes,
     write_fasta_record, write_fasta_record_with_abundance, write_fastq_record_with_abundance,
@@ -113,7 +115,7 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
     input_path: &str,
     output_path: &str,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let mut verifier = HashVerifier::<T>::new(cfg.estimated_capacity)?;
 
     if cfg.dry_run {
@@ -136,12 +138,16 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
             processed_sequences += 1;
         }
 
-        return Ok((processed_sequences, duplicates));
+        return Ok((processed_sequences, duplicates, 0));
     }
 
     // --- PRELOADING ---
     let output_path_bound = Path::new(output_path);
     let is_gz = OutputFormat::is_gz(output_path_bound);
+
+    // Records already on disk from a previous run: the caller needs them to
+    // report the WHOLE output, not just what this invocation appended.
+    let mut preloaded = 0;
 
     if crate::stream::is_stream(output_path) {
         // D-4: a stream is written fresh — nothing exists to preload hashes
@@ -156,6 +162,7 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
     } else {
         let (preloads, valid_bytes) =
             preload_existing_hashes::<T>(output_path, &mut verifier, cfg.verbose)?;
+        preloaded = preloads;
         if preloads > 0 && cfg.verbose {
             println!("{} sequences preloaded.", preloads);
         }
@@ -230,7 +237,7 @@ pub(crate) fn execute_deduplication<T: SequenceHasher + 'static>(
         .flush()
         .context("Failed to flush output buffer")?;
 
-    Ok((processed_sequences, duplicates))
+    Ok((processed_sequences, duplicates, preloaded))
 }
 
 // ==========================================
@@ -244,7 +251,7 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
     output_r1_path: &str,
     output_r2_path: &str,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let mut verifier = HashVerifier::<T>::new(cfg.estimated_capacity)?;
 
     let mut reader_r1 = crate::stream::open_fastx(input_r1_path)?;
@@ -258,8 +265,34 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
             println!("--dry-run enabled: calculating Paired-End duplication rate.");
         }
 
-        while let (Some(record_r1_res), Some(record_r2_res)) = (reader_r1.next(), reader_r2.next())
-        {
+        // One `next()` per mate per iteration, ending only when BOTH are
+        // exhausted. Reading both unconditionally (the two `next()` calls sat
+        // in one `while let` tuple) consumed the longer side's surplus record
+        // on the failing iteration, so the post-loop check then saw EOF: a
+        // one-record surplus exited 0 and was reported as half a pair.
+        loop {
+            let record_r1_res = match reader_r1.next() {
+                Some(record) => record,
+                None => {
+                    if reader_r2.next().is_some() {
+                        return Err(read_count_mismatch(
+                            processed_sequences,
+                            processed_sequences + 1,
+                        ));
+                    }
+                    break;
+                }
+            };
+            let record_r2_res = match reader_r2.next() {
+                Some(record) => record,
+                None => {
+                    return Err(read_count_mismatch(
+                        processed_sequences + 1,
+                        processed_sequences,
+                    ));
+                }
+            };
+
             let seq_r1 = record_r1_res.context("Invalid sequence in R1")?;
             let seq_r2 = record_r2_res.context("Invalid sequence in R2")?;
 
@@ -283,24 +316,7 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
             processed_sequences += 1;
         }
 
-        // Count remaining records to detect length mismatch
-        let mut r1_remaining = 0;
-        while reader_r1.next().is_some() {
-            r1_remaining += 1;
-        }
-        let mut r2_remaining = 0;
-        while reader_r2.next().is_some() {
-            r2_remaining += 1;
-        }
-        if r1_remaining != r2_remaining {
-            bail!(
-                "Desynchronization detected at the end: R1 has {} unmatched reads, R2 has {} unmatched reads",
-                r1_remaining,
-                r2_remaining
-            );
-        }
-
-        return Ok((processed_sequences, duplicates));
+        return Ok((processed_sequences, duplicates, 0));
     }
 
     // --- PRELOADING AND SYNCHRONIZED TRUNCATION ---
@@ -309,6 +325,10 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
 
     let is_gz_r1 = OutputFormat::is_gz(path_r1_bound);
     let is_gz_r2 = OutputFormat::is_gz(path_r2_bound);
+
+    // Pairs already on disk from a previous run: the caller needs them to
+    // report the WHOLE output, not just what this invocation appended.
+    let mut preloaded = 0;
 
     if crate::stream::is_stream(output_r1_path) || crate::stream::is_stream(output_r2_path) {
         // D-4: a stream is written fresh — nothing exists to preload hashes
@@ -327,6 +347,7 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
             &mut verifier,
             cfg.verbose,
         )?;
+        preloaded = preloads;
 
         if preloads > 0 && cfg.verbose {
             println!("{} pairs preloaded and synchronized.", preloads);
@@ -387,7 +408,34 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
     // --- SYNCHRONIZED MAIN WRITE LOOP ---
     let mut format_validated = false;
 
-    while let (Some(record_r1_res), Some(record_r2_res)) = (reader_r1.next(), reader_r2.next()) {
+    // One `next()` per mate per iteration; the loop ends only when BOTH are
+    // exhausted. The previous `while let (Some(a), Some(b)) = (r1.next(),
+    // r2.next())` evaluated both calls on every iteration, so the failing one
+    // consumed the longer side's surplus record and the end-of-loop check below
+    // then saw EOF — a one-record surplus exited 0 and the record was lost.
+    loop {
+        let record_r1_res = match reader_r1.next() {
+            Some(record) => record,
+            None => {
+                if reader_r2.next().is_some() {
+                    return Err(read_count_mismatch(
+                        processed_sequences,
+                        processed_sequences + 1,
+                    ));
+                }
+                break;
+            }
+        };
+        let record_r2_res = match reader_r2.next() {
+            Some(record) => record,
+            None => {
+                return Err(read_count_mismatch(
+                    processed_sequences + 1,
+                    processed_sequences,
+                ));
+            }
+        };
+
         let seq_r1 = record_r1_res.context("Invalid sequence in R1")?;
         let seq_r2 = record_r2_res.context("Invalid sequence in R2")?;
 
@@ -436,12 +484,6 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
         processed_sequences += 1;
     }
 
-    if reader_r1.next().is_some() || reader_r2.next().is_some() {
-        bail!(
-            "Desynchronization detected at the end: one file contains more reads than the other!"
-        );
-    }
-
     buf_writer_r1
         .flush()
         .context("Failed to flush R1 output buffer")?;
@@ -449,7 +491,7 @@ pub(crate) fn execute_paired_deduplication<T: SequenceHasher + 'static>(
         .flush()
         .context("Failed to flush R2 output buffer")?;
 
-    Ok((processed_sequences, duplicates))
+    Ok((processed_sequences, duplicates, preloaded))
 }
 
 // ==========================================
@@ -465,7 +507,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
     input_path: &str,
     output_path: &str,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     // --dry-run writes nothing — not even the temp file: the plain counting
     // pass reaches the identical verdict without creating anything.
     if cfg.dry_run {
@@ -593,7 +635,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
             .context("Failed to flush output buffer")?;
 
         let duplicates = total_reads - tracker.len();
-        Ok((total_reads, duplicates))
+        Ok((total_reads, duplicates, 0))
 
     } else {
         // === CLASSIC PATH (re-read input gzip for second pass) ===
@@ -673,7 +715,7 @@ pub(crate) fn execute_deduplication_with_abundance<T: SequenceHasher + 'static>(
             .context("Failed to flush output buffer")?;
 
         let duplicates = total_reads - tracker.len();
-        Ok((total_reads, duplicates))
+        Ok((total_reads, duplicates, 0))
     }
 }
 
@@ -692,7 +734,7 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
     output_r1_path: &str,
     output_r2_path: &str,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     // --dry-run writes nothing — not even the temp file: the plain paired
     // counting pass reaches the identical verdict without creating anything.
     if cfg.dry_run {
@@ -728,7 +770,26 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
             let mut is_fastq = false;
             let mut format_detected = false;
 
-            while let (Some(r1_res), Some(r2_res)) = (reader_r1.next(), reader_r2.next()) {
+            // Same synchronized loop as the write path: one `next()` per mate
+            // per iteration, so a surplus record is refused instead of being
+            // consumed by the failing iteration and then mistaken for EOF.
+            loop {
+                let r1_res = match reader_r1.next() {
+                    Some(record) => record,
+                    None => {
+                        if reader_r2.next().is_some() {
+                            return Err(read_count_mismatch(total_reads, total_reads + 1));
+                        }
+                        break;
+                    }
+                };
+                let r2_res = match reader_r2.next() {
+                    Some(record) => record,
+                    None => {
+                        return Err(read_count_mismatch(total_reads + 1, total_reads));
+                    }
+                };
+
                 let seq_r1 = r1_res.context("Invalid sequence in R1")?;
 
                 if !format_detected {
@@ -756,13 +817,6 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
                 if is_first {
                     write_paired_record(&mut temp_writer, &seq_r1, &seq_r2, is_fastq)?;
                 }
-            }
-
-            // Check for trailing records (desynchronization at end)
-            if reader_r1.next().is_some() || reader_r2.next().is_some() {
-                bail!(
-                    "Desynchronization detected at the end: one file contains more reads than the other!"
-                );
             }
         }
 
@@ -877,7 +931,7 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
             .context("Failed to flush R2 output buffer")?;
 
         let duplicates = total_reads - tracker.len();
-        Ok((total_reads, duplicates))
+        Ok((total_reads, duplicates, 0))
 
     } else {
         // === CLASSIC PATH (re-read input gzip for second pass) ===
@@ -887,7 +941,25 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
             let mut reader_r1 = crate::stream::open_fastx(input_r1_path)?;
             let mut reader_r2 = crate::stream::open_fastx(input_r2_path)?;
 
-            while let (Some(r1_res), Some(r2_res)) = (reader_r1.next(), reader_r2.next()) {
+            // Same synchronized loop as the write path: one `next()` per mate
+            // per iteration, so a surplus record is refused, not swallowed.
+            loop {
+                let r1_res = match reader_r1.next() {
+                    Some(record) => record,
+                    None => {
+                        if reader_r2.next().is_some() {
+                            return Err(read_count_mismatch(total_reads, total_reads + 1));
+                        }
+                        break;
+                    }
+                };
+                let r2_res = match reader_r2.next() {
+                    Some(record) => record,
+                    None => {
+                        return Err(read_count_mismatch(total_reads + 1, total_reads));
+                    }
+                };
+
                 let seq_r1 = r1_res.context("Invalid sequence in R1")?;
                 let seq_r2 = r2_res.context("Invalid sequence in R2")?;
 
@@ -905,13 +977,6 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
                 let combined_hash = T::hash_pair(&seq_r1.seq(), &seq_r2.seq());
                 tracker.track(combined_hash);
                 total_reads += 1;
-            }
-
-            // Check for trailing records (desynchronization at end)
-            if reader_r1.next().is_some() || reader_r2.next().is_some() {
-                bail!(
-                    "Desynchronization detected at the end: one file contains more reads than the other!"
-                );
             }
         }
 
@@ -939,8 +1004,28 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
         let mut reader_r2 = crate::stream::open_fastx(input_r2_path)?;
         let mut written = rustc_hash::FxHashSet::default();
         let mut format_validated = false;
+        // Pass 1 already refused a length mismatch; this counter keeps the
+        // refusal message honest if the inputs changed between the two passes.
+        let mut pairs_seen = 0usize;
 
-        while let (Some(r1_res), Some(r2_res)) = (reader_r1.next(), reader_r2.next()) {
+        loop {
+            let r1_res = match reader_r1.next() {
+                Some(record) => record,
+                None => {
+                    if reader_r2.next().is_some() {
+                        return Err(read_count_mismatch(pairs_seen, pairs_seen + 1));
+                    }
+                    break;
+                }
+            };
+            let r2_res = match reader_r2.next() {
+                Some(record) => record,
+                None => {
+                    return Err(read_count_mismatch(pairs_seen + 1, pairs_seen));
+                }
+            };
+            pairs_seen += 1;
+
             let seq_r1 = r1_res.context("Invalid sequence in R1")?;
             let seq_r2 = r2_res.context("Invalid sequence in R2")?;
 
@@ -1004,7 +1089,7 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
                         sep,
                     )?;
                 }
-                }
+            }
         }
 
         buf_writer_r1
@@ -1014,7 +1099,7 @@ pub(crate) fn execute_paired_deduplication_with_abundance<T: SequenceHasher + 's
             .flush()
             .context("Failed to flush R2 output buffer")?;
 
-        Ok((total_reads, total_reads - tracker.len()))
+        Ok((total_reads, total_reads - tracker.len(), 0))
     }
 }
 

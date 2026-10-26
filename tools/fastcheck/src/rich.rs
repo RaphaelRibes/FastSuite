@@ -76,11 +76,13 @@ pub fn head_dropout(acc: &Accum) -> (f64, f64) {
 /// `crate::overrep` (§5.9) — this function only reports what the exact fingerprint table
 /// knows. The top list names no sequences: that requires one of the --overrep-mode table
 /// modes, and `names_available` says so.
-pub fn repeated_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
+pub fn repeated_metrics(acc: &Accum, min_count: u32) -> (Map<String, Value>, Value) {
     let reads = acc.reads.max(1) as f64;
     let distinct = acc.seq_counts.distinct();
     let hist = acc.seq_counts.multiplicity_hist();
-    let min_count = (reads * 0.001).max(10.0) as u32;
+    // The threshold is the caller's: `--overrep-min-count` when given, otherwise the
+    // resolved 0.1%-of-reads floor. Computing a second threshold here made this metric
+    // say "1 repeated sequence" while the `overrep` block it summarises said [].
     let overrep = acc.seq_counts.at_least(min_count);
 
     let mut m = Map::new();
@@ -96,8 +98,10 @@ pub fn repeated_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
     m.insert("dup_multiplicity_max".into(), json!(hist.len().saturating_sub(2)));
     m.insert("dup_singletons".into(), json!(hist.get(1).copied().unwrap_or(0)));
     m.insert("repeated_seq_count".into(), json!(overrep.len()));
-    let frac: f64 = overrep.iter().map(|(_, c)| *c as f64).sum::<f64>() / reads;
-    m.insert("repeated_seq_frac".into(), json!(r4(frac)));
+    // Integer sum first: `f64::sum` over an empty iterator is -0.0 (the additive
+    // identity), which serialised as "repeated_seq_frac": -0.0 in the report.
+    let repeated_reads: u64 = overrep.iter().map(|(_, c)| *c as u64).sum();
+    m.insert("repeated_seq_frac".into(), json!(r4(repeated_reads as f64 / reads)));
 
     // `names_available: false` is not a caveat, it is the contract of this mode: the
     // multiplicities are exact, the sequences are not recoverable from a hash.
@@ -124,16 +128,19 @@ pub fn repeated_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
 /// whatever `-j` is.
 pub fn kmer_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
     let reads = acc.reads.max(1) as f64;
+    // The denominator is the number of k-mer WINDOWS counted, not the number of reads: a
+    // read of L bases carries L-11 windows, so a 12-mer repeating inside every read can be
+    // counted L-11 times per read. Dividing by reads made the share unbounded (2 000 reads
+    // of 40 bp: 16 000 windows, kmer_top_frac 8.0).
+    let windows = acc.kmer_windows.max(1) as f64;
     let min_count = (reads * 0.001).max(10.0) as u32;
     let kmers = acc.kmer_counts.report(min_count);
+    let top = kmers.first().map(|(_, c)| *c).unwrap_or(0);
     let mut m = Map::new();
-    m.insert(
-        "kmer_top_count".into(),
-        json!(kmers.first().map(|(_, c)| *c).unwrap_or(0)),
-    );
+    m.insert("kmer_top_count".into(), json!(top));
     m.insert(
         "kmer_top_frac".into(),
-        json!(kmers.first().map(|(_, c)| r4(*c as f64 / reads)).unwrap_or(0.0)),
+        json!(r4((top as f64 / windows).min(1.0))),
     );
     let list: Vec<Value> = kmers
         .iter()
@@ -142,7 +149,7 @@ pub fn kmer_metrics(acc: &Accum) -> (Map<String, Value>, Value) {
             json!({
                 "kmer": repeated::unpack_kmer(*k, 12),
                 "count": c,
-                "frac": r4(*c as f64 / reads),
+                "frac": r4((*c as f64 / windows).min(1.0)),
             })
         })
         .collect();

@@ -27,23 +27,23 @@ const ASCII_ART: &str = r#"
 #[command(help_expected = true)]
 pub struct Cli {
     /// Path to the input FASTX file (R1 or Single-End). `-` reads stdin (D-4).
-    #[arg(required = true, short = '1', long, visible_alias = "in1")]
+    #[arg(required = true, short = '1', long = "in1", visible_alias = "input")]
     pub input: String,
 
     /// Path to the R2 input FASTX file (Optional, enables Paired-End mode)
-    /// --output-r2 is required unless --dry-run is set.
-    #[arg(short = '2', long, visible_alias = "in2")]
+    /// --out2 is required unless --dry-run is set.
+    #[arg(short = '2', long = "in2", visible_alias = "input-r2")]
     pub input_r2: Option<String>,
 
     /// Path to the output file (R1 or Single-End). `-` writes stdout (D-4).
     /// Supported formats: .fastq, .fq, .fasta, .fa, .fna (+ .gz for compression)
     /// Optional when --dry-run is set.
-    #[arg(short = 'o', long, visible_alias = "out1")]
+    #[arg(short = 'o', long = "out1", visible_alias = "output")]
     pub output: Option<String>,
 
-    /// Path to the R2 output file (Required if --input-r2 is provided without --dry-run)
-    /// Must have the same format as --output
-    #[arg(short = 'p', long, visible_alias = "out2")]
+    /// Path to the R2 output file (Required if --in2 is provided without --dry-run)
+    /// Must have the same format as --out1
+    #[arg(short = 'p', long = "out2", visible_alias = "output-r2")]
     pub output_r2: Option<String>,
 
     /// Output record format when the output is a stream (`-`).
@@ -113,10 +113,11 @@ pub struct Cli {
     #[arg(long, default_value = ";size=")]
     pub abundance_sep: String,
 
-    /// Number of threads for parallel processing (0 = auto-detect). Default: 1 (single-threaded).
+    /// Number of threads for parallel processing (0 = auto-detect).
+    /// Default: 1, or $FASTSUITE_THREADS when set and -j is absent.
     /// When > 1, uses a producer/consumer pipeline for parallel hashing.
-    #[arg(long, short = 'j', default_value_t = 1)]
-    pub threads: usize,
+    #[arg(long, short = 'j')]
+    pub threads: Option<usize>,
 
     /// Pre-count the exact number of sequences by doing a fast first pass over the input.
     /// This gives the hash table an exact capacity, avoiding both OOM from over-estimation

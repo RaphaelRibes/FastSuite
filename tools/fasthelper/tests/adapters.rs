@@ -362,6 +362,11 @@ fn fastmaps_wrapper_beside_its_grid_is_not_a_phantom_sample() {
 
 /// The pre-streaming reader, verbatim, as an oracle: x-major accumulation,
 /// `n == 0.0` shortcut, pitch as f64.
+///
+/// One change (2026-10-26): the row now also states the corner window the
+/// fractions were built with (`max(size/50, 2)`), because copying the grid's
+/// declared value published a window the numbers had not used. The fractions
+/// themselves are still the old reader's, bit for bit.
 fn reference_grid_metrics(
     size: i64,
     counts: &[u64],
@@ -371,6 +376,9 @@ fn reference_grid_metrics(
     metrics.insert("total_reads".to_string(), header_total);
     metrics.insert("grid_size".to_string(), size as f64);
     let c = (size / 50).max(2);
+    if size > 0 {
+        metrics.insert("corner_window".to_string(), c as f64);
+    }
     if counts.len() < (size * size) as usize {
         return metrics;
     }
@@ -449,6 +457,37 @@ fn streamed_grid_matches_the_value_based_reference_bit_for_bit() {
 }
 
 #[test]
+fn a_grid_publishes_the_corner_window_it_actually_used() {
+    // H8: the grid's declared `corner_window` was copied into the metrics while
+    // the fractions were computed with `size/50`, so a row named a window it
+    // had not used. A cell at distance 3 from the corner is inside a window of
+    // 4 and outside a window of 2, so the two readings are distinguishable.
+    let size = 9i64;
+    let mut counts = vec![0u64; (size * size) as usize];
+    counts[(8 * size + 8) as usize] = 5; // the far corner
+    counts[(5 * size + 5) as usize] = 7; // inside a window of 4, outside of 2
+    let doc = serde_json::json!({
+        "version": 2,
+        "size": size,
+        "total_reads": 12,
+        "corner_window": 4, // declared by the producer, NOT what is used
+        "counts": counts,
+    });
+    let path = tmp("fh8_window").join("heatmap.json");
+    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let r = adapt_file(&path, None).unwrap().unwrap();
+    assert_eq!(
+        r.metrics["corner_window"], 2.0,
+        "the published window must be the one the fractions were built with: {:?}",
+        r.metrics
+    );
+    let mut expected = reference_grid_metrics(size, &counts, 12.0);
+    expected.insert("corner_window".to_string(), 2.0);
+    assert_eq!(r.metrics, expected, "fractions and the published window must agree");
+}
+
+#[test]
 fn streamed_grid_keeps_short_windows_and_key_order_independent() {
     // `counts_r1`/`counts_r2` are bare arrays in fastmaps' output, which the
     // reader has always ignored (it looks for a nested "counts" key); a window
@@ -522,15 +561,18 @@ fn streamed_report_json_is_byte_identical_to_the_value_tree() {
                 })
             })
             .collect();
+        // The aggregate is a COLLECTION of reports, not a measurement: it is
+        // stamped with its own schema tag, because `fastsuite.report.v1`
+        // promises `tool` + `metrics` that an aggregate does not have (and
+        // `check --report` used to reject fasthelper's own output over it).
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": fasthelper::report::SCHEMA_VERSION,
+            "schema": fasthelper::report::AGGREGATE_SCHEMA_VERSION,
             "generator": "fasthelper",
             "generator_version": env!("CARGO_PKG_VERSION"),
             "title": "T",
             "reports": samples,
         }))
-        .unwrap()
-            + "\n"
+        .unwrap() + "\n"
     };
     let mut out = Vec::new();
     write_json(&mut out, "T", &reports).unwrap();

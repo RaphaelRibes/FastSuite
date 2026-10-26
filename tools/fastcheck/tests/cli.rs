@@ -103,13 +103,32 @@ fn identical_bytes_only_in_the_input_give_identical_reports() {
 
     let mut va = read_json(&a);
     let mut vb = read_json(&b);
-    // Only timing and the recorded command line may differ.
-    for v in [&mut va, &mut vb] {
-        v["elapsed_s"] = serde_json::json!(0.0);
-        v["command"] = serde_json::json!("");
-        v["metrics"]["elapsed_s"] = serde_json::json!(0.0);
+    // Only the run parameters may differ (timing, the recorded command line, and the
+    // resolved thread count the report now states — see `blank_run_variance`).
+    blank_run_variance(&mut va);
+    blank_run_variance(&mut vb);
+    assert_eq!(va, vb, "-j must not change any MEASURED number");
+    // ... and the parameter it does change is stated, not silently different.
+    assert_eq!(read_json(&b)["metrics"]["threads"], 8);
+}
+
+#[test]
+fn metrics_record_the_resolved_thread_count() {
+    let d = tmpdir("threads_metric");
+    let fq = write_fixture(&d);
+    for j in ["1", "3"] {
+        let json = d.join(format!("t{j}.json"));
+        let (_, stderr, code) = run(
+            &d,
+            &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-j", j, "-q"],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(
+            read_json(&json)["metrics"]["threads"],
+            j.parse::<u64>().unwrap(),
+            "the report must state the -j it ran with"
+        );
     }
-    assert_eq!(va, vb, "-j must not change any reported number");
 }
 
 #[test]
@@ -128,11 +147,8 @@ fn multi_file_reports_are_identical_whatever_the_thread_split() {
 
     let mut v1 = read_json(&j1);
     let mut v8 = read_json(&j8);
-    for v in [&mut v1, &mut v8] {
-        v["elapsed_s"] = serde_json::json!(0.0);
-        v["command"] = serde_json::json!("");
-        v["metrics"]["elapsed_s"] = serde_json::json!(0.0);
-    }
+    blank_run_variance(&mut v1);
+    blank_run_variance(&mut v8);
     assert_eq!(v1, v8);
     assert_eq!(v1["metrics"]["files"], 2);
 }
@@ -519,6 +535,7 @@ fn overrep_mode_none_is_the_default_and_reports_no_names() {
     assert_eq!(v["overrep"]["names_available"], false);
     // Duplication levels are still exact in this mode.
     assert!(v["metrics"]["distinct_seqs"].is_u64());
+    assert_eq!(v["overrep"]["min_count"], 10, "the default 0.1%-of-reads floor");
     assert!(v["overrep"]["sequences"].as_array().unwrap().is_empty());
 }
 
@@ -835,11 +852,21 @@ const ALL_METRICS: &[&str] = &[
     "polyx5_max", "distinct_seqs", "duplication_level", "kmer_top_count", "heatmap_peak",
 ];
 
-/// Blank the two fields that legitimately differ between two runs of the same input.
+/// Blank the fields that are run parameters rather than measurements: the elapsed time,
+/// the recorded command line, and the resolved thread count.
+///
+/// REVERSAL, named deliberately: this helper used not to blank `metrics.threads` because
+/// the report did not carry one, and the two identity tests below asserted that `-j`
+/// changes no reported number at all. The report now STATES the -j it ran with (a run
+/// parameter a consumer needs, and the one thing that legitimately differs between two
+/// runs of the same bytes), so the assertion is narrowed to what it was really about:
+/// every MEASURED number is thread-count invariant. `metrics_record_the_resolved_thread_count`
+/// pins the field itself.
 fn blank_run_variance(v: &mut serde_json::Value) {
     v["elapsed_s"] = serde_json::json!(0.0);
     v["command"] = serde_json::json!("");
     v["metrics"]["elapsed_s"] = serde_json::json!(0.0);
+    v["metrics"]["threads"] = serde_json::json!(0);
 }
 
 #[test]
@@ -928,6 +955,15 @@ fn only_bases_keeps_the_composition_and_drops_the_quality() {
     // rows (which normally define the coverage) were never grown.
     assert_eq!(v["base_position"].as_object().unwrap().len(), 10, "10 positions");
     assert_eq!(v["base_position"]["1"][0], 3, "3 reads start with A");
+    // The composition block is summed from the every-base totals, which the gated path
+    // fills exactly as the ungated one does: a gated run must not report zeros here.
+    let comp = &v["base_composition"];
+    let comp_sum: u64 = ["a", "c", "g", "t", "other"]
+        .iter()
+        .map(|k| comp[*k].as_u64().unwrap())
+        .sum();
+    assert_eq!(comp_sum, v["metrics"]["bases"].as_u64().unwrap(), "{comp}");
+    assert_eq!(comp["a"], 15, "hand count from the fixture: {comp}");
     assert!(v["metrics"].get("head_g_frac").is_some());
     assert!(v.get("read_mean_q_hist").is_none());
     assert!(v["metrics"].get("quality_byte_min").is_none());
@@ -1401,5 +1437,432 @@ fn insert_hist_refuses_two_files_that_are_not_in_the_same_pair_order() {
     assert!(
         !json.exists() && !html.exists(),
         "no report may be written from mis-paired reads"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reproduced-defect regressions (C1-C10) and the output-path contract.
+// Each fixture is the one in the defect report, so the numbers below are the
+// numbers that were wrong, not a proxy for them.
+// ---------------------------------------------------------------------------
+
+/// C1: `base_composition` must sum to `metrics.bases`, including the bases past
+/// --max-read-len. Reported: 10 reads x 8 bp at --max-read-len 4 summed to 40 with
+/// bases 80, because the block was summed from the truncated per-position rows.
+#[test]
+fn base_composition_covers_every_base_even_past_max_read_len() {
+    let d = tmpdir("composition_all_bases");
+    let p = d.join("ten.fastq");
+    let mut body = String::new();
+    for i in 0..10 {
+        body.push_str(&format!("@r{i}\nACGTACGT\n+\nIIIIIIII\n"));
+    }
+    std::fs::write(&p, body).unwrap();
+    let json = d.join("c.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[p.to_str().unwrap(), "--max-read-len", "4", "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&json);
+    let comp = &v["base_composition"];
+    let sum: u64 = ["a", "c", "g", "t", "other"]
+        .iter()
+        .map(|k| comp[*k].as_u64().unwrap())
+        .sum();
+    assert_eq!(v["metrics"]["bases"], 80);
+    assert_eq!(sum, 80, "the composition must account for every base: {comp}");
+    assert_eq!(comp["a"], 20, "ACGT x 10 reads, 4 As each");
+    assert_eq!(v["metrics"]["reads_over_max_read_len"], 10);
+    // The per-position matrix still stops at the covered window: the fix widens the
+    // totals, it does not attribute untracked positions.
+    assert_eq!(v["base_position"].as_object().unwrap().len(), 4);
+}
+
+/// C2: `kmer_top_frac` is a share of the k-mer WINDOWS counted, not of the reads.
+/// Reported: 2 000 reads of 40 bp gave kmer_top_count 16000 and kmer_top_frac 8.0
+/// (29 windows per read -> 58 000 windows, so 16000/58000 = 0.2759).
+#[test]
+fn kmer_top_fraction_divides_by_windows_and_never_exceeds_one() {
+    let d = tmpdir("kmer_windows");
+    let p = d.join("k.fastq");
+    let read = "ACGT".repeat(10); // 40 bp -> 29 windows
+    let mut body = String::new();
+    for i in 0..2000 {
+        body.push_str(&format!("@r{i}\n{read}\n+\n{}\n", "I".repeat(40)));
+    }
+    std::fs::write(&p, body).unwrap();
+    let json = d.join("k.json");
+    let (_, stderr, code) = run(&d, &[p.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&json);
+    let m = &v["metrics"];
+    assert_eq!(m["kmer_top_count"], 16_000);
+    let frac = m["kmer_top_frac"].as_f64().unwrap();
+    assert!(
+        (frac - 16_000.0 / 58_000.0).abs() < 1e-4,
+        "kmer_top_frac must be top/windows = 0.2759, got {frac}"
+    );
+    assert!(frac <= 1.0, "a share of windows cannot exceed 1, got {frac}");
+    let top0 = &v["kmer_spectrum"]["top"][0];
+    assert_eq!(top0["count"], 16_000);
+    assert!(
+        top0["frac"].as_f64().unwrap() <= 1.0,
+        "the per-k-mer share is the same denominator: {top0}"
+    );
+}
+
+/// C3: `--profile` must never publish gc 0.0 for a library with GC. Reported: 800 reads
+/// at ~51% GC, every R1 starting with the TruSeq prefix, gave metrics.gc_fraction 0.5138
+/// and profile gc 0.0 with no warning — the fragment GC has no denominator when every
+/// read is readthrough. It must fall back to the whole-read GC and say so.
+#[test]
+fn profile_falls_back_to_whole_read_gc_when_every_read_is_readthrough() {
+    let d = tmpdir("profile_gc_fallback");
+    let p = d.join("adapter.fastq");
+    let mut body = String::new();
+    for i in 0..800u64 {
+        // Adapter prefix on every read (so no fragment base is measurable), body from
+        // deterministic DNA so the library has a real, non-zero GC.
+        let body_seq = String::from_utf8(dna(37, 7_000 + i)).unwrap();
+        body.push_str(&format!("@r{i}\nAGATCGGAAGAGC{body_seq}\n+\n{}\n", "I".repeat(50)));
+    }
+    std::fs::write(&p, body).unwrap();
+    let json = d.join("p.json");
+    let prof = d.join("fitted.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[p.to_str().unwrap(), "--profile", prof.to_str().unwrap(),
+          "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&prof);
+    let report_gc = read_json(&json)["metrics"]["gc_fraction"].as_f64().unwrap();
+    let gc = v["gc"].as_f64().unwrap();
+    assert!(report_gc > 0.3, "fixture GC: {report_gc}");
+    assert!(gc > 0.3, "the profile must not report 0.0 for a {report_gc:.3}-GC library: {gc}");
+    assert!(
+        (gc - report_gc).abs() < 1e-4,
+        "the fallback is the whole-read GC: profile {gc} vs report {report_gc}"
+    );
+    let fr: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("fitted.fit_report.json")).unwrap())
+            .unwrap();
+    assert_eq!(fr["measured"]["gc_is_fragment"], false, "{fr}");
+    let warnings = fr["fit_warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap_or("").contains("WHOLE-READ GC")),
+        "the fallback must be recorded as a fit warning: {warnings:?}"
+    );
+}
+
+/// C4: `--profile --insert-hist` may claim "MEASURED by --insert-hist" only when the
+/// pass resolved an insert. Reported: 30 pairs with no overlap at all (100% censored,
+/// every pair on the saturation bin) produced a comment claiming the distribution was
+/// measured.
+#[test]
+fn profile_labels_an_all_censored_insert_distribution_as_censored() {
+    let d = tmpdir("profile_insert_censored");
+    // 400 bp fragments read from both ends with 50 bp reads: no overlap anywhere.
+    let (mut a, mut b) = (String::new(), String::new());
+    for i in 0..30u64 {
+        let frag = dna(400, 5_000 + i);
+        a.push_str(&format!("@q{i}/1\n{}\n+\n{}\n",
+            String::from_utf8(frag[..50].to_vec()).unwrap(), "I".repeat(50)));
+        b.push_str(&format!("@q{i}/2\n{}\n+\n{}\n",
+            String::from_utf8(revcomp(&frag[350..])).unwrap(), "I".repeat(50)));
+    }
+    let r1 = d.join("r1.fastq");
+    let r2 = d.join("r2.fastq");
+    std::fs::write(&r1, a).unwrap();
+    std::fs::write(&r2, b).unwrap();
+    let json = d.join("c.json");
+    let prof = d.join("c.json.prof");
+    let (_, stderr, code) = run(
+        &d,
+        &[r1.to_str().unwrap(), r2.to_str().unwrap(), "--insert-hist",
+          "--profile", prof.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let ih = &read_json(&json)["insert_hist"];
+    assert_eq!(ih["measured"], 0, "the fixture must measure nothing: {ih}");
+    assert_eq!(ih["censored_no_overlap"], 30);
+    let v = read_json(&prof);
+    let comment = v["_comment"].as_str().unwrap();
+    assert!(comment.contains("CENSORED"), "an all-censored CDF is not measured: {comment}");
+    assert!(
+        !comment.contains("MEASURED by --insert-hist"),
+        "the label must not claim a measurement that never happened: {comment}"
+    );
+    let fr: serde_json::Value = serde_json::from_str(
+        // `with_extension` replaces the LAST extension: c.json.prof -> c.json.fit_report.json
+        &std::fs::read_to_string(d.join("c.json.fit_report.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        fr["invented"].as_array().unwrap().iter().any(|v| v == "insert distribution shape"),
+        "the fit report must name the invented shape: {fr}"
+    );
+
+    // The other branch: an overlapping pair set IS measured, and says so.
+    let (o1, o2) = write_pairs(&d, 100);
+    let json2 = d.join("m.json");
+    let prof2 = d.join("m.prof");
+    let (_, stderr, code) = run(
+        &d,
+        &[o1.to_str().unwrap(), o2.to_str().unwrap(), "--insert-hist",
+          "--profile", prof2.to_str().unwrap(), "--json", json2.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(read_json(&json2)["insert_hist"]["measured"].as_u64().unwrap() > 90);
+    let c2 = read_json(&prof2)["_comment"].as_str().unwrap().to_string();
+    assert!(c2.contains("MEASURED by --insert-hist"), "{c2}");
+}
+
+/// C5a: mates with different record counts are refused. Reported: R2 truncated to 10 of
+/// 50 records gave pairs_sampled 10, pairs_in_input 30, scale_factor 3.0 and exit 0.
+#[test]
+fn insert_hist_refuses_mates_with_different_record_counts() {
+    let d = tmpdir("insert_unequal");
+    let (r1, r2) = write_pairs(&d, 20);
+    let text = std::fs::read_to_string(&r2).unwrap();
+    let mut kept = String::new();
+    for (i, rec) in text.trim_end().split('@').filter(|s| !s.is_empty()).enumerate() {
+        if i >= 4 {
+            break;
+        }
+        kept.push('@');
+        kept.push_str(rec);
+        if !rec.ends_with('\n') {
+            kept.push('\n');
+        }
+    }
+    std::fs::write(&r2, kept).unwrap();
+
+    let json = d.join("u.json");
+    let (stdout, stderr, code) = run(
+        &d,
+        &[r1.to_str().unwrap(), r2.to_str().unwrap(), "--insert-hist",
+          "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_ne!(code, 0, "unequal mate counts must be refused, not measured: {stdout}{stderr}");
+    assert!(
+        stderr.contains("different numbers of records"),
+        "the refusal must name the cause: {stderr}"
+    );
+    assert!(!json.exists(), "no report may be written from a truncated mate file");
+}
+
+/// C5b: the reported pair counters are the ones the insert pass actually scanned. Reported:
+/// `--reads 4` sampled 50 pairs, reported pairs_in_input 4 and scale_factor 0.08 — a factor
+/// derived from the QC scan's budget applied to a different pass's sample.
+#[test]
+fn insert_hist_reports_the_pairs_it_scanned_and_a_known_input_size() {
+    let d = tmpdir("insert_counters");
+    let (r1, r2) = write_pairs(&d, 50);
+
+    // A complete run: the pass reaches EOF, so it knows both the sample and the input.
+    let full = d.join("full.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[r1.to_str().unwrap(), r2.to_str().unwrap(), "--insert-hist",
+          "--json", full.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let ih = &read_json(&full)["insert_hist"];
+    assert_eq!(ih["pairs_sampled"], 50);
+    assert_eq!(ih["pairs_in_input"], 50, "both files were read to the end: {ih}");
+    assert_eq!(ih["scale_factor"], 1.0);
+
+    // --reads 4: the insert pass honours the same budget, and the input's pair count is
+    // then genuinely unknown to it (it did not reach EOF), so both are null rather than a
+    // rescaled lie.
+    let budget = d.join("budget.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[r1.to_str().unwrap(), r2.to_str().unwrap(), "--insert-hist", "--reads", "4",
+          "--json", budget.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let ih = &read_json(&budget)["insert_hist"];
+    assert_eq!(ih["pairs_sampled"], 4, "the sample stops at the run's own budget: {ih}");
+    assert!(
+        ih["pairs_in_input"].is_null() && ih["scale_factor"].is_null(),
+        "an unknown input size is null, never derived from another pass: {ih}"
+    );
+}
+
+/// C6: `--overrep-min-count` is THE threshold for over-represented sequences, in the
+/// metrics, the `overrep` block and the HTML alike. Reported: at 600 on a 500x sequence
+/// the block said [] while repeated_seq_count said 1 and the page listed it.
+#[test]
+fn overrep_min_count_is_the_same_threshold_everywhere() {
+    let d = tmpdir("overrep_threshold");
+    let p = d.join("rep.fastq");
+    let mut body = String::new();
+    for i in 0..500u64 {
+        body.push_str(&format!("@d{i}\nACGTACGTACGTACGTACGT\n+\n{}\n", "I".repeat(20)));
+    }
+    for i in 0..500u64 {
+        let seq = String::from_utf8(dna(20, 90_000 + i)).unwrap();
+        body.push_str(&format!("@u{i}\n{seq}\n+\n{}\n", "I".repeat(20)));
+    }
+    std::fs::write(&p, body).unwrap();
+
+    let strict_json = d.join("strict.json");
+    let strict_html = d.join("strict.html");
+    let (_, stderr, code) = run(
+        &d,
+        &[p.to_str().unwrap(), "--overrep-mode", "fingerprint", "--overrep-min-count", "600",
+          "--json", strict_json.to_str().unwrap(), "--html", strict_html.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&strict_json);
+    assert_eq!(v["overrep"]["min_count"], 600, "the block states the flag's threshold");
+    assert!(v["overrep"]["sequences"].as_array().unwrap().is_empty());
+    assert_eq!(v["metrics"]["repeated_seq_count"], 0, "the metric must honour the flag");
+    assert_eq!(v["metrics"]["repeated_seq_frac"], 0.0);
+    assert!(v["repeated_sequences"]["top"].as_array().unwrap().is_empty());
+    let h = std::fs::read_to_string(&strict_html).unwrap();
+    assert!(
+        h.contains("at least 600 times"),
+        "the page must state the effective threshold and list nothing"
+    );
+    assert!(!h.contains("<table class=\"rep\">"), "no repeated sequence may be listed");
+
+    // The default threshold (0.1% of 1000 reads = 10) does find the 500x sequence.
+    let default_json = d.join("default.json");
+    let default_html = d.join("default.html");
+    let (_, stderr, code) = run(
+        &d,
+        &[p.to_str().unwrap(), "--overrep-mode", "fingerprint",
+          "--json", default_json.to_str().unwrap(),
+          "--html", default_html.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = read_json(&default_json);
+    assert_eq!(v["metrics"]["repeated_seq_count"], 1);
+    assert_eq!(v["metrics"]["repeated_seq_frac"], 0.5);
+    assert_eq!(v["overrep"]["sequences"].as_array().unwrap().len(), 1);
+    let h = std::fs::read_to_string(&default_html).unwrap();
+    assert!(h.contains("<table class=\"rep\">"), "the default threshold lists it");
+}
+
+/// C7: a `--max-mem` below the old fixed 512 MB reserve must admit a run that fits.
+/// Reported: `--max-mem 568` refused every run ("needs ~0.0 MB ... limited to 568.0 MB")
+/// while 569 proceeded.
+#[test]
+fn a_max_mem_below_the_old_reserve_admits_a_small_run() {
+    let d = tmpdir("maxmem_small");
+    let fq = write_fixture(&d);
+    for mb in ["256", "512", "568"] {
+        let (_, stderr, code) =
+            run(&d, &[fq.to_str().unwrap(), "--max-mem", mb, "-q"]);
+        assert_eq!(code, 0, "--max-mem {mb} must run: {stderr}");
+        assert!(!stderr.contains("limited to"), "{stderr}");
+    }
+    // ... and a limit at or below the reserve still refuses, rather than pretending.
+    let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--max-mem", "64", "-q"]);
+    assert_ne!(code, 0, "a 64 MB ceiling cannot hold the 64 MB reserve: {stdout}{stderr}");
+    assert!(stderr.contains("limited to"), "{stderr}");
+}
+
+/// C8: an absurd `--max-read-len` is refused before anything is allocated. Reported:
+/// `--insert-hist --max-read-len 1099511627776` aborted with
+/// "memory allocation of 17592186044424 bytes failed" AFTER the whole scan.
+#[test]
+fn an_absurd_max_read_len_is_refused_before_it_is_allocated() {
+    let d = tmpdir("max_read_len");
+    let (r1, r2) = write_pairs(&d, 2);
+    let json = d.join("x.json");
+    let (stdout, stderr, code) = run(
+        &d,
+        &[r1.to_str().unwrap(), r2.to_str().unwrap(), "--insert-hist",
+          "--max-read-len", "1099511627776", "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_ne!(code, 0, "the value must be refused: {stdout}{stderr}");
+    assert!(stderr.contains("--max-read-len"), "name the flag: {stderr}");
+    assert!(stderr.contains("maximum"), "say what the maximum is: {stderr}");
+    assert!(
+        !stderr.contains("memory allocation"),
+        "it must refuse, not reach the allocator: {stderr}"
+    );
+    assert!(!stderr.contains("accumulator state"), "refused before the scan: {stderr}");
+    assert!(!json.exists());
+}
+
+/// C9: two reports cannot share stdout. Reported: `--json - --positions-tsv -` wrote
+/// 596 KB of JSON with TSV threaded through it, and `--json - --html -` appended a page.
+#[test]
+fn two_outputs_on_one_stdout_are_refused() {
+    let d = tmpdir("stdout_conflict");
+    let fq = write_fixture(&d);
+    for extra in ["--positions-tsv", "--html"] {
+        let (stdout, stderr, code) = run(
+            &d,
+            &[fq.to_str().unwrap(), "--json", "-", extra, "-", "-q"],
+        );
+        assert_ne!(code, 0, "--json - {extra} - must be refused: {stdout}{stderr}");
+        assert!(stderr.contains("stdout"), "name the stream: {stderr}");
+        assert!(stdout.is_empty(), "nothing may be written to a refused stream: {stdout}");
+    }
+    // One stdout output stays legal.
+    let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--json", "-", "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.starts_with('{'), "a lone --json - still writes the report: {stdout}");
+}
+
+/// C10: an empty input is a refusal, not an all-zero 593 KB report. Reported: a 0-byte
+/// file exited 0 and wrote a report of zeros; the other FASTQ tools refuse.
+#[test]
+fn an_empty_input_is_refused_instead_of_reported_as_zero() {
+    let d = tmpdir("empty_input");
+    let empty = d.join("empty.fastq");
+    std::fs::write(&empty, b"").unwrap();
+    let blank = d.join("blank.fastq");
+    std::fs::write(&blank, b"\n\n\n\n").unwrap();
+    for p in [&empty, &blank] {
+        let json = d.join("e.json");
+        let (stdout, stderr, code) =
+            run(&d, &[p.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"]);
+        assert_ne!(code, 0, "an empty input must be refused: {stdout}{stderr}");
+        assert!(
+            stderr.contains("no FASTQ records"),
+            "the refusal must say what was missing: {stderr}"
+        );
+        assert!(!json.exists(), "no zero report may be written");
+    }
+    // --profile keeps its own refusal for the same input.
+    let prof = d.join("p.json");
+    let (_, stderr, code) =
+        run(&d, &[empty.to_str().unwrap(), "--profile", prof.to_str().unwrap(), "-q"]);
+    assert_ne!(code, 0, "{stderr}");
+}
+
+/// An output path's parent directory is created, the way fastmaps does: the report path
+/// is a promise to write the report, not a place the user has to mkdir first.
+#[test]
+fn output_parent_directories_are_created() {
+    let d = tmpdir("mkdir_outputs");
+    let fq = write_fixture(&d);
+    let json = d.join("out/deep/r.json");
+    let html = d.join("out/deep/r.html");
+    let tsv = d.join("out/deep/r.tsv");
+    let prof = d.join("out/deep/r.profile.json");
+    let (_, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(),
+          "--json", json.to_str().unwrap(),
+          "--html", html.to_str().unwrap(),
+          "--positions-tsv", tsv.to_str().unwrap(),
+          "--profile", prof.to_str().unwrap(), "-q"],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    for p in [&json, &html, &tsv, &prof] {
+        assert!(p.is_file(), "{} was not written", p.display());
+    }
+    assert!(
+        d.join("out/deep/r.profile.fit_report.json").is_file(),
+        "the fit report travels next to the profile it describes"
     );
 }

@@ -8,7 +8,9 @@ use needletail::parse_fastx_reader;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::hasher::SequenceHasher;
-use crate::utils::{base_read_id, compute_write_buffer_size, validate_format_compatibility};
+use crate::utils::{
+    base_read_id, compute_write_buffer_size, read_count_mismatch, validate_format_compatibility,
+};
 use crate::writer::{
     ByteCounter, OutputFormat, StreamCompression, open_preload_reader, preload_is_empty,
     prepare_writer, write_fasta_record,
@@ -337,11 +339,11 @@ fn resume_existing_output<T: SequenceHasher>(
     path: &str,
     cfg: &DedupConfig,
     verifier: &mut ShardedHashVerifier<T>,
-) -> Result<()> {
+) -> Result<usize> {
     let bound = Path::new(path);
     if cfg.force || crate::stream::is_stream(path) || !bound.exists() || OutputFormat::is_gz(bound)
     {
-        return Ok(());
+        return Ok(0);
     }
 
     if cfg.verbose {
@@ -352,7 +354,8 @@ fn resume_existing_output<T: SequenceHasher>(
     // since the file is created before the first write. Nothing to preload; cut
     // it to 0 so the append starts on a record boundary.
     if preload_is_empty(bound)? {
-        return truncate_to_valid_len(bound, 0, "file", cfg.verbose);
+        truncate_to_valid_len(bound, 0, "file", cfg.verbose)?;
+        return Ok(0);
     }
 
     let mut reader = open_preload_reader(path, "preload")?;
@@ -379,7 +382,8 @@ fn resume_existing_output<T: SequenceHasher>(
         println!("{preloads} sequences preloaded.");
     }
 
-    truncate_to_valid_len(bound, valid_bytes.0, "file", cfg.verbose)
+    truncate_to_valid_len(bound, valid_bytes.0, "file", cfg.verbose)?;
+    Ok(preloads)
 }
 
 /// Paired-end twin of [`resume_existing_output`]: preloads the pair hashes and
@@ -389,7 +393,7 @@ fn resume_existing_paired_outputs<T: SequenceHasher>(
     path_r2: &str,
     cfg: &DedupConfig,
     verifier: &mut ShardedHashVerifier<T>,
-) -> Result<()> {
+) -> Result<usize> {
     let bound_r1 = Path::new(path_r1);
     let bound_r2 = Path::new(path_r2);
     if cfg.force
@@ -400,7 +404,7 @@ fn resume_existing_paired_outputs<T: SequenceHasher>(
         || OutputFormat::is_gz(bound_r1)
         || OutputFormat::is_gz(bound_r2)
     {
-        return Ok(());
+        return Ok(0);
     }
 
     if cfg.verbose {
@@ -411,7 +415,8 @@ fn resume_existing_paired_outputs<T: SequenceHasher>(
     // both are cut to 0 so the pairs re-synchronize from the first record.
     if preload_is_empty(bound_r1)? || preload_is_empty(bound_r2)? {
         truncate_to_valid_len(bound_r1, 0, "R1", cfg.verbose)?;
-        return truncate_to_valid_len(bound_r2, 0, "R2", cfg.verbose);
+        truncate_to_valid_len(bound_r2, 0, "R2", cfg.verbose)?;
+        return Ok(0);
     }
 
     let mut reader_r1 = open_preload_reader(path_r1, "R1 preload")?;
@@ -445,7 +450,7 @@ fn resume_existing_paired_outputs<T: SequenceHasher>(
     truncate_to_valid_len(bound_r1, valid_bytes_r1.0, "R1", cfg.verbose)?;
     truncate_to_valid_len(bound_r2, valid_bytes_r2.0, "R2", cfg.verbose)?;
 
-    Ok(())
+    Ok(preloads)
 }
 
 // ==========================================
@@ -462,7 +467,7 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     input_path: &str,
     output_path: &str,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     // --dry-run writes nothing: the serial counting pass reaches the identical
     // verdict (same refusals, same duplicate count) without creating a file.
     if cfg.dry_run {
@@ -480,7 +485,7 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     // Resume an existing output before any thread starts, so the preload pass
     // cannot race the unbounded worker channel.
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, worker_threads)?;
-    resume_existing_output(output_path, cfg, &mut verifier)?;
+    let preloaded = resume_existing_output(output_path, cfg, &mut verifier)?;
 
     let (chunk_tx, chunk_rx): (Sender<Vec<RawRecord>>, Receiver<Vec<RawRecord>>) =
         bounded(num_workers * 2);
@@ -654,7 +659,7 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
         );
     }
 
-    Ok((total_reads, duplicates))
+    Ok((total_reads, duplicates, preloaded))
 }
 
 // ==========================================
@@ -673,7 +678,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     output_r1_path: &str,
     output_r2_path: &str,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     // --dry-run writes nothing: the serial counting pass reaches the identical
     // verdict (same refusals, same duplicate count) without creating a file.
     if cfg.dry_run {
@@ -695,7 +700,8 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     // Resume existing outputs before any thread starts, so the preload pass
     // cannot race the worker channel.
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, worker_threads)?;
-    resume_existing_paired_outputs(output_r1_path, output_r2_path, cfg, &mut verifier)?;
+    let preloaded =
+        resume_existing_paired_outputs(output_r1_path, output_r2_path, cfg, &mut verifier)?;
 
     let (chunk_tx, chunk_rx): (Sender<Vec<RawPair>>, Receiver<Vec<RawPair>>) =
         bounded(num_workers * 2);
@@ -732,9 +738,8 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
                 let r1 = r1.context("Invalid R1 sequence")?;
                 let r2 = match reader_r2.next() {
                     Some(r) => r.context("Invalid R2 sequence")?,
-                    None => {
-                        bail!("Desynchronization: R1 has more records than R2");
-                    }
+                    // R1 already gave a record: R2 is the shorter mate.
+                    None => return Err(read_count_mismatch(total + 1, total)),
                 };
 
                 // The serial PE path validates against R1's quality only; do the
@@ -784,7 +789,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
 
             // Check for R2 having extra records
             if reader_r2.next().is_some() {
-                bail!("Desynchronization: R2 has more records than R1");
+                return Err(read_count_mismatch(total, total + 1));
             }
 
             if !chunk.is_empty() {
@@ -924,7 +929,7 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         h.join().unwrap();
     }
 
-    Ok((total_reads, duplicates))
+    Ok((total_reads, duplicates, preloaded))
 }
 
 // ==========================================

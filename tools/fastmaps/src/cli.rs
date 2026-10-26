@@ -115,7 +115,12 @@ pub struct Args {
     #[arg(long, value_name = "x1,y1:x2,y2", action = clap::ArgAction::Append)]
     pub corners: Vec<String>,
 
-    /// Number of preview reads stored per pixel in heatmap.preview.
+    /// Number of preview reads stored per pixel per file kind in
+    /// heatmap.preview: the quota is applied per (pixel, kind), so R1 and R2
+    /// each get their own quota and a pixel holding both mates stores up to
+    /// 2xN (3xN with an Unknown file). The grid JSON and the report publish
+    /// the granularity as preview_reads_per_pixel_per_kind and this run's
+    /// measured maximum as max_previews_per_pixel.
     /// Set to 0 to store no reads: heatmap.preview is still written, as empty
     /// rows, so its row offsets stay valid.
     #[arg(long, default_value = "5", value_name = "N")]
@@ -160,8 +165,10 @@ pub struct Args {
     pub output_dir: PathBuf,
 
     /// Directory for temporary per-row spill files.
-    /// Defaults to ./tmp_<pid>. Cleaned up automatically on success;
-    /// if the job is killed, delete the directory manually before re-running.
+    /// Defaults to ./tmp_<pid>. Each run creates its own uniquely named
+    /// subdirectory inside it and removes that subdirectory on success and on
+    /// error, so leftovers from a killed run can never be read as the next
+    /// run's data.
     #[arg(long, value_name = "PATH")]
     pub temp_dir: Option<PathBuf>,
 

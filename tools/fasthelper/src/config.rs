@@ -215,6 +215,7 @@ impl Config {
             .parent()? // release
             .parent()? // target
             .parent()? // fasthelper
+            .parent()? // tools
             .to_path_buf();
         if tools.is_dir() {
             Some(tools)

@@ -40,6 +40,12 @@ use report::FileReport;
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let requested_offset = cli.requested_offset()?;
+    // Bounded before anything is sized from it: --insert-hist allocates from this value,
+    // and an absurd one used to abort in the allocator after the whole scan.
+    let max_pos = cli.checked_max_read_len()?;
+    // Two outputs on one stream interleave into a file that is neither format, so this is
+    // refused before a byte is read rather than after a 596 KB mixed report is written.
+    check_stdout_outputs(&cli)?;
     let threads = cli.thread_count();
     let limits = Limits {
         max_reads: cli.reads,
@@ -70,7 +76,6 @@ fn main() -> Result<()> {
 
     let started = Instant::now();
     let files: Vec<PathBuf> = cli.files.clone();
-    let max_pos = cli.max_read_len;
     // The per-read profile scan (adapter prefix + fragment GC) is only paid for
     // when a profile was asked for.
     let track_profile = cli.profile.is_some();
@@ -269,13 +274,27 @@ fn main() -> Result<()> {
         all
     };
 
-    let mut total = Accum::new(cli.max_read_len);
+    let mut total = Accum::new(max_pos);
     let mut stopped: Option<&'static str> = None;
     let mut work = Work::default();
     for r in &reports {
         total.merge(&r.acc);
         stopped = stopped.or(r.scan.stopped);
         work.add(&r.scan.work);
+    }
+
+    // An empty input used to exit 0 with a 593 KB report of zeros, which reads like a
+    // measurement of a library that has nothing in it. It is not: nothing was examined.
+    if total.reads == 0 {
+        let why = match stopped {
+            Some(reason) => format!("the {reason} stopped the scan before the first record"),
+            None => "the input is empty (or carries only blank lines)".to_string(),
+        };
+        anyhow::bail!(
+            "no FASTQ records in {}: {why}, so there is nothing to measure and no report is \
+             written",
+            files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ")
+        );
     }
 
     // Memory projection, printed before the numbers: what this run's analysis
@@ -285,7 +304,7 @@ fn main() -> Result<()> {
         "fastcheck: accumulator state {:.1} MB for {} file(s) at --max-read-len {}",
         projection as f64 / (1024.0 * 1024.0),
         reports.len(),
-        cli.max_read_len
+        max_pos
     );
 
     // Only when --tiles: the per-tile module's memory, printed so a run's cost is known
@@ -316,12 +335,16 @@ fn main() -> Result<()> {
                 files.len()
             );
         }
+        // The sample honours the run's own --reads budget: sampling past it made the
+        // insert block cover 50 pairs of a run whose QC part measured 4 reads. `pairs_in_input`
+        // is no longer derived from `total.reads / 2` either (see the report call below).
+        let pair_budget = cli.insert_pairs.min(cli.reads.unwrap_or(u64::MAX));
         let h = insert::scan_pair(
             &files[0],
             &files[1],
             threads.max(1),
-            cli.insert_pairs,
-            cli.max_read_len * 2,
+            pair_budget,
+            max_pos.saturating_mul(2),
             cli.adapter_seq.iter().map(|s| s.as_bytes().to_ascii_uppercase()).collect(),
         )?;
         Some(h)
@@ -332,7 +355,7 @@ fn main() -> Result<()> {
     // Optional processed files: a second scan whose results are stored as the
     // "after" side of a before/after comparison.
     let mut processed_reports: Vec<FileReport> = Vec::new();
-    let mut processed_total = Accum::new(cli.max_read_len);
+    let mut processed_total = Accum::new(max_pos);
     if let Some(p1) = &cli.processed_1 {
         let mut pfiles = vec![p1.clone()];
         if let Some(p2) = &cli.processed_2 {
@@ -352,7 +375,16 @@ fn main() -> Result<()> {
     let min_count = cli
         .overrep_min_count
         .unwrap_or_else(|| ((total.reads as f64 * 0.001) as u32).max(10));
+    // What the insert CDF can be rescaled by: the insert pass's own pair count when it
+    // reached the end of both files, otherwise the main scan's (only when that scan was
+    // complete). Never `total.reads / 2` on its own: under --reads or --bytes that number
+    // is the budget's, not the input's, and it produced pairs_in_input 4 against 50 sampled.
+    let insert_in_input = insert.as_ref().map(|h| {
+        h.pairs_in_input
+            .or_else(|| stopped.is_none().then(|| total.reads / 2))
+    });
     if let Some(p) = &cli.json {
+        ensure_parent(p, "--json")?;
         report::write_report(
             p,
             &reports,
@@ -361,7 +393,7 @@ fn main() -> Result<()> {
             elapsed,
             stopped,
             cli.positions_tsv.as_deref(),
-            insert.as_ref().map(|h| (h, total.reads / 2)),
+            insert.as_ref().map(|h| (h, insert_in_input.flatten())),
             if processed_reports.is_empty() { None } else { Some(&processed_total) },
             overrep,
             min_count,
@@ -374,12 +406,15 @@ fn main() -> Result<()> {
         )?;
     }
     if let Some(p) = &cli.html {
+        ensure_parent(p, "--html")?;
         html::write_html(p, &reports, &total, verdict.offset, elapsed,
                          insert.as_ref(), stopped,
                          if processed_reports.is_empty() { None }
-                         else { Some((&processed_reports, &processed_total)) })?;
+                         else { Some((&processed_reports, &processed_total)) },
+                         min_count)?;
     }
     if let Some(p) = &cli.positions_tsv {
+        ensure_parent(p, "--positions-tsv")?;
         report::write_positions_tsv(
             p,
             &total,
@@ -389,6 +424,7 @@ fn main() -> Result<()> {
         )?;
     }
     if let Some(p) = &cli.profile {
+        ensure_parent(p, "--profile")?;
         let name = files
             .first()
             .and_then(|f| f.file_stem())
@@ -479,6 +515,57 @@ fn scan_one(
         acc,
         scan,
     })
+}
+
+/// Refuse a run that points more than one output at stdout.
+///
+/// `-` means "the stream", and two reports on one stream are not two reports: they are
+/// one file that is neither JSON, nor TSV, nor HTML. `--json - --positions-tsv -` wrote
+/// 596 KB of JSON with TSV rows threaded through it, and `--json - --html -` started a
+/// JSON document and appended a whole HTML page. Nothing downstream can read either, so
+/// the combination is refused before the scan rather than discovered afterwards.
+fn check_stdout_outputs(cli: &Cli) -> Result<()> {
+    let mut on_stdout: Vec<&str> = Vec::new();
+    for (flag, p) in [
+        ("--json", &cli.json),
+        ("--html", &cli.html),
+        ("--positions-tsv", &cli.positions_tsv),
+    ] {
+        if p.as_deref().is_some_and(|p| p.as_os_str() == "-") {
+            on_stdout.push(flag);
+        }
+    }
+    if on_stdout.len() > 1 {
+        anyhow::bail!(
+            "{} would all write to stdout, and two reports interleaved on one stream are \
+             neither format. Give at most one output `-` and a path to the others",
+            on_stdout.join(" and ")
+        );
+    }
+    Ok(())
+}
+
+/// Create the parent directory of an output path before writing it.
+///
+/// A report path is a promise to write the report, not a place the user has to `mkdir`
+/// first — fastmaps already behaves this way, and the suite's quick-start writes
+/// `out/report.json` before `out/` exists.
+fn ensure_parent(path: &std::path::Path, flag: &str) -> Result<()> {
+    if path.as_os_str() == "-" {
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else { return Ok(()) };
+    if parent.as_os_str().is_empty() || parent.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "creating {} for {flag} {}",
+            parent.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Refuse an output whose inputs the selected modules will not materialise.

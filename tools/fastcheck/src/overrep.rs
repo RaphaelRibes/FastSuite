@@ -96,6 +96,9 @@ impl Packed {
     }
 
     /// Bytes this entry occupies: 2 bits per base plus the length and the map's overhead.
+    /// Test-only: the admission check projects from the length and the load factor
+    /// (`table_projection`), not from a per-entry figure.
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         2 + self.words.len() * 8 + 8 // len + payload + HashMap slot estimate
     }

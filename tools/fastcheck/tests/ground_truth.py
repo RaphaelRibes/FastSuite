@@ -11,7 +11,7 @@ No real data is involved (docs/DECISIONS.md D-11): the profile
 (`tests/gt_profile.json`) is hand-written round numbers describing a mechanism,
 so the expected recovery is computable by hand.
 
-The ten checks and their tolerances are the plan's table
+The eleven checks and their tolerances are the plan's table
 (`docs/plans/2026-10-12_fastcheck-exactness.md`, "Tolerances the ground-truth
 test asserts"):
 
@@ -27,6 +27,11 @@ test asserts"):
   9  insert mean                       gt.tsv insert, in the     +/- 2%
                                        overlap-measurable set
   10 duplication level                 0 <= level <= dup_rate    lower bound
+  11 mates carrying an injected N      gt.tsv r*_n > 0           exact
+
+The per-mate `r1_full` / `r2_full` columns are used as the G-run denominator:
+a mate that is entirely artefact has no drawn biology left, so its emitted run
+is the artefact and cannot be compared against the drawn `r*_t`.
 
 `mean_read_mean_q` is deliberately NOT asserted: it bins the floor of each
 read's mean, biasing it low by ~0.5 (measured 29.53 for a true 30.0). The
@@ -48,6 +53,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NoReturn
 
 # fastcheck's overlap anchor (src/insert.rs ANCHOR = 12). The documented
 # measurement ceiling is `insert <= 2L - ANCHOR`.
@@ -56,7 +62,15 @@ ANCHOR = 12
 GT_TSV_COLUMNS = [
     "pair_id", "insert", "r1_h", "r1_t", "r2_h", "r2_t",
     "r1_adapter", "r2_adapter", "full_flag", "is_dup", "r1_n", "r2_n",
+    # Per-mate "entirely artefact" flags, appended by fastsim's truth writer after the
+    # 12-column schema this harness used to expect (`h + t >= read_len` for that mate:
+    # a trimmer must drop it and its reported run is artefact, not the drawn tail).
+    "r1_full", "r2_full",
 ]
+
+
+def die(msg: str) -> NoReturn:
+    sys.exit(f"ground_truth: {msg}")
 
 
 def repo_root() -> Path:
@@ -92,12 +106,36 @@ def histogram_to_pmf(h: dict) -> dict:
 
 
 def load_gt(path: Path):
-    """Return the per-pair rows of sim.gt.tsv as dicts of ints."""
+    """Return the per-pair rows of sim.gt.tsv as dicts of ints.
+
+    The schema is checked against the CURRENT writer, field for field, and every row is
+    required to carry exactly that many integer fields: a shorter row used to be zipped
+    silently against a longer header, so a schema drift could not be distinguished from a
+    truncated file.
+    """
     lines = path.read_text().splitlines()
+    if not lines:
+        die(f"{path} is empty")
     header = lines[0].split("\t")
     if header != GT_TSV_COLUMNS:
-        sys.exit(f"ground_truth: unexpected gt.tsv header: {header}")
-    return [{c: int(v) for c, v in zip(header, row.split("\t"))} for row in lines[1:]]
+        die(
+            f"unexpected gt.tsv header in {path}:\n  got:      {header}\n"
+            f"  expected: {GT_TSV_COLUMNS}\n"
+            "  (fastsim's truth writer and this harness have drifted apart: update "
+            "GT_TSV_COLUMNS to the writer's schema, not the other way round)"
+        )
+    rows = []
+    for i, row in enumerate(lines[1:], start=2):
+        fields = row.split("\t")
+        if len(fields) != len(header):
+            die(f"{path}:{i}: {len(fields)} fields, header has {len(header)}: {row!r}")
+        try:
+            rows.append({c: int(v) for c, v in zip(header, fields)})
+        except ValueError as e:
+            die(f"{path}:{i}: non-integer field ({e}): {row!r}")
+    if not rows:
+        die(f"{path} carries a header and no pairs")
+    return rows
 
 
 def main() -> int:
@@ -163,11 +201,40 @@ def main() -> int:
     pairs = len(gt)
     reads = 2 * pairs  # both mates are QC'd together
 
+    # The gate verifies the simulator's OWN record of the same run, so the two must be
+    # talking about the same pairs. Without these, a short gt.tsv or a sampled insert pass
+    # would make every comparison below a comparison against a different dataset.
+    if pairs != args.pairs:
+        die(f"gt.tsv carries {pairs} pairs but fastsim was asked for {args.pairs}")
+    if insert_hist is None:
+        die("the report carries no insert_hist block, so the insert checks cannot run")
+    if insert_hist["pairs_sampled"] != pairs:
+        die(
+            f"the insert pass sampled {insert_hist['pairs_sampled']} of {pairs} pairs: "
+            "the insert checks below compare against the whole gt.tsv and need a full sample"
+        )
+    if insert_hist["pairs_in_input"] not in (None, pairs):
+        die(
+            f"the report claims {insert_hist['pairs_in_input']} pairs in the input, "
+            f"but the simulator wrote {pairs}"
+        )
+
     # Ground-truth quantities.
     gt_adapter_pairs = sum(1 for r in gt if r["r1_adapter"] > 0 or r["r2_adapter"] > 0)
+    # A mate that is ENTIRELY artefact (r*_full) has no drawn-biology tail left to compare:
+    # its emitted run is the artefact, so counting it against the drawn r*_t compares two
+    # different things. The per-mate columns are what make that exclusion expressible.
     gt_tail = {}
     for k in (5, 10):
-        gt_tail[k] = sum((r["r1_t"] == k) + (r["r2_t"] == k) for r in gt)
+        gt_tail[k] = sum(
+            (r["r1_t"] == k and r["r1_full"] == 0) + (r["r2_t"] == k and r["r2_full"] == 0)
+            for r in gt
+        )
+    # Injected ambiguous bases: the exact count of mates the overlay gave an N to. fastcheck
+    # reports reads_with_non_acgt over the same two files, so this is an equality, not a
+    # tolerance — and it uses r*_n, which nothing read before.
+    gt_n_mates = sum((r["r1_n"] > 0) + (r["r2_n"] > 0) for r in gt)
+    gt_full_mates = sum(r["r1_full"] + r["r2_full"] for r in gt)
     # Insert mean over the OVERLAP-MEASURABLE WINDOW: read_len < insert <=
     # 2*read_len - ANCHOR (the documented measurement ceiling, ANCHOR = 12).
     # The window is the support BOTH sides can express: the tool reports a
@@ -212,6 +279,11 @@ def main() -> int:
 
     # Ground-truth per-position mean Q: the profile's flat curve.
     pos_q_r1 = prof["pos_q"]["R1"]
+    # zip() silently truncates, which would turn a coverage bug into a passing check.
+    if len(pos_mean_q) != read_len:
+        die(f"positions TSV covers {len(pos_mean_q)} positions, but read_len is {read_len}")
+    if len(pos_q_r1) != read_len:
+        die(f"the profile's pos_q[R1] covers {len(pos_q_r1)} positions, read_len {read_len}")
 
     def p3g(k):
         return polyx["3p"]["G"].get(str(k), 0)
@@ -240,6 +312,11 @@ def main() -> int:
         f"{abs(got_ad - gt_adapter_pairs)}",
         f"+/- 1% of {pairs}", abs(got_ad - gt_adapter_pairs) <= 0.01 * pairs)
 
+    # 3b. mates carrying an injected N: exact, mate for mate, from gt.tsv's r*_n.
+    got_n = metrics["reads_with_non_acgt"]
+    add("mates carrying an injected N", gt_n_mates, got_n,
+        f"{abs(got_n - gt_n_mates)}", "exact", got_n == gt_n_mates)
+
     # 4-5. 3' G-run histogram, bins 5 and 10 (per read, both mates).
     for k in (5, 10):
         g, o = gt_tail[k], p3g(k)
@@ -266,6 +343,10 @@ def main() -> int:
         f"{abs(metrics['insert_mean'] - gt_perpair_mean) / gt_perpair_mean * 100:.3f}%"
         f" (a basis difference: the tool's bins include inserts below the read "
         f"length, which the per-pair set excludes by construction)"
+    )
+    print(
+        f"  note: {gt_full_mates} of {reads} mates are entirely artefact (r*_full) and are "
+        f"excluded from the G-run histograms, where their emitted run is the artefact"
     )
 
     # 10. duplication level is a documented LOWER BOUND on the PCR duplicate rate.

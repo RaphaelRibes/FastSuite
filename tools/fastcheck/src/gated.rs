@@ -182,6 +182,13 @@ impl Accum {
                     self.base_pos[i][code] += 1;
                     w.base_cells += 1;
                 }
+                // The composition totals are the report's `base_composition`, which covers
+                // EVERY base (including those past --max-read-len). The gated path must
+                // fill them whenever the bases module is on, or a gated run reports a
+                // composition of zeros next to a real `bases` count.
+                if m.bases {
+                    self.base_totals[code] += 1;
+                }
             }
             if in_run && m.bases {
                 record_n_run(self, run_start, len, len);
@@ -385,6 +392,7 @@ mod tests {
         assert_eq!(plain.meanq_raw_hist, gated.meanq_raw_hist);
         assert_eq!(plain.qual_byte, gated.qual_byte);
         assert_eq!(plain.base_pos, gated.base_pos);
+        assert_eq!(plain.base_totals, gated.base_totals, "composition totals cover every base");
         assert_eq!(plain.qual_pos, gated.qual_pos);
         assert_eq!(plain.polyx3, gated.polyx3);
         assert_eq!(plain.polyx5, gated.polyx5);

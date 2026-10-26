@@ -171,7 +171,7 @@ pub fn write_report(
     elapsed_s: f64,
     partial: Option<&str>,
     positions_tsv: Option<&Path>,
-    insert: Option<(&crate::insert::InsertHist, u64)>,
+    insert: Option<(&crate::insert::InsertHist, Option<u64>)>,
     processed: Option<&Accum>,
     overrep: crate::overrep::OverrepMode,
     overrep_min_count: u32,
@@ -245,8 +245,9 @@ pub fn write_report(
     }
     if total.reads_over_max_len > 0 {
         notes.push(format!(
-            "{} reads longer than --max-read-len are counted in the summary but excluded from \
-             the per-position matrices",
+            "{} reads longer than --max-read-len are counted in the summary and in \
+             base_composition (which covers every base), but excluded from the per-position \
+             matrices",
             total.reads_over_max_len
         ));
     }
@@ -303,6 +304,9 @@ pub fn write_report(
     put("quality_byte_max", json!(byte_max));
     put("partial", json!(if partial.is_some() { 1 } else { 0 }));
     put("bytes_read", json!(bytes_read));
+    // The resolved `-j` count, so a report says how it was run: it is a run parameter,
+    // not a measurement, and two runs of one file at different -j are otherwise identical.
+    put("threads", json!(threads));
     put("elapsed_s", json!(elapsed_s));
     // Only when --insert-hist ran: a consumer must never read an absent metric
     // as a measured zero.
@@ -318,7 +322,8 @@ pub fn write_report(
     // Rich-report metrics (polyX, head dropout, repeats, k-mers, heatmap).
     let (polyx_m, polyx_block) = rich::polyx_metrics(total);
     let (hg, hd) = rich::head_dropout(total);
-    let (rep_m, rep_block) = rich::repeated_metrics(total);
+    // The SAME effective threshold the `overrep` block uses: one flag, one answer.
+    let (rep_m, rep_block) = rich::repeated_metrics(total, overrep_min_count);
     let (kmer_m, kmer_block) = rich::kmer_metrics(total);
     let (hm_m, hm_block) = rich::heatmap_metrics(total);
     for (k, v) in [polyx_m, rep_m, kmer_m, hm_m].into_iter().flatten() {
@@ -327,10 +332,13 @@ pub fn write_report(
     put("head_g_frac", json!(r4(hg)));
     put("head_dropout", json!(r4(hd)));
 
+    // The composition covers EVERY base. `base_totals` is summed over the whole read,
+    // including the bases past --max-read-len that no per-position row can hold; summing
+    // `base_at` over the covered window instead made the block disagree with metrics.bases
+    // (10 reads of 8 bp at --max-read-len 4 reported 40 bases of composition against 80).
     let mut composition = serde_json::Map::new();
     for (k, idx) in [("a", 0usize), ("c", 1), ("g", 2), ("t", 3), ("other", 4)] {
-        let n: u64 = (0..total.max_pos).map(|p| total.base_at(p, idx)).sum();
-        composition.insert(k.to_string(), json!(n));
+        composition.insert(k.to_string(), json!(total.base_totals[idx]));
     }
 
     // Per-read mean quality in Phred space, from the exact raw-byte bins.
@@ -388,7 +396,7 @@ pub fn write_report(
             Some(pa) => {
                 let (pm, pb) = rich::polyx_metrics(pa);
                 let (phg, phd) = rich::head_dropout(pa);
-                let (prm, prb) = rich::repeated_metrics(pa);
+                let (prm, prb) = rich::repeated_metrics(pa, overrep_min_count);
                 let (pkm, pkb) = rich::kmer_metrics(pa);
                 let (phm, phb) = rich::heatmap_metrics(pa);
                 let mut pm = pm;
@@ -413,12 +421,15 @@ pub fn write_report(
         },
         "insert_hist": match &insert {
             Some((h, pairs)) => {
-                // The sample is a fraction of the input, so the histogram is
-                // rescaled to the input's pair count and the factor is stated.
-                let scale = if h.pairs_sampled > 0 {
-                    Some(*pairs as f64 / h.pairs_sampled as f64)
-                } else { None };
-                h.to_json(Some(*pairs), scale)
+                // The sample is a fraction of the input, so the histogram is rescaled to
+                // the input's pair count — when that count is KNOWN. A sample cap or a
+                // budget leaves it null, and so does the scale factor: a factor derived
+                // from a different pass's budget rescaled 50 sampled pairs by 0.08.
+                let scale = match (pairs, h.pairs_sampled) {
+                    (Some(p), sampled) if sampled > 0 => Some(*p as f64 / sampled as f64),
+                    _ => None,
+                };
+                h.to_json(*pairs, scale)
             }
             None => serde_json::Value::Null,
         },

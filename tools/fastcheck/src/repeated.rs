@@ -57,7 +57,9 @@ impl KmerTable {
         }
     }
 
-    /// Exact count of one key (0 if never seen).
+    /// Exact count of one key (0 if never seen). Test-only: the bin never reads a single
+    /// cell back — the report consumes `report()` — but the width/merge tests need it.
+    #[cfg(test)]
     pub fn count(&self, key: u32) -> u32 {
         if self.cells.is_empty() {
             return 0;
@@ -133,6 +135,11 @@ impl KmerTable {
 
 /// Pack a k-mer into a u64 (2 bits per base: A=00, C=01, G=10, T=11).
 /// Returns `None` if the slice is empty or contains a non-ACGT base.
+///
+/// Test-only: this is the frozen reference the fused `KmerRoll` register (in
+/// `accum`) and the gated k-mer loop are held to, so it must stay exactly as the
+/// pre-fusion code was. No production path packs a window this way any more.
+#[cfg(test)]
 pub fn pack_kmer(seq: &[u8]) -> Option<u64> {
     let mut v = 0u64;
     for &b in seq {

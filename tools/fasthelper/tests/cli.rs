@@ -1864,3 +1864,551 @@ fn threads_zero_is_forwarded_to_every_tool() {
         }
     }
 }
+
+// ------------------------------------------------ 2026-10-26 review round --- //
+
+#[test]
+fn compare_refuses_more_than_one_sample_per_side() {
+    // H1: compare folded every report on a side into ONE flat metric map
+    // ("last file wins"), so a before/ holding two samples produced a single
+    // row carrying one sample's numbers, no sample names, and exit 0. compare
+    // is a single-sample before/after tool: it must refuse, naming the samples.
+    let d = tmpdir("compare_multi");
+    for (side, sample, reads) in [
+        ("before", "alpha", 100u64),
+        ("before", "beta", 900),
+        ("after", "alpha", 90),
+    ] {
+        let dir = d.join(side).join(sample);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_report(&dir, "fastcheck.json", reads, 0.4);
+    }
+    let out = d.join("out");
+
+    let (_, stderr, code) = run(&[
+        "compare",
+        "--before", d.join("before").to_str().unwrap(),
+        "--after", d.join("after").to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "two samples on one side must be refused: {stderr}");
+    assert!(
+        stderr.contains("alpha") && stderr.contains("beta"),
+        "the refusal must name the samples it found: {stderr}"
+    );
+    assert!(
+        stderr.contains("before"),
+        "the refusal must name the side that holds them: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("single-sample") || stderr.contains("one sample"),
+        "it must say compare is a single-sample before/after tool: {stderr}"
+    );
+    assert!(
+        !out.join("compare.tsv").exists(),
+        "a refused compare must not publish a table built from one sample's numbers"
+    );
+}
+
+#[test]
+fn fail_on_with_an_unknown_metric_is_refused_with_the_available_metrics() {
+    // H3: `--fail-on no_such_metric>0` matched nothing and exited 0 with no
+    // diagnostic, so a typo silently disabled the gate.
+    let d = tmpdir("failon_unknown");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    write_report(&reports, "a.json", 100, 0.5);
+
+    let (_, stderr, code) = run(&[
+        "concatenate", reports.to_str().unwrap(),
+        "-o", d.join("out").to_str().unwrap(),
+        "--fail-on", "no_such_metric>0",
+    ]);
+    assert_ne!(code, 0, "an unknown --fail-on metric must be an error: {stderr}");
+    assert!(
+        stderr.contains("no_such_metric"),
+        "the error must name the unknown metric: {stderr}"
+    );
+    for available in ["gc_fraction", "reads"] {
+        assert!(
+            stderr.contains(available),
+            "the error must list the metrics that do exist ({available}): {stderr}"
+        );
+    }
+    // A metric that does exist still gates as before.
+    let (_, ok_err, ok_code) = run(&[
+        "concatenate", reports.to_str().unwrap(),
+        "-o", d.join("out2").to_str().unwrap(),
+        "--fail-on", "gc_fraction>0.9",
+    ]);
+    assert_eq!(ok_code, 0, "a satisfied threshold must stay exit 0: {ok_err}");
+}
+
+#[test]
+fn positions_refuses_fail_on_and_format_instead_of_dropping_them() {
+    // H3: both flags were silently dropped under --positions: `--fail-on
+    // no_such>0` exited 0 and `--format` produced none of the requested files.
+    let d = tmpdir("positions_flags");
+    let dir = d.join("A");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("positions.tsv"), "pos\tmean_q\n1\t30.0\n").unwrap();
+
+    let (_, stderr, code) = run(&[
+        "concatenate", "--positions", d.to_str().unwrap(),
+        "-o", d.join("m").to_str().unwrap(),
+        "--fail-on", "mean_q>0",
+    ]);
+    assert_ne!(code, 0, "a gate that cannot run must be refused: {stderr}");
+    assert!(
+        stderr.contains("fail-on") && stderr.contains("positions"),
+        "the refusal must name the flag and the mode: {stderr}"
+    );
+
+    let (_, stderr2, code2) = run(&[
+        "concatenate", "--positions", d.to_str().unwrap(),
+        "-o", d.join("m2").to_str().unwrap(),
+        "--format", "json",
+    ]);
+    assert_ne!(code2, 0, "an ignored --format must be refused: {stderr2}");
+    assert!(
+        stderr2.contains("format") && stderr2.contains("positions"),
+        "the refusal must name the flag and the mode: {stderr2}"
+    );
+
+    // Neither refusal may leave a half-written matrix behind.
+    assert!(!d.join("m/positions_matrix.tsv").exists());
+    assert!(!d.join("m2/positions_matrix.tsv").exists());
+}
+
+#[test]
+fn html_and_md_escape_tool_versions_and_metric_keys() {
+    // H11: sample names and the title were escaped, but the tool name, its
+    // version and the metric keys were interpolated raw into report.html and
+    // report.md, so a report could inject markup into the published aggregate.
+    let d = tmpdir("escape_tool");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    let doc = serde_json::json!({
+        "schema": "fastsuite.report.v1",
+        "tool": "fast<x>&tool",
+        "tool_version": "9.9.9<b>",
+        "metrics": {"m<key": 1.5, "reads": 10},
+    });
+    std::fs::write(reports.join("r.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+
+    let out = d.join("out");
+    let (_, stderr, code) = run(&[
+        "concatenate", reports.to_str().unwrap(),
+        "-o", out.to_str().unwrap(),
+        "--format", "html,md,json",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let html = std::fs::read_to_string(out.join("report.html")).unwrap();
+    assert!(
+        !html.contains("<h2>fast<x>"),
+        "the tool name must not reach the HTML raw: {html}"
+    );
+    assert!(
+        html.contains("fast&lt;x&gt;&amp;tool"),
+        "the tool name must be escaped in the HTML: {html}"
+    );
+    assert!(
+        html.contains("9.9.9&lt;b&gt;"),
+        "the tool version must be escaped in the HTML: {html}"
+    );
+    assert!(
+        !html.contains("<code>m<key</code>"),
+        "the metric key must not reach the HTML raw: {html}"
+    );
+    assert!(
+        html.contains("m&lt;key"),
+        "the metric key must be escaped in the HTML: {html}"
+    );
+
+    let md = std::fs::read_to_string(out.join("report.md")).unwrap();
+    assert!(
+        md.contains("## fast&lt;x&gt;&amp;tool"),
+        "the tool heading must be escaped in the markdown: {md}"
+    );
+    assert!(
+        !md.contains("## fast<x>&tool"),
+        "the markdown heading must not carry raw markup: {md}"
+    );
+    assert!(
+        md.contains("`m&lt;key`"),
+        "the metric key must be escaped in the markdown: {md}"
+    );
+
+    // The JSON aggregate is data, not markup: it keeps the true names.
+    let json = std::fs::read_to_string(out.join("report.json")).unwrap();
+    assert!(json.contains("fast<x>&tool"), "report.json must stay raw: {json}");
+}
+
+#[test]
+fn aggregate_carries_the_resolved_thread_count_a_step_reported() {
+    // Cross-cutting: fastdedup reports the thread count it actually resolved
+    // (`-j 0` = all cores), which is not the number the manifest records. The
+    // aggregate must carry it, so a published table can state the parallelism.
+    let d = tmpdir("agg_threads");
+    let with = d.join("with");
+    let without = d.join("without");
+    std::fs::create_dir_all(&with).unwrap();
+    std::fs::create_dir_all(&without).unwrap();
+    for (dir, metrics) in [
+        (&with, serde_json::json!({"reads_in": 10, "reads_out": 10, "threads": 7})),
+        (&without, serde_json::json!({"reads_in": 10})),
+    ] {
+        let doc = serde_json::json!({
+            "schema": "fastsuite.report.v1",
+            "tool": "fastdedup",
+            "tool_version": "1.3.0",
+            "metrics": metrics,
+        });
+        std::fs::write(dir.join("fastdedup.json"), serde_json::to_string(&doc).unwrap()).unwrap();
+    }
+
+    let out = d.join("out");
+    let (_, stderr, code) = run(&["concatenate", with.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    let agg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+    assert_eq!(agg["threads"], 7.0, "the reported thread count must be carried: {agg}");
+
+    let out2 = d.join("out2");
+    let (_, stderr, code) = run(&["concatenate", without.to_str().unwrap(), "-o", out2.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    let agg2: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out2.join("report.json")).unwrap()).unwrap();
+    assert!(
+        agg2.get("threads").is_none(),
+        "no step reported threads, so the aggregate must not invent one: {agg2}"
+    );
+}
+
+#[test]
+fn fasthelpers_own_aggregate_passes_check_report() {
+    // H12: report.json was stamped `schema: fastsuite.report.v1` while not
+    // being a v1 report (no tool, no metrics), so `check --report` rejected
+    // fasthelper's own output with four problems.
+    let d = tmpdir("check_aggregate");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    write_report(&reports, "a.json", 100, 0.41);
+    let out = d.join("out");
+    let (_, stderr, code) = run(&["concatenate", reports.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let agg = out.join("report.json");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&agg).unwrap()).unwrap();
+    assert_eq!(
+        doc["schema"], "fastsuite.aggregate.v1",
+        "an aggregate is not a fastsuite.report.v1 report: {doc}"
+    );
+
+    let (stdout, stderr, code) = run(&["check", "--report", agg.to_str().unwrap()]);
+    assert_eq!(code, 0, "check must accept fasthelper's own aggregate: {stderr}");
+    assert!(stdout.contains("aggregate"), "the verdict must say what it checked: {stdout}");
+}
+
+#[test]
+fn check_report_refuses_a_broken_aggregate() {
+    let d = tmpdir("check_aggregate_bad");
+    // A row without a tool: exactly the shape that made an aggregate unusable.
+    let bad = d.join("report.json");
+    std::fs::write(
+        &bad,
+        r#"{"schema":"fastsuite.aggregate.v1","generator":"fasthelper",
+            "generator_version":"0.1.0","title":"t",
+            "reports":[{"sample":"A","metrics":{"reads":1}}]}"#,
+    )
+    .unwrap();
+    let (_, stderr, code) = run(&["check", "--report", bad.to_str().unwrap()]);
+    assert_ne!(code, 0, "an aggregate row without a tool must be refused: {stderr}");
+    assert!(
+        stderr.contains("reports[0]") && stderr.contains("tool"),
+        "the problem must locate the row and name the missing key: {stderr}"
+    );
+}
+
+/// A stand-in fastcheck that exits 0 and writes a CORRUPT `--json` report: the
+/// shape that used to become a zero-metric "unparsable" row and be resumed
+/// forever (the resume signature is size+mtime, and neither ever changed).
+const FAKE_CORRUPT_CHECK: &str = r#"#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo "fastcheck 9.9.9"; exit 0; fi
+json=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) json="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$(dirname "$json")"
+printf 'this is not json\n' > "$json"
+exit 0
+"#;
+
+#[test]
+fn a_step_whose_report_does_not_parse_fails_and_is_not_resumed() {
+    // H2: a step that exits 0 with a corrupt --json passed the existence-only
+    // check, was published as a zero-metric "unparsable" row, and was resumed
+    // on every later run because size+mtime never changed.
+    let d = tmpdir("corrupt_report");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    write_exe(&tools.join("fastcheck"), FAKE_CORRUPT_CHECK);
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"corrupt\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+    let td = tools.to_str().unwrap();
+
+    let (_, stderr, code) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert_ne!(code, 0, "an unparsable report must fail the step: {stderr}");
+    assert!(
+        stderr.contains("S1/fastcheck.json"),
+        "the failure must name the report path: {stderr}"
+    );
+    assert!(
+        stderr.contains("not valid JSON") || stderr.contains("unparsable"),
+        "the failure must say the report does not parse: {stderr}"
+    );
+    // It must not be published as a measurement of anything.
+    let agg = std::fs::read_to_string(out.join("report.json")).unwrap_or_default();
+    assert!(
+        !agg.contains("unparsable"),
+        "a step whose report does not parse must not reach the aggregate: {agg}"
+    );
+
+    // And it must not be adopted by the next run.
+    let (stdout2, stderr2, c2) = run(&["run", "-c", cfg.to_str().unwrap(), "--tools-dir", td]);
+    assert!(
+        !stdout2.contains("resumed"),
+        "an unparsable report must never be resumed: {stdout2}"
+    );
+    assert_ne!(c2, 0, "the rerun must still fail: {stderr2}");
+}
+
+#[test]
+fn from_a_disabled_step_is_refused() {
+    // H7: `--from fastcheck` on a config where fastcheck is disabled was a
+    // silent no-op — the step was skipped before `from_reached` was set, so
+    // every step resumed and nothing reran, with exit 0.
+    require_tool("fastcheck");
+    let d = tmpdir("from_disabled");
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"f\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [steps.fastcheck]\nenabled = false\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run", "-c", cfg.to_str().unwrap(), "--from", "fastcheck",
+        "--tools-dir", tools_dir().to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "--from a disabled step must be refused: {stderr}");
+    assert!(
+        stderr.contains("fastcheck") && stderr.contains("disabled"),
+        "the refusal must name the step and say it is disabled: {stderr}"
+    );
+    assert!(
+        !out.join("S1").exists(),
+        "no sample may be started before --from is validated"
+    );
+}
+
+#[test]
+fn the_default_tools_dir_is_the_tools_directory() {
+    // H9: the default resolved to tools/fasthelper (one parent short), so a run
+    // without --tools-dir bailed "looked in .../tools/fasthelper" although the
+    // binaries sit in tools/<tool>/target/release.
+    require_tool("fastcheck");
+    let d = tmpdir("default_tools_dir");
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"dt\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let o = Command::new(fasthelper())
+        .args(["run", "-c", cfg.to_str().unwrap()])
+        .env_remove("FASTSUITE_TOOLS_DIR")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert_eq!(o.status.code(), Some(0), "the default must find tools/: {stderr}");
+
+    let man: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let binary = man["commands"][0]["binary"].as_str().unwrap();
+    assert!(
+        Path::new(binary).starts_with(tools_dir()),
+        "the resolved binary must come from tools/, not tools/fasthelper: {binary}"
+    );
+}
+
+#[test]
+fn doctor_exits_non_zero_when_tools_are_missing() {
+    // H10: doctor printed "missing: ..." and exited 0.
+    let d = tmpdir("doctor_missing");
+    let empty = d.join("tools");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let o = Command::new(fasthelper())
+        .args(["doctor", "--tools-dir", empty.to_str().unwrap()])
+        .env_remove("FASTSUITE_TOOLS_DIR")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert_ne!(
+        o.status.code(),
+        Some(0),
+        "doctor must fail when every tool is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("fastcheck") && stderr.contains("not found"),
+        "the failure must name the missing tools: {stderr}"
+    );
+
+    // With the suite built, the same command is a clean pass.
+    let o = Command::new(fasthelper())
+        .args(["doctor", "--tools-dir", tools_dir().to_str().unwrap()])
+        .env_remove("FASTSUITE_TOOLS_DIR")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "a complete install must pass: {out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!out.contains("NOT FOUND"), "{out}");
+}
+
+#[test]
+fn install_says_what_it_could_not_link_and_exits_non_zero() {
+    // H10: install exited 0 having linked 1 of 6, saying nothing about the rest.
+    let d = tmpdir("install_missing");
+    let prefix = d.join("prefix");
+    std::fs::create_dir_all(&prefix).unwrap();
+    let empty = d.join("tools");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let o = Command::new(fasthelper())
+        .args([
+            "install", "--prefix", prefix.to_str().unwrap(),
+            "--tools-dir", empty.to_str().unwrap(),
+        ])
+        .env_remove("FASTSUITE_TOOLS_DIR")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert_ne!(
+        o.status.code(),
+        Some(0),
+        "install must fail when it cannot link the suite: {stderr}"
+    );
+    for missing in ["fastprep", "fastmaps"] {
+        assert!(
+            stderr.contains(missing),
+            "install must name what it could not link ({missing}): {stderr}"
+        );
+    }
+
+    // A complete install still succeeds, and now really links all six + legacy.
+    for tool in ["fastcheck", "fastdedup", "fastprep", "fastmaps", "fastsim"] {
+        require_tool(tool);
+    }
+    let o = Command::new(fasthelper())
+        .args([
+            "install", "--prefix", prefix.to_str().unwrap(),
+            "--tools-dir", tools_dir().to_str().unwrap(),
+        ])
+        .env_remove("FASTSUITE_TOOLS_DIR")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(o.status.code(), Some(0), "a complete install must pass: {combined}");
+    for name in [
+        "fastcheck", "fastdedup", "fastprep", "fastmaps", "fastsim", "fasthelper",
+        "rpolyx", "fdedup", "novaseq-sim",
+    ] {
+        assert!(
+            prefix.join("bin").join(name).is_symlink(),
+            "{name} must be linked into the prefix: {combined}"
+        );
+    }
+}
+
+#[test]
+fn check_validates_the_simulate_block() {
+    // H6: `check -c` returned OK for a config `run` rejects at minute zero —
+    // the [simulate] fastsim binary and profile path were never validated.
+    let d = tmpdir("check_simulate");
+    let empty = d.join("tools");
+    std::fs::create_dir_all(&empty).unwrap();
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        "[run]\nname = \"sim\"\nsteps = []\n\n\
+         [simulate]\nenabled = true\npairs = 10\nprofile = \"nope_profile.json\"\n",
+    )
+    .unwrap();
+
+    let o = Command::new(fasthelper())
+        .args([
+            "check", "-c", cfg.to_str().unwrap(),
+            "--tools-dir", empty.to_str().unwrap(),
+        ])
+        .env_remove("FASTSUITE_TOOLS_DIR")
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert_ne!(o.status.code(), Some(0), "check must refuse it: {stderr}");
+    assert!(
+        stderr.contains("nope_profile.json"),
+        "the missing simulate profile must be named: {stderr}"
+    );
+    assert!(
+        stderr.contains("fastsim"),
+        "the missing fastsim binary must be named: {stderr}"
+    );
+}

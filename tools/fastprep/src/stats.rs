@@ -289,6 +289,10 @@ impl Stats {
             // the process and summing two mates would report 2x the truth.
             "busy_cores": cost.busy_cores,
             "threads_used": cost.threads_used,
+            // The suite-wide shared key (REPORT-SCHEMA rule 3): the RESOLVED
+            // thread count, so a consumer does not have to know which tool
+            // spells it `threads_used`.
+            "threads": cost.threads_used,
         })
     }
 }
@@ -426,7 +430,10 @@ pub fn to_report_paired_v1(
     //   * `threads_used` is the `-j` that was asked for, not a per-mate count.
     // All three are inserted once below, from the run-level values.
     for key in a.keys() {
-        if matches!(key.as_str(), "phred_offset" | "busy_cores" | "threads_used") {
+        if matches!(
+            key.as_str(),
+            "phred_offset" | "busy_cores" | "threads_used" | "threads"
+        ) {
             continue;
         }
         let sum = a[key].as_u64().unwrap_or(0) + b[key].as_u64().unwrap_or(0);
@@ -435,6 +442,7 @@ pub fn to_report_paired_v1(
     metrics.insert("phred_offset".into(), serde_json::json!(p.r1.phred_offset));
     metrics.insert("busy_cores".into(), serde_json::json!(cost.busy_cores));
     metrics.insert("threads_used".into(), serde_json::json!(cost.threads_used));
+    metrics.insert("threads".into(), serde_json::json!(cost.threads_used));
     // Per-mate breakdown for the keys that are genuinely mate-specific:
     // r1_* and r2_*, so neither mate is lost when the sum is what a
     // consumer wants.
@@ -450,6 +458,30 @@ pub fn to_report_paired_v1(
         }
         metrics.insert(format!("r2_{key}"), val.clone());
     }
+    // Records that had a surviving mate but nowhere to go (no --singletons*
+    // path) are DROPPED records, not records that vanished: counting them in
+    // `legacy` only left `reads_in != reads_out + reads_dropped` (100 pairs
+    // reported 200 in, 0 out, 100 dropped, with the other 100 invisible).
+    let discarded_r1 = p.discarded_singletons_r1;
+    let discarded_r2 = p.discarded_singletons_r2;
+    let bump = |m: &mut serde_json::Map<String, serde_json::Value>, key: &str, by: u64| {
+        if by == 0 {
+            return;
+        }
+        let cur = m.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+        m.insert(key.to_string(), serde_json::json!(cur + by));
+    };
+    bump(&mut metrics, "reads_dropped", discarded_r1 + discarded_r2);
+    bump(&mut metrics, "r1_reads_dropped", discarded_r1);
+    bump(&mut metrics, "r2_reads_dropped", discarded_r2);
+    metrics.insert(
+        "discarded_singletons_r1".into(),
+        serde_json::json!(discarded_r1),
+    );
+    metrics.insert(
+        "discarded_singletons_r2".into(),
+        serde_json::json!(discarded_r2),
+    );
     // Pair-level counters, from the PairedStats header.
     metrics.insert("pairs_out".into(), serde_json::json!(p.pairs_out));
     metrics.insert("pairs_dropped".into(), serde_json::json!(p.pairs_dropped));

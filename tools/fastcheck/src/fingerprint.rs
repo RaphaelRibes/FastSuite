@@ -56,7 +56,9 @@ impl FingerprintTable {
         self.counts.capacity()
     }
 
-    /// Total observations recorded (sum of multiplicities).
+    /// Total observations recorded (sum of multiplicities). Test-only: the report reads
+    /// `distinct()` and the multiplicity histogram, never this sum on its own.
+    #[cfg(test)]
     pub fn total(&self) -> u64 {
         self.counts.values().map(|&c| c as u64).sum()
     }

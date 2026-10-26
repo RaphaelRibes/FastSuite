@@ -35,6 +35,22 @@ pub fn cmd_compare(before: &[PathBuf], after: &[PathBuf], outdir: &Path) -> Resu
             a.len()
         );
     }
+    // One sample per side. `merge_metrics` below is flat and last-wins, so a
+    // side holding two samples produced ONE row of one sample's numbers, with
+    // no sample names and exit 0 — a silently wrong table. Refusing is the
+    // only honest answer: a per-sample before/after needs one sample.
+    for (side, reports) in [("before", &b), ("after", &a)] {
+        let samples: BTreeSet<&str> = reports.iter().map(|r| r.sample.as_str()).collect();
+        if samples.len() > 1 {
+            anyhow::bail!(
+                "compare is a single-sample before/after tool: --{side} holds {} samples ({}). \
+                 Point it at one sample per side, e.g. --{side} <run>/{}/fastcheck.json",
+                samples.len(),
+                samples.iter().copied().collect::<Vec<_>>().join(", "),
+                samples.iter().next().copied().unwrap_or("<sample>")
+            );
+        }
+    }
     let bm = merge_metrics(&b);
     let am = merge_metrics(&a);
 

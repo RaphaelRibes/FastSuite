@@ -552,6 +552,74 @@ fn explicit_phred_assumption(offset: u8) -> crate::stats::Assumption {
 // Single-end.
 // ---------------------------------------------------------------------------
 
+/// The message a total-drop refusal carries.
+///
+/// Shared by the pre-commit refusal here and the post-run guard in `main`, so
+/// the two paths cannot drift apart.
+pub fn total_drop_message(reads_in: u64, mode: &str, outputs: &str) -> String {
+    format!(
+        "fastprep: dropped all {reads_in} {mode} reads — nothing was written to {outputs}. \
+         Refusing to report success on a total drop. Check the per-cause drop \
+         table above; the usual causes are --min-len above the trimmed insert \
+         length, --mean-q above the library's mean quality, and a Phred offset \
+         read the wrong way (pass --phred-offset 64 for legacy data). Pass \
+         --allow-total-drop to accept an empty output."
+    )
+}
+
+/// Refuse a record format the destination path contradicts.
+///
+/// fastprep preserves the input's record format (FASTA in, FASTA out) and
+/// infers only the *compression* from the destination extension. That is a
+/// footgun when the name says otherwise: a FASTA input written to `out.fq`
+/// produced a FASTA file with a FASTQ name, and the next tool in the chain
+/// refused it with a quality-length error that pointed at the wrong step.
+/// CLI-SPEC §4 states named paths use the extension, so honour it here.
+fn check_output_format(out: &Path, fmt: RecordFormat) -> Result<()> {
+    let ext = out
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let says_fastq = matches!(ext.as_str(), "fq" | "fastq");
+    let says_fasta = matches!(ext.as_str(), "fa" | "fasta" | "fna" | "faa");
+    match fmt {
+        RecordFormat::Fasta if says_fastq => anyhow::bail!(
+            "fastprep: {} is a FASTA input but the output {} says FASTQ. \
+             Qualities cannot be invented, so name the output .fa/.fasta \
+             (or drop the extension) and the run will keep the record format.",
+            "the input",
+            out.display()
+        ),
+        RecordFormat::Fastq if says_fasta => anyhow::bail!(
+            "fastprep: the input is FASTQ but the output {} says FASTA. \
+             Name the output .fq/.fastq (or drop the extension) to keep the \
+             record format.",
+            out.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a total drop **before** the atomic rename.
+///
+/// The refusal used to run in `main` after `run_single`/`run_paired` had
+/// already committed, so a run that dropped every read still replaced the
+/// destination with a 0-byte file — and then claimed "nothing was written to
+/// the output file". With `--force` that destroyed a good previous output.
+fn refuse_before_commit(
+    reads_in: u64,
+    written: u64,
+    allow: bool,
+    mode: &str,
+    outputs: &str,
+) -> Result<()> {
+    if allow || reads_in == 0 || written > 0 {
+        return Ok(());
+    }
+    anyhow::bail!("{}", total_drop_message(reads_in, mode, outputs))
+}
+
 pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Result<Stats> {
     // Phred offset: a census of the input, or the configured value. Either way
     // the choice is recorded as an assumption: a +64 file read as +33 is a
@@ -641,6 +709,9 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
         buf.reserve(rt.chunk, 151);
         let mut chunk = Vec::with_capacity(rt.chunk);
         fill_chunk(&mut *reader, &mut buf, &mut chunk, rt.chunk, phred_offset)?;
+        if let Some(first) = chunk.first() {
+            check_output_format(out1, first.format)?;
+        }
 
         while !chunk.is_empty() {
             raw_tx.send((buf, chunk)).ok();
@@ -760,6 +831,15 @@ pub fn run_single(in1: &Path, out1: &Path, params: &Params, rt: &Runtime) -> Res
     // Atomic rename: committed output replaces the destination path.
     // A dry run never got here with a file to commit.
     if !rt.dry_run {
+        // Refuse a total drop here, while the destination is still untouched:
+        // the temp file is removed by its guard on the error path.
+        refuse_before_commit(
+            stats.reads_in,
+            stats.reads_kept,
+            rt.allow_total_drop,
+            "single-end",
+            "the output file",
+        )?;
         std::fs::rename(&tmp_out, out1)
             .with_context(|| format!("committing {} → {}", tmp_out.display(), out1.display()))?;
         guard_out.commit();
@@ -995,6 +1075,12 @@ pub fn run_paired(
         let mut chunk2 = Vec::with_capacity(rt.chunk);
         fill_chunk(&mut *r1, &mut buf1, &mut chunk1, rt.chunk, phred_offset)?;
         fill_chunk(&mut *r2, &mut buf2, &mut chunk2, rt.chunk, phred_offset)?;
+        if let Some(first) = chunk1.first() {
+            check_output_format(out1, first.format)?;
+        }
+        if let Some(first) = chunk2.first() {
+            check_output_format(out2, first.format)?;
+        }
         let (n1, n2) = (chunk1.len(), chunk2.len());
         if n1 != n2 && !(n1 == 0 && n2 == 0) {
             bail!(
@@ -1114,6 +1200,15 @@ pub fn run_paired(
 
     // Atomic renames. A dry run wrote nothing, so it commits nothing.
     if !rt.dry_run {
+        // Refuse a total drop before any rename: pairs plus salvaged
+        // singletons are what the output actually holds.
+        refuse_before_commit(
+            stats.r1.reads_in,
+            stats.pairs_out + stats.singletons_r1 + stats.singletons_r2,
+            rt.allow_total_drop,
+            "paired-end",
+            "the R1/R2 outputs or either singleton file",
+        )?;
         std::fs::rename(&tmp_w1, out1)
             .with_context(|| format!("committing {} → {}", tmp_w1.display(), out1.display()))?;
         guard_w1.commit();
@@ -1821,8 +1916,12 @@ mod tests {
              IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
         );
         let p = default_params();
-        let stats =
-            run_paired(&in1, &in2, &out1, &out2, None, None, &p, &p, &default_rt()).unwrap();
+        // This fixture is a total drop by design (R1 doomed, R2 discarded):
+        // opt out of the refusal, which `run_paired` now raises BEFORE the
+        // rename, so the counters can be inspected.
+        let mut rt = default_rt();
+        rt.allow_total_drop = true;
+        let stats = run_paired(&in1, &in2, &out1, &out2, None, None, &p, &p, &rt).unwrap();
         assert_eq!(stats.pairs_out, 0);
         assert_eq!(stats.singletons_r2, 0);
         assert_eq!(stats.discarded_singletons_r2, 1);

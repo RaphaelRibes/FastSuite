@@ -40,6 +40,14 @@ pub const DEFAULT_THRESHOLD: f64 = 0.05;
 /// most `(1 - min_reduction) * raw`. 0.5 = the trim must at least halve it.
 pub const DEFAULT_MIN_REDUCTION: f64 = 0.5;
 
+/// Smallest raw fraction the relative-fall rule may judge.
+///
+/// Below 1% the rule is measuring noise: 10 of 39 166 reads (0.026%) falling to
+/// 12 of 37 740 (0.032%) is not evidence that trimming failed, yet it tripped
+/// the halving rule and blamed strict matching. A real under-trimmed library
+/// sits far above this floor, where the absolute threshold applies anyway.
+pub const DEFAULT_MIN_RAW_FRAC: f64 = 0.01;
+
 /// One adapter measurement, from a fastcheck report's `adapter_content` block.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Measurement {
@@ -103,6 +111,9 @@ pub struct Policy {
     pub threshold: f64,
     /// Relative fall required from the raw fraction (see [`DEFAULT_MIN_REDUCTION`]).
     pub min_reduction: f64,
+    /// Raw fraction below which the relative-fall rule cannot trip (see
+    /// [`DEFAULT_MIN_RAW_FRAC`]).
+    pub min_raw_frac: f64,
     /// Turn a trip into a hard failure (exit 2, the `--fail-on` convention)
     /// instead of a warning.
     pub fail: bool,
@@ -114,6 +125,7 @@ impl Default for Policy {
             enabled: true,
             threshold: DEFAULT_THRESHOLD,
             min_reduction: DEFAULT_MIN_REDUCTION,
+            min_raw_frac: DEFAULT_MIN_RAW_FRAC,
             fail: false,
         }
     }
@@ -241,7 +253,11 @@ pub fn evaluate(
     let trim_frac = trimmed.fraction();
 
     let still_present = trim_frac > policy.threshold;
-    let not_reduced = trim_frac > (1.0 - policy.min_reduction) * raw_frac;
+    // The relative rule only judges a fraction worth judging: below
+    // `min_raw_frac` a "fall" is counting noise, and saying "did not at least
+    // halve" about 0.026% -> 0.032% was a false alarm that blamed the trimmer.
+    let judgeable = raw_frac >= policy.min_raw_frac;
+    let not_reduced = judgeable && trim_frac > (1.0 - policy.min_reduction) * raw_frac;
     if !(still_present || not_reduced) {
         return Verdict::Silent("adapter content fell below the residual threshold");
     }
@@ -254,13 +270,15 @@ pub fn evaluate(
         )
     } else {
         format!(
-            "adapter content did not fall from the raw {:.1}% (it must at least halve)",
+            "adapter content did not fall from the raw {:.3}% (it must at least halve)",
             raw_frac * 100.0
         )
     };
+    // Three decimals: at two, a sub-0.1% fraction printed as "0.0%", so the
+    // message asked the reader to trust a number it had rounded away.
     let msg = format!(
-        "adapter survived the trim: {:.1}% of trimmed reads still carry adapter \
-(raw {:.1}%, {} match(es) left) — {reason}\n  \
+        "adapter survived the trim: {:.3}% of trimmed reads still carry adapter \
+(raw {:.3}%, {} match(es) left) — {reason}\n  \
 likely cause: {}\n  {REMEDIES}",
         trim_frac * 100.0,
         raw_frac * 100.0,
@@ -604,6 +622,31 @@ mod tests {
         assert!(!evaluate(&raw, &trimmed, &lenient, &[]).is_trip(), "1.0/0.0 disables the trip");
         let strict = Policy { threshold: 0.05, min_reduction: 0.5, ..Policy::default() };
         assert!(evaluate(&raw, &trimmed, &strict, &[]).is_trip());
+    }
+
+    #[test]
+    fn a_tiny_raw_fraction_cannot_trip_the_relative_fall_rule() {
+        // H5: raw 10/39 166 (0.026%) vs trimmed 12/37 740 (0.032%) tripped the
+        // "must at least halve" rule — a false alarm on noise, reported as
+        // "0.0% ... 0.0%" and blamed on strict matching.
+        let raw = Measurement::from_report(&report(39_166, 10, 10)).unwrap();
+        let trimmed = Measurement::from_report(&report(37_740, 12, 12)).unwrap();
+        let v = evaluate(&raw, &trimmed, &Policy::default(), &[]);
+        assert!(!v.is_trip(), "sub-percent noise must not trip the guard: {v:?}");
+    }
+
+    #[test]
+    fn a_material_fall_failure_reports_the_percentages_it_judged() {
+        // 2.0% -> 1.9%: above the 1% floor, not halved, so it trips — and the
+        // message must show the numbers it decided on, not "0.0%".
+        let raw = Measurement::from_report(&report(1000, 20, 20)).unwrap();
+        let trimmed = Measurement::from_report(&report(1000, 19, 19)).unwrap();
+        let v = evaluate(&raw, &trimmed, &Policy::default(), &[]);
+        assert!(v.is_trip(), "{v:?}");
+        let msg = v.message().unwrap();
+        assert!(msg.contains("2.000%"), "the raw fraction must be truthful: {msg}");
+        assert!(msg.contains("1.900%"), "the trimmed fraction must be truthful: {msg}");
+        assert!(!msg.contains("0.0%"), "no misleading rounding: {msg}");
     }
 
     #[test]

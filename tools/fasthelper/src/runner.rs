@@ -419,6 +419,21 @@ fn run_sample(
                 failed.push(format!("{}/{}", sample.name, tool));
                 break;
             }
+            // The report must also PARSE. A tool that exited 0 and left a
+            // corrupt --json used to pass this check, be published as a
+            // zero-metric "unparsable" row, and then be resumed forever: the
+            // resume signature is size+mtime, and neither ever changed.
+            if let Err(e) = parses_as_json(&json_path) {
+                eprintln!(
+                    "fasthelper: {} for {} exited 0 but wrote an unparsable report: {} is not \
+                     valid JSON ({e}) — treating the step as failed",
+                    tool,
+                    sample.name,
+                    json_path.display()
+                );
+                failed.push(format!("{}/{}", sample.name, tool));
+                break;
+            }
         }
         // What this step actually left on disk, recorded so the next run can
         // tell a completed step from a partial output of a failed one.
@@ -578,6 +593,17 @@ fn run_step(
 
 fn s(p: &Path) -> String {
     p.display().to_string()
+}
+
+/// Does `path` parse as JSON? Returns the parse error text when it does not.
+///
+/// A step's `--json` file is its measurement: an unparsable one is not a report
+/// of zero metrics, it is no report at all, and the run must not continue on it.
+fn parses_as_json(path: &Path) -> std::result::Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Run `<bin> --version` and return its trimmed stdout (None if it fails).
@@ -880,6 +906,14 @@ pub fn run(args: &RunArgs) -> Result<()> {
                 cfg.run.steps.join(", ")
             );
         }
+        // A disabled step is skipped before `from_reached` can be set, so
+        // naming it used to resume everything and rerun nothing while exiting 0.
+        if !cfg.step(from).enabled {
+            bail!(
+                "--from '{from}' names a disabled step ([steps.{from}] enabled = false), so it \
+                 would never run and nothing after it would rerun — enable it or drop --from"
+            );
+        }
     }
     let tools_dir = cfg.tools_dir(args.tools_dir.clone());
     let ts = toolset(tools_dir.clone());
@@ -907,6 +941,7 @@ pub fn run(args: &RunArgs) -> Result<()> {
         threshold: args.adapter_residual_threshold,
         min_reduction: args.adapter_min_reduction,
         fail: args.fail_on_adapter_residual,
+        ..Policy::default()
     };
     // The guard costs two fastcheck passes per trimming step; say so once when
     // it is enabled but its measurement tool is missing, rather than silently
@@ -1276,6 +1311,13 @@ pub fn doctor(args: &DoctorArgs) -> Result<()> {
     if !missing.is_empty() {
         println!(
             "\nmissing: {}\nbuild with: for t in fastcheck fastdedup fastprep fastmaps fastsim; do (cd tools/$t && cargo build --release); done",
+            missing.join(", ")
+        );
+        // A "missing" report with exit 0 made a broken install look healthy to
+        // every script and CI job that only checks the exit code.
+        bail!(
+            "{} required tool(s) not found: {}",
+            missing.len(),
             missing.join(", ")
         );
     }

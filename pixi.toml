@@ -170,6 +170,11 @@ test = "bash scripts/test.sh"
 # compiler is the env's 1.99) never gets confused with a bare `bash scripts/ci.sh`
 # on a machine whose ambient cargo is 1.95.
 ci = "bash scripts/ci.sh"
+# The ground-truth gate: fastsim emits paired reads from a known profile, then
+# fastcheck recovers every parameter against the simulator's own GT within the
+# plan's tolerances (PLAN-QC §7.3). STATUS.md pointed at this task for weeks
+# while it did not exist.
+ground-truth = { cmd = "/usr/bin/python3 tools/fastcheck/tests/ground_truth.py", depends-on = ["build"] }
 doctor = "./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools"
 demo = "bash examples/demo.sh"
 report = "./tools/fasthelper/target/release/fasthelper report examples/runs/demo -o examples/runs/demo --format html,tsv"

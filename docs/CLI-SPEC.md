@@ -56,8 +56,11 @@ only to a `-j >1` gzippy build *below* level 6, which the code does not do.
 Rules:
 
 0. **`-` means the stream** (D-4). FASTQ input from stdin and FASTQ/report
-   output to stdout, in a pipe or on a file, with no intermediate on disk:
-   `zcat in.fq.gz | fastdedup -1 - -o - | fastprep -1 - -o clean.fq.gz`.
+   output to stdout, in a pipe or on a file, with no intermediate on disk.
+   Working today: `zcat in.fq.gz | fastdedup -1 - -o - | gzip > d.fq.gz`, and
+   `fastcheck -` reads a stream. **`fastprep` is still file-only**, so the
+   three-stage pipe `… | fastprep -1 - …` is the target, not a working
+   command (gap §4 item 7).
    Compression is decided from **magic bytes**, never from a filename, so a
    stream and a mislabelled file behave identically. When stdout carries a
    report (`--json -`), the summary line moves to stderr.

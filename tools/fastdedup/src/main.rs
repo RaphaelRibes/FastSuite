@@ -29,7 +29,7 @@ fn dispatch(
     output_path: &str,
     hash_type: &HashType,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     match hash_type {
         HashType::XXH3_64 => {
             if cfg.verbose {
@@ -52,7 +52,7 @@ fn dispatch_abundance(
     output_path: &str,
     hash_type: &HashType,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     match hash_type {
         HashType::XXH3_64 => {
             if cfg.verbose {
@@ -77,7 +77,7 @@ fn dispatch_paired(
     output_r2: &str,
     hash_type: &HashType,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     match hash_type {
         HashType::XXH3_64 => {
             if cfg.verbose {
@@ -102,7 +102,7 @@ fn dispatch_paired_abundance(
     output_r2: &str,
     hash_type: &HashType,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     match hash_type {
         HashType::XXH3_64 => {
             if cfg.verbose {
@@ -129,7 +129,7 @@ fn dispatch_threaded(
     output_path: &str,
     hash_type: &HashType,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     match hash_type {
         HashType::XXH3_64 => {
             if cfg.verbose {
@@ -154,7 +154,7 @@ fn dispatch_paired_threaded(
     output_r2: &str,
     hash_type: &HashType,
     cfg: &DedupConfig,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     match hash_type {
         HashType::XXH3_64 => {
             if cfg.verbose {
@@ -189,6 +189,21 @@ fn refuse_same_file(a: &str, a_role: &str, b: &str, b_role: &str, why: &str) -> 
         bail!("{a_role} ({a}) and {b_role} ({b}) name the same file: {why}");
     }
     Ok(())
+}
+
+/// Threads requested on the command line, else `$FASTSUITE_THREADS`, else 1.
+///
+/// CLI-SPEC §4 item 6: the environment variable is a suite-wide DEFAULT, read
+/// only when `-j/--threads` is absent — it must never override an explicit
+/// flag. An unset, empty, unparseable or zero value means "not set".
+fn requested_thread_count(flag: Option<usize>) -> usize {
+    flag.or_else(|| {
+        std::env::var("FASTSUITE_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    })
+    .unwrap_or(1)
 }
 
 fn main() -> Result<()> {
@@ -265,6 +280,26 @@ fn main() -> Result<()> {
                     out,
                     role,
                     "the report would overwrite the sequences (or the reverse). \
+                     Give the report its own path.",
+                )?;
+            }
+        }
+        // Inputs are inputs whatever --dry-run says: the report is the LAST
+        // writer, so `--json victim.fq -1 victim.fq` replaced the reads with
+        // JSON and exited 0. A dry run writes no sequences but still writes the
+        // report, so this check is deliberately outside the `!dry_run` block
+        // below.
+        for (role, input) in [
+            ("--input (-1)", Some(args.input.as_str())),
+            ("--input-r2 (-2)", args.input_r2.as_deref()),
+        ] {
+            if let Some(input) = input {
+                refuse_same_file(
+                    json,
+                    "--json",
+                    input,
+                    role,
+                    "the report would overwrite the reads it describes. \
                      Give the report its own path.",
                 )?;
             }
@@ -380,7 +415,18 @@ fn main() -> Result<()> {
         );
     }
 
-    let resolved_threads = crate::parallel::resolve_thread_count(args.threads);
+    // `-j` absent: `$FASTSUITE_THREADS` is the suite-wide default (CLI-SPEC §4
+    // item 6), else 1. An explicit `-j` always wins, so a batch script's export
+    // can never silently re-parallelize a one-thread reproduction.
+    let requested_threads = requested_thread_count(args.threads);
+    // `--abundance` runs single-threaded whatever `-j` says (two passes over
+    // one shared tracker): announce the pool that runs, not the request. It
+    // used to print "4 threads" right after warning that it runs one.
+    let resolved_threads = if args.abundance {
+        1
+    } else {
+        crate::parallel::resolve_thread_count(requested_threads)
+    };
 
     // `--out-compression` is the stream counterpart of the `.gz` extension: a
     // named path used to ignore it and write plain records in silence.
@@ -420,7 +466,7 @@ fn main() -> Result<()> {
         },
     };
 
-    if args.abundance && args.threads != 1 {
+    if args.abundance && requested_threads != 1 {
         eprintln!(
             "Warning: --abundance does not support multi-threading. Running single-threaded."
         );
@@ -428,7 +474,7 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
 
-    let (processed, duplicates) = if let Some(input_r2) = &args.input_r2 {
+    let (processed, duplicates, preloaded) = if let Some(input_r2) = &args.input_r2 {
         let output_r2 = args.output_r2.as_deref().unwrap_or("");
 
         if args.verbose {
@@ -483,6 +529,16 @@ fn main() -> Result<()> {
         }
     };
 
+    // A resume preloads the hashes already on disk (`preloaded`) and appends
+    // only what is missing, so `processed - duplicates` is what THIS invocation
+    // wrote, not what the output holds. After repairing a torn tail of a
+    // 20 000-record output the run wrote one record and reported "1 out,
+    // 19999 duplicates (100.00%)" for a file holding all 20 000. The counts
+    // below describe the whole output and the whole input. Saturating, because
+    // a resume may legitimately start from an output larger than this input.
+    let reads_out = preloaded + processed.saturating_sub(duplicates);
+    let duplicates = processed.saturating_sub(reads_out);
+
     if args.verbose {
         println!(
             "Processed fragments: {}\nDuplicates removed: {:.2}%",
@@ -508,7 +564,6 @@ fn main() -> Result<()> {
         0.0
     };
     let collisions_pct = birthday_problem_square_approximation(processed, &selected_hash_type) * 100.0;
-    let reads_out = processed.saturating_sub(duplicates);
 
     if !args.quiet {
         // D-4 / CLI-SPEC §0: with `-o -` or `--json -` stdout carries data,
@@ -555,7 +610,10 @@ fn main() -> Result<()> {
             "collision_estimate": collisions_pct / 100.0,
             "threads": resolved_threads,
             "gz_level": args.compression,
-            "abundance": args.abundance
+            // REPORT-SCHEMA rule 1: `metrics` is a flat NUMERIC namespace, so a
+            // boolean is 0/1. Emitting `false` violated the schema
+            // `fasthelper check --report` enforces.
+            "abundance": u8::from(args.abundance)
         });
         if let Some((pairs_in, pairs_out)) = pairs {
             metrics["pairs_in"] = pairs_in.into();

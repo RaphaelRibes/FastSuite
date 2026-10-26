@@ -22,6 +22,12 @@ use crate::cli::ReportArgs;
 
 pub const SCHEMA_VERSION: &str = "fastsuite.report.v1";
 
+/// Schema tag of the aggregate document (`report.json`): a *collection* of
+/// per-tool reports, not a measurement. It carries `generator`, `title` and
+/// `reports[]` instead of `tool` + `metrics`, so it must not claim the v1
+/// report tag — `check --report` rejected fasthelper's own output over that.
+pub const AGGREGATE_SCHEMA_VERSION: &str = "fastsuite.aggregate.v1";
+
 pub const SCHEMA_DOC: &str = r#"fastsuite.report.v1 — per-tool report contract
 =======================================================================
 Every FastSuite tool writes exactly one JSON per run with --json <PATH>:
@@ -64,6 +70,13 @@ Producers today
   fastprep    --json  -> v1 (native)
   fastmaps    --json  -> heatmap.json in --output-dir (v1 wrapper planned)
   fastsim     -       -> no JSON yet (planned: --json with truth summary)
+
+fastsuite.aggregate.v1 — fasthelper's own report.json
+----------------------------------------------------
+A collection, not a measurement: `generator`, `generator_version`, `title`,
+an optional numeric `threads` (the count a step reported), and `reports[]`
+where every row carries `sample`, `tool` and a numeric `metrics` map.
+`fasthelper check --report report.json` validates this shape.
 "#;
 
 /// One tool's report for one sample, normalised.
@@ -319,8 +332,9 @@ struct GridDoc {
     /// travel with them.
     min_seq_len: Option<f64>,
     max_seq_len: Option<f64>,
-    corner_window: Option<f64>,
-    /// windows in metric order: all, r1, r2
+    /// `corner_window` in the file is NOT read: the fractions are built with
+    /// [`corner_window`], and the published metric states that same number, so
+    /// a row can never name a window it did not use.
     windows: [Option<WindowSums>; 3],
     /// `counts` numbers buffered because `size` had not been seen yet — JSON
     /// object order is not guaranteed, so a grid may list them in any order.
@@ -336,12 +350,21 @@ impl Default for GridDoc {
             version: None,
             min_seq_len: None,
             max_seq_len: None,
-            corner_window: None,
             windows: [None, None, None],
             deferred: [None, None, None],
             has_counts: false,
         }
     }
+}
+
+/// Side of the corner window on a grid of side `size`: `max(size/50, 2)`.
+///
+/// The ONE place it is derived, so the `corner_window` metric states the window
+/// the fractions were actually built with. It used to be copied from the grid's
+/// declared value while the sums were computed with this formula, so a row could
+/// name a window it had not used.
+fn corner_window(size: i64) -> i64 {
+    (size / 50).max(2)
 }
 
 fn read_window<'de, A: MapAccess<'de>>(
@@ -352,7 +375,7 @@ fn read_window<'de, A: MapAccess<'de>>(
 ) -> Result<(), A::Error> {
     match doc.size.filter(|s| *s > 0) {
         Some(size) => {
-            let c = (size / 50).max(2); // corner window: 2% of the read length
+            let c = corner_window(size);
             doc.windows[idx] = map.next_value_seed(WindowSeed {
                 size,
                 c,
@@ -393,7 +416,6 @@ impl<'de> Visitor<'de> for GridDocVisitor {
                 "version" => doc.version = Some(map.next_value::<f64>()?),
                 "min_seq_len" => doc.min_seq_len = Some(map.next_value::<f64>()?),
                 "max_seq_len" => doc.max_seq_len = Some(map.next_value::<f64>()?),
-                "corner_window" => doc.corner_window = Some(map.next_value::<f64>()?),
                 "counts" => {
                     doc.has_counts = true;
                     read_window(&mut map, &mut doc, 0, true)?;
@@ -419,6 +441,7 @@ impl GridDoc {
     fn into_report(mut self, sample: String, path: &Path) -> ToolReport {
         self.fold_deferred();
         let size = self.size.unwrap_or(0);
+        let c = corner_window(size);
         let mut metrics = BTreeMap::new();
         metrics.insert("total_reads".into(), self.total_reads.unwrap_or(0.0));
         metrics.insert("grid_size".into(), size as f64);
@@ -427,11 +450,15 @@ impl GridDoc {
         for (key, value) in [
             ("min_seq_len", self.min_seq_len),
             ("max_seq_len", self.max_seq_len),
-            ("corner_window", self.corner_window),
         ] {
             if let Some(v) = value {
                 metrics.insert(key.into(), v);
             }
+        }
+        // The window these fractions are built with, not the one the grid
+        // claims: a consumer must be able to recompute them from the row.
+        if size > 0 {
+            metrics.insert("corner_window".into(), c as f64);
         }
         for (idx, label) in ["all", "r1", "r2"].into_iter().enumerate() {
             let Some(w) = self.windows[idx] else { continue };
@@ -469,7 +496,7 @@ impl GridDoc {
         let Some(size) = self.size.filter(|s| *s > 0) else {
             return;
         };
-        let c = (size / 50).max(2);
+        let c = corner_window(size);
         let deferred = std::mem::replace(&mut self.deferred, [None, None, None]);
         for (idx, cells) in deferred.into_iter().enumerate() {
             if let Some(cells) = cells {
@@ -603,12 +630,17 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
         let mut metrics = BTreeMap::new();
         metrics.insert("total_reads".into(), get_num(&v, "total_reads"));
         metrics.insert("grid_size".into(), size as f64);
-        for key in ["min_seq_len", "max_seq_len", "corner_window"] {
+        for key in ["min_seq_len", "max_seq_len"] {
             if let Some(n) = v.get(key).and_then(num) {
                 metrics.insert(key.into(), n);
             }
         }
-        let c = (size / 50).max(2); // corner window: 2% of the read length
+        // Derived, never copied from the file: the fractions below are built
+        // with this window, so this is the number the row must state.
+        let c = corner_window(size);
+        if size > 0 {
+            metrics.insert("corner_window".into(), c as f64);
+        }
         for (label, obj) in windows {
             let counts = match obj.get("counts") {
                 Some(serde_json::Value::Array(a)) => a,
@@ -935,7 +967,10 @@ pub fn matrix_md(reports: &[ToolReport]) -> String {
         for r in reports {
             columns.extend(r.metrics.keys().map(|k| k.as_str()));
         }
-        s.push_str(&format!("## {tool}\n\n| metric |"));
+        // The tool name and the metric keys come from a report file, not from
+        // this program: markdown renders raw HTML, so they are escaped like the
+        // sample names already are.
+        s.push_str(&format!("## {}\n\n| metric |", esc(tool)));
         for r in reports {
             s.push_str(&format!(" {} |", esc(&r.sample)));
         }
@@ -945,7 +980,7 @@ pub fn matrix_md(reports: &[ToolReport]) -> String {
         }
         s.push('\n');
         for c in &columns {
-            s.push_str(&format!("| `{c}` |"));
+            s.push_str(&format!("| `{}` |", esc(c)));
             for r in reports {
                 s.push_str(&format!(
                     " {} |",
@@ -1012,7 +1047,11 @@ code{{background:#f2f3f5;padding:0 .25rem;border-radius:3px}}\
             .collect::<BTreeSet<_>>()
             .len(),
         reports.len(),
-        by_tool.keys().cloned().collect::<Vec<_>>().join(", ")
+        by_tool
+            .keys()
+            .map(|t| esc(t))
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
 
     for (tool, reps) in &by_tool {
@@ -1020,12 +1059,18 @@ code{{background:#f2f3f5;padding:0 .25rem;border-radius:3px}}\
             .iter()
             .filter_map(|r| r.version.clone())
             .collect();
+        // Tool name and version are report-supplied text, like the sample
+        // names: unescaped they close the tag they are written into.
         out.push_str(&format!(
-            "<h2>{tool}{}</h2>",
+            "<h2>{}{}</h2>",
+            esc(tool),
             if versions.is_empty() {
                 String::new()
             } else {
-                format!(" <span class='meta'>{}</span>", versions.into_iter().collect::<Vec<_>>().join(", "))
+                format!(
+                    " <span class='meta'>{}</span>",
+                    versions.iter().map(|v| esc(v)).collect::<Vec<_>>().join(", ")
+                )
             }
         ));
         let mut columns: BTreeSet<&str> = BTreeSet::new();
@@ -1041,7 +1086,7 @@ code{{background:#f2f3f5;padding:0 .25rem;border-radius:3px}}\
             let numeric: Vec<Option<f64>> = reps.iter().map(|r| r.metrics.get(*c).copied()).collect();
             let max = numeric.iter().flatten().cloned().fold(0.0f64, f64::max);
             let is_rate = c.ends_with("_frac") || c.ends_with("rate") || c.ends_with("retention");
-            out.push_str(&format!("<tr><td><code>{c}</code></td>"));
+            out.push_str(&format!("<tr><td><code>{}</code></td>", esc(c)));
             for v in &numeric {
                 match v {
                     Some(v) => {
@@ -1095,6 +1140,12 @@ struct JsonDoc<'a> {
     generator_version: &'a str,
     reports: Vec<JsonRow<'a>>,
     schema: &'a str,
+    /// The thread count a step REPORTED for this run (`fastdedup` publishes the
+    /// value it resolved, so `-j 0` shows the core count instead of the
+    /// sentinel). Absent when no step reported one: the aggregate does not
+    /// invent a measurement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads: Option<f64>,
     title: &'a str,
 }
 
@@ -1117,11 +1168,18 @@ pub fn write_json<W: Write>(w: &mut W, title: &str, reports: &[ToolReport]) -> R
             tool_version: r.version.as_deref(),
         })
         .collect();
+    // Pass-through only: the highest count any step reported. Every step of a
+    // run is handed the same number, so this is the run's resolved parallelism.
+    let threads = reports
+        .iter()
+        .filter_map(|r| r.metrics.get("threads").copied())
+        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))));
     let doc = JsonDoc {
         generator: "fasthelper",
         generator_version: env!("CARGO_PKG_VERSION"),
         reports: rows,
-        schema: SCHEMA_VERSION,
+        schema: AGGREGATE_SCHEMA_VERSION,
+        threads,
         title,
     };
     serde_json::to_writer_pretty(&mut *w, &doc).context("serialising report.json")?;
@@ -1323,6 +1381,33 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
     }
     let formats: Vec<String> = a.format.split(',').map(|s| s.trim().to_string()).collect();
     let title = "FastSuite report";
+    // Parse and validate the gate BEFORE writing anything: `--fail-on
+    // no_such_metric>0` used to match nothing and exit 0, so a typo silently
+    // disabled the gate.
+    let thresholds: Vec<Threshold> = a
+        .fail_on
+        .iter()
+        .map(|s| Threshold::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+    if !thresholds.is_empty() {
+        let available: BTreeSet<&str> = reports
+            .iter()
+            .flat_map(|r| r.metrics.keys().map(|k| k.as_str()))
+            .collect();
+        for t in &thresholds {
+            if !available.contains(t.metric.as_str()) {
+                anyhow::bail!(
+                    "--fail-on '{}' names no metric in these reports — available metrics: {}",
+                    t.metric,
+                    if available.is_empty() {
+                        "(none: no report carried a metric)".to_string()
+                    } else {
+                        available.iter().cloned().collect::<Vec<_>>().join(", ")
+                    }
+                );
+            }
+        }
+    }
     // Built once: the TSV writer and --stdout are the same table, and the
     // matrix borrows the reports instead of cloning them.
     let matrix = if a.stdout || formats.iter().any(|f| f == "tsv") {
@@ -1331,12 +1416,7 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
         None
     };
     let written = write_reports(title, &reports, &a.outdir, &formats, matrix.as_ref())?;
-    if !a.fail_on.is_empty() {
-        let thresholds: Vec<Threshold> = a
-            .fail_on
-            .iter()
-            .map(|s| Threshold::parse(s))
-            .collect::<Result<Vec<_>>>()?;
+    if !thresholds.is_empty() {
         let tripped = evaluate_thresholds(&reports, &thresholds);
         if !tripped.is_empty() {
             for t in &tripped {

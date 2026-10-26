@@ -7,13 +7,14 @@
 //! pair_id  insert  r1_h  r1_t  r2_h  r2_t  r1_ad  r2_ad  full_flag  is_dup  r1_n  r2_n  r1_full  r2_full
 //! ```
 //!
-//! - `r1_n` / `r2_n`: ambiguous (`N`) bases the sequencing overlay injected
-//!   into that mate (0 when the profile carries no N model). An injected `N`
-//!   is an instrument no-call recorded INSIDE the keep window — it never
-//!   touches `h`/`t` — so the GT states it explicitly rather than letting a
-//!   reader mistake it for fragment biology. The `N` filler of the no-adapter
-//!   mode is NOT a no-call and is not counted here (it is reported separately
-//!   in the run's `adapter_pad_bases` metric).
+//! - `r1_n` / `r2_n`: ambiguous (`N`) bases in that mate's emitted record,
+//!   EXCLUDING the no-adapter length filler. Two sources produce them: the
+//!   sequencing overlay's no-call model (an instrument no-call recorded INSIDE
+//!   the keep window — it never touches `h`/`t`) and a template `N` inherited
+//!   from a `--reference` contig. Both are in the read the scorer sees, so both
+//!   are recorded here. The `N` filler of the no-adapter mode is NOT a no-call
+//!   and is not counted here (it is reported separately in the run's
+//!   `adapter_pad_bases` metric).
 //!
 //! - `pair_id`: unique integer (matches the FASTQ coordinate x:y).
 //! - `insert`: true fragment length I.
@@ -48,6 +49,21 @@ use anyhow::{Context, Result};
 
 use crate::artefact::Artefact;
 use crate::fmtint::push_u64;
+use crate::profile::Mate;
+
+/// Is one mate's emitted record entirely artefact (`h + t >= L`)?
+///
+/// The single definition of "full" for a mate: the GT's `r1_full`/`r2_full`
+/// columns and `full_flag` are computed from it, and the run's
+/// `full_artefact_pairs` counters call it too, so a published count can never
+/// disagree with the rows a scorer reads.
+pub fn mate_is_full(a: &Artefact, read_len: u32, mate: Mate) -> bool {
+    let (h, t) = match mate {
+        Mate::R1 => (a.h1, a.t1),
+        Mate::R2 => (a.h2, a.t2),
+    };
+    h.min(read_len) + t.min(read_len) >= read_len
+}
 
 pub struct GtWriter<W: Write> {
     out: W,
@@ -141,8 +157,8 @@ impl<W: Write> GtWriter<W> {
         // "Entirely artefact" is measured per mate from the EMITTED record the
         // GT names: `a.h1`/`a.t1` are the emitted runs after substitutions, so
         // a row can never claim a run the FASTQ does not contain.
-        let f1: u8 = u8::from(a.h1.min(l) + a.t1.min(l) >= l);
-        let f2: u8 = u8::from(a.h2.min(l) + a.t2.min(l) >= l);
+        let f1: u8 = u8::from(mate_is_full(a, l, Mate::R1));
+        let f2: u8 = u8::from(mate_is_full(a, l, Mate::R2));
         // The pair must be dropped only when BOTH mates are useless; a pair
         // with one full mate still has valid biology in the other.
         let full: u8 = if single { f1 } else { f1 & f2 };

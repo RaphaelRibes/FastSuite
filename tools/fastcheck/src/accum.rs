@@ -948,6 +948,29 @@ mod tests {
         }
     }
 
+    /// C1: the composition totals cover EVERY base, including the bases past
+    /// `--max-read-len` that no per-position row can hold. Ten reads of 8 bp at
+    /// max_pos 4 used to report 40 bases of composition against `bases` 80.
+    #[test]
+    fn base_totals_cover_every_base_including_past_max_read_len() {
+        let mut a = Accum::new(4);
+        for _ in 0..10 {
+            a.observe(b"@r", b"ACGTACGT", b"IIIIIIII");
+        }
+        assert_eq!(a.bases, 80);
+        assert_eq!(a.base_totals.iter().sum::<u64>(), 80, "every base is accounted for");
+        assert_eq!(a.base_totals[0], 20, "4 As per read x 10 reads");
+        assert_eq!(a.base_totals[4], 0, "no ambiguous base in this fixture");
+        // ... and it merges exactly, so a multi-file report sums the same way.
+        let mut b = Accum::new(4);
+        for _ in 0..10 {
+            b.observe(b"@r", b"NNNNACGT", b"IIIIIIII");
+        }
+        a.merge(&b);
+        assert_eq!(a.base_totals.iter().sum::<u64>(), 160);
+        assert_eq!(a.base_totals[4], 40);
+    }
+
     /// Regression: `Accum::merge` summed every counter except the 12-mer one, so the merged
     /// accumulator — the only one any report renders — always had an empty spectrum:
     /// `kmer_top_count` 0 and `kmer_spectrum.top` [] even when every read carried the same
@@ -972,6 +995,9 @@ mod tests {
         // phase-0 one (ACGTACGTACGT) at 8 windows per read: 8 * 2000 = 16000.
         let (m, block) = crate::rich::kmer_metrics(&total);
         assert_eq!(m["kmer_top_count"], json!(16_000));
+        // C2: the share is of the 29 windows per read (58 000 windows), not of the
+        // 2 000 reads: 16000/58000 = 0.2759, where the read denominator said 8.0.
+        assert_eq!(m["kmer_top_frac"], json!(0.2759));
         assert_eq!(block["top"].as_array().unwrap().len(), 4);
         assert_eq!(block["top"][0]["kmer"], json!("ACGTACGTACGT"));
         assert_eq!(block["top"][0]["count"], json!(16_000));

@@ -458,15 +458,33 @@ pub fn write_profile(
 
     // The profile's gc is the FRAGMENT gc: the simulator lays adapters and
     // artefacts on top, so a read gc would double-count them.
-    let gc = if qc1.frag_bases > 0 {
-        let (mut gc_sum, mut n) = (0u64, 0u64);
-        for a in accs {
-            gc_sum += a.frag_gc;
-            n += a.frag_bases;
-        }
-        if n > 0 { gc_sum as f64 / n as f64 } else { 0.0 }
+    //
+    // When EVERY read carries an adapter prefix there is no adapter-free base to measure
+    // and this denominator is zero. Reporting 0.0 there published a GC the library does
+    // not have (800 reads at 51.4% GC -> profile gc 0.0, no warning): fall back to the
+    // whole-read GC, and record in the fit report that the fit could not isolate
+    // fragments. If even that is zero, the library really is 0% GC.
+    let frag_bases: u64 = accs.iter().map(|a| a.frag_bases).sum();
+    let gc_is_fragment = frag_bases > 0;
+    let gc = if gc_is_fragment {
+        let gc_sum: u64 = accs.iter().map(|a| a.frag_gc).sum();
+        gc_sum as f64 / frag_bases as f64
     } else {
-        0.0
+        // Whole-read GC, from the every-base composition totals (the bases module is
+        // required by --profile, so a profile run always has them), with the per-read GC
+        // histograms as the fallback for an accumulator built without it.
+        let (mut gc_bases, mut acgt) = (0u64, 0u64);
+        for a in accs {
+            gc_bases += a.base_totals[1] + a.base_totals[2];
+            acgt += a.base_totals[..4].iter().sum::<u64>();
+        }
+        if acgt == 0 {
+            for a in accs {
+                gc_bases += (0..a.gc_hist.len()).map(|i| i as u64 * a.gc_hist[i]).sum::<u64>();
+                acgt += (0..a.acgt_hist.len()).map(|i| i as u64 * a.acgt_hist[i]).sum::<u64>();
+            }
+        }
+        if acgt > 0 { gc_bases as f64 / acgt as f64 } else { 0.0 }
     };
 
     let mates: Vec<Mate> = accs.iter().map(|a| fit_mate(a, g_mean, read_len, offset)).collect();
@@ -485,22 +503,39 @@ pub fn write_profile(
     let rt_rate = rt[0].max(rt[1]);
     let adapter_name = if rt[0] >= rt[1] { "TruSeq" } else { "Nextera" };
 
-    let (insert_cdf_map, insert_summary, insert_measured) = match insert {
+    let (insert_cdf_map, insert_summary, insert_hist) = match insert {
         Some(h) => {
             let (cdf, sum) = insert_cdf(h, read_len);
-            (cdf, sum, true)
+            (cdf, sum, Some(h))
         }
-        None => (BTreeMap::new(), Value::Null, false),
+        None => (BTreeMap::new(), Value::Null, None),
     };
+    let insert_measured = insert_hist.is_some();
+    // What the pass RESOLVED, not merely that it ran. When every pair is censored, every
+    // bin of the CDF is a bound (all the mass lands on the saturation bin at 2L+1), and
+    // the comment claimed "MEASURED by --insert-hist" for a distribution that measured
+    // nothing at all.
+    let insert_pairs_measured =
+        insert_hist.map(|h| h.measured + h.measured_adapter).unwrap_or(0);
+    let insert_pairs_sampled = insert_hist.map(|h| h.pairs_sampled).unwrap_or(0);
+    let insert_shape_measured = insert_pairs_measured > 0;
 
-    let comment = if insert_measured {
-        format!("fitted from {name} by fastcheck --profile (as-measured): head/tail run lengths \
-                 MEASURED (per-base G-run histograms, biological boundary run deconvolved), \
-                 insert distribution MEASURED by --insert-hist, mate tail correlation invented")
-    } else {
+    let comment = if !insert_measured {
         format!("fitted from {name} by fastcheck --profile (as-measured): head/tail run lengths \
                  MEASURED (per-base G-run histograms, biological boundary run deconvolved), \
                  insert shape invented")
+    } else if insert_shape_measured {
+        format!("fitted from {name} by fastcheck --profile (as-measured): head/tail run lengths \
+                 MEASURED (per-base G-run histograms, biological boundary run deconvolved), \
+                 insert distribution MEASURED by --insert-hist ({insert_pairs_measured} of \
+                 {insert_pairs_sampled} sampled pairs resolved an insert; the rest sit on their \
+                 censored bounds), mate tail correlation invented")
+    } else {
+        format!("fitted from {name} by fastcheck --profile (as-measured): head/tail run lengths \
+                 MEASURED (per-base G-run histograms, biological boundary run deconvolved), \
+                 insert distribution CENSORED: --insert-hist resolved no insert in \
+                 {insert_pairs_sampled} sampled pair(s), so every pair sits on a censored bound \
+                 and the CDF's shape is INVENTED, mate tail correlation invented")
     };
 
     // Joint tail. Both labels this tool emits are the "independent" plan: the
@@ -676,6 +711,14 @@ pub fn write_profile(
     // The fit report, so the assumptions travel with the profile the way the
     // Python fitter's fit_report.json does.
     let mut warnings: Vec<String> = Vec::new();
+    if !gc_is_fragment {
+        warnings.push(format!(
+            "no fragment base was measurable — every read carried an adapter prefix, so the \
+             fragment GC has no denominator. `gc` is the WHOLE-READ GC ({:.4}), which includes \
+             the adapter bases; treat it as an upper bound for the fragment GC",
+            gc
+        ));
+    }
     if max_len != mode_len {
         warnings.push(format!(
             "read_len is the modal length {mode_len} bp, but the longest read is {max_len} bp — \
@@ -701,6 +744,8 @@ pub fn write_profile(
         "measured": {
             "read_len": read_len, "mode_len": mode_len, "mode_share": (mode_share * 10000.0).round() / 10000.0,
             "gc_fragment": (gc * 10000.0).round() / 10000.0,
+            // false = no fragment base existed, so `gc` is the whole-read fallback.
+            "gc_is_fragment": gc_is_fragment,
             "mean_read_q": crate::report::mean_read_mean_q(qc1, offset),
             "readthrough": {"TruSeq": (rt[0] * 100000.0).round() / 100000.0,
                             "Nextera": (rt[1] * 100000.0).round() / 100000.0},
@@ -710,7 +755,9 @@ pub fn write_profile(
         },
         "insert_measured": insert_summary,
         "fit_warnings": warnings,
-        "invented": if insert_measured { json!(["mate tail correlation"]) }
+        // The insert CDF is only the measured distribution when at least one pair
+        // resolved an insert; an all-censored pass leaves the shape invented.
+        "invented": if insert_shape_measured { json!(["mate tail correlation"]) }
                     else { json!(["insert distribution shape", "mate tail correlation"]) },
     });
     let rp = path.with_extension("fit_report.json");

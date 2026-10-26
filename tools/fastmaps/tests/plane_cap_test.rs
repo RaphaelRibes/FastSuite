@@ -137,3 +137,59 @@ fn short_reads_are_unaffected_by_the_cap() {
     assert!(out.join("heatmap.json").is_file());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// M6 — the refusal must fire on the read that needs the plane, not after the
+/// whole input has been scanned and spilled. `[1/1]` is the progress line the
+/// worker prints only when it finishes the file, so its absence proves the run
+/// stopped mid-file; the temp dir must be gone too, not left full of rows.
+#[test]
+fn an_oversize_read_is_refused_before_the_pass_completes() {
+    let dir = tmpdir("early");
+    let fq = dir.join("mixed_R1.fastq");
+    let mut body = String::new();
+    for i in 0..650 {
+        let s = "A".repeat(60);
+        body.push_str(&format!("@s{i}\n{s}\n+\n{}\n", "I".repeat(60)));
+    }
+    // The oversize read is last: the whole file used to be read and spilled
+    // before `write_format` looked at the plane.
+    let s = "ACGT".repeat(750); // 3000 bp
+    body.push_str(&format!("@long\n{s}\n+\n{}\n", "I".repeat(s.len())));
+    std::fs::write(&fq, body).unwrap();
+
+    let out = dir.join("out");
+    let temp = dir.join("temp");
+    let o = Command::new(bin())
+        .arg("-o")
+        .arg(&out)
+        .arg("--temp-dir")
+        .arg(&temp)
+        .arg(&fq)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(!o.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("3000") && stderr.contains("plane") && stderr.contains("--buffer-mb"),
+        "the refusal must still explain the plane cap; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("[1/1]"),
+        "the run must stop when the 3000 bp read is seen, not after the file is done; stderr:\n{stderr}"
+    );
+    assert!(
+        !out.join("heatmap.json").exists() && !out.join("heatmap.data").exists(),
+        "a refused run must not write outputs"
+    );
+    // No spill rows left behind at the top of --temp-dir.
+    if let Ok(rd) = std::fs::read_dir(&temp) {
+        for e in rd {
+            let name = e.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with("heatmap_row_") && !name.starts_with("preview_row_"),
+                "a refused run left a spill row behind: {name}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

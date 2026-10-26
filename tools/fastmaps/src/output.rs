@@ -20,6 +20,12 @@ fn log_norm(count: u64, max_count: u64) -> f64 {
     }
 }
 
+/// The PNG encoder's error type is not `io::Error`; every caller here is
+/// reporting a failed write either way, so map it once (M8).
+fn png_error(e: png::EncodingError) -> std::io::Error {
+    std::io::Error::other(e.to_string())
+}
+
 fn heat_color(t: f64) -> [u8; 3] {
     const STOPS: &[[f64; 3]] = &[
         [0.0, 0.0, 0.0],
@@ -43,7 +49,11 @@ fn heat_color(t: f64) -> [u8; 3] {
     ]
 }
 
-pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
+pub fn write_svg(
+    counts: &HashMap<(u32, u32), PixelAcc>,
+    output_dir: &Path,
+    quiet: bool,
+) -> std::io::Result<()> {
     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
     let w = max_x + 1;
@@ -56,7 +66,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
 
     let max_count = counts.values().map(|a| a.count).max().unwrap();
 
-    let f = BufWriter::new(File::create(output_dir.join("heatmap.svg")).unwrap());
+    let f = BufWriter::new(File::create(output_dir.join("heatmap.svg"))?);
     let mut f = f;
 
     let hdr = format!(
@@ -68,7 +78,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
         view_w, view_h,
         margin, margin
     );
-    f.write_all(hdr.as_bytes()).unwrap();
+    f.write_all(hdr.as_bytes())?;
 
     for y in 0..h as u32 {
         for x in 0..w as u32 {
@@ -86,7 +96,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
                 "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"#{:02X}{:02X}{:02X}\"/>\n",
                 px, py, cell, cell, r, g, b
             );
-            f.write_all(line.as_bytes()).unwrap();
+            f.write_all(line.as_bytes())?;
         }
     }
 
@@ -100,8 +110,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
             cb_x, cb_y, cb_w, cb_h
         )
         .as_bytes(),
-    )
-    .unwrap();
+    )?;
 
     let stops = [("#000", 0), ("#00F", 20), ("#0FF", 40), ("#0F0", 60), ("#FF0", 80), ("#F00", 100)];
     for &(color, pct) in &stops {
@@ -112,8 +121,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
                 cb_x, cy, cb_w, color
             )
             .as_bytes(),
-        )
-        .unwrap();
+        )?;
     }
 
     for x in (0..=max_x).step_by(5.max(max_x / 10)) {
@@ -124,8 +132,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
                 px, y_axis + 8, x
             )
             .as_bytes(),
-        )
-        .unwrap();
+        )?;
     }
     for y in (0..=max_y).step_by(5.max(max_y / 10)) {
         let py = view_h - (margin + (y as u32 + 1) * cell);
@@ -135,8 +142,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
                 margin - 4, py, y
             )
             .as_bytes(),
-        )
-        .unwrap();
+        )?;
     }
 
     f.write_all(
@@ -146,8 +152,7 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
             y_axis + 18
         )
         .as_bytes(),
-    )
-    .unwrap();
+    )?;
     let y_mid = margin + h as u32 * cell / 2;
     f.write_all(
         format!(
@@ -155,17 +160,21 @@ pub fn write_svg(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
             y_mid, y_mid
         )
         .as_bytes(),
-    )
-    .unwrap();
+    )?;
 
-    f.write_all(b"</svg>\n").unwrap();
-    f.flush().unwrap();
+    f.write_all(b"</svg>\n")?;
+    f.flush()?;
 
     if !quiet {
         println!("Saved heatmap.svg  ({}x{} cells, {} unique)", w, h, counts.len());
     }
+    Ok(())
 }
-pub fn write_png(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
+pub fn write_png(
+    counts: &HashMap<(u32, u32), PixelAcc>,
+    output_dir: &Path,
+    quiet: bool,
+) -> std::io::Result<()> {
     let max_x = counts.keys().map(|(x, _)| *x).max().unwrap() as usize;
     let max_y = counts.keys().map(|(_, y)| *y).max().unwrap() as usize;
     let max_count = counts.values().map(|a| a.count).max().unwrap();
@@ -185,14 +194,16 @@ pub fn write_png(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
         }
     }
 
-    let f = BufWriter::new(File::create(output_dir.join("heatmap.png")).unwrap());
+    let f = BufWriter::new(File::create(output_dir.join("heatmap.png"))?);
     let mut enc = png::Encoder::new(f, w as u32, h as u32);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
-    enc.write_header().unwrap().write_image_data(&rgb).unwrap();
+    let mut writer = enc.write_header().map_err(png_error)?;
+    writer.write_image_data(&rgb).map_err(png_error)?;
     if !quiet {
         println!("Saved heatmap.png  ({w}×{h} px)");
     }
+    Ok(())
 }
 
 /// Write an interactive Plotly 3-D scatter HTML to `output_dir/heatmap_3d.html`.
@@ -202,7 +213,11 @@ pub fn write_png(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quie
 /// iteration order, which std seeds per process — so two runs of the identical
 /// command produced different files even at `-j 1`. Together with the integer
 /// quality accumulators this makes the page reproducible.
-pub fn write_html(counts: &HashMap<(u32, u32), PixelAcc>, output_dir: &Path, quiet: bool) {
+pub fn write_html(
+    counts: &HashMap<(u32, u32), PixelAcc>,
+    output_dir: &Path,
+    quiet: bool,
+) -> std::io::Result<()> {
     let max_count = counts.values().map(|a| a.count).max().unwrap();
     let total: u64 = counts.values().map(|a| a.count).sum();
 
@@ -271,11 +286,12 @@ Plotly.newPlot('plot', [trace], layout, {{responsive: true}});
         fmt_vec(&zs), fmt_vec(&cs),
     );
 
-    let mut f = File::create(output_dir.join("heatmap_3d.html")).unwrap();
-    f.write_all(html.as_bytes()).unwrap();
+    let mut f = File::create(output_dir.join("heatmap_3d.html"))?;
+    f.write_all(html.as_bytes())?;
     if !quiet {
         println!("Saved heatmap_3d.html");
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -329,7 +345,7 @@ mod tests {
                 PixelAcc { count: c, sum_q: 30 * c, sum_len: c },
             );
         }
-        write_html(&counts, &dir, true);
+        write_html(&counts, &dir, true).unwrap();
         let text = std::fs::read_to_string(dir.join("heatmap_3d.html")).unwrap();
 
         let grab = |open: &str, close: &str| -> Vec<u32> {

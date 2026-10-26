@@ -235,7 +235,16 @@ pub enum Admission {
 }
 
 /// Reserve covering chunk arenas, compression buffers and allocator slack.
-pub fn reserve_for(limit: u64) -> u64 { (512 * 1024 * 1024).max(limit / 10) }
+///
+/// Scaled to the limit, with a floor and a cap: a fixed 512 MB reserve meant `--max-mem
+/// 568` refused EVERY run (512 MB of reserve against a 568 MB ceiling, whatever the
+/// projection) while `--max-mem 569` proceeded. 25% of the limit, clamped to
+/// [64 MiB, 512 MiB], keeps the reserve meaningful on a big machine without making a
+/// small limit unusable. The admission rule below still refuses a projection that
+/// genuinely would not fit.
+pub fn reserve_for(limit: u64) -> u64 {
+    (limit / 4).clamp(64 * 1024 * 1024, 512 * 1024 * 1024)
+}
 
 /// Admission rule. `limit: None` means undiscoverable, which degrades to
 /// [`Admission::Proceed`]: refusing on an unknown bound would make the tool unusable
@@ -435,9 +444,40 @@ mod tests {
         assert_eq!(admit(4 * GB, Some(&l)), Admission::Proceed);
     }
 
+    /// The reserve is 25% of the limit, clamped to [64 MiB, 512 MiB]. The old rule was a
+    /// flat 512 MB floor, which made every `--max-mem` below 569 MB refuse every run.
     #[test]
-    fn reserve_has_a_floor() {
-        assert_eq!(reserve_for(1 * GB), 512 * 1024 * 1024);
-        assert_eq!(reserve_for(100 * GB), 10 * GB);
+    fn reserve_scales_with_the_limit_between_a_floor_and_a_cap() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(reserve_for(8 * MB), 64 * MB, "the floor, for a tiny limit");
+        assert_eq!(reserve_for(256 * MB), 64 * MB, "25% of 256 MB");
+        assert_eq!(reserve_for(512 * MB), 128 * MB, "25% of 512 MB");
+        assert_eq!(reserve_for(568 * MB), 142 * MB, "25% of 568 MB is 142 MB");
+        assert_eq!(reserve_for(1 * GB), 256 * MB, "25% of 1 GB is still below the cap");
+        assert_eq!(reserve_for(2 * GB), 512 * MB, "the cap binds at 2 GB");
+        assert_eq!(reserve_for(100 * GB), 512 * MB);
+    }
+
+    /// A small `--max-mem` must admit a small run. 256 / 512 / 568 MB all admit a run whose
+    /// table projection is nil, and all three still refuse a projection that cannot fit.
+    #[test]
+    fn a_small_limit_admits_a_small_projection_and_refuses_a_large_one() {
+        const MB: u64 = 1024 * 1024;
+        for limit_mb in [256u64, 512, 568] {
+            let l = Limit { bytes: limit_mb * MB, source: LimitSource::RlimitAs };
+            assert_eq!(
+                admit(0, Some(&l)),
+                Admission::Proceed,
+                "--max-mem {limit_mb}: a nil projection must run"
+            );
+            assert!(
+                matches!(admit(limit_mb * MB, Some(&l)), Admission::Refuse { .. }),
+                "--max-mem {limit_mb}: a projection at the ceiling must still be refused"
+            );
+        }
+        // The reported repro: --max-mem 568 on a 10-read file refused with
+        // "needs ~0.0 MB ... limited to 568.0 MB".
+        let l = Limit { bytes: 568 * MB, source: LimitSource::RlimitAs };
+        assert_eq!(admit(0, Some(&l)), Admission::Proceed);
     }
 }

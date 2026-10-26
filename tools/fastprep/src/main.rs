@@ -37,6 +37,24 @@ fn write_json(
 /// `reads_written` is every record the run actually wrote, not just the pairs:
 /// a paired run whose R2 all fails the quality gate still writes R1 singletons
 /// when `--singletons1` is given, and calling that an empty output was wrong.
+/// Create the parent directory of an output path.
+///
+/// The suite's other tools disagree about this (fastmaps creates it, the rest
+/// failed with ENOENT), and the documented chain assumes `-o out/x.fq.gz` works
+/// on a fresh tree. Creating it is the friendlier half of the choice; a dry run
+/// touches nothing.
+fn ensure_parent(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() || parent.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating output directory {}", parent.display()))
+}
+
 fn refuse_total_drop(
     reads_in: u64,
     reads_written: u64,
@@ -47,14 +65,7 @@ fn refuse_total_drop(
     if allow || reads_in == 0 || reads_written > 0 {
         return Ok(());
     }
-    anyhow::bail!(
-        "fastprep: dropped all {reads_in} {mode} reads — nothing was written to {outputs}. \
-         Refusing to report success on a total drop. Check the per-cause drop \
-         table above; the usual causes are --min-len above the trimmed insert \
-         length, --mean-q above the library's mean quality, and a Phred offset \
-         read the wrong way (pass --phred-offset 64 for legacy data). Pass \
-         --allow-total-drop to accept an empty output."
-    )
+    anyhow::bail!("{}", fastprep::pipeline::total_drop_message(reads_in, mode, outputs))
 }
 
 /// The `dedup` block of the report: which anchor window the fingerprint used.
@@ -139,6 +150,15 @@ fn main() -> Result<()> {
 
     match mode {
         Mode::Single { in1, out1, params } => {
+            if !rt.dry_run {
+                ensure_parent(&out1)?;
+                if let Some(j) = rt.json.as_deref() {
+                    ensure_parent(j)?;
+                }
+                if let Some(m) = rt.metadata.as_deref() {
+                    ensure_parent(m)?;
+                }
+            }
             let s = run_single(&in1, &out1, &params, &rt)?;
             let elapsed = start.elapsed();
             if !quiet {
@@ -181,6 +201,19 @@ fn main() -> Result<()> {
             params_r1,
             params_r2,
         } => {
+            if !rt.dry_run {
+                ensure_parent(&out1)?;
+                ensure_parent(&out2)?;
+                for p in [singletons1.as_deref(), singletons2.as_deref()].into_iter().flatten() {
+                    ensure_parent(p)?;
+                }
+                if let Some(j) = rt.json.as_deref() {
+                    ensure_parent(j)?;
+                }
+                if let Some(m) = rt.metadata.as_deref() {
+                    ensure_parent(m)?;
+                }
+            }
             let s = run_paired(
                 &in1,
                 &in2,

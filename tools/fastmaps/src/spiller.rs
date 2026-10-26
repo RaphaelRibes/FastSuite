@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -26,6 +27,8 @@ pub struct SpillerState {
     pub no_call: u64,
     pub no_call_r1: u64,
     pub no_call_r2: u64,
+    /// Reads ending in a homopolymer run of `[A, C, G, T]` (M3).
+    pub poly_tail: [u64; 4],
     /// Shortest / longest read length over the whole run. `min_seq_len` is
     /// `None` only when no read was seen at all.
     pub min_seq_len: Option<u32>,
@@ -61,17 +64,19 @@ pub fn preview_row_temp_path(temp_dir: &Path, y: u16) -> PathBuf {
     temp_dir.join(format!("preview_row_{y:05}.tmp"))
 }
 
-fn create_row_writer(temp_dir: &Path, y: u16, tag: &str) -> BufWriter<File> {
+fn create_row_writer(temp_dir: &Path, y: u16, tag: &str) -> std::io::Result<BufWriter<File>> {
     let path = if tag.is_empty() {
         row_temp_path(temp_dir, y)
     } else {
         preview_row_temp_path(temp_dir, y)
     };
-    let f = File::create(&path).unwrap_or_else(|e| {
-        eprintln!("Cannot create temp file {}: {e}", path.display());
-        std::process::exit(1);
-    });
-    BufWriter::with_capacity(ROW_WRITER_BUF, f)
+    let f = File::create(&path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot create temp file {}: {e}", path.display()),
+        )
+    })?;
+    Ok(BufWriter::with_capacity(ROW_WRITER_BUF, f))
 }
 
 // ── Spiller thread ───────────────────────────────────────────────────────────
@@ -88,7 +93,13 @@ fn create_row_writer(temp_dir: &Path, y: u16, tag: &str) -> BufWriter<File> {
 /// `Vec<Option<_>>` sized to `u16::MAX` (2.1 MB of `None`s allocated before a
 /// single row is seen). A short-read run has `max_seq_len + 1` ≈ 152 rows, so
 /// the map holds ~152 entries whatever the read length.
-pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> SpillerState {
+///
+/// Errors are returned, not unwrapped: a full disk or a vanished temp
+/// directory used to abort with a panic (exit 101) mid-run (M8).
+pub fn spiller_thread(
+    rx: mpsc::Receiver<SpillerMsg>,
+    temp_dir: PathBuf,
+) -> std::io::Result<SpillerState> {
     // Lazily-opened writers, one per y value actually seen.
     let mut row_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
     let mut preview_writers: HashMap<u16, BufWriter<File>> = HashMap::new();
@@ -100,6 +111,7 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
     let mut no_call = 0u64;
     let mut no_call_r1 = 0u64;
     let mut no_call_r2 = 0u64;
+    let mut poly_tail = [0u64; 4];
     let mut min_seq_len: Option<u32> = None;
     let mut max_seq_len = 0u32;
     let mut total_reads = 0u64;
@@ -108,26 +120,27 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
         match msg {
             SpillerMsg::Chunk(chunk) => {
                 for (x, y, fid, rn) in chunk.indices {
-                    let w = row_writers
-                        .entry(y)
-                        .or_insert_with(|| create_row_writer(&temp_dir, y, ""));
+                    let w = match row_writers.entry(y) {
+                        Entry::Occupied(e) => e.into_mut(),
+                        Entry::Vacant(e) => e.insert(create_row_writer(&temp_dir, y, "")?),
+                    };
                     // FM-9: one packed 8-byte store instead of three
                     // `write_all` calls per record (30 M → 10 M per 10 M reads).
                     let mut rec: IndexRecord = [0u8; INDEX_RECORD_BYTES];
                     rec[0..2].copy_from_slice(&x.to_le_bytes());
                     rec[2..4].copy_from_slice(&fid.to_le_bytes());
                     rec[4..8].copy_from_slice(&rn.to_le_bytes());
-                    w.write_all(&rec).unwrap();
+                    w.write_all(&rec)?;
                 }
                 for p in chunk.previews {
                     let y = p.y;
-                    let w = preview_writers
-                        .entry(y)
-                        .or_insert_with(|| create_row_writer(&temp_dir, y, "preview"));
-                    write_preview_entry(w, &p).unwrap_or_else(|e| {
-                        eprintln!("Error writing preview temp row: {e}");
-                        std::process::exit(1);
-                    });
+                    let w = match preview_writers.entry(y) {
+                        Entry::Occupied(e) => e.into_mut(),
+                        Entry::Vacant(e) => {
+                            e.insert(create_row_writer(&temp_dir, y, "preview")?)
+                        }
+                    };
+                    write_preview_entry(w, &p)?;
                 }
             }
             SpillerMsg::Done {
@@ -138,6 +151,7 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
                 no_call: nc,
                 no_call_r1: nc1,
                 no_call_r2: nc2,
+                poly_tail: pt,
                 min_seq_len: mn,
                 max_seq_len: m,
                 n_reads: n,
@@ -154,6 +168,9 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
                 no_call += nc;
                 no_call_r1 += nc1;
                 no_call_r2 += nc2;
+                for (dst, src) in poly_tail.iter_mut().zip(pt) {
+                    *dst += src;
+                }
                 // Integer accumulation: exact in any `Done` arrival order
                 // (FM-12). The old `f64` partial means were not.
                 for (k, p) in c {
@@ -183,21 +200,15 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
 
     // Flush all open writers before write_format reads them.
     for w in row_writers.values_mut() {
-        w.flush().unwrap_or_else(|e| {
-            eprintln!("Error flushing spill file: {e}");
-            std::process::exit(1);
-        });
+        w.flush()?;
     }
     for w in preview_writers.values_mut() {
-        w.flush().unwrap_or_else(|e| {
-            eprintln!("Error flushing preview spill file: {e}");
-            std::process::exit(1);
-        });
+        w.flush()?;
     }
     drop(row_writers); // close all handles
     drop(preview_writers);
 
-    SpillerState {
+    Ok(SpillerState {
         counts,
         counts_r1,
         counts_r2,
@@ -205,11 +216,12 @@ pub fn spiller_thread(rx: mpsc::Receiver<SpillerMsg>, temp_dir: PathBuf) -> Spil
         no_call,
         no_call_r1,
         no_call_r2,
+        poly_tail,
         min_seq_len,
         max_seq_len,
         total_reads,
         temp_dir,
-    }
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -239,6 +251,7 @@ mod tests {
             no_call: 0,
             no_call_r1: 0,
             no_call_r2: 0,
+            poly_tail: [0; 4],
             min_seq_len: Some(max_seq_len),
             max_seq_len,
             n_reads,
@@ -265,7 +278,7 @@ mod tests {
         tx.send(done(&[], 4, 9)).unwrap();
         drop(tx);
 
-        let state = spiller_thread(rx, dir.clone());
+        let state = spiller_thread(rx, dir.clone()).unwrap();
         assert_eq!(state.total_reads, 4);
         assert_eq!(state.max_seq_len, 9);
 
@@ -312,7 +325,7 @@ mod tests {
             tx.send(first.clone()).unwrap();
             tx.send(second.clone()).unwrap();
             drop(tx);
-            let s = spiller_thread(rx, dir.clone());
+            let s = spiller_thread(rx, dir.clone()).unwrap();
             let _ = std::fs::remove_dir_all(&dir);
             s.counts[&(4, 5)]
         };
@@ -327,5 +340,34 @@ mod tests {
         assert_eq!(ab.sum_q, 171);
         assert_eq!(ab.sum_len, 5);
         assert_eq!(ab.mean_quality(), 171.0 / 5.0);
+    }
+
+    /// M8: a spill write that cannot succeed is an error from
+    /// `spiller_thread` — not an `unwrap` panic (exit 101) inside a thread
+    /// nobody is watching, and not a silently dropped row.
+    #[test]
+    fn a_spill_write_failure_is_reported_not_panicked() {
+        let dir = tmpdir("badtemp");
+        // A *file* where the row directory should be, so every row's
+        // `File::create` fails.
+        let bad = dir.join("not_a_dir");
+        std::fs::write(&bad, b"x").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(SpillerMsg::Chunk(SpillChunk {
+            indices: vec![(1, 0, 0, 0)],
+            previews: vec![],
+        }))
+        .unwrap();
+        drop(tx);
+
+        let e = spiller_thread(rx, bad)
+            .err()
+            .expect("a row that cannot be created must be an error");
+        assert!(
+            e.to_string().contains("cannot create temp file"),
+            "the error must name the operation and the path: {e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

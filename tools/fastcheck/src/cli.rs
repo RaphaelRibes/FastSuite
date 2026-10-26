@@ -65,6 +65,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 1000, value_name = "N")]
     pub max_read_len: usize,
 
+    // NOTE: this value is bounded by MAX_READ_LEN, checked by
+    // `checked_max_read_len` before anything is allocated. `--insert-hist` sizes two
+    // bin vectors from it, which is how an absurd value used to reach the allocator.
+
     /// Refuse to start if the projected fingerprint table exceeds this many megabytes.
     /// Defaults to the enforced memory limit of the process (cgroup v2/v1, SLURM,
     /// RLIMIT_AS, then MemAvailable — the minimum of them, per tools/fastprep's model).
@@ -163,7 +167,31 @@ pub struct Cli {
     pub quiet: bool,
 }
 
+/// Longest read `--max-read-len` accepts.
+///
+/// The flag sizes the per-position planes, which cost `128 x 8 B` = 1 KiB per position
+/// per file, so 1 Mi positions already project 1 GiB of accumulator state; on top of
+/// that `--insert-hist` allocates two bin vectors of `2 * max_read_len + 2` u64. The
+/// value is therefore bounded once, here, before any of that is requested: a typo such
+/// as 1099511627776 used to be taken at face value and died inside the insert
+/// allocator ("memory allocation of 17592186044424 bytes failed") after the whole scan.
+pub const MAX_READ_LEN: usize = 1 << 20;
+
 impl Cli {
+    /// `--max-read-len`, bounded to what the per-position planes can carry.
+    pub fn checked_max_read_len(&self) -> anyhow::Result<usize> {
+        if self.max_read_len > MAX_READ_LEN {
+            anyhow::bail!(
+                "--max-read-len {} is above the supported maximum {MAX_READ_LEN}: the \
+                 per-position planes cost 1 KiB per position per file and --insert-hist \
+                 allocates two vectors of 2 x max-read-len + 2 bins, so a larger value is a \
+                 multi-terabyte request, not a longer read length",
+                self.max_read_len
+            );
+        }
+        Ok(self.max_read_len)
+    }
+
     pub fn requested_offset(&self) -> anyhow::Result<Option<u8>> {
         match self.phred_offset.as_str() {
             "auto" => Ok(None),

@@ -66,6 +66,13 @@ const MAX_ANCHOR_MISMATCHES: usize = 1;
 /// treating it as one would shave real biology off both mates and bias the insert low.
 const MIN_HOMOPOLYMER: usize = 3;
 
+/// Ceiling on the two insert bin vectors (`bins` + `bins_adapter`), in bytes.
+///
+/// At the supported `--max-read-len` maximum (1 Mi positions) both vectors together are
+/// 32 MiB, so this ceiling is never reached by a legal run; it exists so a value that
+/// reached this module from anywhere else is refused instead of aborting the allocator.
+const MAX_INSERT_BINS_BYTES: u64 = 1 << 30; // 1 GiB
+
 #[inline]
 fn comp(b: u8) -> u8 {
     match b {
@@ -211,6 +218,13 @@ pub struct InsertHist {
     pub unequal_len: u64,
     pub measured_adapter: u64,
     pub pairs_sampled: u64,
+    /// Pairs the input held, when this pass reached the end of BOTH files.
+    ///
+    /// `None` when the sample cap (or a budget) stopped it first: this pass then does not
+    /// know the input's pair count, and the report publishes null rather than a number
+    /// derived from another pass's budget — which is how a 50-pair file came to report
+    /// `pairs_in_input` 4 against 50 sampled pairs and a scale factor of 0.08.
+    pub pairs_in_input: Option<u64>,
     /// Lengths the two mates had, so a mixed-length library is visible.
     pub mate_len_min: usize,
     pub mate_len_max: usize,
@@ -234,10 +248,36 @@ impl InsertHist {
             censored_above: 0,
             unequal_len: 0,
             pairs_sampled: 0,
+            pairs_in_input: None,
             mate_len_min: usize::MAX,
             mate_len_max: 0,
             tail_kmers: std::collections::HashMap::new(),
         }
+    }
+
+    /// [`new`], refusing a bin allocation that is not a histogram but an allocation
+    /// accident.
+    ///
+    /// `--insert-hist --max-read-len 1099511627776` asked for two vectors of
+    /// `2 * 2^40 + 2` u64 (17.6 TB each) and aborted with "memory allocation of
+    /// 17592186044424 bytes failed" AFTER the whole scan had already run. The refusal
+    /// names the flag and the size, and happens before either vector is allocated.
+    pub fn try_new(max_insert: usize, adapters: Vec<Vec<u8>>) -> Result<Self> {
+        let bins = (max_insert as u64).saturating_add(1);
+        let bytes = bins.saturating_mul(2 * 8);
+        if bytes > MAX_INSERT_BINS_BYTES {
+            anyhow::bail!(
+                "--insert-hist would allocate two bin vectors of {} x 8 B ({:.1} GiB) for \
+                 --max-read-len {}: above the {:.1} GiB ceiling this pass will not allocate. \
+                 Lower --max-read-len (its own maximum is {})",
+                bins,
+                bytes as f64 / (1u64 << 30) as f64,
+                max_insert / 2,
+                MAX_INSERT_BINS_BYTES as f64 / (1u64 << 30) as f64,
+                crate::cli::MAX_READ_LEN,
+            );
+        }
+        Ok(Self::new(max_insert, adapters))
     }
 
     pub fn observe_pair(&mut self, s1: &[u8], s2: &[u8]) {
@@ -295,8 +335,6 @@ impl InsertHist {
         }
     }
 
-    /// Merge another histogram into this one. Integer addition, like every other
-    /// accumulator in fastcheck, so a parallel run's result is exact.
     /// Position of an adapter's start in `s`, which for a readthrough read is
     /// the insert length. Anchored on the adapter's first bases and verified for
     /// the whole overlap, like the overlap search.
@@ -326,6 +364,14 @@ impl InsertHist {
         }
     }
 
+    /// Merge another histogram into this one. Integer addition, like every other
+    /// accumulator in fastcheck, so a parallel run's result is exact.
+    ///
+    /// No runtime path calls this today (the insert pass is one lockstep pass), so rustc
+    /// reports it as dead code and it is deliberately KEPT: it is the exact merger a
+    /// parallel insert pass would need, `merge_is_exact_and_stats_survive_it` exercises it,
+    /// and re-deriving it beside a parallel pass is how the two sides drift. Remove it only
+    /// with the parallel pass, not before.
     pub fn merge(&mut self, o: &Self) {
         Self::merge_bins(&mut self.bins, &o.bins);
         Self::merge_bins(&mut self.bins_adapter, &o.bins_adapter);
@@ -335,6 +381,8 @@ impl InsertHist {
         self.censored_above += o.censored_above;
         self.unequal_len += o.unequal_len;
         self.pairs_sampled += o.pairs_sampled;
+        // An input pair count is not additive: the first side that knows it states it.
+        self.pairs_in_input = self.pairs_in_input.or(o.pairs_in_input);
         self.mate_len_min = self.mate_len_min.min(o.mate_len_min);
         self.mate_len_max = self.mate_len_max.max(o.mate_len_max);
         for (k, v) in &o.tail_kmers {
@@ -490,6 +538,9 @@ impl InsertHist {
         var.sqrt()
     }
 
+    /// Total observations recorded across the overlap regime. Test-only: the report
+    /// publishes `measured`, and a second accessor for the same sum is one name too many.
+    #[cfg(test)]
     pub fn total_measured(&self) -> u64 {
         self.bins.iter().sum()
     }
@@ -576,6 +627,12 @@ fn pair_key(header: &[u8]) -> &[u8] {
 }
 
 /// Read up to `max_pairs` pairs from two files in lockstep and fill the histogram.
+///
+/// Unequal record counts are REFUSED, exactly as the census path refuses them: this pass
+/// pairs by position, so a mate file with fewer records used to stop the pass silently
+/// after 10 of 50 pairs and let the report describe those 10 as the library (`pairs_sampled`
+/// 10 against `pairs_in_input` 30, scale factor 3.0, exit 0). A record that is present but
+/// truncated (four lines are required) is refused too, rather than ending the pass quietly.
 pub fn scan_pair(
     r1: &Path,
     r2: &Path,
@@ -584,26 +641,62 @@ pub fn scan_pair(
     max_insert: usize,
     adapters: Vec<Vec<u8>>,
 ) -> Result<InsertHist> {
+    // Refuse the bin allocation before it is made, and before the scan.
+    let mut hist = InsertHist::try_new(max_insert, adapters)?;
     let (mut a, _ca, _ma) = open(r1, gz_threads)?;
     let (mut b, _cb, _mb) = open(r2, gz_threads)?;
-    let mut hist = InsertHist::new(max_insert, adapters);
     let (mut h1, mut s1, mut p1, mut q1) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let (mut h2, mut s2, mut p2, mut q2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut pairs_read: u64 = 0;
+    let mut ended_at_eof = false;
     for _ in 0..max_pairs {
-        // Four lines per record; either stream ending ends the pass.
-        let mut ok = true;
-        for buf in [&mut h1, &mut s1, &mut p1, &mut q1] {
-            if read_line(a.as_mut(), buf)? == 0 {
-                ok = false;
-            }
+        // Four lines per record, counted per side so "one file ended" is distinguishable
+        // from "both files ended" and from "a record is truncated".
+        let mut n1 = [0usize; 4];
+        let mut n2 = [0usize; 4];
+        for (k, buf) in [&mut h1, &mut s1, &mut p1, &mut q1].into_iter().enumerate() {
+            n1[k] = read_line(a.as_mut(), buf)?;
         }
-        for buf in [&mut h2, &mut s2, &mut p2, &mut q2] {
-            if read_line(b.as_mut(), buf)? == 0 {
-                ok = false;
-            }
+        for (k, buf) in [&mut h2, &mut s2, &mut p2, &mut q2].into_iter().enumerate() {
+            n2[k] = read_line(b.as_mut(), buf)?;
         }
-        if !ok || s1.is_empty() || s2.is_empty() {
+        if n1[0] == 0 && n2[0] == 0 {
+            ended_at_eof = true;
             break;
+        }
+        if n1[0] == 0 || n2[0] == 0 {
+            let (shorter, longer) = if n1[0] == 0 { (r1, r2) } else { (r2, r1) };
+            anyhow::bail!(
+                "{} and {} carry different numbers of records: {} ended after {} pair(s) while \
+                 {} still has a record. --insert-hist pairs by position, so the surplus record \
+                 would be paired with nothing — a truncated or merged mate file cannot be \
+                 measured. Fix the pair of files first",
+                r1.display(),
+                r2.display(),
+                shorter.display(),
+                pairs_read,
+                longer.display(),
+            );
+        }
+        if n1[1..].iter().any(|&n| n == 0) || n2[1..].iter().any(|&n| n == 0) {
+            let (side, header) = if n1[1..].iter().any(|&n| n == 0) {
+                (r1, &h1)
+            } else {
+                (r2, &h2)
+            };
+            anyhow::bail!(
+                "{}: record {:?} is truncated — a FASTQ record needs a sequence, a '+' and a \
+                 quality line, and --insert-hist will not measure a partial one",
+                side.display(),
+                String::from_utf8_lossy(header)
+            );
+        }
+        if s1.is_empty() || s2.is_empty() {
+            anyhow::bail!(
+                "{}: record {:?} has an empty sequence line, so there is no pair to measure",
+                if s1.is_empty() { r1.display().to_string() } else { r2.display().to_string() },
+                String::from_utf8_lossy(if s1.is_empty() { &h1 } else { &h2 })
+            );
         }
         // This pass pairs by ORDINAL, so a file that is sorted differently (or
         // truncated) pairs unrelated reads and yields a smooth, entirely
@@ -636,6 +729,11 @@ pub fn scan_pair(
             }
         }
         hist.observe_pair(&s1, &s2);
+        pairs_read += 1;
+    }
+    // Only a pass that reached the end of both files knows how many pairs the input has.
+    if ended_at_eof {
+        hist.pairs_in_input = Some(pairs_read);
     }
     Ok(hist)
 }
@@ -829,5 +927,122 @@ mod tests {
         assert_eq!(h.measured, 0, "4 mismatches in 80 bases must not verify");
         assert_eq!(h.censored_above, 1, "the rejected pair is censored above, not dropped");
         assert_eq!(h.censored_below, 0);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    /// Deterministic pseudo-random DNA (the same generator the unit tests above use).
+    fn dna(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                b"ACGT"[((x >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    fn revcomp(s: &[u8]) -> Vec<u8> {
+        s.iter().rev().map(|&b| comp(b)).collect()
+    }
+
+    /// C8: an unallocatable bin request is refused, naming the flag and the size, before
+    /// either vector is allocated. `--insert-hist --max-read-len 1099511627776` used to ask
+    /// for 17.6 TB per vector and abort after the whole scan.
+    #[test]
+    fn an_unallocatable_bin_request_is_refused_before_allocating() {
+        let e = InsertHist::try_new(usize::MAX / 2, Vec::new()).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("--insert-hist"), "name the module: {msg}");
+        assert!(msg.contains("--max-read-len"), "name the flag: {msg}");
+        assert!(msg.contains("GiB"), "state the size: {msg}");
+        // The supported maximum (1 Mi read length -> 2 Mi bins) still allocates.
+        assert!(InsertHist::try_new(2 << 20, Vec::new()).is_ok());
+    }
+
+    fn pair_fastq(dir: &Path, n: u64) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (mut a, mut b) = (String::new(), String::new());
+        for i in 0..n {
+            let frag = dna(70, 3_000 + i);
+            let r1 = frag[..50].to_vec();
+            let r2 = revcomp(&frag[20..]);
+            a.push_str(&format!(
+                "@p{i}/1\n{}\n+\n{}\n",
+                String::from_utf8(r1).unwrap(),
+                "I".repeat(50)
+            ));
+            b.push_str(&format!(
+                "@p{i}/2\n{}\n+\n{}\n",
+                String::from_utf8(r2).unwrap(),
+                "I".repeat(50)
+            ));
+        }
+        let d = dir.to_path_buf();
+        let p1 = d.join("r1.fastq");
+        let p2 = d.join("r2.fastq");
+        std::fs::write(&p1, a).unwrap();
+        std::fs::write(&p2, b).unwrap();
+        (p1, p2)
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "fastcheck_insert_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// C5: the pass knows how many pairs the input has only when it reached the end of
+    /// BOTH files, so a capped sample reports `None` rather than a number it never saw.
+    #[test]
+    fn scan_pair_counts_what_it_actually_scanned() {
+        let d = scratch("counts");
+        let (p1, p2) = pair_fastq(&d, 3);
+
+        let full = scan_pair(&p1, &p2, 1, 10, 200, Vec::new()).unwrap();
+        assert_eq!(full.pairs_sampled, 3);
+        assert_eq!(full.pairs_in_input, Some(3), "both streams reached EOF");
+
+        let capped = scan_pair(&p1, &p2, 1, 2, 200, Vec::new()).unwrap();
+        assert_eq!(capped.pairs_sampled, 2, "the cap bounds the sample");
+        assert_eq!(
+            capped.pairs_in_input, None,
+            "a capped pass never saw the input's pair count, so it must not invent one"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// C5: unequal mate record counts are refused. The pass used to stop silently at the
+    /// shorter stream, so 10 of 50 pairs described the whole library with a scale factor.
+    #[test]
+    fn scan_pair_refuses_mates_with_different_record_counts() {
+        let d = scratch("unequal");
+        let (p1, p2) = pair_fastq(&d, 3);
+        let text = std::fs::read_to_string(&p2).unwrap();
+        let mut kept = String::new();
+        for (i, rec) in text.trim_end().split('@').filter(|s| !s.is_empty()).enumerate() {
+            if i >= 2 {
+                break;
+            }
+            kept.push('@');
+            kept.push_str(rec);
+            if !rec.ends_with('\n') {
+                kept.push('\n');
+            }
+        }
+        std::fs::write(&p2, kept).unwrap();
+        let e = scan_pair(&p1, &p2, 1, 10, 200, Vec::new()).unwrap_err();
+        assert!(
+            e.to_string().contains("different numbers of records"),
+            "the refusal must say why: {e}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -24,6 +24,8 @@ pub struct FormatOpts<'a> {
     /// `<output_dir>/heatmap.json` (review 2026-10-21, item 1).
     pub report_path: Option<&'a Path>,
     pub elapsed_s: f64,
+    /// Worker threads this run actually used, published as `metrics.threads`.
+    pub threads: usize,
     pub quiet: bool,
 }
 
@@ -49,6 +51,44 @@ pub const MAX_PLANE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Largest accepted `size` (= longest read + 1).
 pub const MAX_PLANE_SIDE: usize = 2048;
+
+/// Check the plane a `max_seq_len`-bp library needs, before it is allocated.
+///
+/// Returns the grid side, or the refusal message. Shared by `write_format`
+/// (the end-of-run backstop) and the worker (which fires the moment a read
+/// pushes the maximum over the cap, instead of after the whole input has been
+/// scanned and spilled — M6). Keeping one function means the two paths cannot
+/// drift into different limits or different explanations.
+pub fn plane_check(max_seq_len: u32) -> Result<usize, String> {
+    let size = max_seq_len as usize + 1;
+    // The plane is O(max_read_len²): three dense u64 grids of `size²` cells
+    // plus their JSON rendering. `--buffer-mb` sizes the read-index buffer and
+    // cannot bound it, so the plane gets its own published ceiling and a
+    // refusal that names both (review 2026-10-21, item 4). 4 000 bp used to
+    // peak at 976 MB and 8 000 bp at 3 788 MB, identically at --buffer-mb 1 and
+    // 8; the u16 guard admitted ~65 kb reads (~100 GB).
+    let cells = size.saturating_mul(size);
+    let plane_bytes = cells.saturating_mul(PLANE_BYTES_PER_CELL);
+    if plane_bytes > MAX_PLANE_BYTES {
+        return Err(format!(
+            "max read length {max_seq_len} bp needs a {size}x{size} plane ({cells} cells x \
+             {PLANE_BYTES_PER_CELL} B/cell = {} MiB), over the {} MiB plane cap. The plane \
+             grows as O(max read length^2); --buffer-mb bounds the read-index buffer only and \
+             cannot bound it. The cap allows reads up to {} bp: trim reads to <= {} bp upstream \
+             and re-run.",
+            plane_bytes / (1024 * 1024),
+            MAX_PLANE_BYTES / (1024 * 1024),
+            MAX_PLANE_SIDE - 1,
+            MAX_PLANE_SIDE - 1,
+        ));
+    }
+    if size > u16::MAX as usize {
+        return Err(format!(
+            "max read length {max_seq_len} exceeds u16::MAX"
+        ));
+    }
+    Ok(size)
+}
 
 // ── Row encoding ─────────────────────────────────────────────────────────────
 
@@ -115,16 +155,22 @@ pub fn encode_data_row(indices: Vec<(u16, u16, u32)>) -> Vec<u8> {
 /// `(file_id, read_num)`, so R1 and R2 each get their own quota. The worker
 /// keeps the first `preview_n` of *each file*, so this rule sees the same
 /// candidates at any `-j`.
+///
+/// Returns the encoded row and the largest number of previews any one pixel in
+/// it holds — `preview_n` per kind means up to `preview_n x kinds` per pixel,
+/// and the run publishes the measured maximum (`max_previews_per_pixel`) next
+/// to the quota (M4).
 pub fn encode_preview_row(
     previews: Vec<PreviewRead>,
     preview_n: usize,
     file_kinds: &[FileKind],
-) -> Vec<u8> {
+) -> (Vec<u8>, usize) {
     // Group by x.
     let mut by_x: HashMap<u16, Vec<PreviewRead>> = HashMap::new();
     for p in previews {
         by_x.entry(p.x).or_default().push(p);
     }
+    let mut max_per_pixel = 0usize;
 
     // Per pixel: split by kind, take preview_n of each, merge.
     for v in by_x.values_mut() {
@@ -144,6 +190,7 @@ pub fn encode_preview_row(
         }
         // Final order: by (file_id, read_num) so the wire layout is stable.
         out.sort_unstable_by_key(|p| (p.file_id, p.read_num));
+        max_per_pixel = max_per_pixel.max(out.len());
         *v = out;
     }
 
@@ -166,7 +213,7 @@ pub fn encode_preview_row(
             buf.extend_from_slice(r.qual.as_bytes());
         }
     }
-    buf
+    (buf, max_per_pixel)
 }
 
 // ── Preview temp-file codec ──────────────────────────────────────────────────
@@ -245,6 +292,18 @@ pub fn decode_preview_row(raw: &[u8], y: u16) -> std::io::Result<Vec<PreviewRead
 
 // ── Output ───────────────────────────────────────────────────────────────────
 
+/// Create one output file, naming it in the error.
+///
+/// `File::create(...).unwrap()` aborted with a panic (exit 101) when an output
+/// path was a directory; the bare `io::Error` that replaces it says "Is a
+/// directory (os error 21)" and nothing about *which* of six outputs failed
+/// (M8).
+fn create_out(path: &Path) -> std::io::Result<File> {
+    File::create(path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot write {}: {e}", path.display()))
+    })
+}
+
 /// Write `heatmap.data`, `heatmap.preview`, and `heatmap.json` to `output_dir`.
 ///
 /// Index entries are read one row at a time from the per-y temp files written
@@ -264,37 +323,20 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
         output_dir,
         report_path,
         elapsed_s,
+        threads,
         quiet,
     } = *opts;
 
-    let size = (state.max_seq_len + 1) as usize;
-    // The plane is O(max_read_len²): three dense u64 grids of `size²` cells
-    // plus their JSON rendering. `--buffer-mb` sizes the read-index buffer and
-    // cannot bound it, so the plane gets its own published ceiling and a
-    // refusal that names both (review 2026-10-21, item 4). 4 000 bp used to
-    // peak at 976 MB and 8 000 bp at 3 788 MB, identically at --buffer-mb 1 and
-    // 8; the u16 guard admitted ~65 kb reads (~100 GB).
-    let cells = size.saturating_mul(size);
-    let plane_bytes = cells.saturating_mul(PLANE_BYTES_PER_CELL);
-    if plane_bytes > MAX_PLANE_BYTES {
-        eprintln!(
-            "Error: max read length {} bp needs a {size}x{size} plane ({cells} cells x \
-             {PLANE_BYTES_PER_CELL} B/cell = {} MiB), over the {} MiB plane cap. The plane \
-             grows as O(max read length^2); --buffer-mb bounds the read-index buffer only and \
-             cannot bound it. The cap allows reads up to {} bp: trim reads to <= {} bp upstream \
-             and re-run.",
-            state.max_seq_len,
-            plane_bytes / (1024 * 1024),
-            MAX_PLANE_BYTES / (1024 * 1024),
-            MAX_PLANE_SIDE - 1,
-            MAX_PLANE_SIDE - 1,
-        );
-        std::process::exit(1);
-    }
-    if size > u16::MAX as usize {
-        eprintln!("Error: max read length {} exceeds u16::MAX", state.max_seq_len);
-        std::process::exit(1);
-    }
+    // The plane is O(max_read_len²). The worker refuses an oversize read the
+    // moment it sees one (M6); this is the end-of-run backstop for a state
+    // built some other way, and it is the same check either way.
+    let size = match plane_check(state.max_seq_len) {
+        Ok(size) => size,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            std::process::exit(1);
+        }
+    };
 
     // The grid is sized for the *longest* read, so a shorter read cannot reach
     // a corner: on a mixed-length run the corner fractions silently describe
@@ -318,6 +360,9 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
     let mut preview_offsets: Vec<u64> = Vec::with_capacity(size + 1);
     let mut data_written:    u64 = 0;
     let mut preview_written: u64 = 0;
+    // Measured, not assumed: `preview_n` is a per-(pixel, kind) quota, so a
+    // pixel holding R1 and R2 stores up to 2*preview_n (M4).
+    let mut max_previews_per_pixel: usize = 0;
     data_offsets.push(0);
     preview_offsets.push(0);
 
@@ -327,8 +372,8 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
     let grid_path = output_dir.join(GRID_JSON_NAME);
     let grid_name = GRID_JSON_NAME;
 
-    let mut data_file    = BufWriter::new(File::create(output_dir.join("heatmap.data"))?);
-    let mut preview_file = BufWriter::new(File::create(output_dir.join("heatmap.preview"))?);
+    let mut data_file    = BufWriter::new(create_out(&output_dir.join("heatmap.data"))?);
+    let mut preview_file = BufWriter::new(create_out(&output_dir.join("heatmap.preview"))?);
 
     // `varint(0)`: a row with no pixels. Off mode emits this for every row.
     const EMPTY_ROW: [u8; 1] = [0];
@@ -374,7 +419,8 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             }
         };
 
-        let prow = encode_preview_row(previews, preview_n, file_kinds);
+        let (prow, row_max_previews) = encode_preview_row(previews, preview_n, file_kinds);
+        max_previews_per_pixel = max_previews_per_pixel.max(row_max_previews);
 
         data_file.write_all(&drow)?;
         preview_file.write_all(&prow)?;
@@ -419,6 +465,22 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
     metrics.insert("min_seq_len".into(), min_seq_len as f64);
     metrics.insert("max_seq_len".into(), state.max_seq_len as f64);
     metrics.insert("corner_window".into(), corner_window as f64);
+    // The resolved worker count, so a report says how the run was actually
+    // executed: the outputs are -j-invariant, the wall time is not.
+    metrics.insert("threads".into(), threads as f64);
+    // M4: `preview_reads_per_pixel` reads like "N previews per pixel", but the
+    // quota is per (pixel, kind) — R1 and R2 (and Unknown) each get N, so one
+    // pixel can hold 2N/3N. Publish both the granularity and the measured
+    // maximum instead of leaving the reader to infer either.
+    metrics.insert("preview_reads_per_pixel".into(), preview_n as f64);
+    metrics.insert(
+        "preview_reads_per_pixel_per_kind".into(),
+        preview_n as f64,
+    );
+    metrics.insert(
+        "max_previews_per_pixel".into(),
+        max_previews_per_pixel as f64,
+    );
     // FM-1: a non-exact data mode is a labelled approximation of
     // `heatmap.data` alone. Both the grid JSON and the v1 wrapper carry the
     // label, so no consumer can mistake a capped/absent stream for the exact
@@ -437,6 +499,15 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             data_mode.reads_per_pixel()
         )
     };
+    // M3: the corner fractions measure whole-read composition, so a library
+    // whose 3' ends are a polyX run can report `polyG_frac 0` with no trace of
+    // it anywhere. The note goes in `notes` (a metric must stay numeric) and
+    // the same sentence is warned on stderr, because nobody reads a report
+    // they did not ask for.
+    let notes = crate::report::poly_tail_notes(&state.poly_tail, &metrics, state.total_reads);
+    for note in &notes {
+        eprintln!("fastmaps: warning: {note}");
+    }
     // A dense Vec indexed by file id. Out-of-range ids are a gap, not an
     // error, so they serialise as 0 exactly as the old HashMap's `.get()` did.
     let per_file_json = (0..files.len())
@@ -467,6 +538,8 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             "  \"total_reads\": {total},\n",
             "  \"per_file_counts\": [{pfc}],\n",
             "  \"preview_reads_per_pixel\": {pn},\n",
+            "  \"preview_reads_per_pixel_per_kind\": {pn},\n",
+            "  \"max_previews_per_pixel\": {max_pv},\n",
             "{labels}",
             "  \"counts\": [{counts}],\n",
             "  \"counts_r1\": [{counts_r1}],\n",
@@ -484,6 +557,7 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
         total     = state.total_reads,
         pfc       = per_file_json,
         pn        = preview_n,
+        max_pv    = max_previews_per_pixel,
         labels    = data_labels,
         counts    = counts_join(&counts_arr),
         counts_r1 = counts_join(&counts_r1_arr),
@@ -492,7 +566,7 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
         poff      = preview_offsets.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(","),
     );
 
-    let mut jf = BufWriter::new(File::create(grid_path)?);
+    let mut jf = BufWriter::new(create_out(&grid_path)?);
     jf.write_all(json.as_bytes())?;
     jf.flush()?;
 
@@ -507,6 +581,7 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             elapsed_s,
             files,
             &metrics,
+            &notes,
             grid_name,
         )?;
         report_suffix = format!(
@@ -581,7 +656,7 @@ mod tests {
     fn preview_row_truncates() {
         // All file_ids are 0/1/2, all unknown kind → single bucket truncates to 3.
         let kinds = vec![FileKind::Unknown; 4];
-        let buf = encode_preview_row(
+        let (buf, max) = encode_preview_row(
             vec![
                 make_preview(1, 50), make_preview(0, 10), make_preview(0, 5),
                 make_preview(2, 1),  make_preview(0, 20), make_preview(1, 30),
@@ -593,6 +668,7 @@ mod tests {
         assert_eq!(varint_read(&buf, &mut pos), 1); // n_pixels
         assert_eq!(varint_read(&buf, &mut pos), 0); // x
         assert_eq!(varint_read(&buf, &mut pos), 3); // n_stored — truncated
+        assert_eq!(max, 3, "the measured maximum is what the pixel holds");
     }
 
     #[test]
@@ -606,11 +682,12 @@ mod tests {
         for fid in 0..8u16 {
             reads.push(make_preview(fid, 10));
         }
-        let buf = encode_preview_row(reads, 2, &kinds);
+        let (buf, max) = encode_preview_row(reads, 2, &kinds);
         let mut pos = 0;
         assert_eq!(varint_read(&buf, &mut pos), 1); // n_pixels
         assert_eq!(varint_read(&buf, &mut pos), 0); // x
         assert_eq!(varint_read(&buf, &mut pos), 4); // 2 per kind × 2 kinds
+        assert_eq!(max, 4, "a pixel holding R1 and R2 stores 2*preview_n (M4)");
     }
 
     #[test]

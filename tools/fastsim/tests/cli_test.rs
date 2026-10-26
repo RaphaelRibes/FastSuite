@@ -787,3 +787,75 @@ fn single_mode_report_matches_the_files() {
     assert!(!dir.join("s_R2.fastq").exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// S6: a profile with `read_len` 0 used to be accepted and wrote structurally
+/// invalid FASTQ (empty sequence and quality lines) with exit 0. A zero-length
+/// read is not a library; it must be refused before any output is opened.
+#[test]
+fn zero_read_len_profile_is_refused() {
+    let dir = std::env::temp_dir().join(format!("fastsim_rl0_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = r#"{
+        "read_len": 0, "gc": 0.5, "geometry": "tail3p_both",
+        "head": {"R1": {"0": 100}, "R2": {"0": 100}},
+        "tail": {"R1": {"0": 100}, "R2": {"0": 100}},
+        "joint_tail": {"0,0": 100},
+        "tail_q_collapse": {"R1": 0.0, "R2": 0.0},
+        "pos_q": {"R1": [], "R2": []},
+        "read_meanq": {"R1": {"30": 100}, "R2": {"30": 100}},
+        "full_length_rate": 0.0,
+        "full_length_q": {"R1": 20, "R2": 20},
+        "adapter": {"seq": "CTGTCTCTTATACACATCT", "mode": "none"}
+    }"#;
+    let profile = dir.join("zero.json");
+    std::fs::write(&profile, json).unwrap();
+
+    let out = dir.join("z");
+    let o = Command::new(bin())
+        .args([
+            "--pairs", "10", "--profile", profile.to_str().unwrap(),
+            "--out", out.to_str().unwrap(), "--no-gzip",
+        ])
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "read_len 0 must be refused");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("read_len"), "the error must name read_len: {err}");
+    assert!(
+        !dir.join("z_R1.fastq").exists(),
+        "a refused profile must not leave output behind"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Cross-cutting: `-o` is a prefix, so its parent directories are created (a
+/// harness writing into a fresh per-run directory should not have to mkdir).
+#[test]
+fn out_prefix_creates_missing_parent_directories() {
+    let dir = std::env::temp_dir().join(format!("fastsim_mkdir_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_test_profile(&dir);
+
+    let out = dir.join("a/b/c/sim");
+    assert!(!dir.join("a").exists(), "the parent must really be absent");
+    let o = Command::new(bin())
+        .args([
+            "--pairs", "50", "--profile", profile.to_str().unwrap(),
+            "--out", out.to_str().unwrap(), "--no-gzip", "-q",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        o.status.success(),
+        "nested --out prefix: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for suffix in ["_R1.fastq", "_R2.fastq", ".gt.tsv"] {
+        assert!(dir.join(format!("a/b/c/sim{suffix}")).exists(), "{suffix} missing");
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
