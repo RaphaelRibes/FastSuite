@@ -208,22 +208,41 @@ is what you want, change the level before adding threads.
 
 ## Output order is not part of the contract
 
-The **kept set** of reads is stable across `-j`; the **order** in which they are
-written is not. Measured on a 200 000-pair corpus at `-j 1/2/4/8`: every run
-produced the same 200 000 records, and one single digest of the sorted records
-matched across all four — but three distinct start-to-finish orderings appeared
-(j1 and j2 happened to agree; j4 and j8 each differed).
+The **kept set** of records is stable across `-j`: the same file in, the same
+records out, including *which* record of an exactly-duplicated group is kept —
+it is the first one in input order, at every thread count. The **order** in
+which records are written is not contractual (it is completion order), so a
+byte-for-byte diff between two runs of the same input can still differ.
+
+This was not true before 2026-10-26 and the measured failure is worth keeping:
+when the retained copy was decided by whichever worker reached the fingerprint
+table first, six runs at `-j 8` under CPU contention produced **six distinct
+header multisets** on the same input — the sequence multiset stayed identical,
+so only the record identity was unstable. A quiet box hid it completely (24/24
+runs agreed). The fix orders results by input ordinal before the dedup decision;
+`dedup_writes_the_first_occurrence_in_input_order` pins it.
 
 So a check that compares output byte-for-byte between two runs is comparing
-something the tool never promised. Compare **sorted** records instead. If you
-need a deterministic byte-for-byte output, sort the file once at the end; the
-tool will not do it for you, because serialising the emit order costs wall time.
+something the tool never promised. Compare **sorted** records instead — since
+the fix above, that comparison is stable. If you need a deterministic
+byte-for-byte output, sort the file once at the end; the tool will not do it for
+you, because serialising the emit order costs wall time.
 
 ## Recommendations
 
 If you are using FDedup in a pre-processing step, we recommend you to not export your file to a `.gz` format.
 Incremental/resumable deduplication, only works with uncompressed output files.
 If you output to a compressed format, FDedup requires `--force` to restart from scratch on any subsequent run.
+
+A run that finds an existing output resumes it and says so on stderr
+(`fastdedup: resuming: the output already held N record(s); ...`), with the
+`reads_preloaded` / `reads_already_present` / `reads_new` metrics in `--json`
+accounting for what came from the output and what this run wrote. `--force`
+starts from scratch.
+
+Writing to stdout (`-o -`, `-p -`) never mixes the summary into the data: the
+summary moves to stderr whenever any output stream or `--json` is on stdout, and
+`--json -` together with any `-` output is refused.
 However, if you output to an uncompressed format, FDedup will automatically detect any crash-induced corruption, safely truncate the file to the last valid sequence, and seamlessly resume deduplication.
 
 ## To-Do List

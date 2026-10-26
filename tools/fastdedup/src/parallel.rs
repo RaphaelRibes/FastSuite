@@ -487,7 +487,7 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     let mut verifier = ShardedHashVerifier::<T>::new(cfg.estimated_capacity, worker_threads)?;
     let preloaded = resume_existing_output(output_path, cfg, &mut verifier)?;
 
-    let (chunk_tx, chunk_rx): (Sender<Vec<RawRecord>>, Receiver<Vec<RawRecord>>) =
+    let (chunk_tx, chunk_rx): (Sender<(u64, Vec<RawRecord>)>, Receiver<(u64, Vec<RawRecord>)>) =
         bounded(num_workers * 2);
     // Bounded, not unbounded: the writer blocks on gzippy's 16-chunk channel
     // whenever compression is the bottleneck (1-2 gzip threads at low `-j`), and
@@ -496,7 +496,7 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     // `-j 2/4/8` ~4.0 GB, with peak tracking input size rather than threads. At
     // 100 M pairs that is tens of GB for a queue nobody asked for. The bound
     // applies the backpressure the pipeline already has one stage downstream.
-    let (hash_tx, hash_rx): (Sender<HashedRecord<T>>, Receiver<HashedRecord<T>>) =
+    let (hash_tx, hash_rx): (Sender<(u64, HashedRecord<T>)>, Receiver<(u64, HashedRecord<T>)>) =
         bounded(num_workers * 256);
 
     // The reader reports, off the first record, whether the input carries
@@ -515,6 +515,10 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
                 parse_fastx_reader(reader).map_err(|e| anyhow::anyhow!("Parse error: {e}"))?;
 
             let mut total = 0;
+            // Input ordinal of the chunk being filled: workers hash concurrently
+            // and the writer re-orders by it, so the kept copy of a duplicated
+            // sequence is the first in INPUT order on every run.
+            let mut ordinal: u64 = 0;
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
             let mut format_reported = false;
 
@@ -534,14 +538,17 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
                 total += 1;
 
                 if chunk.len() >= CHUNK_SIZE {
-                    if chunk_tx.send(chunk).is_err() {
+                    let base = ordinal;
+                    ordinal += chunk.len() as u64;
+                    if chunk_tx.send((base, chunk)).is_err() {
                         return Ok(total);
                     }
                     chunk = Vec::with_capacity(CHUNK_SIZE);
                 }
             }
             if !chunk.is_empty() {
-                let _ = chunk_tx.send(chunk);
+                let base = ordinal;
+                let _ = chunk_tx.send((base, chunk));
             }
 
             Ok(total)
@@ -554,10 +561,11 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
         let chunk_rx = chunk_rx.clone();
         let hash_tx = hash_tx.clone();
         worker_handles.push(std::thread::spawn(move || {
-            while let Ok(chunk) = chunk_rx.recv() {
-                for record in chunk {
+            while let Ok((base, chunk)) = chunk_rx.recv() {
+                for (offset, record) in chunk.into_iter().enumerate() {
                     let hash = T::hash_sequence(&record.seq);
-                    if hash_tx.send(HashedRecord { hash, record }).is_err() {
+                    let ordinal = base + offset as u64;
+                    if hash_tx.send((ordinal, HashedRecord { hash, record })).is_err() {
                         return;
                     }
                 }
@@ -607,28 +615,41 @@ pub(crate) fn execute_deduplication_parallel<T: SequenceHasher + Send + 'static>
     }
 
     // Receive and process results from workers
-    while let Ok(hr) = hash_rx.recv() {
-        processed += 1;
-        if verifier.verify(hr.hash) {
-            match output_format {
-                OutputFormat::Fasta => {
-                    write_fasta_record(&mut buffered_writer, &hr.record.id, &hr.record.seq)?;
+        // Results arrive in COMPLETION order (workers hash chunks concurrently), but
+    // the writer must keep the first record of a duplicate group in FILE order:
+    // otherwise which header survives depends on thread scheduling (measured
+    // before this fix: six runs at `-j 8` under CPU contention produced six
+    // distinct header multisets, sequence multiset identical). `pending` is
+    // bounded by the two channel capacities, so this cannot grow with input.
+    let mut pending: std::collections::BTreeMap<u64, HashedRecord<T>> =
+        std::collections::BTreeMap::new();
+    let mut next_ordinal: u64 = 0;
+    while let Ok((ordinal, hr)) = hash_rx.recv() {
+        pending.insert(ordinal, hr);
+        while let Some(hr) = pending.remove(&next_ordinal) {
+            next_ordinal += 1;
+            processed += 1;
+            if verifier.verify(hr.hash) {
+                match output_format {
+                    OutputFormat::Fasta => {
+                        write_fasta_record(&mut buffered_writer, &hr.record.id, &hr.record.seq)?;
+                    }
+                    OutputFormat::Fastq => {
+                        let nl = ending(hr.record.crlf);
+                        buffered_writer.write_all(b"@")?;
+                        buffered_writer.write_all(&hr.record.id)?;
+                        buffered_writer.write_all(nl)?;
+                        buffered_writer.write_all(&hr.record.seq)?;
+                        buffered_writer.write_all(nl)?;
+                        buffered_writer.write_all(b"+")?;
+                        buffered_writer.write_all(nl)?;
+                        buffered_writer.write_all(&hr.record.qual)?;
+                        buffered_writer.write_all(nl)?;
+                    }
                 }
-                OutputFormat::Fastq => {
-                    let nl = ending(hr.record.crlf);
-                    buffered_writer.write_all(b"@")?;
-                    buffered_writer.write_all(&hr.record.id)?;
-                    buffered_writer.write_all(nl)?;
-                    buffered_writer.write_all(&hr.record.seq)?;
-                    buffered_writer.write_all(nl)?;
-                    buffered_writer.write_all(b"+")?;
-                    buffered_writer.write_all(nl)?;
-                    buffered_writer.write_all(&hr.record.qual)?;
-                    buffered_writer.write_all(nl)?;
-                }
+            } else {
+                duplicates += 1;
             }
-        } else {
-            duplicates += 1;
         }
     }
 
@@ -703,12 +724,12 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
     let preloaded =
         resume_existing_paired_outputs(output_r1_path, output_r2_path, cfg, &mut verifier)?;
 
-    let (chunk_tx, chunk_rx): (Sender<Vec<RawPair>>, Receiver<Vec<RawPair>>) =
+    let (chunk_tx, chunk_rx): (Sender<(u64, Vec<RawPair>)>, Receiver<(u64, Vec<RawPair>)>) =
         bounded(num_workers * 2);
     // Bounded for the same reason as the single-end path: when gzip output is the
     // bottleneck the writer stalls, and an unbounded queue would absorb the whole
     // stream in memory instead of applying backpressure.
-    let (hash_tx, hash_rx): (Sender<HashedPair<T>>, Receiver<HashedPair<T>>) =
+    let (hash_tx, hash_rx): (Sender<(u64, HashedPair<T>)>, Receiver<(u64, HashedPair<T>)>) =
         bounded(num_workers * 256);
 
     // Same as the single-end path: the reader reports whether R1 carries
@@ -731,6 +752,10 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
                 parse_fastx_reader(reader2).map_err(|e| anyhow::anyhow!("Parse error: {e}"))?;
 
             let mut total = 0;
+            // Input ordinal of the chunk being filled: workers hash concurrently
+            // and the writer re-orders by it, so the kept copy of a duplicated
+            // sequence is the first in INPUT order on every run.
+            let mut ordinal: u64 = 0;
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
             let mut format_reported = false;
 
@@ -780,7 +805,9 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
                 total += 1;
 
                 if chunk.len() >= CHUNK_SIZE {
-                    if chunk_tx.send(chunk).is_err() {
+                    let base = ordinal;
+                    ordinal += chunk.len() as u64;
+                    if chunk_tx.send((base, chunk)).is_err() {
                         return Ok(total);
                     }
                     chunk = Vec::with_capacity(CHUNK_SIZE);
@@ -793,7 +820,8 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
             }
 
             if !chunk.is_empty() {
-                let _ = chunk_tx.send(chunk);
+                let base = ordinal;
+                let _ = chunk_tx.send((base, chunk));
             }
 
             Ok(total)
@@ -806,10 +834,11 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         let chunk_rx = chunk_rx.clone();
         let hash_tx = hash_tx.clone();
         worker_handles.push(std::thread::spawn(move || {
-            while let Ok(chunk) = chunk_rx.recv() {
-                for pair in chunk {
+            while let Ok((base, chunk)) = chunk_rx.recv() {
+                for (offset, pair) in chunk.into_iter().enumerate() {
                     let hash = T::hash_pair(&pair.r1.seq, &pair.r2.seq);
-                    if hash_tx.send(HashedPair { hash, pair }).is_err() {
+                    let ordinal = base + offset as u64;
+                    if hash_tx.send((ordinal, HashedPair { hash, pair })).is_err() {
                         return;
                     }
                 }
@@ -871,40 +900,53 @@ pub(crate) fn execute_paired_deduplication_parallel<T: SequenceHasher + Send + '
         );
     }
 
-    while let Ok(hp) = hash_rx.recv() {
-        processed += 1;
-        if verifier.verify(hp.hash) {
-            match output_format {
-                OutputFormat::Fasta => {
-                    write_fasta_record(&mut buf_r1, &hp.pair.r1.id, &hp.pair.r1.seq)?;
-                    write_fasta_record(&mut buf_r2, &hp.pair.r2.id, &hp.pair.r2.seq)?;
-                }
-                OutputFormat::Fastq => {
-                    let nl1 = ending(hp.pair.r1.crlf);
-                    let nl2 = ending(hp.pair.r2.crlf);
-                    buf_r1.write_all(b"@")?;
-                    buf_r1.write_all(&hp.pair.r1.id)?;
-                    buf_r1.write_all(nl1)?;
-                    buf_r1.write_all(&hp.pair.r1.seq)?;
-                    buf_r1.write_all(nl1)?;
-                    buf_r1.write_all(b"+")?;
-                    buf_r1.write_all(nl1)?;
-                    buf_r1.write_all(&hp.pair.r1.qual)?;
-                    buf_r1.write_all(nl1)?;
+        // Results arrive in COMPLETION order (workers hash chunks concurrently), but
+    // the writer must keep the first record of a duplicate group in FILE order:
+    // otherwise which header survives depends on thread scheduling (measured
+    // before this fix: six runs at `-j 8` under CPU contention produced six
+    // distinct header multisets, sequence multiset identical). `pending` is
+    // bounded by the two channel capacities, so this cannot grow with input.
+    let mut pending: std::collections::BTreeMap<u64, HashedPair<T>> =
+        std::collections::BTreeMap::new();
+    let mut next_ordinal: u64 = 0;
+    while let Ok((ordinal, hp)) = hash_rx.recv() {
+        pending.insert(ordinal, hp);
+        while let Some(hp) = pending.remove(&next_ordinal) {
+            next_ordinal += 1;
+            processed += 1;
+            if verifier.verify(hp.hash) {
+                match output_format {
+                    OutputFormat::Fasta => {
+                        write_fasta_record(&mut buf_r1, &hp.pair.r1.id, &hp.pair.r1.seq)?;
+                        write_fasta_record(&mut buf_r2, &hp.pair.r2.id, &hp.pair.r2.seq)?;
+                    }
+                    OutputFormat::Fastq => {
+                        let nl1 = ending(hp.pair.r1.crlf);
+                        let nl2 = ending(hp.pair.r2.crlf);
+                        buf_r1.write_all(b"@")?;
+                        buf_r1.write_all(&hp.pair.r1.id)?;
+                        buf_r1.write_all(nl1)?;
+                        buf_r1.write_all(&hp.pair.r1.seq)?;
+                        buf_r1.write_all(nl1)?;
+                        buf_r1.write_all(b"+")?;
+                        buf_r1.write_all(nl1)?;
+                        buf_r1.write_all(&hp.pair.r1.qual)?;
+                        buf_r1.write_all(nl1)?;
 
-                    buf_r2.write_all(b"@")?;
-                    buf_r2.write_all(&hp.pair.r2.id)?;
-                    buf_r2.write_all(nl2)?;
-                    buf_r2.write_all(&hp.pair.r2.seq)?;
-                    buf_r2.write_all(nl2)?;
-                    buf_r2.write_all(b"+")?;
-                    buf_r2.write_all(nl2)?;
-                    buf_r2.write_all(&hp.pair.r2.qual)?;
-                    buf_r2.write_all(nl2)?;
+                        buf_r2.write_all(b"@")?;
+                        buf_r2.write_all(&hp.pair.r2.id)?;
+                        buf_r2.write_all(nl2)?;
+                        buf_r2.write_all(&hp.pair.r2.seq)?;
+                        buf_r2.write_all(nl2)?;
+                        buf_r2.write_all(b"+")?;
+                        buf_r2.write_all(nl2)?;
+                        buf_r2.write_all(&hp.pair.r2.qual)?;
+                        buf_r2.write_all(nl2)?;
+                    }
                 }
+            } else {
+                duplicates += 1;
             }
-        } else {
-            duplicates += 1;
         }
     }
 

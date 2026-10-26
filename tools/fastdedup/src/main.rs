@@ -206,6 +206,39 @@ fn requested_thread_count(flag: Option<usize>) -> usize {
     .unwrap_or(1)
 }
 
+
+/// Refuse a FASTA -> FASTQ conversion BEFORE any output is opened.
+///
+/// Every engine validates the pairing inside its record loop, i.e. after
+/// `open_output` has created — and on an existing path truncated — the
+/// destination. Measured before this check existed: a FASTA input with
+/// `-o keep.fq --force` left `keep.fq` at 0 bytes and exited 1, so a refusal
+/// destroyed the previous run's output (and without `--force` it still left a
+/// 0-byte file behind that a resume would treat as an empty corpus).
+///
+/// Reading one record through the same stream/gzip reader the engines use is
+/// the only reliable probe: an extension cannot tell, and a gzipped FASTA needs
+/// decompression. Streams are skipped — there is nothing to destroy, and the
+/// engine uses `--out-format` there.
+fn ensure_output_format_matches_input(input: &str, output: &str, cfg: &DedupConfig) -> Result<()> {
+    if crate::stream::is_stream(input) || crate::stream::is_stream(output) {
+        return Ok(());
+    }
+    // `--dry-run` writes nothing, so it cannot damage an existing destination.
+    if cfg.dry_run {
+        return Ok(());
+    }
+    let mut reader = crate::stream::open_fastx(input)?;
+    let Some(first) = reader.next().transpose()? else {
+        return Ok(());
+    };
+    let has_quality = first.qual().is_some_and(|q| !q.is_empty());
+    crate::utils::validate_format_compatibility(
+        has_quality,
+        OutputFormat::from_extension(Path::new(output)),
+    )
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
 
@@ -332,9 +365,9 @@ fn main() -> Result<()> {
             }
         }
     }
-    if out1_stream && args.json.as_deref() == Some("-") {
+    if (out1_stream || out2_stream) && args.json.as_deref() == Some("-") {
         bail!(
-            "--out1 (-) and --json (-) cannot both write to stdout. Send the report to a file, or drop one of them."
+            "an output (-) and --json (-) cannot both write to stdout. Send the report to a file, or drop one of them."
         );
     }
 
@@ -474,6 +507,13 @@ fn main() -> Result<()> {
 
     let start = Instant::now();
 
+    // One pre-flight for every engine: refuse a format/extension contradiction
+    // before the output is opened, not after it has been truncated.
+    ensure_output_format_matches_input(&args.input, &output, &cfg)?;
+    if let (Some(input_r2), Some(output_r2)) = (&args.input_r2, args.output_r2.as_deref()) {
+        ensure_output_format_matches_input(input_r2, output_r2, &cfg)?;
+    }
+
     let (processed, duplicates, preloaded) = if let Some(input_r2) = &args.input_r2 {
         let output_r2 = args.output_r2.as_deref().unwrap_or("");
 
@@ -529,15 +569,42 @@ fn main() -> Result<()> {
         }
     };
 
+    // Make the resume visible. Appending is a feature (incremental runs) but it
+    // is also what a plain re-run does, and the two are indistinguishable from
+    // the outside: a user who re-ran by accident got a silently larger output
+    // with no signal. `--force` is the explicit "start from scratch".
+    if preloaded > 0 && !args.quiet {
+        eprintln!(
+            "fastdedup: resuming: the output already held {preloaded} record(s); \
+             only the missing ones were appended. Pass --force to start from scratch."
+        );
+    }
+
     // A resume preloads the hashes already on disk (`preloaded`) and appends
     // only what is missing, so `processed - duplicates` is what THIS invocation
     // wrote, not what the output holds. After repairing a torn tail of a
     // 20 000-record output the run wrote one record and reported "1 out,
     // 19999 duplicates (100.00%)" for a file holding all 20 000. The counts
-    // below describe the whole output and the whole input. Saturating, because
-    // a resume may legitimately start from an output larger than this input.
-    let reads_out = preloaded + processed.saturating_sub(duplicates);
-    let duplicates = processed.saturating_sub(reads_out);
+    // below describe the whole output and the whole input.
+    //
+    // Three-term accounting, so both identities hold and neither is fudged by a
+    // saturating subtraction:
+    //
+    //   reads_out    == reads_preloaded + reads_new            (output composition)
+    //   reads_in     == reads_new + reads_already_present + reads_duplicate
+    //                                                          (per-run accounting)
+    //
+    // The engine reports one number for "not written", mixing preloaded hits
+    // with genuine duplicates; `min(preloaded, not_written)` recovers the
+    // already-present share (it can never exceed the records the output held).
+    // Recomputing `duplicates` from `reads_out` instead — the previous code —
+    // saturated to 0 whenever the output was larger than the input, publishing
+    // "4 in, 20000 out, 0 duplicates" for a run that wrote nothing, and breaking
+    // the record identity `fasthelper check --report` enforces.
+    let written = processed.saturating_sub(duplicates);
+    let already_present = preloaded.min(duplicates);
+    let duplicates = duplicates.saturating_sub(already_present);
+    let reads_out = preloaded + written;
 
     if args.verbose {
         println!(
@@ -566,13 +633,25 @@ fn main() -> Result<()> {
     let collisions_pct = birthday_problem_square_approximation(processed, &selected_hash_type) * 100.0;
 
     if !args.quiet {
-        // D-4 / CLI-SPEC §0: with `-o -` or `--json -` stdout carries data,
-        // so the summary goes to stderr and never pollutes the pipe.
+        // D-4 / CLI-SPEC §0: with `-o -`, `-p -` or `--json -` stdout carries
+        // data, so the summary goes to stderr and never pollutes the pipe.
+        // `-p -` was the missing sibling: the line used to be appended to the R2
+        // stream, so `-p - | gzip > r2.fq.gz` produced an unparseable file.
+        //
+        // Units: `processed`/`reads_out`/`duplicates` count RECORDS, i.e. pairs
+        // in paired mode, while the report publishes reads (pairs x 2). The
+        // summary printed the raw record count, so every PE run understated
+        // throughput by 2x against its own report.
+        let (s_in, s_out, s_dup) = if args.input_r2.is_some() {
+            (processed * 2, reads_out * 2, duplicates * 2)
+        } else {
+            (processed, reads_out, duplicates)
+        };
         let summary = format!(
             "fastdedup: {} reads in, {} out, {} duplicates ({:.2}%), {} threads, {:.2?}",
-            processed, reads_out, duplicates, dup_pct, resolved_threads, elapsed
+            s_in, s_out, s_dup, dup_pct, resolved_threads, elapsed
         );
-        if out1_stream || args.json.as_deref() == Some("-") {
+        if out1_stream || out2_stream || args.json.as_deref() == Some("-") {
             eprintln!("{summary}");
         } else {
             println!("{summary}");
@@ -618,6 +697,17 @@ fn main() -> Result<()> {
         if let Some((pairs_in, pairs_out)) = pairs {
             metrics["pairs_in"] = pairs_in.into();
             metrics["pairs_out"] = pairs_out.into();
+        }
+        // Resume term, published only when a resume actually happened. It is the
+        // operand that makes the record identity hold on a resumed run:
+        //   reads_in + reads_preloaded == reads_out + reads_duplicate
+        // Without it a resume looks like a report claiming more reads out than
+        // in, which is exactly what `fasthelper check --report` rejects.
+        if preloaded > 0 {
+            let scale = |n: usize| if paired { n * 2 } else { n };
+            metrics["reads_preloaded"] = scale(preloaded).into();
+            metrics["reads_already_present"] = scale(already_present).into();
+            metrics["reads_new"] = scale(written).into();
         }
 
         let report = serde_json::json!({

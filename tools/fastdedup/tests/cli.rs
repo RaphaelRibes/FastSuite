@@ -2087,7 +2087,10 @@ fn test_dry_run_paire_parallele_ne_cree_aucun_fichier() {
         .arg("--dry-run")
         .assert()
         .success()
-        .stdout(predicate::str::contains("fastdedup: 25 reads in"));
+        // Reversed deliberately (2026-10-26): the summary printed the RECORD
+        // count (pairs) while the same run's --json reported reads, i.e. pairs
+        // x 2. 25 pairs is 50 reads; this fixture had pinned the bug.
+        .stdout(predicate::str::contains("fastdedup: 50 reads in"));
 
     assert!(
         !sortie_r1.path().exists(),
@@ -2929,4 +2932,73 @@ fn test_dry_run_rapport_sorties_nulles() {
         "--dry-run n'écrit pas R2 : outputs.r2 doit être null, obtenu {}",
         v["outputs"]["r2"]
     );
+}
+
+// ================================================================
+// RÉGRESSION 2026-10-26 : L'ORDRE D'ENTRÉE DÉCIDE DU REPRÉSENTANT
+// ================================================================
+
+/// The retained copy of an exactly duplicated record is the FIRST one in input
+/// order, at every thread count.
+///
+/// Before the 2026-10-26 fix the dedup decision ran on results in *completion*
+/// order, so which worker reached the fingerprint table first decided which
+/// header survived: six runs at `-j 8` under CPU contention produced six
+/// distinct header multisets on the same input (the sequence multiset stayed
+/// identical, which is why no set-comparing test could see it).
+#[test]
+fn dedup_writes_the_first_occurrence_in_input_order() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    // 100 DISTINCT sequences, each appearing twice: the pair must collapse onto
+    // the earlier header. (All-identical records would collapse to one record
+    // and the test would prove nothing.)
+    let encode = |i: usize| -> String {
+        let alphabet = [b'A', b'C', b'G', b'T'];
+        let mut suffix = String::new();
+        for shift in (0..4).rev() {
+            suffix.push(alphabet[(i >> (shift * 2)) & 3] as char);
+        }
+        format!("ACGTTGCAACGTTGCAACGTTGCAACGTTGCA{suffix}")
+    };
+    let mut body = String::new();
+    for i in 0..100 {
+        let seq = encode(i);
+        body.push_str(&format!("@first{i}\n{seq}\n+\n{}\n", "I".repeat(seq.len())));
+    }
+    for i in 0..100 {
+        // Byte-identical duplicates, later in the file, different headers.
+        let seq = encode(i);
+        body.push_str(&format!("@dup{i}\n{seq}\n+\n{}\n", "I".repeat(seq.len())));
+    }
+    let input = temp_dir.child("in.fastq");
+    input.write_str(&body).unwrap();
+
+    for threads in [1usize, 2, 4, 8] {
+        for run in 0..2 {
+            let out = temp_dir.child(format!("out_{threads}_{run}.fastq"));
+            cmd()
+                .arg("-1")
+                .arg(input.path())
+                .arg("-o")
+                .arg(out.path())
+                .arg("-j")
+                .arg(threads.to_string())
+                .arg("--force")
+                .arg("-q")
+                .assert()
+                .success();
+            let text = fs::read_to_string(out.path()).unwrap();
+            let ids: Vec<&str> = text.lines().filter(|l| l.starts_with('@')).collect();
+            assert_eq!(
+                ids.len(),
+                100,
+                "-j {threads} run {run}: 100 duplicate pairs must collapse to 100 records"
+            );
+            assert!(
+                ids.iter().all(|id| id.starts_with("@first")),
+                "-j {threads} run {run} kept a later duplicate as its representative: {:?}",
+                &ids[..ids.len().min(6)]
+            );
+        }
+    }
 }
