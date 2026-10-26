@@ -96,6 +96,24 @@ fn run(args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// Spawn with `PATH` reduced to `path`, for the tests whose subject is a binary
+/// that must be ABSENT. Without this the test's verdict depended on whether the
+/// tool that was supposed to be missing happened to be installed on the machine
+/// running it — it passed in the suite tree (where nothing is on `PATH`) and
+/// failed in a standalone checkout, where `fastcheck` typically is.
+fn run_with_path(args: &[&str], path: &Path) -> (String, String, i32) {
+    let out = Command::new(fasthelper())
+        .args(args)
+        .env("PATH", path)
+        .output()
+        .expect("spawn fasthelper");
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
 #[test]
 fn concatenate_merges_reports_into_one_row_per_sample() {
     let d = tmpdir("concat");
@@ -796,12 +814,16 @@ fn missing_step_binary_fails_the_run_like_check() {
     )
     .unwrap();
 
-    let (_, run_err, run_code) = run(&[
+    // An empty PATH directory: no ambient fastcheck can satisfy the step, so
+    // "missing" means missing on every machine (#standalone-repo).
+    let empty_path = d.join("empty-path");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    let (_, run_err, run_code) = run_with_path(&[
         "run", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap(),
-    ]);
-    let (_, check_err, check_code) = run(&[
+    ], &empty_path);
+    let (_, check_err, check_code) = run_with_path(&[
         "check", "-c", cfg.to_str().unwrap(), "--tools-dir", tools.to_str().unwrap(),
-    ]);
+    ], &empty_path);
     assert_eq!(
         run_code == 0,
         check_code == 0,
@@ -924,21 +946,40 @@ fn check_still_accepts_the_repo_example_config() {
     for tool in ["fastcheck", "fastdedup", "fastprep"] {
         require_tool(tool);
     }
-    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+    // Two example configs exist and both must validate, each where it sits: the
+    // suite's (`<suite>/examples/fastsuite.toml`, the one users copy) and this
+    // crate's own (`examples/fastsuite.toml`, which is what exists when the
+    // crate is checked out alone). They cannot be byte-identical — every path
+    // in the file is relative to the file itself, so the vendored copy points at
+    // its own `profiles/` — which is why this validates both instead of
+    // comparing them.
+    let suite = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("examples/fastsuite.toml");
-    let (stdout, stderr, code) = run(&[
-        "check",
-        "-c",
-        example.to_str().unwrap(),
-        "--tools-dir",
-        tools_dir().to_str().unwrap(),
-    ]);
-    assert_eq!(code, 0, "examples/fastsuite.toml must validate: {stderr}");
+    let local = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fastsuite.toml");
+    let examples: Vec<PathBuf> = [suite, local].into_iter().filter(|p| p.is_file()).collect();
     assert!(
-        stdout.contains("OK") && !stderr.contains("duplicate"),
-        "{stdout}{stderr}"
+        !examples.is_empty(),
+        "no example config found: expected examples/fastsuite.toml at this crate's root"
     );
+    for example in &examples {
+        let (stdout, stderr, code) = run(&[
+            "check",
+            "-c",
+            example.to_str().unwrap(),
+            "--tools-dir",
+            tools_dir().to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code, 0,
+            "{} must validate: {stderr}",
+            example.display()
+        );
+        assert!(
+            stdout.contains("OK") && !stderr.contains("duplicate"),
+            "{stdout}{stderr}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- FH-3 ----
