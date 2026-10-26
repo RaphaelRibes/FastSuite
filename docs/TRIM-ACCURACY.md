@@ -41,11 +41,16 @@ denominator moves with it. Re-run
 numbers against a 0.67L build; the ordering of the tools at a fixed floor is
 what this document established, and that ordering is expected to hold.
 
-`bench/scripts/overtrim_vs_fastp.py` produces these numbers from
+**Provenance caveat (2026-10-26).** The four-tool table comes from
 `bench/results/phase-d/overtrim-vs-fastp.tsv` (817 lines: header + 816 rows,
-102 datasets, four tools, two tolerances). The script refuses to overwrite an
-existing `--out` unless `--force` is passed: it appends, so a second run would
-silently mix two corpora in one file.
+102 datasets, four tools, two tolerances), but the script this document used to
+name as its producer — `bench/scripts/overtrim_vs_fastp.py` — **is not in this
+repository and never has been** (`git log --all -- bench/scripts` has no such
+path). The fastp columns therefore cannot be regenerated from the committed
+tree; only the fastprep rows can, with `bench/scripts/trim_score.py` (committed
+2026-10-26 with `bench/results/fix2026/`), which re-derives them from the
+committed GT. Treat the fastp numbers as campaign records, not as something the
+repo can reproduce today.
 
 ## What is measured
 
@@ -136,6 +141,25 @@ Read the `undertrim` column here only next to the decomposition below (full
 argument in §"What the undertrim figure actually contains"): **almost all of it
 is irreducible, not a defect.** Of fastprep-hd-off's 10.3%, **0.094 pp is
 recoverable** and **10.21 pp is not.**
+
+### Tolerance 0, shipped default re-derived after the 2026-10-26 fix wave
+
+`bench/scripts/trim_score.py` on `bench/results/fix2026/` (the same 102 datasets,
+the fixed fastprep at its shipped defaults — `0.67L`, `--min-run 12`,
+`--mercy 3`, `--head-dropout 4`, boundary-anchored, dedup on):
+
+| | mates | of scored | of all |
+|---|---|---|---|
+| exact | 13,913,273 | **77.87%** | 68.20% |
+| overtrim | 3,573,808 | 20.00% | 17.52% |
+| undertrim | 380,327 | 2.13% | 1.86% |
+| dropped | 2,532,592 | — | 12.41% |
+| scored | 17,867,408 | | |
+
+That is 75.5 / 22.5 / 2.0 in this section's terms, moved ~2.4 pp from overtrim to
+exact: the fix closes the case where a 3′ polyX run whose trim landed at the
+trim-budget boundary was emitted **whole** (a 48-base artefact on a 151 bp read
+at `0.67L`). The row is measured on the fixed build, not spliced in.
 
 ### Tolerance 0 (strict), undertrim decomposed
 
@@ -438,12 +462,14 @@ biology are the same base with the same quality; the simulator knows which is
 which only because it injected one. Keeping those bases is the **correct**
 decision, and the loop counts it as error.
 
-Decomposed, the 10.3% is:
+Decomposed, the 10.3% is (shares re-derived from
+`bench/results/exactness/undertrim-decomp.tsv` on 2026-10-26; this table said
+~54% / ~40%, which the committed file contradicts by 20–25 points):
 
 | | share of undertrim | verdict |
 |---|---|---|
-| 5′ r=1–4 | ~54% | irreducible — trimming would be wrong ~73% of the time |
-| 3′ r=1–5 | ~40% | irreducible — P = 0.07–0.38 |
+| 5′ r=1–4 | **79.58%** | irreducible — trimming would be wrong ~73% of the time |
+| 3′ r=1–5 | **19.01%** | irreducible — P = 0.07–0.38 |
 | **3′ r≥6 that the scan missed** | **~0.9%** (~17,700 mates) | **genuinely recoverable** |
 
 The default `min_run` is 12, so 3′ runs of 6–11 fall below it even though
@@ -468,8 +494,16 @@ signature of a long missed run rather than boundary jitter.
 ## Reproducing
 
 ```bash
-python3 bench/scripts/overtrim_vs_fastp.py   # writes bench/results/phase-d/overtrim-vs-fastp.tsv
+# The fastprep rows, re-derived from the committed GT (one configuration per
+# invocation, the binary's defaults unless wrapped):
+python3 bench/scripts/trim_score.py \
+  --work <worktree with sim.v0.*> \
+  --fastprep tools/fastprep/target/release/fastprep \
+  --out bench/results/fix2026/trim-accuracy-shipped.tsv
 ```
+`bench/scripts/overtrim_vs_fastp.py` (cited by older revisions of this file)
+does not exist in the repository; the four-tool table's fastp columns can only
+be taken from `bench/results/phase-d/overtrim-vs-fastp.tsv`.
 
 The tables above are aggregates of that file (tool x domain x accession x
 tolerance). Two further scripts back the undertrim decomposition:

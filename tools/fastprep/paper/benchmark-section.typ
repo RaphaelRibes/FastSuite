@@ -219,7 +219,11 @@ artefact against biology. On a library where a quarter of reads begin with a
 genuine G, that rule removes real sequence; the 20.9 points are what
 `--head-dropout 0` avoids. It is not the shipped default: the 0.5.0 release
 ships 4 again, because an artefact left in the output costs 7x a base trimmed
-(D-16), which puts the break-even at 2.6. `fastp-tuned` shows the mirror image of
+(D-16), which puts the break-even at 2.6. Re-derived on the fixed 2026-10-26
+build the same configuration measures 77.87 / 20.00 / 2.13 at tolerance 0
+(`bench/results/fix2026/`), so the ordering, and the argument built on it, are
+unchanged: the shipped rule is still the worst of the fastprep configurations,
+just less so. `fastp-tuned` shows the mirror image of
 the same mistake: its aggressive `--cut_front`/`--cut_tail` raise over-trim from
 0.7 to 9.3 points while lowering exactness by 8 points, and unlike boundary
 jitter the

@@ -90,16 +90,22 @@ examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 
 ## Phase D — the closed loop, re-measured
 
-The campaign ran the full corpus: **102 real ENA datasets × 57 configs ×
-3 variants = 306 comparisons**. Earlier revisions said 55 configs; the authored
-grid is **57** (`sweep.py::GRID`, which now carries the `head_dropout` axis).
+The campaign ran the full corpus: **102 real ENA datasets × 3 closed-loop
+variants = 306 comparisons** (the sweep is a separate axis: the authored grid is
+**57** configs, `sweep.py::GRID`, which carries the `head_dropout` axis; an
+earlier revision of this line multiplied the two axes together and claimed
+17,442 comparisons).
 
-**Current build (2026-10-21): PASS 183/306 = 59.8%**, 62 of 102 datasets passing
-every variant, median per-position G-fraction difference **0.0093 against the
-0.02 bound** (it was 0.0218, outside). Record:
-`bench/results/gt2026/closed_loop.tsv`, re-run on the desktop with
-`bench/scripts/closed_loop.py` after the profile-gc, insert-anchor and
-exact-histogram fitter fixes. Per-domain comparisons passed: human gut 51/51,
+**Current build (2026-10-26): PASS 183/306 = 59.8%**, **60** of 102 datasets
+passing every variant (this section said 62 until the 2026-10-26 audit
+re-derived it from the committed TSV; 60 is what
+`bench/results/gt2026/closed_loop.tsv` and the post-fix re-run both contain),
+median per-position G-fraction difference **0.0092 against the 0.02 bound** (it
+was 0.0218, outside). Record: `bench/results/fix2026/closed_loop.tsv`, re-run
+end to end on the desktop after the 2026-10-26 fix wave; its first 17 columns are
+byte-identical to `bench/results/gt2026/closed_loop.tsv`, so the fix wave is a
+no-change regression check on these gates, and `gt2026` stays as the provenance
+of the 2026-10-21 numbers. Per-domain comparisons passed: human gut 51/51,
 generalised 47/51, bacterial isolates 40/51, viromes 21/51, RNA-seq 21/51,
 metagenomes 3/51 — metagenomics is the domain the simulator still cannot model.
 Gate counts over the 306: G fraction 121 over tolerance, mean quality 8, GC 4,
@@ -207,6 +213,60 @@ tuned against and worse at the one the loop scores. See
 - **One gap stays open**: the *closed-loop* campaign TSVs still predate the GT
   `full_flag` change (pair-level AND, per-mate `r1_full`/`r2_full`), so their
   numbers describe the previous GT semantics until that campaign is re-run.
+
+## Fixed in the 2026-10-26 fix wave (`3c9cc28`, `1fbd0d8`)
+
+A second full-suite audit reproduced 40 defects on the release binaries; the
+fix wave closes them in one commit with a regression test each (**962 cargo
+tests**, was 852). The ones with real consequences:
+
+* **fastdedup** — `--json` naming an input overwrote that input (exit 0);
+  a one-record surplus mate was dropped silently by the serial engine while the
+  parallel one refused; a resume reported a 20 000-record file as "1 out,
+  19 999 duplicates"; `metrics.abundance` was a JSON boolean
+  (`fasthelper check --report` rejected the file); the canonical long names are
+  now `--in1/--in2/--out1/--out2` with the pre-suite spellings as aliases.
+* **fastprep** — a 3′ polyX run whose trim landed at the trim-budget boundary
+  was emitted **whole** (48-base artefact, `bases_trimmed_3 = 0`, while a
+  47-base one trimmed; non-monotone); the total-drop refusal ran after the
+  rename and destroyed an existing output under `--force`; discarded singletons
+  broke `reads_in == reads_out + reads_dropped`; FASTA input written to a `.fq`
+  path produced FASTA under a FASTQ name; `--dedup` help said "off" above
+  `[default: true]`; `threads`, `FASTSUITE_THREADS` and output-directory
+  creation were fixed suite-wide.
+* **fastcheck** — `base_composition` dropped every base past `--max-read-len`
+  (40 vs 80; `base_totals` was written and never read); `kmer_top_frac` reached
+  8.0; `--profile` emitted `gc: 0.0` when every R1 read was readthrough, and
+  labelled an all-censored insert distribution "MEASURED"; the fixed 512 MB
+  reserve refused every run under a 569 MB limit; `--insert-hist` with an absurd
+  `--max-read-len` SIGABRTed after the scan; two `-` outputs interleaved; an
+  empty input was a clean zero run. The ground-truth harness now loads the
+  14-column GT, and **`pixi run ground-truth` exists** (STATUS had been pointing
+  at it for weeks).
+* **fastsim** — `pad_n` counted every `N`, so template `N` from `--reference`
+  was netted out of the GT's `r1_n`/`r2_n` and booked as adapter padding;
+  `--gc` was inert whenever the profile carried a base plane while the report
+  published the requested value; `full_artefact_pairs` counted either mate
+  while the GT's `full_flag` is both.
+* **fastmaps** — `--json` aimed at `heatmap.data/.json/.png` replaced that
+  output; a stale `--temp-dir` was consumed as this run's index stream (phantom
+  membership, count-0 pixels); the preview channel was unbounded (190 MB on a
+  64-file run, now 16.6 MB with byte-identical outputs); a 3′ polyX tail is now
+  noted and warned; FASTA is refused per D-4.
+* **fasthelper** — `compare` folded a multi-sample side into one arbitrary
+  sample; a step exiting 0 with a corrupt `--json` was published as "unparsable"
+  and resumed forever; `--fail-on` ignored an unknown metric; `check --report`
+  skipped the base identity for float spellings; the adapter guard tripped on
+  0.03% adapter content; the aggregate is stamped `fastsuite.aggregate.v1` and
+  validates.
+
+**Re-derivation on the fixed build** (`bench/results/fix2026/`): the closed loop
+reproduces **183/306 = 59.8%**, 60/102 datasets, median G-fraction 0.0092 —
+byte-identical to `gt2026` over the scored columns, because the fixes are
+report/GT-integrity defects that do not feed these four gates. The trim table's
+shipped-default row, however, moves: **77.87% exact / 20.00% overtrim / 2.13%
+undertrim** on 17.9 M scored mates (was 75.5 / 22.5 / 2.0), which is the
+budget-boundary fix.
 
 ## Fixed in the 2026-10-21 review round (full-suite review: six crates + six papers)
 
@@ -333,7 +393,9 @@ still be re-derived before the sweep numbers are quoted again.
    `0a19d06` (+duplicate replay), `bd31d9a` (+head-G deconvolution) — the
    count is **3/51 in all four**, while the other domains gained 25–60
    points over the same span. All 48 failures are `g_frac`, at a median
-   over-tolerance error of 0.0529. Neither the dup model, nor the 3′
+   over-tolerance error of **0.0402** (mean 0.0522 — the earlier 0.0529 was a
+   mean mislabelled as a median, and it does not reproduce from either
+   `closed_loop.tsv`). Neither the dup model, nor the 3′
    boundary rule, nor the head-G deconvolution touched it: this is a
    **distinct mechanism — DIAGNOSED 2026-10-18, and it is not in the fitter.**
    All 16 failing datasets are accounted for by three consumer-side mechanisms:
@@ -448,13 +510,13 @@ New and open after the review round:
   contribute 0, while 200 entirely-G reads give `r2_polyG_frac` 0.5. A NovaSeq
   polyG signature needs a positional metric (3'-end base composition), which does
   not exist yet; the paper states the limit, the tool does not warn about it.
-* **fastsim ignores `profile.gc`** (`main.rs:221` uses `--gc`): a profile with
-  `gc=0.30` emits GC 0.4881. Measured, open.
-* **fastprep's `--adapter-error-rate` rounds the mismatch tolerance UP**
-  (`ceil(k*eps)`), so 0.2 admits 3/14 = 21.4% at the shipped overlap. Switching
-  to `floor` perturbs the pigeonhole seed-width bound and the differential test
-  catches the prefilter missing a real short-overlap adapter — it needs its own
-  test-first round, not a one-line edit. Open, deliberately.
+* ~~**fastsim ignores `profile.gc`**~~ **FIXED twice over**: the profile is the
+  authority for random DNA (2026-10-21), and a profile carrying a base plane now
+  warns that `--gc` has no effect and publishes the ACHIEVED gc instead of the
+  requested one (2026-10-26).
+* ~~**fastprep's `--adapter-error-rate` rounds the mismatch tolerance UP**~~
+  **FIXED**: `adapter.rs` rounds DOWN (`floor`), pinned by the differential
+  test that had caught the old prefilter missing a real adapter.
 * **`winners.tsv` and `fastp-comparison.tsv` disagree on the winning config for
   93 of the 101 datasets they share** (11 vs 16 distinct configs). Reconcile
   before quoting any sweep winner.
