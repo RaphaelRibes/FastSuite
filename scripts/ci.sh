@@ -357,6 +357,51 @@ cases=""
 [ -n "$short_list" ] && cases="${cases}short=[${short_list}] "
 [ -n "$long_list" ] && cases="${cases}long=[${long_list}] "
 
+# --- report-schema gate ---------------------------------------------------
+# `fasthelper check --report` is the only consumer of REPORT-SCHEMA, and until
+# now nothing ran it on the suite's own output: that is how fastdedup shipped
+# `metrics.abundance = false` (a boolean in a numeric namespace, schema rule 1)
+# while its validator rejected the file. Every tool's report must pass here.
+schema_gate() {
+    local tmp t rep rc=0
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/fs-schema.XXXXXX") || return 1
+    printf '@r1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n' > "$tmp/a.fq"
+    printf '@r2\nTTGGTTGGTTGGTTGGTTGGTTGGTTGGTTGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n' > "$tmp/b.fq"
+    local th=tools/fasthelper/target/release/fasthelper
+    for t in fastdedup fastprep fastcheck fastsim fastmaps; do
+        rep="$tmp/$t.report.json"
+        case "$t" in
+            fastdedup) tools/fastdedup/target/release/fastdedup -1 "$tmp/a.fq" -o "$tmp/d.fq" --json "$rep" -q --force >/dev/null 2>&1 ;;
+            fastprep)  tools/fastprep/target/release/fastprep -1 "$tmp/a.fq" -o "$tmp/p.fq" --json "$rep" --no-adapter -q --force >/dev/null 2>&1 ;;
+            fastcheck) tools/fastcheck/target/release/fastcheck "$tmp/a.fq" --json "$rep" -q >/dev/null 2>&1 ;;
+            fastsim)   tools/fastsim/target/release/fastsim --profile tools/fastsim/profiles/test_small.json --pairs 50 -o "$tmp/sim" --json "$rep" --force >/dev/null 2>&1 ;;
+            fastmaps)  tools/fastmaps/target/release/fastmaps -o "$tmp/maps" "$tmp/a.fq" --json "$rep" -q --force >/dev/null 2>&1 ;;
+        esac
+        if [ ! -s "$rep" ]; then
+            echo "  ! $t wrote no --json report: the schema gate cannot verify it"
+            rc=1
+            continue
+        fi
+        if ! "$th" check --report "$rep" >/dev/null 2>"$tmp/$t.err"; then
+            echo "  ! $t report failed fasthelper check --report:"
+            sed 's/^/      /' "$tmp/$t.err"
+            rc=1
+        else
+            echo "  $t report: schema ok"
+        fi
+    done
+    rm -rf "$tmp"
+    return "$rc"
+}
+
+echo
+echo "==> report-schema gate (fasthelper check --report on each tool's own output)"
+if ! schema_gate; then
+    n_bad=$((n_bad + 1))
+    problems="${problems}  ! a tool's --json report does not satisfy REPORT-SCHEMA (see the gate output above)
+"
+fi
+
 if [ "$n_bad" -eq 0 ]; then
     printf 'ci: OK — %d/%d entries match (GRAND %s), 0 failing tests, rustc %s, manifest %s\n' \
         "${#exp_order[@]}" "${#exp_order[@]}" "${exp[GRAND]}" "$rustc_ver" "$COUNTS"

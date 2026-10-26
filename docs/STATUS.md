@@ -16,22 +16,21 @@ production-ready** (see the README banner).
 
 | tool | version | tests | state | next plan |
 |---|---|---|---|---|
-| fastdedup | 1.3.0 | 135 | shipped (published: bioRxiv 2026.04.29.721745) — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
+| fastdedup | 1.3.0 | 151 | paper published (bioRxiv 2026.04.29.721745); **1.3.0 is repo-only** — crates.io and bioconda still serve 1.2.2 — **D-4 stdin/stdout streaming landed**: `-` for `-1/-2/-o/-p` with `--out-format`/`--out-compression`, and the documented refusal cases (two inputs as `-`, `--json -` with `-o -`, …) | — |
 | fastprep | 0.5.0 | 306 | working — `--force`/`--dry-run`/`-q`, `fastsuite.report.v1` with the raw stats under `legacy`, `--pe-correct`, and **`--auto-params` is real**: a decision-list model (trained on Phase D's 101 libraries, embedded in the binary, `docs/MODEL-CARD-auto-params.md`) recommends the config from a `fastcheck` report; CV regret 0.0331 vs the default's 0.0721, delta +0.0389, top-5 0.533 vs 0.020, with one of five folds losing. **Defaults re-priced 2026-10-23 (D-18):** `--min-len 0.67L` (100 bp of a 150 bp read; the floor is also the trim budget) and a mercy clause that no longer charges a run's own bases, so a low-quality 4-colour polyG tail is trimmed whole instead of 37 bases deep. `--head-dropout` is **4** (D-16's 7:1 price; earlier revisions of this row said 0). The report now closes at base level (`bases_out`/`bases_dropped`), and six exit-0 data-loss paths are closed (`--adapter-scored-retry`, `--json`/{`-o`} collisions, `.bz2`/`.xz` outputs, a swallowed final flush, the `--pe-correct` hang) | `bench/scripts/train_auto_params.py` on a 500-dataset corpus, then the held-out fastp comparison (E5's third criterion) |
 | fastsim | 0.1.0 | 93 | working — measured insert CDF, SE mode, **clap-migrated**, **profile-driven ambiguous-base (N) emission** (`n_run`: read rate, run-length histogram, edge shares; recorded in the GT as `r1_n`/`r2_n`), and **all four (plane × artefact) pairs deconvolved on the consumer side** (`7631292`, the g_frac fix order's step 1(b)) — DRR083326's R1 terminal moved 0.5292 → 0.4140 against a real 0.4245. The insert ceiling (`2L − 12 = 288 bp`) is now stated in `--help` too | — |
 | fastmaps | 0.1.0 | 96 | **CLI-converged** — `--json` + v1 wrapper, `-j`, `--force`, `-q`, `FASTSUITE_THREADS`; `--corners` and `--preview-reads`; **previews streamed instead of held resident** (`90573ea`: defaults 202.6 → 141.2 MB, `--buffer-mb 8` 100.5 → 36.1 MB, outputs verified byte-identical) | — |
 | fastcheck | 0.1.0 | 143 | working — `--max-mem` + admission, insert measurement fixed (Task 10), **profile fitter fixed** (`430117a`: `BASE_POSITIONS` 60 → 512), **polyG head/tail and the per-position quality curve now MEASURED, not estimated** (see Known defects 2–3), **per-tile quality modules** (`--tiles`, opt-in, `93ed54a`), harness green | `plans/2026-10-12_fastcheck-exactness.md` — **tasks 5–14 all landed**; the ground-truth recovery claim is a gate now, not a session: `pixi run ground-truth` |
 | fasthelper | 0.1.0 | 78 | working — fastcheck step, `check -c`, `--fail-on`, **post-trim residual-adapter guard**: a `run` step measures fastcheck's adapter content on the reads entering and leaving a trimming step and warns — or exits 2 under `--fail-on-adapter-residual` — when adapter survived (`tools/fasthelper/src/adapter_guard.rs`) | `plans/2026-10-12_fasthelper-hardening.md` — **every item is landed** (`run`, `compare`, `check -c`, `doctor`, `schema`, `--fail-on`, `-P/--jobs`, `install --prefix`, and `--from`/resume, which `runner.rs` implements via the per-step `ResumeEntry` re-run rule) |
 
-**852 cargo tests, 0 failures** (143/135/306/93/96/78 + the pathology aggregate
+**962 cargo tests, 0 failures** (162/151/315/103/135/95 + the pathology aggregate
 line), plus the **pathology corpus: 9 assertions passed, 0 failed**.
 `scripts/expected-test-counts.txt` is the manifest and `pixi run ci` asserts
 every per-tool count against it and refuses a rustc outside the pinned
 `>=1.99,<2`; **run it after any change** (the laptop's ambient cargo is 1.95
 while the desktop's is 1.99, and an unasserted total is what let a stale test
-binary report 463 against 471 unnoticed). fastprep's 306 was measured on the
-2026-10-23 0.5.0 build (`pixi run cargo test`, 213 lib + 75 integration); the other
-rows are the 2026-10-19 counts. `pixi run doctor` lists all six binaries; `bash
+binary report 463 against 471 unnoticed). all six counts are the 2026-10-26 post-fix build (`pixi run ci`, manifest
+`scripts/expected-test-counts.txt`); the previous rows were 143/135/306/93/96/78. `pixi run doctor` lists all six binaries; `bash
 examples/demo.sh 20000` runs the whole chain end to end (report on disk at
 `examples/runs/demo/report.html`, mtime 2026-10-15 21:40).
 

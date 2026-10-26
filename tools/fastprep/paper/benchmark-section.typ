@@ -216,8 +216,10 @@ ceiling. `fastprep-hd4`, the configuration that shipped during the sweep, is
 worst on the axis that matters most: 20.9% of mates over-trimmed, because a
 leading G-run of length 1 to 4 is trimmed unconditionally with no test of
 artefact against biology. On a library where a quarter of reads begin with a
-genuine G, that rule removes real sequence; the 20.9 points are what the
-`--head-dropout 0` default avoids. `fastp-tuned` shows the mirror image of
+genuine G, that rule removes real sequence; the 20.9 points are what
+`--head-dropout 0` avoids. It is not the shipped default: the 0.5.0 release
+ships 4 again, because an artefact left in the output costs 7x a base trimmed
+(D-16), which puts the break-even at 2.6. `fastp-tuned` shows the mirror image of
 the same mistake: its aggressive `--cut_front`/`--cut_tail` raise over-trim from
 0.7 to 9.3 points while lowering exactness by 8 points, and unlike boundary
 jitter the

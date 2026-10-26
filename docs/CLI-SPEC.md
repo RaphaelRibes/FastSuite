@@ -183,11 +183,11 @@ Ordered by user-visible value:
 4. `--threads 0 = all cores` in **fastprep** — fastprep documents `>= 1` and
    refuses 0; `fasthelper` resolves the sentinel for it.
 5. ~~`--quiet` in **fastprep**/**fastmaps**.~~ **Done** (fastmaps gained `-q`).
-6. `FASTSUITE_THREADS` honoured as a default by all four binaries. **fastsim
-   done 2026-10-12** (read when `-j` is absent; the value is reported-and-ignored
-   because the simulator is single-threaded); **fastmaps done** (read when `-j`
-   is 0 or absent, clamped by the file count; `-j 0` is all cores); fastprep and
-   fastdedup to do.
+6. ~~`FASTSUITE_THREADS` honoured as a default by all four binaries.~~
+   **Done 2026-10-26** for all six: the env var applies only when no thread flag
+   is present (in any spelling: `-j4`, `-j 4`, `--threads=4`), and an explicit
+   flag always wins. Every report now carries the **resolved** count as
+   `metrics.threads` (`-j 0` and `--abundance -j N` do not report the request).
 7. `-`/stdin-stdout support (streaming mode) — **fastdedup done** (2026-10-12:
    `-` on `-1/-2/-o/-p`, plus `--out-format`/`--out-compression`); fastprep and
    fastmaps remain, needed to compete with `fastp`'s pipe usage.

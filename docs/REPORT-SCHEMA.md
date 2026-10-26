@@ -42,7 +42,8 @@ fasthelper schema
    ambiguous across tools (`r2_polyG_frac`, not `fastmaps_r2_polyG_frac`).
 3. Recommended shared keys — tools emit whatever they can compute, none are
    mandatory: `reads_in`, `reads_out`, `reads_dropped`, `bases_in`, `bases_out`,
-   `bases_dropped`, `bases_trimmed`. `elapsed_s` is top-level, not a metric.
+   `bases_dropped`, `bases_trimmed`, and `threads` (the **resolved** worker
+   count: `-j 0` and `--abundance` do not report the requested number). `elapsed_s` is top-level, not a metric.
    `fastprep` emits all of these except the drop-cause split's siblings, and
    satisfies `bases_in == bases_out + bases_trimmed + bases_dropped` (a
    dropped read can still have been trimmed first). Its `reads_out` counts
@@ -159,13 +160,35 @@ base/quality census; `fastprep` populates it for the Phred offset (and records
 as notes on the report row, so a published table cannot silently drop the
 caveat.
 
+## Keys added in the 2026-10-26 fix wave
+
+All additive, so the schema stays `v1`.
+
+| tool | key | meaning |
+|---|---|---|
+| fastsim | `full_artefact_pairs` | pairs where **both** mates are entirely artefact — the count the GT's `full_flag` carries. It used to be the either-mate count, which no GT row could reconcile |
+| fastsim | `full_artefact_pairs_either` | the historical "at least one mate full" count, published under its own name |
+| fastsim | `adapter_pad_bases` | `N`s the no-adapter length filler emitted. A template `N` from `--reference` is **not** padding: it is counted in the GT's `r1_n`/`r2_n` and in `ambiguous_bases` |
+| fastprep | `discarded_singletons_r1`, `discarded_singletons_r2` | records whose mate survived but had no `--singletons*` path: they are dropped records and count in `reads_dropped` (the record identity `reads_in == reads_out + reads_dropped` holds) |
+| fastmaps | `preview_reads_per_pixel_per_kind`, `max_previews_per_pixel` | the preview quota's real granularity is per (pixel, kind), not per pixel; the second key is the measured maximum in this run's file |
+| fastcheck | `threads` | resolved worker count (see rule 3) |
+
 ## Aggregate report (fasthelper output)
+
+The aggregate is **not** a per-tool `fastsuite.report.v1` document: it has no
+`tool`/`command`/`metrics` of its own. It used to carry the per-tool schema tag
+anyway, which made `fasthelper check --report report.json` fail on the suite's
+own output; it is now stamped `fastsuite.aggregate.v1`, and `check --report`
+validates that shape (generator, generator_version, title, an optional numeric
+`threads`, and every report row with sample + tool + a numeric metrics map).
+`threads` is the highest resolved count any step reported, omitted when no step
+reports one.
 
 `fasthelper concatenate` (alias `report`) / `fasthelper run` write:
 
 | file | content |
 |---|---|
-| `report.json` | `{schema, generator, title, reports:[{sample, tool, tool_version, source, metrics, notes}]}` |
+| `report.json` | `{schema: "fastsuite.aggregate.v1", generator, generator_version, title, threads?, reports:[{sample, tool, tool_version, source, metrics, notes}]}` |
 | `report.tsv` | wide matrix: one row per `(sample, tool)`, one column per metric, empty cell = not applicable |
 | `report.md` | one table per tool |
 | `report.html` | self-contained page (no scripts, no external assets), inline bars on rate metrics |

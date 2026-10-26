@@ -136,7 +136,7 @@ FastSuite/
 for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper
     cd tools/$t; and cargo test --offline; and cd ../..
 end
-# 852 tests, 0 failures (as of the 2026-10-23 status; scripts/ci.sh asserts
+# 962 tests, 0 failures (as of the 2026-10-26 fix wave; scripts/ci.sh asserts
 # every per-tool count against scripts/expected-test-counts.txt)
 ```
 

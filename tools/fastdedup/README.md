@@ -41,6 +41,12 @@ You can install FastDedup directly from Cargo:
 cargo install fastdedup
 ```
 
+> **Version note (2026-10-26):** the published channels — crates.io
+> (`fastdedup` 1.2.2) and bioconda (`fdedup` 1.2.2) — are one release behind
+> this checkout, which is 1.3.0. `cargo install fastdedup` and
+> `pixi add bioconda::fdedup` therefore give you **1.2.2**; the 1.3.0 sources
+> here build with `cargo build --release`. The next release publishes 1.3.0.
+
 ## CLI Usage
 
 ```bash
