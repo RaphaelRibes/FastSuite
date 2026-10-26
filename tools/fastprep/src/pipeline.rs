@@ -1077,9 +1077,18 @@ pub fn run_paired(
         fill_chunk(&mut *r2, &mut buf2, &mut chunk2, rt.chunk, phred_offset)?;
         if let Some(first) = chunk1.first() {
             check_output_format(out1, first.format)?;
+            // The singleton streams are outputs too: a FASTA input written into
+            // a `.fq` singleton path is the same footgun (a FASTA file with a
+            // FASTQ name, exit 0) that `-o`/`-p` refuse.
+            if let Some(s) = singletons1 {
+                check_output_format(s, first.format)?;
+            }
         }
         if let Some(first) = chunk2.first() {
             check_output_format(out2, first.format)?;
+            if let Some(s) = singletons2 {
+                check_output_format(s, first.format)?;
+            }
         }
         let (n1, n2) = (chunk1.len(), chunk2.len());
         if n1 != n2 && !(n1 == 0 && n2 == 0) {

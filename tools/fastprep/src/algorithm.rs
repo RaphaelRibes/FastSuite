@@ -553,6 +553,43 @@ pub fn scan(
     }
 }
 
+/// Extent of the homopolymer run anchored at a scan's start, ignoring its
+/// budget cap.
+///
+/// Only meaningful after a budget stop in which EVERY capped step matched
+/// (`ScanResult::matches == budget`): the walk then stopped inside the run, and
+/// `matches + 1` is the cap's reach rather than the run's length. Walks the
+/// read one predicate step at a time, exactly as [`scan`] would have with no
+/// cap, so the result is the extent `run_span` would have reported.
+fn observed_run_extent(
+    bases: &[u8],
+    quals: &[u8],
+    start: usize,
+    upper: usize,
+    direction: Direction,
+    params: &Params,
+) -> usize {
+    let n = bases.len();
+    let mut extent = 1usize; // the anchor base
+    while start + extent <= upper {
+        let i1 = idx(start + extent - 1, n, direction);
+        let i2 = idx(start + extent, n, direction);
+        let (_, is_match) = per_step_gap_and_match(
+            bases[i1],
+            bases[i2],
+            quals[i1],
+            quals[i2],
+            params,
+            &params.rule,
+        );
+        if !is_match {
+            break;
+        }
+        extent += 1;
+    }
+    extent
+}
+
 // ---------------------------------------------------------------------------
 // Main pipeline (@alg:main).
 // ---------------------------------------------------------------------------
@@ -1446,10 +1483,24 @@ fn polyx_trim_inner(
         let res = scan(
             sub_bases, sub_quals, 0, upper, second_dir, params, budget_opt,
         );
-        if res.mode == StopMode::Budget
-            && res.matches >= budget
-            && res.matches + 1 >= params.min_run
-        {
+        // A budget stop in which every capped step matched stopped INSIDE the
+        // run: `matches + 1` is then the cap's reach (`budget + 1` bases), not
+        // the run's length, so the qualifying test is unsatisfiable whenever
+        // the remaining budget is below `min_run - 1` and a real artefact
+        // resolves to "no run". Reproduced at the shipped defaults (151 bp,
+        // Δ_L = 50) as 5′40 + 3′60: the 5′ cut left the reverse walk 10 steps
+        // for a 60-base 3′ tail, the walk stopped at 10 matches, `11 >= 12` was
+        // false, and the read was emitted with `t3 = 0`. Measure the run past
+        // the cap; `None` means any other stop, where `matches + 1` is the run.
+        let capped_run = if res.mode == StopMode::Budget && res.matches >= budget {
+            Some(observed_run_extent(
+                sub_bases, sub_quals, 0, upper, second_dir, params,
+            ))
+        } else {
+            None
+        };
+        let run_len = capped_run.unwrap_or(res.matches + 1);
+        if capped_run.is_some() && run_len >= params.min_run {
             let reason = match dir {
                 Direction::Forward => DropReason::Poly3,
                 Direction::Reverse => DropReason::Poly5,
@@ -1486,7 +1537,10 @@ fn polyx_trim_inner(
         // artefact length. The cut is the run extent, never `k_star` (which at
         // a budget stop includes the flanking walk).
         if res.mode == StopMode::Budget {
-            if res.matches + 1 >= params.min_run {
+            if run_len >= params.min_run {
+                // Only the ended-before-the-cap case arrives here (a capped
+                // run that qualifies was dropped above): its extent is the
+                // capped `run_span`.
                 res.run_span
             } else {
                 0

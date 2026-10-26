@@ -87,6 +87,94 @@ fn a_tail_below_min_run_is_still_kept() {
     }
 }
 
+/// 151 bp read: a `five`-base polyA 5′ run, a GTAC body, a `three`-base polyA
+/// 3′ tail. The body's first base is C, so the 5′ run is exactly `five`; its
+/// last base is A, so the 3′ artefact is `three + 1` bases long — that is what
+/// makes the reviewed 48-base control trim 49.
+fn read_151(five: usize, three: usize) -> (Vec<u8>, Vec<u8>) {
+    let l = 151usize;
+    let body_len = l - five - three;
+    let pat = b"GTAC";
+    let mut seq: Vec<u8> = Vec::with_capacity(l);
+    seq.resize(five, b'A');
+    for i in 0..body_len {
+        seq.push(pat[i % 4]);
+    }
+    seq[five] = b'C';
+    seq[five + body_len - 1] = b'A';
+    seq.resize(l, b'A');
+    assert_eq!(seq.len(), l);
+    (seq, vec![40u8; l])
+}
+
+/// `Some((emitted, t5, t3))` for an emitted read, `None` when it dropped.
+fn outcome(p: &Params, five: usize, three: usize) -> Option<(usize, usize, usize)> {
+    let (seq, q) = read_151(five, three);
+    match polyx_trim(&seq, &q, p) {
+        TrimResult::Emit {
+            t5_poly, t3_poly, ..
+        } => Some((seq.len() - t5_poly - t3_poly, t5_poly, t3_poly)),
+        TrimResult::Drop { .. } => None,
+    }
+}
+
+/// The four rows reproduced on the CLI at the shipped defaults (151 bp,
+/// Δ_L = 50), which the library must reproduce because `shipped()` is exactly
+/// that configuration:
+///
+/// | read            | emitted | t5 | t3   |
+/// |-----------------|---------|----|------|
+/// | 5′40 only       | 111     | 40 | 0    |
+/// | 3′60 only       | drop    |    |      |
+/// | 5′40 + 3′60     | 111     | 40 | **0**|  ← the defect: 60 bp kept whole
+/// | 3′48 (control)  | 102     | 0  | 49   |
+///
+/// The 5′ cut spends 40 of the 50-base budget, leaving the reverse walk 10
+/// steps for a 60-base tail. It stops on `StopMode::Budget` after 10 matches,
+/// and the old qualifying test (`matches + 1 >= min_run`) is unsatisfiable
+/// below `min_run - 1` reach, so the real run resolved to "no run".
+#[test]
+fn a_three_prime_artefact_is_not_kept_when_the_five_prime_one_spent_the_budget() {
+    let p = shipped();
+    assert_eq!(outcome(&p, 40, 0), Some((111, 40, 0)), "5′40 only");
+    assert_eq!(outcome(&p, 0, 60), None, "3′60 only must drop");
+    assert_eq!(
+        outcome(&p, 40, 60),
+        None,
+        "5′40 + 3′60: the 60-base tail must not be emitted whole"
+    );
+    assert_eq!(outcome(&p, 0, 48), Some((102, 0, 49)), "3′48 control");
+
+    // The chosen outcome for the two-artefact row is the single-sided 3′60
+    // row's fate: a real tail the remaining budget cannot cover drops the read
+    // as Poly3, never emits it with the tail intact.
+    let (seq, q) = read_151(40, 60);
+    match polyx_trim(&seq, &q, &p) {
+        TrimResult::Drop { reason, .. } => assert_eq!(reason, DropReason::Poly3),
+        TrimResult::Emit { t3_poly, .. } => {
+            panic!("emitted with t3 = {t3_poly}; the tail was kept whole")
+        }
+    }
+}
+
+/// The reverse pass owns the 5′ end under `--r1-scan-reverse`. Same defect,
+/// other physical end: the streaming pass spends 41 of the 50-base budget on
+/// the 3′ run, leaving the reverse pass 9 steps for a 60-base 5′ run.
+#[test]
+fn the_reverse_pass_cuts_a_five_prime_run_the_same_way() {
+    let mut p = shipped();
+    p.direction = Direction::Reverse;
+    let (seq, q) = read_151(60, 40);
+    match polyx_trim(&seq, &q, &p) {
+        // Poly5 is the reverse pass reporting a run it could not cover; before
+        // the fix this emitted the 151 bp read with t5 = 0.
+        TrimResult::Drop { reason, .. } => assert_eq!(reason, DropReason::Poly5),
+        TrimResult::Emit { t5_poly, .. } => {
+            panic!("5′ tail emitted with t5 = {t5_poly}")
+        }
+    }
+}
+
 #[test]
 fn a_tail_longer_than_the_budget_still_drops() {
     let p = shipped();

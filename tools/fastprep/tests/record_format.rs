@@ -111,3 +111,67 @@ fn fastq_input_refuses_a_fasta_named_output() {
     assert!(!out.exists(), "nothing may be committed on the refusal");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// The singleton streams are outputs too: a FASTA input written into a `.fq`
+/// singleton path is the same footgun `check_output_format` closed for `-o`/`-p`
+/// (a FASTA file with a FASTQ name, exit 0), and it skipped the check.
+///
+/// The mate that survives is the one the other's `--min-len` floor rejects, so
+/// each direction writes a singleton: R1 in the first run, R2 in the second.
+#[test]
+fn singletons_refuse_a_format_contradicting_their_extension() {
+    let d = dir("singleton-fmt");
+    let long = d.join("long.fa");
+    let short = d.join("short.fa");
+    write(&long, &format!(">long\n{}\n", "GTAC".repeat(38)));
+    write(&short, &format!(">short\n{}\n", "GTAC".repeat(15)));
+
+    // (in1, in2, singleton flag, singleton path, tag)
+    let cases = [
+        (&long, &short, "--singletons1", d.join("s1.fq"), "s1"),
+        (&short, &long, "--singletons2", d.join("s2.fq"), "s2"),
+    ];
+    for (in1, in2, flag, singleton, tag) in cases {
+        let out1 = d.join(format!("o1-{tag}.fa"));
+        let out2 = d.join(format!("o2-{tag}.fa"));
+        let o = run(&[
+            "-1",
+            in1.to_str().unwrap(),
+            "-2",
+            in2.to_str().unwrap(),
+            "-o",
+            out1.to_str().unwrap(),
+            "-p",
+            out2.to_str().unwrap(),
+            flag,
+            singleton.to_str().unwrap(),
+            "--no-adapter",
+            "--no-mean-q",
+            "--min-len",
+            "100",
+            "-q",
+        ]);
+        assert!(
+            !o.status.success(),
+            "{flag}: a FASTA input named .fq must be refused, not silently written"
+        );
+        let msg = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            msg.contains("FASTA") && msg.contains("FASTQ"),
+            "{flag}: the refusal must name both formats, got: {msg}"
+        );
+        assert!(
+            msg.contains(singleton.file_name().unwrap().to_str().unwrap()),
+            "{flag}: the refusal must name the singleton path, got: {msg}"
+        );
+        assert!(
+            !singleton.exists(),
+            "{flag}: nothing may be committed on the refusal"
+        );
+        assert!(
+            !out1.exists() && !out2.exists(),
+            "{flag}: nor the main outputs"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
