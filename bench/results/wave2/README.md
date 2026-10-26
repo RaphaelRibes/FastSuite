@@ -31,7 +31,7 @@ cd /mnt/Fast/fastsuite-scratch
 WORKROOT=/mnt/Fast/fastsuite-scratch/work-wave2 \
 RESULTS=/mnt/Fast/fastsuite-scratch/results-wave2 \
 BIN=/home/raphael/FastSuite/tools JOBS=8 THREADS=2 SIM_PAIRS=100000 \
-  bash rerun_closed_loop_gt2026.sh          # 306 sim reports, 13:37:17 -> 13:42:20
+  bash bench/scripts/rerun-closed-loop.sh   # 306 sim reports, 13:37:17 -> 13:42:20
 
 # stage 2: trim accuracy against the same GT, shipped default
 /usr/bin/python3 /home/raphael/FastSuite/bench/scripts/trim_score.py \
@@ -142,11 +142,13 @@ row's denominator (scored for the three buckets, all 20,400,000 mates for droppe
 
 ## Note on the driver's summary line
 
-The driver prints `closed_loop: 0/306 comparisons pass (0.0%)` and
-`0/102 datasets pass all arms`. Those lines are wrong: the inline Python compares
-`verdict == "pass"` (lowercase) while `closed_loop.py` writes `PASS`. The TSV is
-correct; every count here is computed from `closed_loop.tsv`. The bug is still
-present in `rerun_closed_loop_gt2026.sh` (same as the `fix2026` wave) and should
-be fixed there, not worked around in prose.
+The driver used to print `closed_loop: 0/306 comparisons pass (0.0%)` and
+`0/102 datasets pass all arms` for a run with 183: its inline Python compared
+`verdict == "pass"` (lowercase) while `closed_loop.py` writes `PASS`. The TSV was
+always right — every count here is computed from `closed_loop.tsv`. The
+comparison is fixed in the committed driver
+(`bench/scripts/rerun-closed-loop.sh`, previously a desktop-only file named
+`rerun_closed_loop_gt2026.sh`), so the next campaign's log line agrees with its
+own table.
 
 Raw counts live in `summary.json` next to this file.
