@@ -1,0 +1,30 @@
+=== binaries
+/mnt/Fast/cost-bench/base/tools/fastdedup/target/release/fastdedup     ok
+/home/raphael/FastSuite/tools/fastdedup/target/release/fastdedup       ok
+/mnt/Fast/cost-bench/base/tools/fastprep/target/release/fastprep       ok
+/home/raphael/FastSuite/tools/fastprep/target/release/fastprep         ok
+corpus: 584M, 2400000 reads
+=== fastdedup (5 reps each)
+  j=1 done
+  j=4 done
+  j=8 done
+  j=16 done
+=== fastprep (5 reps each, shipped defaults)
+=== reduction
+  fastdedup base j= 1 n=5 median 1086.019s  min 989.573s  max 1107.022s
+  fastdedup base j=16 n=5 median 10676.342s  min 10503.037s  max 10702.089s
+  fastdedup base j= 4 n=5 median 2062.091s  min 2008.618s  max 2153.566s
+  fastdedup base j= 8 n=5 median 4419.975s  min 4278.433s  max 5009.716s
+  fastdedup head j= 1 n=5 median 1069.901s  min 1067.964s  max 1111.694s
+  fastdedup head j=16 n=5 median 11108.191s  min 11050.157s  max 11207.523s
+  fastdedup head j= 4 n=5 median 2443.186s  min 2399.461s  max 2458.565s
+  fastdedup head j= 8 n=5 median 2547.656s  min 2475.454s  max 2586.701s
+  fastprep  base j= 8 n=5 median 1594.455s  min 1563.287s  max 1608.386s
+  fastprep  head j= 8 n=5 median 1610.030s  min 1599.268s  max 1642.577s
+
+DELTA fastdedup j= 1: base 1086.019s  head 1069.901s   -1.48%
+DELTA fastdedup j= 4: base 2062.091s  head 2443.186s  +18.48%
+DELTA fastdedup j= 8: base 4419.975s  head 2547.656s  -42.36%
+DELTA fastdedup j=16: base 10676.342s  head 11108.191s   +4.04%
+DELTA fastprep  j= 8: base 1594.455s  head 1610.030s   +0.98%
+=== done 2026-10-26T14:11:00+01:00

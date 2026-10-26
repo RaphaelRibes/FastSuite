@@ -1,0 +1,44 @@
+=== interleaved base/head, 3 reps (elapsed from the tool's own summary)
+  corpus6 j=1 done
+  corpus6 j=2 done
+  corpus6 j=4 done
+  corpus6 j=8 done
+  corpus6 j=16 done
+  corpus24 j=1 done
+  corpus24 j=2 done
+  corpus24 j=4 done
+  corpus24 j=8 done
+  corpus24 j=16 done
+=== raw summary lines (head, rep 1)
+  6	1	fastdedup: 1200000 reads in, 1191972 out, 8028 duplicates (0.67%), 1 threads, 229.73ms
+  6	2	fastdedup: 1200000 reads in, 1191972 out, 8028 duplicates (0.67%), 2 threads, 573.40ms
+  6	4	fastdedup: 1200000 reads in, 1191972 out, 8028 duplicates (0.67%), 4 threads, 577.01ms
+  6	8	fastdedup: 1200000 reads in, 1191972 out, 8028 duplicates (0.67%), 8 threads, 658.03ms
+  6	16	fastdedup: 1200000 reads in, 1191972 out, 8028 duplicates (0.67%), 16 threads, 2.78s
+  24	1	fastdedup: 4800000 reads in, 4784296 out, 15704 duplicates (0.33%), 1 threads, 1.01s
+  24	2	fastdedup: 4800000 reads in, 4784296 out, 15704 duplicates (0.33%), 2 threads, 2.58s
+  24	4	fastdedup: 4800000 reads in, 4784296 out, 15704 duplicates (0.33%), 4 threads, 2.35s
+  24	8	fastdedup: 4800000 reads in, 4784296 out, 15704 duplicates (0.33%), 8 threads, 2.50s
+  24	16	fastdedup: 4800000 reads in, 4784296 out, 15704 duplicates (0.33%), 16 threads, 11.16s
+=== reduction
+
+--- corpus 6 (150 MB R1)
+  j   base med  base min   head med  head min   delta(head-base)
+  1     0.244s    0.237s      0.255s    0.230s     +4.6%
+  2     0.538s    0.532s      0.579s    0.573s     +7.5%
+  4     0.487s    0.483s      0.577s    0.575s    +18.4%
+  8     0.929s    0.916s      0.643s    0.617s    -30.8%
+ 16     2.770s    2.730s      2.740s    2.700s     -1.1%
+  speedup vs j=1 [base]: j1:1.00x  j2:0.45x  j4:0.50x  j8:0.26x  j16:0.09x
+  speedup vs j=1 [head]: j1:1.00x  j2:0.44x  j4:0.44x  j8:0.40x  j16:0.09x
+
+--- corpus 24 (584 MB R1)
+  j   base med  base min   head med  head min   delta(head-base)
+  1     1.030s    1.030s      1.050s    1.010s     +1.9%
+  2     2.370s    2.360s      2.580s    2.490s     +8.9%
+  4     2.000s    2.000s      2.360s    2.350s    +18.0%
+  8     4.490s    4.390s      2.500s    2.490s    -44.3%
+ 16    10.980s   10.880s     11.150s   11.070s     +1.5%
+  speedup vs j=1 [base]: j1:1.00x  j2:0.43x  j4:0.52x  j8:0.23x  j16:0.09x
+  speedup vs j=1 [head]: j1:1.00x  j2:0.41x  j4:0.44x  j8:0.42x  j16:0.09x
+=== done 2026-10-26T14:36:44+01:00

@@ -1,0 +1,23 @@
+one: 21M, 100000 reads
+=== interleaved, 3 reps
+  j=1 done
+  j=2 done
+  j=4 done
+  j=8 done
+  j=16 done
+=== summary lines (head rep1)
+  1	fastdedup: 200000 reads in, 199980 out, 20 duplicates (0.01%), 1 threads, 42.15ms
+  2	fastdedup: 200000 reads in, 199980 out, 20 duplicates (0.01%), 2 threads, 96.68ms
+  4	fastdedup: 200000 reads in, 199980 out, 20 duplicates (0.01%), 4 threads, 108.79ms
+  8	fastdedup: 200000 reads in, 199980 out, 20 duplicates (0.01%), 8 threads, 126.95ms
+  16	fastdedup: 200000 reads in, 199980 out, 20 duplicates (0.01%), 16 threads, 306.91ms
+=== reduction
+  j   base med  base min   head med  head min   delta
+  1     0.041s    0.041s      0.040s    0.038s     -2.2%
+  2     0.090s    0.089s      0.097s    0.097s     +7.7%
+  4     0.100s    0.099s      0.108s    0.108s     +8.4%
+  8     0.154s    0.137s      0.127s    0.123s    -17.6%
+ 16     0.315s    0.313s      0.323s    0.307s     +2.6%
+  speedup vs j=1 [base]: j1:1.00x  j2:0.45x  j4:0.41x  j8:0.26x  j16:0.13x
+  speedup vs j=1 [head]: j1:1.00x  j2:0.41x  j4:0.37x  j8:0.31x  j16:0.12x
+=== done 2026-10-26T14:40:08+01:00

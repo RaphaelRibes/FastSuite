@@ -418,6 +418,20 @@ still be re-derived before the sweep numbers are quoted again.
 
 ## Known defects (measured, not guessed)
 
+0. **fastdedup gets SLOWER with more threads, on every corpus tried.**
+   Measured 2026-10-26 while timing the fix wave (`bench/results/wave2/thread-scaling.md`,
+   `bench/scripts/thread-scaling.sh`): speedup against `-j 1` is 1.00× (1),
+   0.41–0.53× (2), 0.37–0.55× (4), 0.31–0.57× (8) and **0.09–0.12× (16)** — 11 s
+   where `-j 1` takes 1.03 s on 4.8 M reads. It reproduces on a single unmodified
+   unit (200 k reads, 0.01 % duplicates), on uncompressed and on gz input, and on
+   the **published 1.3.0 binary** as well as HEAD, so it is neither the fix wave
+   nor the corpus. It is a concurrency-design defect in the dedup engine, not a
+   fix-pass edit: it needs the verifier sharded (or the decision stage moved off
+   the shared path) and its own before/after campaign. Until then the honest
+   advice is `-j 1` for dedup, which contradicts §5.4 of the paper ("one worker
+   thread per physical core") — that paragraph is now known to describe the
+   engine's intent rather than its measured behaviour.
+
 1. **metagenomics closed-loop pass rate is 5.9% and has not moved across any
    of the four fixes.** Re-read at each commit in the
    chain — `efaf834` (first full-corpus run), `c3ad7a0` (+dup_rate),
