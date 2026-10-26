@@ -1,3 +1,13 @@
+# PLACEHOLDER RECIPE — not submittable as it stands (2026-10-26).
+#
+# The version below (0.5.0) does not match the source URL (fastprep-v0.2.0) and
+# every checksum is `FILL_ME`: no tag exists (`git tag --list` is empty), so
+# there is no tarball to hash. Regenerate this file at release time:
+#   git tag fastprep-v<version> && git push --tags
+#   curl -L https://github.com/RaphaelRibes/FastSuite/archive/refs/tags/fastprep-v<version>.tar.gz \
+#     | sha256sum
+# then set `version`, the URL and both sha256 values from that run (one per
+# platform), and re-run `conda build` before opening the bioconda PR.
 {% set name = "fastprep" %}
 {% set version = "0.5.0" %}
 
