@@ -1,5 +1,6 @@
 //! fastsim's CLI flag contract, in one file: the FastSuite common flags
-//! (`--force`, `-q/--quiet`), the `FASTSUITE_THREADS` env default, and the
+//! (`--force` and the outputs it guards, `-q/--quiet`), the flags a measured
+//! profile makes inert, the `FASTSUITE_THREADS` env default, and the
 //! clap-generated help/version surface. The parse-error and smoke-level
 //! cases live in `cli_test.rs`.
 
@@ -60,6 +61,64 @@ fn force_refuses_to_clobber_without_the_flag() {
     assert!(Command::new(bin()).args(a).output().unwrap().status.success());
     let again = Command::new(bin()).args(a).arg("-f").output().unwrap();
     assert!(again.status.success(), "-f must overwrite");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn json_report_is_guarded_by_force_like_every_other_output() {
+    // --json is an output the run creates, so the clobber guard must probe it
+    // too: it used to check only the FASTQ/GT suffixes and replaced an existing
+    // report with no --force and exit 0.
+    let dir = std::env::temp_dir().join(format!("fastsim_force_json_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = write_test_profile(&dir);
+    let out = dir.join("j");
+    let report = dir.join("j-report.json");
+    std::fs::write(&report, "SENTINEL\n").unwrap();
+    let args = [
+        "--pairs",
+        "50",
+        "--profile",
+        profile.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--json",
+        report.to_str().unwrap(),
+        "--no-gzip",
+    ];
+
+    let refused = Command::new(bin()).args(args).output().unwrap();
+    assert!(
+        !refused.status.success(),
+        "an existing --json report was clobbered without --force"
+    );
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("--force"), "stderr must name --force: {err}");
+    assert!(
+        err.contains(&report.display().to_string()),
+        "the refusal must name the report it protects: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&report).unwrap(),
+        "SENTINEL\n",
+        "the sentinel report must be untouched"
+    );
+    assert!(
+        !dir.join("j.gt.tsv").exists(),
+        "the guard must fire before any output is written"
+    );
+
+    let forced = Command::new(bin()).args(args).arg("--force").output().unwrap();
+    assert!(
+        forced.status.success(),
+        "--force must overwrite the report: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(written["tool"], "fastsim", "the report was replaced");
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -391,6 +450,29 @@ fn insert_cdf_profile(dir: &Path, name: &str) -> std::path::PathBuf {
     p
 }
 
+/// A profile that carries BOTH measured authorities the CLI flags cannot
+/// override: a `dup_rate` (0.0) and an insert CDF (150 bp only).
+fn measured_profile(dir: &Path, name: &str) -> std::path::PathBuf {
+    let q: Vec<f64> = vec![30.0; 150];
+    let v = serde_json::json!({
+        "read_len": 150, "gc": 0.5, "geometry": "tail3p_both",
+        "dup_rate": 0.0,
+        "head": {"R1": {"0": 100}, "R2": {"0": 100}},
+        "tail": {"R1": {"0": 100}, "R2": {"0": 100}},
+        "joint_tail": {"0,0": 100},
+        "tail_q_collapse": {"R1": 0.0, "R2": 0.0},
+        "pos_q": {"R1": q.clone(), "R2": q},
+        "read_meanq": {"R1": {"30": 100}, "R2": {"30": 100}},
+        "full_length_rate": 0.0,
+        "full_length_q": {"R1": 20, "R2": 20},
+        "insert": {"150": 100},
+        "adapter": {"seq": "CTGTCTCTTATACACATCT", "mode": "readthrough"},
+    });
+    let p = dir.join(format!("{name}.json"));
+    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    p
+}
+
 /// S2: a profile carrying a per-position base plane governs the composition, so
 /// `--gc` cannot change a single emitted base. The run must say so instead of
 /// silently publishing the requested value, and the report must publish the
@@ -515,6 +597,105 @@ fn insert_min_above_read_len_is_ignored_only_when_an_insert_cdf_exists() {
     assert!(!o.status.success(), "a live insert floor above read_len must be refused");
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("--insert-min (200)"), "stderr: {err}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// S3: the flags that lose to the profile must say so, like `--gc` does.
+///
+/// `--dup-rate` loses to a measured `dup_rate` and
+/// `--insert-mean`/`--insert-sd`/`--insert-min` lose to a measured insert CDF;
+/// all four used to be dropped in silence (only `--insert-min` above the read
+/// length warned), so a harness pinning them for reproducibility published a
+/// run the profile had shaped instead. Precedence is unchanged — the profile
+/// still wins — and the warning goes to stderr so `-q` keeps stdout clean.
+#[test]
+fn profile_authority_flags_warn_when_inert() {
+    let dir = std::env::temp_dir().join(format!("fastsim_inert_flags_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = measured_profile(&dir, "measured");
+    let out = dir.join("w");
+    let base = [
+        "--pairs",
+        "200",
+        "--profile",
+        profile.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--no-gzip",
+        "--drop-rate",
+        "0",
+        "--dup-rate",
+        "0.9",
+        "--insert-mean",
+        "30",
+        "--insert-sd",
+        "1",
+        "--insert-min",
+        "20",
+    ];
+
+    let o = Command::new(bin()).args(base).output().unwrap();
+    assert!(
+        o.status.success(),
+        "an inert flag must not refuse the run: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.stdout.is_empty(), "warnings must not go to stdout");
+    for flag in ["--dup-rate", "--insert-mean", "--insert-sd"] {
+        assert!(
+            err.contains(flag) && err.contains("no effect"),
+            "{flag} loses to the profile and must warn: {err}"
+        );
+    }
+    assert!(
+        err.contains("--insert-min"),
+        "--insert-min loses to the insert CDF too: {err}"
+    );
+
+    // The profile really did win: its 150 bp insert and its 0.0 dup rate.
+    let gt = std::fs::read_to_string(dir.join("w.gt.tsv")).unwrap();
+    assert!(
+        gt.lines().skip(1).all(|l| l.split('\t').nth(1) == Some("150")),
+        "--insert-mean 30 must not move a single insert"
+    );
+    assert!(
+        gt.lines().skip(1).all(|l| l.split('\t').nth(9) == Some("0")),
+        "--dup-rate 0.9 must not create a duplicate the profile's 0.0 forbids"
+    );
+
+    // -q silences the summary, never the warning, and writes nothing to stdout.
+    let quiet_out = dir.join("q");
+    let o = Command::new(bin())
+        .args([
+            "--pairs",
+            "50",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--out",
+            quiet_out.to_str().unwrap(),
+            "--no-gzip",
+            "--drop-rate",
+            "0",
+            "--dup-rate",
+            "0.9",
+            "-q",
+        ])
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.stdout.is_empty(), "stdout must stay clean under -q");
+    assert!(
+        err.contains("--dup-rate") && err.contains("no effect"),
+        "the warning must survive -q: {err}"
+    );
+    assert!(
+        !err.contains("fastsim: 50 pairs"),
+        "the summary line must not leak under -q: {err}"
+    );
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

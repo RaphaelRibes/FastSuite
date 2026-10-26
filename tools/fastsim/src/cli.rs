@@ -19,7 +19,8 @@
 //! same reason).
 
 use anyhow::{bail, Result};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -205,6 +206,19 @@ pub struct Config {
     pub single: bool,
     pub force: bool,
     pub quiet: bool,
+    /// Did the command line actually carry `--dup-rate`?
+    ///
+    /// clap hands over the RESOLVED value, so an explicit `--dup-rate 0.05` and
+    /// the 0.02 default are indistinguishable in `Config`. A profile that
+    /// measures its own rate overrides both, and `main` must warn only about a
+    /// value the user actually typed (a default is inert by definition, and
+    /// warning about it would fire on every fitted profile). `parse` fills these
+    /// from clap's value sources; a programmatic `Config` leaves them false.
+    pub dup_rate_given: bool,
+    /// Same question for `--insert-mean` / `--insert-sd`, which a profile's
+    /// measured insert CDF overrides.
+    pub insert_mean_given: bool,
+    pub insert_sd_given: bool,
 }
 
 impl From<Cli> for Config {
@@ -237,6 +251,12 @@ impl From<Cli> for Config {
             single: cli.single,
             force: cli.force,
             quiet: cli.quiet,
+            // Filled by `parse` from clap's value sources: `From<Cli>` sees only
+            // resolved values, where an explicit flag and its default are the
+            // same thing.
+            dup_rate_given: false,
+            insert_mean_given: false,
+            insert_sd_given: false,
         }
     }
 }
@@ -307,7 +327,8 @@ fn thread_flag(args: &[String]) -> bool {
 /// Parse the process argv into a validated `Config`.
 /// `-V/--version` and `-h/--help` print and exit 0, clap-style.
 pub fn parse() -> Result<Config> {
-    let mut cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
     // FASTSUITE_THREADS is the suite-wide default when NO thread flag is given
     // (CLI-SPEC §1). clap's `env` attribute can't express "only when the flag
     // is absent AND the value is valid", so resolve it manually.
@@ -321,7 +342,13 @@ pub fn parse() -> Result<Config> {
             cli.threads = n;
         }
     }
-    let cfg: Config = cli.into();
+    let mut cfg: Config = cli.into();
+    // Which of the profile-overridden flags did the user actually type? The
+    // resolved value cannot say (see `dup_rate_given`), so ask the matches.
+    let given = |name: &str| matches.value_source(name) == Some(ValueSource::CommandLine);
+    cfg.dup_rate_given = given("dup_rate");
+    cfg.insert_mean_given = given("insert_mean");
+    cfg.insert_sd_given = given("insert_sd");
     if cfg.threads > 1 {
         eprintln!(
             "fastsim: warning: simulation is single-threaded; --threads {} accepted for \

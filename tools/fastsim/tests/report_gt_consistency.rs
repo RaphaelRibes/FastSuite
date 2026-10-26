@@ -1,7 +1,7 @@
 //! GT-vs-report consistency: every count the run publishes must describe
 //! exactly what the GT and the FASTQ contain.
 //!
-//! Pins two reproduced defects. `adapter_pad_bases` counted every `N` of the
+//! Pins four reproduced defects. `adapter_pad_bases` counted every `N` of the
 //! CONSTRUCTED read, so a template `N` (a 30-N run in `--reference`) was
 //! subtracted from the GT's `r1_n`/`r2_n` columns and added to the pad metric:
 //! a reference full of N produced all-zero GT N columns, a pad count of 28k and
@@ -9,6 +9,14 @@
 //! pairs where EITHER mate is full, while the GT's `full_flag` is the AND of the
 //! two per-mate flags — a 10% full R1 head published 10% full pairs against a GT
 //! of zero. Both counts are now published, each named for what it measures.
+//!
+//! The adapter columns had the same shape of problem in two directions: the GT
+//! published the no-adapter `N` filler's LENGTH as `r1_adapter`/`r2_adapter`
+//! (so a padded read claimed readthrough while `adapter_pad_bases` claimed the
+//! same bases as padding), and `adapter_readthrough_pairs` skipped the replay
+//! branch, so a run of duplicates counted one readthrough pair however many GT
+//! rows carried adapter. The columns now name emitted adapter bases only, and
+//! the count follows the rows on both branches.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -217,7 +225,133 @@ fn gt_n_columns_and_pad_metric_split_the_two_n_sources() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// S3: `full_artefact_pairs` must agree with the GT's `full_flag` (BOTH mates
+/// S2: the GT's adapter columns must name adapter BASES the read carries.
+///
+/// The no-adapter mode fills the same window with `N` padding, and the columns
+/// used to be filled from that window's length: with `adapter.mode = "none"`
+/// every read published `r1_adapter = r2_adapter = 129` while its tail was
+/// `NNNN…`, and the report counted the same bases twice — once as
+/// `adapter_readthrough_pairs` and again as `adapter_pad_bases`.
+#[test]
+fn gt_adapter_columns_follow_the_emitted_adapter_bases() {
+    let dir = scratch("adapter_cols");
+    let none = (
+        serde_json::json!({"0": 100}),
+        serde_json::json!({"0": 100}),
+    );
+    // A 20 bp insert in a 40 bp window: 20 bases of adapter (or of filler).
+    let insert = Some(serde_json::json!({"20": 100}));
+    let pair_cost = 20u64;
+
+    // (A) mode none: the window is `N` padding, so no read carries adapter and
+    // the GT's adapter columns must be 0 — the filler is `adapter_pad_bases`.
+    let pad = profile(
+        &dir,
+        "adapter_none",
+        40,
+        none.clone(),
+        "none",
+        insert.clone(),
+    );
+    let a = run(&dir, "a", &pad, 200, &[]);
+    let rows = gt_rows(&a.out);
+    assert!(
+        rows.iter().all(|r| r[6] == "0" && r[7] == "0"),
+        "no adapter was read through, so both GT adapter columns must be 0: {:?}",
+        rows[0]
+    );
+    assert_eq!(
+        a.report["metrics"]["adapter_readthrough_pairs"], 0,
+        "a padded read is not a readthrough pair: {}",
+        a.report["metrics"]
+    );
+    let (n1, n2) = (n_bases(&seqs(&a.out, "R1")), n_bases(&seqs(&a.out, "R2")));
+    assert_eq!((n1, n2), (200 * pair_cost, 200 * pair_cost), "the filler ran");
+    assert_eq!(
+        a.report["metrics"]["adapter_pad_bases"],
+        n1 + n2,
+        "the pad metric must account for exactly the N bases emitted"
+    );
+
+    // (B) mode readthrough: the same window carries adapter bases, and the GT
+    // columns must equal them base for base.
+    let rt = profile(&dir, "adapter_rt", 40, none, "readthrough", insert);
+    let b = run(&dir, "b", &rt, 200, &[]);
+    let rows = gt_rows(&b.out);
+    assert_eq!(
+        sum_col(&rows, 6),
+        200 * pair_cost,
+        "r1_adapter must be the emitted adapter bases"
+    );
+    assert_eq!(sum_col(&rows, 7), 200 * pair_cost, "r2_adapter likewise");
+    // The window really holds adapter, not filler: no `N` there, and the read is
+    // still exactly read_len bases. (Substitutions land in the adapter too, so
+    // the bytes are not compared literally.)
+    for s in seqs(&b.out, "R1") {
+        assert_eq!(s.len(), 40, "sequencer output is always read_len bases");
+        assert!(
+            !s[20..].contains('N'),
+            "the readthrough window must hold adapter, not padding: {s}"
+        );
+    }
+    for s in seqs(&a.out, "R1") {
+        assert_eq!(&s[20..], "N".repeat(20), "mode none pads the window: {s}");
+    }
+    assert_eq!(b.report["metrics"]["adapter_readthrough_pairs"], 200);
+    assert_eq!(b.report["metrics"]["adapter_pad_bases"], 0);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// S3: `adapter_readthrough_pairs` must count the pairs whose GT rows carry
+/// adapter — including the ones that REPLAY a stored pair.
+///
+/// The replay branch recomputed every counter except this one, so a run made
+/// entirely of duplicates published 1 readthrough pair (the single fresh one)
+/// while all 5 GT rows carried `r1_adapter = 99`.
+#[test]
+fn readthrough_count_includes_replayed_duplicate_pairs() {
+    let dir = scratch("adapter_dup");
+    let p = profile(
+        &dir,
+        "adapter_rt_dup",
+        150,
+        (
+            serde_json::json!({"0": 100}),
+            serde_json::json!({"0": 100}),
+        ),
+        "readthrough",
+        // 40 bp insert in a 150 bp window -> 110 bases of adapter per mate.
+        Some(serde_json::json!({"40": 100})),
+    );
+    let r = run(&dir, "dup", &p, 5, &["--dup-rate", "1.0"]);
+    let rows = gt_rows(&r.out);
+    assert_eq!(rows.len(), 5, "one GT row per pair");
+    assert_eq!(
+        rows.iter().filter(|x| x[9] == "1").count(),
+        4,
+        "every pair after the first replays the pool"
+    );
+    assert!(
+        rows.iter().all(|x| x[6] == "110" && x[7] == "110"),
+        "every row carries 110 adapter bases: {:?}",
+        rows
+    );
+    assert_eq!(
+        r.report["metrics"]["adapter_readthrough_pairs"], 5,
+        "all five pairs read through adapter, replayed or not: {}",
+        r.report["metrics"]
+    );
+    assert!(
+        r.stderr.contains("adapter-readthrough 5"),
+        "the summary must count them too: {}",
+        r.stderr
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// S4: `full_artefact_pairs` must agree with the GT's `full_flag` (BOTH mates
 /// full), while the old either-mate count stays available, named for what it is.
 #[test]
 fn full_pair_counters_agree_with_the_gt() {

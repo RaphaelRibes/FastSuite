@@ -54,6 +54,26 @@ fn pad_n(read: &Read, mode: AdapterMode) -> u32 {
     }
 }
 
+/// Does the GT name adapter readthrough on either mate of this pair?
+///
+/// Read from the GT's own columns: `a1`/`a2` are set only when the profile read
+/// through adapter, so `adapter_readthrough_pairs` cannot disagree with the rows
+/// a scorer reads — on either branch of the loop (the replay branch used to skip
+/// this counter, publishing 1 readthrough pair for a run whose 5 GT rows all
+/// carried adapter).
+fn has_adapter(a: &Artefact) -> bool {
+    a.a1 > 0 || a.a2 > 0
+}
+
+/// Warn that a value the user typed cannot influence the run.
+///
+/// One shape for every flag a profile overrides, so a harness reading stderr
+/// sees the same sentence and the same reason: the flag, the value it carried,
+/// and the authority that actually governed the run.
+fn warn_inert_flag(flag: &str, value: impl std::fmt::Display, authority: &str) {
+    eprintln!("fastsim: warning: {flag} {value} has no effect: {authority}");
+}
+
 /// The two full-pair tallies for one pair's artefact.
 ///
 /// `either` is the historical "at least one mate is entirely artefact" count;
@@ -79,10 +99,19 @@ fn tally_q(mr: &MateRead, sum: &mut u64, n: &mut u64) {
 
 fn run(cfg: &cli::Config) -> Result<()> {
     // --force: a generator always writes, so the clobber check is the whole
-    // safety net. Probe the artefacts the run will create.
+    // safety net. Probe the artefacts the run will create — the `--json` report
+    // included: it is written last, so an existing file there was silently
+    // replaced by the previous run's report (exit 0, no --force).
     if !cfg.force {
-        for suffix in [".gt.tsv", "_R1.fastq.gz", "_R2.fastq.gz", "_R1.fastq", "_R2.fastq"] {
-            let probe = format!("{}{}", cfg.out, suffix);
+        let mut probes: Vec<String> =
+            [".gt.tsv", "_R1.fastq.gz", "_R2.fastq.gz", "_R1.fastq", "_R2.fastq"]
+                .map(|suffix| format!("{}{suffix}", cfg.out))
+                .into_iter()
+                .collect();
+        if let Some(path) = &cfg.json {
+            probes.push(path.clone());
+        }
+        for probe in probes {
             if std::path::Path::new(&probe).exists() {
                 bail!("{probe} exists; pass --force to overwrite");
             }
@@ -117,6 +146,31 @@ fn run(cfg: &cli::Config) -> Result<()> {
     // (see `profile_dup_rate_beats_the_cli_flag` in tests/cli_test.rs).
     if profile.dup_rate.is_none() {
         profile.dup_rate = Some(cfg.dup_rate);
+    } else if cfg.dup_rate_given {
+        // Only an EXPLICIT flag is worth a warning: the 0.02 default is inert by
+        // definition once the profile measures a rate, and warning about a value
+        // nobody typed would fire on every fitted profile.
+        warn_inert_flag(
+            "--dup-rate",
+            cfg.dup_rate,
+            &format!(
+                "the profile carries a measured dup_rate {}, which governs the duplicate class",
+                profile.dup_rate.unwrap_or(cfg.dup_rate)
+            ),
+        );
+    }
+    // Insert distribution authority: a profile carrying a measured insert CDF
+    // sets every insert length, so the Gaussian flags cannot move a base. Say so
+    // instead of letting a harness believe its `--insert-mean` shaped the run.
+    if profile.insert.is_some() {
+        let authority =
+            "the profile carries a measured insert CDF, which sets the insert distribution";
+        if cfg.insert_mean_given {
+            warn_inert_flag("--insert-mean", cfg.insert_mean, authority);
+        }
+        if cfg.insert_sd_given {
+            warn_inert_flag("--insert-sd", cfg.insert_sd, authority);
+        }
     }
     // Insert floor: the profile's read length is the hard ceiling (a floor
     // above it is unrepresentable), so the default is min(150, read_len) —
@@ -124,22 +178,22 @@ fn run(cfg: &cli::Config) -> Result<()> {
     // loop must work unmodified for a 100 bp or 75 bp library. An explicit
     // --insert-min still wins, and is still validated against the read length —
     // unless the profile carries a measured insert CDF, in which case the flag
-    // is documented as ignored and cannot influence a single base, so a value
-    // above the read length is a no-op to warn about, not a run to refuse.
+    // is documented as ignored and cannot influence a single base, so any value
+    // is a no-op to warn about, not a run to refuse.
     let insert_min = cfg.insert_min.unwrap_or(profile.read_len.min(150));
-    if insert_min > profile.read_len {
-        if profile.insert.is_some() {
+    if profile.insert.is_some() {
+        if cfg.insert_min.is_some() {
             eprintln!(
                 "fastsim: warning: --insert-min {insert_min} ignored: the profile carries a \
                  measured insert CDF, which sets the insert distribution"
             );
-        } else {
-            bail!(
-                "--insert-min ({}) should be <= the profile read_len ({})",
-                insert_min,
-                profile.read_len
-            );
         }
+    } else if insert_min > profile.read_len {
+        bail!(
+            "--insert-min ({}) should be <= the profile read_len ({})",
+            insert_min,
+            profile.read_len
+        );
     }
     // Composition authority: a profile carrying a per-position base plane
     // governs the emitted bases position by position, so --gc cannot change one
@@ -277,11 +331,14 @@ fn run(cfg: &cli::Config) -> Result<()> {
                 pad_total += (src.pad_n1 + src.pad_n2) as u64;
                 n_ambig += (d1 + d2) as u64;
                 n_ambig_reads += (d1 > 0) as u64 + (d2 > 0) as u64;
-                // The replayed row carries the STORED artefact, so the full
-                // tallies must see it: the GT row below is written from `a`.
+                // The replayed row carries the STORED artefact, so every counter
+                // that describes the row must see it — the adapter condition
+                // included (it was the one counter this branch skipped: a run of
+                // 5 replayed readthrough pairs published 1).
                 let (either, both) = full_tallies(&a, profile.read_len, cfg.single);
                 n_full_either += u64::from(either);
                 n_full_both += u64::from(both);
+                n_adapter += u64::from(has_adapter(&a));
                 gt.write_pair(pair_idx, src.insert_len, &a, true, d1, d2)?;
                 n_dup += 1;
                 continue;
@@ -340,9 +397,16 @@ fn run(cfg: &cli::Config) -> Result<()> {
         } else {
             Some(build_read(&profile, &insert, insert_len, Mate::R2, &a, &mut rng))
         };
-        // Record where the adapter actually landed, so the GT labels it explicitly.
-        a.a1 = r1.adapter_len;
-        a.a2 = r2.as_ref().map_or(0, |r| r.adapter_len);
+        // Record where the adapter actually landed, so the GT labels it
+        // explicitly. Only the readthrough mode emits adapter bases: the
+        // no-adapter mode fills the same window with `N` padding, which the GT
+        // publishes as `adapter_pad_bases` (and its rN columns exclude), so
+        // copying that window's length here claimed readthrough for a read whose
+        // tail is `NNNN…` and counted the same bases twice.
+        if profile.adapter.mode == AdapterMode::Readthrough {
+            a.a1 = r1.adapter_len;
+            a.a2 = r2.as_ref().map_or(0, |r| r.adapter_len);
+        }
         // Sequencer output is always exactly read_len bases — every branch
         // of build_read pads to L (adapter readthrough or Ns). This is the
         // contract the bench relies on, so assert it per pair.
@@ -350,9 +414,9 @@ fn run(cfg: &cli::Config) -> Result<()> {
         if let Some(r2) = &r2 {
             debug_assert_eq!(r2.seq.len() as u32, profile.read_len, "R2 length");
         }
-        if r1.adapter_len > 0 {
-            n_adapter += 1;
-        }
+        // A pair is a readthrough pair when either GT row names adapter bases,
+        // so the count always agrees with the rows a scorer reads.
+        n_adapter += u64::from(has_adapter(&a));
 
         // 4. Quality + errors (the per-base deterministic terms come from the
         //    run's QCache; the draws are unchanged).
