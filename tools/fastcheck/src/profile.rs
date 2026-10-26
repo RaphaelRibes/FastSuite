@@ -453,7 +453,10 @@ pub fn write_profile(
     let mode_share = qc1.len_hist[mode_len] as f64 / mode_tot as f64;
     let g_mean = qc1.base_pos.first().map(|_| {
         let g: u64 = qc1.base_pos.iter().map(|r| r[2]).sum();
-        g as f64 / qc1.bases.max(1) as f64
+        // Over the bases the per-position plane holds, not over `bases`: the latter counts
+        // every base in the file, so this fraction scaled with `--max-read-len` (0.0361
+        // against a true 0.2333 on 120 bp reads capped at 20).
+        g as f64 / qc1.per_pos_bases().max(1) as f64
     }).unwrap_or(0.25);
 
     // The profile's gc is the FRAGMENT gc: the simulator lays adapters and
@@ -706,7 +709,10 @@ pub fn write_profile(
     }
 
     let text = serde_json::to_string_pretty(&Value::Object(prof))? + "\n";
-    std::fs::write(path, text).with_context(|| format!("writing profile to {}", path.display()))?;
+    // `-` means the stream (D-4), like every other report output: this used to write a
+    // file named `-` (plus `-.fit_report.json`) and leave stdout empty.
+    crate::report::write_out(path, &text)?;
+    let to_stdout = path.as_os_str() == "-";
 
     // The fit report, so the assumptions travel with the profile the way the
     // Python fitter's fit_report.json does.
@@ -761,8 +767,17 @@ pub fn write_profile(
                     else { json!(["insert distribution shape", "mate tail correlation"]) },
     });
     let rp = path.with_extension("fit_report.json");
-    std::fs::write(&rp, serde_json::to_string_pretty(&report)? + "\n")
-        .with_context(|| format!("writing fit report to {}", rp.display()))?;
+    if to_stdout {
+        // There is no directory to put the side file in when the profile went to the
+        // stream, and `-.fit_report.json` would be the same bug in a new name. The part a
+        // user acts on is the fit warnings, so those go to stderr.
+        for w in &warnings {
+            eprintln!("fastcheck: fit warning: {w}");
+        }
+    } else {
+        std::fs::write(&rp, serde_json::to_string_pretty(&report)? + "\n")
+            .with_context(|| format!("writing fit report to {}", rp.display()))?;
+    }
     Ok(())
 }
 

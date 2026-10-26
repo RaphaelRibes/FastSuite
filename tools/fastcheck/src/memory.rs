@@ -239,11 +239,17 @@ pub enum Admission {
 /// Scaled to the limit, with a floor and a cap: a fixed 512 MB reserve meant `--max-mem
 /// 568` refused EVERY run (512 MB of reserve against a 568 MB ceiling, whatever the
 /// projection) while `--max-mem 569` proceeded. 25% of the limit, clamped to
-/// [64 MiB, 512 MiB], keeps the reserve meaningful on a big machine without making a
-/// small limit unusable. The admission rule below still refuses a projection that
-/// genuinely would not fit.
+/// [8 MiB, 512 MiB], keeps the reserve meaningful on a big machine without making a
+/// small limit unusable.
+///
+/// The floor used to be 64 MiB, which was the same bug one order of magnitude down: the
+/// reserve alone then crossed the 90% refusal threshold for every ceiling below ~72 MB, so
+/// `--max-mem 71` refused a file whose table projected 0.0 MB while 72 proceeded. At 8 MiB
+/// a 32 MB ceiling still admits it (8 MB of reserve against 28.8 MB of threshold) and only
+/// a ceiling at the floor itself has nothing left to admit. The admission rule below still
+/// refuses a projection that genuinely would not fit.
 pub fn reserve_for(limit: u64) -> u64 {
-    (limit / 4).clamp(64 * 1024 * 1024, 512 * 1024 * 1024)
+    (limit / 4).clamp(8 * 1024 * 1024, 512 * 1024 * 1024)
 }
 
 /// Admission rule. `limit: None` means undiscoverable, which degrades to
@@ -444,12 +450,16 @@ mod tests {
         assert_eq!(admit(4 * GB, Some(&l)), Admission::Proceed);
     }
 
-    /// The reserve is 25% of the limit, clamped to [64 MiB, 512 MiB]. The old rule was a
-    /// flat 512 MB floor, which made every `--max-mem` below 569 MB refuse every run.
+    /// The reserve is 25% of the limit, clamped to [8 MiB, 512 MiB]. The old rule was a flat
+    /// 512 MB floor, which made every `--max-mem` below 569 MB refuse every run; the 64 MiB
+    /// floor that replaced it was the same bug below 72 MB.
     #[test]
     fn reserve_scales_with_the_limit_between_a_floor_and_a_cap() {
         const MB: u64 = 1024 * 1024;
-        assert_eq!(reserve_for(8 * MB), 64 * MB, "the floor, for a tiny limit");
+        assert_eq!(reserve_for(8 * MB), 8 * MB, "the floor, for a tiny limit");
+        assert_eq!(reserve_for(16 * MB), 8 * MB, "still the floor: 25% of 16 MB is 4 MB");
+        assert_eq!(reserve_for(32 * MB), 8 * MB, "25% of 32 MB is the floor exactly");
+        assert_eq!(reserve_for(64 * MB), 16 * MB, "25% of 64 MB");
         assert_eq!(reserve_for(256 * MB), 64 * MB, "25% of 256 MB");
         assert_eq!(reserve_for(512 * MB), 128 * MB, "25% of 512 MB");
         assert_eq!(reserve_for(568 * MB), 142 * MB, "25% of 568 MB is 142 MB");
@@ -458,12 +468,13 @@ mod tests {
         assert_eq!(reserve_for(100 * GB), 512 * MB);
     }
 
-    /// A small `--max-mem` must admit a small run. 256 / 512 / 568 MB all admit a run whose
-    /// table projection is nil, and all three still refuse a projection that cannot fit.
+    /// A small `--max-mem` must admit a small run. 32 / 64 / 256 / 512 / 568 MB all admit a
+    /// run whose table projection is nil, and all of them still refuse a projection that
+    /// cannot fit.
     #[test]
     fn a_small_limit_admits_a_small_projection_and_refuses_a_large_one() {
         const MB: u64 = 1024 * 1024;
-        for limit_mb in [256u64, 512, 568] {
+        for limit_mb in [32u64, 64, 256, 512, 568] {
             let l = Limit { bytes: limit_mb * MB, source: LimitSource::RlimitAs };
             assert_eq!(
                 admit(0, Some(&l)),
@@ -479,5 +490,13 @@ mod tests {
         // "needs ~0.0 MB ... limited to 568.0 MB".
         let l = Limit { bytes: 568 * MB, source: LimitSource::RlimitAs };
         assert_eq!(admit(0, Some(&l)), Admission::Proceed);
+        // ... and the second repro: --max-mem 71 refused, 72 proceeded, on a file whose table
+        // projected 0.0 MB. Both now run; 8 MB is the floor itself, so it has nothing to admit.
+        for limit_mb in [71u64, 72, 64, 32] {
+            let l = Limit { bytes: limit_mb * MB, source: LimitSource::RlimitAs };
+            assert_eq!(admit(0, Some(&l)), Admission::Proceed, "--max-mem {limit_mb}");
+        }
+        let l = Limit { bytes: 8 * MB, source: LimitSource::RlimitAs };
+        assert!(matches!(admit(0, Some(&l)), Admission::Refuse { .. }));
     }
 }

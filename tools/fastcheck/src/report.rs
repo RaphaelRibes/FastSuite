@@ -119,7 +119,12 @@ pub(crate) fn pos_stats(row: &[u64; QBINS], offset: u8) -> (f64, f64, f64, f64) 
     )
 }
 
-fn write_out(path: &Path, body: &str) -> Result<()> {
+/// Write `body` to `path`, or to stdout when `path` is `-`.
+///
+/// The one writer every report output uses: `--json`, `--html`, `--profile` and
+/// `--positions-tsv` all stream to the same place, so a `-` cannot mean a file named `-`
+/// in one of them.
+pub(crate) fn write_out(path: &Path, body: &str) -> Result<()> {
     // D-4: `-` means "the stream", for reports as well as FASTQ.
     if path.as_os_str() == "-" {
         use std::io::Write;
@@ -131,6 +136,39 @@ fn write_out(path: &Path, body: &str) -> Result<()> {
     }
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// CPU-seconds consumed by this process so far, for `busy_cores`.
+///
+/// Copied from `tools/fastprep/src/stats.rs` (D-1: no shared crate). `getrusage` on a
+/// single process is cheap and needs no extra dependency: `libc` is already here for
+/// `memory.rs`. A failing call reports 0 rather than a fabricated ratio.
+fn cpu_seconds() -> f64 {
+    let mut ru = libc::rusage {
+        ru_utime: libc::timeval { tv_sec: 0, tv_usec: 0 },
+        ru_stime: libc::timeval { tv_sec: 0, tv_usec: 0 },
+        ..unsafe { std::mem::zeroed() }
+    };
+    // SAFETY: getrusage only writes into the struct we hand it; a failure leaves the
+    // zeroed value, so the metric degrades to 0 rather than lying.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return 0.0;
+    }
+    let secs = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
+    secs(ru.ru_utime) + secs(ru.ru_stime)
+}
+
+/// The cores this run kept busy: CPU-seconds per wall-second, rounded to 3 decimals.
+///
+/// `metrics.threads` says how many threads the run was ASKED for; a report that carried
+/// only that could claim 8 threads while one core did the work. A zero-length run reports
+/// 0 rather than an infinity, so consumers that sum the field do not break.
+pub(crate) fn busy_cores(elapsed_s: f64) -> f64 {
+    if elapsed_s <= 0.0 {
+        return 0.0;
+    }
+    let busy = cpu_seconds() / elapsed_s;
+    (busy * 1000.0).round() / 1000.0
 }
 
 fn base_position_json(a: &Accum) -> serde_json::Value {
@@ -175,10 +213,13 @@ pub fn write_report(
     processed: Option<&Accum>,
     overrep: crate::overrep::OverrepMode,
     overrep_min_count: u32,
-    // The resolved `-j` thread count: the overrep second pass re-reads the files and
+    // The resolved `-j` count: the overrep second pass re-reads the files and
     // builds its BGZF inflate pool from it, so the one mode that pays a second read does
     // not pay it with one thread because a literal said so.
     threads: usize,
+    // CPU-seconds per wall-second over the scan: `threads` is the request, this is what
+    // it bought (fastprep's `busy_cores`).
+    busy_cores: f64,
     adapter_content: Option<(&crate::adapter_pos::AdapterPos, f64, usize)>,
     modules: Option<&Modules>,
     tile: Option<&crate::tile::TileQual>,
@@ -307,6 +348,9 @@ pub fn write_report(
     // The resolved `-j` count, so a report says how it was run: it is a run parameter,
     // not a measurement, and two runs of one file at different -j are otherwise identical.
     put("threads", json!(threads));
+    // The `-j` above is the REQUEST; this is what it bought. A value near 1 says the run
+    // was serial however many cores it was told to use.
+    put("busy_cores", json!(busy_cores));
     put("elapsed_s", json!(elapsed_s));
     // Only when --insert-hist ran: a consumer must never read an absent metric
     // as a measured zero.

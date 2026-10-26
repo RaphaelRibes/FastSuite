@@ -650,6 +650,16 @@ impl Accum {
         self.qual_pos.get(pos).copied().unwrap_or(QUAL_ROW)
     }
 
+    /// Bases the per-position planes hold: the first `--max-read-len` windows of every read.
+    ///
+    /// This is the denominator for a fraction of the per-position G sum. `bases` counts
+    /// EVERY base in the file, so dividing by it made the head-dropout baseline and the
+    /// profile's `g_mean` scale with the cap (120 bp reads at `--max-read-len 20`: a G
+    /// fraction six times too small).
+    pub fn per_pos_bases(&self) -> u64 {
+        self.base_pos.iter().map(|r| r.iter().sum::<u64>()).sum()
+    }
+
     /// Positions carrying at least one quality observation.
     pub fn covered_positions(&self) -> usize {
         self.qual_pos

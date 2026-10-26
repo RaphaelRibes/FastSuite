@@ -74,6 +74,16 @@ fn main() -> Result<()> {
         );
     }
 
+    // --processed-2 is the second mate of a before/after comparison; on its own there is
+    // no `after` side to compare it with, and accepting it then ignoring it (the run
+    // reported `processed: null` and exited 0) is a silent no-op.
+    if cli.processed_2.is_some() && cli.processed_1.is_none() {
+        anyhow::bail!(
+            "--processed-2 needs --processed-1: it is the second mate of the processed \
+             files, so on its own it would be measured against nothing"
+        );
+    }
+
     let started = Instant::now();
     let files: Vec<PathBuf> = cli.files.clone();
     // The per-read profile scan (adapter prefix + fragment GC) is only paid for
@@ -371,6 +381,9 @@ fn main() -> Result<()> {
 
     let verdict = offset_verdict(&total.qual_byte, requested_offset);
     let elapsed = started.elapsed().as_secs_f64();
+    // The cores this run actually kept busy, over the same window as `elapsed`: the report
+    // states the `-j` it was given AND what that bought.
+    let busy_cores = report::busy_cores(elapsed);
 
     let min_count = cli
         .overrep_min_count
@@ -398,6 +411,7 @@ fn main() -> Result<()> {
             overrep,
             min_count,
             threads,
+            busy_cores,
             total.adapter_pos.as_ref().map(|ap| {
                 (ap, cli.adapter_error_rate, cli.min_adapter_overlap)
             }),
@@ -432,7 +446,11 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "input".to_string());
         let accs: Vec<&Accum> = reports.iter().map(|r| &r.acc).collect();
         profile::write_profile(p, &name, &accs, verdict.offset, insert.as_ref())?;
-        eprintln!("fastcheck: wrote fastsim profile to {}", p.display());
+        if p.as_os_str() == "-" {
+            eprintln!("fastcheck: wrote fastsim profile to stdout");
+        } else {
+            eprintln!("fastcheck: wrote fastsim profile to {}", p.display());
+        }
     }
 
     if !cli.quiet {
@@ -453,12 +471,12 @@ fn main() -> Result<()> {
             ),
         ];
         if gate.map_or(true, |m| m.gc) {
-            parts.push(format!("GC {:.2}%", 100.0 * report_gc(&total)));
+            parts.push(format!("GC {:.2}%", 100.0 * report::gc_fraction(&total)));
         }
         if gate.map_or(true, |m| m.quality) {
             parts.push(format!(
                 "mean read Q {:.2} (Phred+{}{})",
-                report_mean_q(&total, verdict.offset),
+                report::mean_read_mean_q(&total, verdict.offset),
                 verdict.offset,
                 if verdict.certain { "" } else { ", uncertain" },
             ));
@@ -469,12 +487,13 @@ fn main() -> Result<()> {
             elapsed,
             stopped.map(|s| format!(" [{s}]")).unwrap_or_default()
         );
-        // With `--json -` stdout carries the report, so the summary goes to
-        // stderr: a consumer parsing the output must not have to skip a line.
-        if cli.json.as_deref() == Some(std::path::Path::new("-")) {
-            eprintln!("{line}");
-        } else {
+        // With a report on stdout (`-`), the summary goes to stderr: a consumer parsing
+        // the stream must not have to skip a line. Every output flag is consulted, not
+        // just `--json`: `--positions-tsv -` used to get the summary appended to the TSV.
+        if stdout_outputs(&cli).is_empty() {
             println!("{line}");
+        } else {
+            eprintln!("{line}");
         }
         // Citation request (MIT stays permissive; this is the community-norm ask).
         eprintln!(
@@ -519,22 +538,13 @@ fn scan_one(
 
 /// Refuse a run that points more than one output at stdout.
 ///
-/// `-` means "the stream", and two reports on one stream are not two reports: they are
-/// one file that is neither JSON, nor TSV, nor HTML. `--json - --positions-tsv -` wrote
-/// 596 KB of JSON with TSV rows threaded through it, and `--json - --html -` started a
-/// JSON document and appended a whole HTML page. Nothing downstream can read either, so
-/// the combination is refused before the scan rather than discovered afterwards.
+/// `-` means "the stream" for every report output (D-4), and two reports on one stream are
+/// not two reports: they are one file that is neither JSON, nor TSV, nor HTML. Each of the
+/// four writers streams, so any pair of `-` outputs really does collide —
+/// `--json - --positions-tsv -` wrote 596 KB of JSON with TSV rows threaded through it.
+/// Refused before the scan rather than discovered afterwards.
 fn check_stdout_outputs(cli: &Cli) -> Result<()> {
-    let mut on_stdout: Vec<&str> = Vec::new();
-    for (flag, p) in [
-        ("--json", &cli.json),
-        ("--html", &cli.html),
-        ("--positions-tsv", &cli.positions_tsv),
-    ] {
-        if p.as_deref().is_some_and(|p| p.as_os_str() == "-") {
-            on_stdout.push(flag);
-        }
-    }
+    let on_stdout = stdout_outputs(cli);
     if on_stdout.len() > 1 {
         anyhow::bail!(
             "{} would all write to stdout, and two reports interleaved on one stream are \
@@ -543,6 +553,25 @@ fn check_stdout_outputs(cli: &Cli) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Every output flag that points at stdout (`-`), in flag order.
+///
+/// The same list the summary line's guard consults: whatever writes to stdout, prose must
+/// not be appended to it.
+fn stdout_outputs(cli: &Cli) -> Vec<&'static str> {
+    let mut on_stdout: Vec<&'static str> = Vec::new();
+    for (flag, p) in [
+        ("--json", &cli.json),
+        ("--html", &cli.html),
+        ("--profile", &cli.profile),
+        ("--positions-tsv", &cli.positions_tsv),
+    ] {
+        if p.as_deref().is_some_and(|p| p.as_os_str() == "-") {
+            on_stdout.push(flag);
+        }
+    }
+    on_stdout
 }
 
 /// Create the parent directory of an output path before writing it.
@@ -633,25 +662,3 @@ fn check_outputs(cli: &Cli, m: &Modules, overrep: overrep::OverrepMode) -> Resul
     Ok(())
 }
 
-// The two helpers below exist only for the summary line; the report module
-// owns the same computations for the JSON, and they are tested there.
-fn report_gc(a: &Accum) -> f64 {
-    let acgt: u64 = (0..a.acgt_hist.len()).map(|i| i as u64 * a.acgt_hist[i]).sum();
-    let gc: u64 = (0..a.gc_hist.len()).map(|i| i as u64 * a.gc_hist[i]).sum();
-    if acgt == 0 {
-        0.0
-    } else {
-        gc as f64 / acgt as f64
-    }
-}
-
-fn report_mean_q(a: &Accum, offset: u8) -> f64 {
-    if a.reads == 0 {
-        return 0.0;
-    }
-    let mut sum = 0.0;
-    for (b, &c) in a.meanq_raw_hist.iter().enumerate() {
-        sum += (b as i64 - offset as i64).max(0) as f64 * c as f64;
-    }
-    sum / a.reads as f64
-}

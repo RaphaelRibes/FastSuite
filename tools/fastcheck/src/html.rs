@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::accum::{quantile, Accum};
 use crate::insert::InsertHist;
@@ -938,7 +938,7 @@ document.addEventListener('keydown', function(e){
     h.push_str("</body></html>\n");
 
 
-    let mut fh = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-    std::io::Write::write_all(&mut fh, h.as_bytes())?;
-    Ok(())
+    // `-` means the stream (D-4), like every other report output: this used to write a
+    // 46 KB file named `-` and leave stdout empty.
+    crate::report::write_out(path, &h)
 }

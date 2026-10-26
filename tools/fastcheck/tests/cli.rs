@@ -33,11 +33,17 @@ fn write_fixture(dir: &Path) -> PathBuf {
 }
 
 fn run(dir: &Path, args: &[&str]) -> (String, String, i32) {
-    let out = Command::new(fastcheck())
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("spawn fastcheck");
+    run_env(dir, args, &[])
+}
+
+/// `run` with extra environment variables: `$FASTSUITE_THREADS` has to be set for the
+/// process under test, not for this one, or the test file would leak into every case.
+fn run_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
+    let mut cmd = Command::new(fastcheck());
+    cmd.args(args).current_dir(dir);
+    cmd.env_remove("FASTSUITE_THREADS");
+    cmd.envs(envs.iter().copied());
+    let out = cmd.output().expect("spawn fastcheck");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
@@ -263,6 +269,9 @@ fn stdin_is_read_exactly_like_a_file() {
     let metrics_of = |s: &str| -> serde_json::Value {
         let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
         v["metrics"]["elapsed_s"] = serde_json::json!(0.0);
+        // `busy_cores` (CPU-s / wall-s) describes the run, like `elapsed_s`: it is not a
+        // function of the bytes, so two runs cannot agree on it.
+        v["metrics"]["busy_cores"] = serde_json::json!(0.0);
         v["metrics"].clone()
     };
     assert_eq!(
@@ -867,6 +876,9 @@ fn blank_run_variance(v: &mut serde_json::Value) {
     v["command"] = serde_json::json!("");
     v["metrics"]["elapsed_s"] = serde_json::json!(0.0);
     v["metrics"]["threads"] = serde_json::json!(0);
+    // `busy_cores` is a measurement of the RUN (CPU-s / wall-s), not of the input: two runs
+    // of the same bytes on a different machine, or at a different -j, cannot agree on it.
+    v["metrics"]["busy_cores"] = serde_json::json!(0.0);
 }
 
 #[test]
@@ -1751,19 +1763,33 @@ fn overrep_min_count_is_the_same_threshold_everywhere() {
 /// C7: a `--max-mem` below the old fixed 512 MB reserve must admit a run that fits.
 /// Reported: `--max-mem 568` refused every run ("needs ~0.0 MB ... limited to 568.0 MB")
 /// while 569 proceeded.
+///
+/// REVERSAL, named deliberately: this test used to end by asserting that `--max-mem 64`
+/// REFUSES, which was the fixture pinning the second half of the same bug — the reserve's
+/// 64 MiB FLOOR made every ceiling below ~72 MB refuse every run whatever the projection
+/// (measured on an 1800-base file whose table projects 0.0 MB: 71 refused, 72 proceeded).
+/// The floor is now 8 MiB, so 32 and 64 MB admit a run that needs ~0 bytes, and only a
+/// ceiling at the floor itself (8 MB) has nothing left to admit.
 #[test]
 fn a_max_mem_below_the_old_reserve_admits_a_small_run() {
     let d = tmpdir("maxmem_small");
     let fq = write_fixture(&d);
-    for mb in ["256", "512", "568"] {
+    let big = write_120bp_fixture(&d);
+    for mb in ["32", "64", "256", "512", "568"] {
         let (_, stderr, code) =
             run(&d, &[fq.to_str().unwrap(), "--max-mem", mb, "-q"]);
         assert_eq!(code, 0, "--max-mem {mb} must run: {stderr}");
         assert!(!stderr.contains("limited to"), "{stderr}");
+        // ... and the 1800-base file whose table projects ~0.0 MB, which the 71/72 cliff
+        // was measured on, stays admitted at the two smallest ceilings.
+        let (_, stderr, code) =
+            run(&d, &[big.to_str().unwrap(), "--max-mem", mb, "-q"]);
+        assert_eq!(code, 0, "--max-mem {mb} on a 1800-base file must run: {stderr}");
     }
-    // ... and a limit at or below the reserve still refuses, rather than pretending.
-    let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--max-mem", "64", "-q"]);
-    assert_ne!(code, 0, "a 64 MB ceiling cannot hold the 64 MB reserve: {stdout}{stderr}");
+    // A ceiling at the reserve floor itself has nothing left for the table: refused, and
+    // the refusal says what the limit was.
+    let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--max-mem", "8", "-q"]);
+    assert_ne!(code, 0, "an 8 MB ceiling is the 8 MiB reserve: {stdout}{stderr}");
     assert!(stderr.contains("limited to"), "{stderr}");
 }
 
@@ -1865,4 +1891,239 @@ fn output_parent_directories_are_created() {
         d.join("out/deep/r.profile.fit_report.json").is_file(),
         "the fit report travels next to the profile it describes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round-3 defects: `-` on every report output, the summary guard, the --max-mem
+// reserve floor, $FASTSUITE_THREADS + busy_cores, the head-dropout denominator,
+// --processed-2 on its own, and the summary line's arithmetic.
+// ---------------------------------------------------------------------------
+
+/// 120 bp reads whose G fraction is 0.3 in the first 20 positions, in the first 40 AND in
+/// the whole read, with an A at position 1. The head-dropout baseline is a G FRACTION, so
+/// it must read 0.3 whatever `--max-read-len` is: the per-position planes cover a prefix
+/// of the read, and a fraction over that prefix is cap-invariant by construction.
+fn write_120bp_fixture(dir: &Path) -> PathBuf {
+    let read = format!(
+        "A{}{}{}{}{}{}",
+        "G".repeat(6),
+        "C".repeat(13),
+        "G".repeat(6),
+        "C".repeat(14),
+        "G".repeat(24),
+        "C".repeat(56)
+    );
+    assert_eq!(read.len(), 120);
+    assert_eq!(read.matches('G').count(), 36, "36/120 = 0.3");
+    let p = dir.join("r120.fastq");
+    let mut body = String::new();
+    for i in 0..8 {
+        body.push_str(&format!("@r{i}\n{read}\n+\n{}\n", "I".repeat(120)));
+    }
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+/// `--html -` was a file named `-` (46 KB) with an empty stdout.
+#[test]
+fn html_dash_streams_to_stdout_and_writes_no_file_named_dash() {
+    let d = tmpdir("html_dash");
+    let fq = write_fixture(&d);
+    let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--html", "-", "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.trim_start().starts_with("<!DOCTYPE html>"),
+        "the page itself must reach stdout: {}",
+        &stdout[..stdout.len().min(120)]
+    );
+    assert!(stdout.trim_end().ends_with("</html>"));
+    assert!(!d.join("-").exists(), "no file may be named `-`");
+}
+
+/// `--profile -` wrote a file named `-` plus `-.fit_report.json`, and left stdout empty.
+#[test]
+fn profile_dash_streams_to_stdout_and_writes_no_file_named_dash() {
+    let d = tmpdir("profile_dash");
+    let fq = write_fixture(&d);
+    let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--profile", "-", "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be the profile JSON: {e}\n{stdout}"));
+    assert!(v.is_object() && v.get("read_len").is_some(), "{stdout}");
+    assert!(!d.join("-").exists(), "no file may be named `-`");
+    assert!(
+        !d.join("-.fit_report.json").exists(),
+        "the fit report must not be named after the stream"
+    );
+}
+
+/// Both really stream now, so their collision is genuine — and the refusal must name both.
+#[test]
+fn html_and_json_on_stdout_are_refused_naming_both_flags() {
+    let d = tmpdir("html_json_stream");
+    let fq = write_fixture(&d);
+    let (stdout, stderr, code) =
+        run(&d, &[fq.to_str().unwrap(), "--html", "-", "--json", "-", "-q"]);
+    assert_ne!(code, 0, "two reports on one stream must be refused: {stdout}{stderr}");
+    assert!(stderr.contains("--json") && stderr.contains("--html"), "{stderr}");
+    assert!(stdout.is_empty(), "nothing may be written to a refused stream: {stdout}");
+    assert!(!d.join("-").exists());
+}
+
+/// `--positions-tsv -` used to get the prose summary appended to the TSV stream: the
+/// guard keyed on `--json` only.
+#[test]
+fn the_summary_line_never_lands_on_a_positions_tsv_stream() {
+    let d = tmpdir("tsv_stream");
+    let fq = write_fixture(&d);
+    let (stdout, stderr, code) = run(&d, &[fq.to_str().unwrap(), "--positions-tsv", "-"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout.lines().count(),
+        11,
+        "header + 10 positions and nothing else: {stdout}"
+    );
+    for line in stdout.lines() {
+        assert!(
+            !line.starts_with("fastcheck:"),
+            "the summary must not be appended to the TSV: {line}"
+        );
+    }
+    assert!(
+        stderr.lines().any(|l| l.starts_with("fastcheck: ") && l.contains("reads")),
+        "the summary still has to be printed somewhere: {stderr}"
+    );
+}
+
+/// The head-dropout baseline divided a per-position G sum by EVERY base in the file, so
+/// `--max-read-len` scaled it: -0.4639 / -0.4181 / -0.2667 on one 1800-base fixture.
+#[test]
+fn head_dropout_is_invariant_to_max_read_len() {
+    let d = tmpdir("head_dropout_cap");
+    let fq = write_120bp_fixture(&d);
+    let mut seen = Vec::new();
+    for cap in ["20", "40", "1000"] {
+        let json = d.join(format!("hd{cap}.json"));
+        let (_, stderr, code) = run(
+            &d,
+            &[fq.to_str().unwrap(), "--max-read-len", cap, "--json", json.to_str().unwrap(), "-q"],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        let m = read_json(&json)["metrics"].clone();
+        assert_eq!(m["head_g_frac"], 0.0, "position 1 is A at every cap: {m}");
+        assert_eq!(
+            m["head_dropout"], 0.3,
+            "cap {cap}: baseline - g1 is a G fraction over the bases the planes hold: {m}"
+        );
+        seen.push(m["head_dropout"].as_f64().unwrap());
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+}
+
+/// The profile's `g_mean` had the same denominator bug (0.0361 against a true 0.2333) and
+/// is published in the fit report.
+#[test]
+fn profile_g_mean_is_invariant_to_max_read_len() {
+    let d = tmpdir("g_mean_cap");
+    let fq = write_120bp_fixture(&d);
+    for cap in ["20", "40", "1000"] {
+        let prof = d.join(format!("p{cap}.json"));
+        let (_, stderr, code) = run(
+            &d,
+            &[fq.to_str().unwrap(), "--max-read-len", cap, "--profile", prof.to_str().unwrap(), "-q"],
+        );
+        assert_eq!(code, 0, "{stderr}");
+        let fit = prof.with_extension("fit_report.json");
+        let v = read_json(&fit);
+        assert_eq!(
+            v["measured"]["g_mean"], 0.3,
+            "cap {cap}: g_mean is a G fraction over the scanned bases: {v}"
+        );
+    }
+}
+
+/// `--processed-2` without `--processed-1` was accepted, then silently ignored
+/// (`processed: null`, exit 0).
+#[test]
+fn processed_2_without_processed_1_is_refused() {
+    let d = tmpdir("processed2_alone");
+    let fq = write_fixture(&d);
+    let p2 = d.join("p2.fastq");
+    std::fs::write(&p2, FASTQ).unwrap();
+    let json = d.join("r.json");
+    let (stdout, stderr, code) = run(
+        &d,
+        &[fq.to_str().unwrap(), "--processed-2", p2.to_str().unwrap(),
+          "--json", json.to_str().unwrap(), "-q"],
+    );
+    assert_ne!(code, 0, "--processed-2 alone must not be silently ignored: {stdout}{stderr}");
+    assert!(stderr.contains("--processed-1"), "name the flag it needs: {stderr}");
+    assert!(!json.exists(), "nothing may be measured under a refused flag combination");
+}
+
+/// `$FASTSUITE_THREADS` supplies the default (the suite's convention); `-j` wins outright,
+/// and unset / unparseable / 0 all mean "not set".
+#[test]
+fn fastsuite_threads_supplies_the_default_and_explicit_j_wins() {
+    let d = tmpdir("fastsuite_threads");
+    let fq = write_fixture(&d);
+    let default = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as u64;
+    for (env, j, want) in [
+        ("4", Some("2"), 2u64),
+        ("4", None, 4),
+        ("0", None, default),
+        ("not-a-number", None, default),
+    ] {
+        let json = d.join(format!("t_{env}_{}.json", j.unwrap_or("x")));
+        let mut args = vec![fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-q"];
+        if let Some(j) = j {
+            args.push("-j");
+            args.push(j);
+        }
+        let (_, stderr, code) = run_env(&d, &args, &[("FASTSUITE_THREADS", env)]);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(
+            read_json(&json)["metrics"]["threads"], want,
+            "FASTSUITE_THREADS={env}, -j={j:?}"
+        );
+    }
+}
+
+/// `metrics.threads` is the `-j` that was ASKED FOR; `busy_cores` is what was used. Without
+/// it a report could claim `threads: 8` while one core did the work (fastprep ships it).
+#[test]
+fn the_report_publishes_the_busy_cores_it_measured() {
+    let d = tmpdir("busy_cores");
+    let fq = write_fixture(&d);
+    let json = d.join("b.json");
+    let (_, stderr, code) =
+        run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap(), "-j", "8", "-q"]);
+    assert_eq!(code, 0, "{stderr}");
+    let m = read_json(&json)["metrics"].clone();
+    let busy = m["busy_cores"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("busy_cores must be a number: {m}"));
+    assert!(busy >= 0.0, "{m}");
+    assert!(
+        busy < 8.0,
+        "a 6-read plain file cannot keep 8 cores busy, whatever -j says: {m}"
+    );
+}
+
+/// The summary line and the report now share one implementation (they used to be two
+/// copies): the two numbers a user sees in the summary are the report's own.
+#[test]
+fn the_summary_line_quotes_the_reports_own_gc_and_mean_q() {
+    let d = tmpdir("summary_agrees");
+    let fq = write_fixture(&d);
+    let json = d.join("r.json");
+    let (stdout, stderr, code) =
+        run(&d, &[fq.to_str().unwrap(), "--json", json.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stderr}");
+    let m = read_json(&json)["metrics"].clone();
+    let line = stdout.lines().next().unwrap();
+    let gc = m["gc_fraction"].as_f64().unwrap();
+    let q = m["mean_read_mean_q"].as_f64().unwrap();
+    assert!(line.contains(&format!("GC {:.2}%", 100.0 * gc)), "{line} vs {m}");
+    assert!(line.contains(&format!("mean read Q {:.2}", q)), "{line} vs {m}");
 }

@@ -67,7 +67,11 @@ pub fn head_dropout(acc: &Accum) -> (f64, f64) {
         0.25
     };
     let g: u64 = acc.base_pos.iter().map(|r| r[2]).sum();
-    let baseline = g as f64 / acc.bases.max(1) as f64;
+    // The G BASELINE is a fraction of the per-position plane, so it divides by the bases
+    // that plane holds — not by `acc.bases`, which counts every base in the file and made
+    // this scale with `--max-read-len` (-0.4639 / -0.4181 / -0.2667 on one file at
+    // 20 / 40 / 1000).
+    let baseline = g as f64 / acc.per_pos_bases().max(1) as f64;
     (g1, baseline - g1)
 }
 

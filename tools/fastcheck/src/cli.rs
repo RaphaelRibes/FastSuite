@@ -203,12 +203,20 @@ impl Cli {
 
     pub fn thread_count(&self) -> usize {
         if self.threads > 0 {
-            self.threads
-        } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
+            return self.threads;
         }
+        // `FASTSUITE_THREADS` supplies the default when `-j` is not given — the suite's
+        // convention (fastprep, fastmaps, fastsim all read it): an explicit `-j` wins
+        // outright, and unset / unparseable / 0 all mean "not set".
+        std::env::var("FASTSUITE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
     }
 
     pub fn overrep_mode(&self) -> anyhow::Result<OverrepMode> {
