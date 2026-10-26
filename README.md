@@ -1,11 +1,46 @@
 # FastSuite — Work In Progress
 
-> **Pre-1.0: the tools work, the interfaces can still move.** Six crates, 852
+> **Pre-1.0: the tools work, the interfaces can still move.** Six crates, 1009
 > tests green on CI (`.github/workflows/ci.yml`), and results measured on 102
 > real ENA libraries — but only `fastdedup` (1.4.0) and `fastprep` (0.6.0) are
 > past 0.1.0, the CLI is still converging (see `docs/CLI-SPEC.md` §4), and no
 > release is tagged. Pin a commit rather than trusting `main` in a production
 > pipeline.
+
+## Repository layout
+
+FastSuite is an **umbrella**: every tool and every paper is its own repository,
+pinned here as a git submodule, so a clone of this repo reproduces exactly this
+state rather than "whatever is latest".
+
+| path | repository | contents |
+|---|---|---|
+| `tools/fastdedup` | [FastDedup](https://github.com/RaphaelRibes/FastDedup) (`fastsuite-1.4`) | PCR deduplication |
+| `tools/fastprep` | [FastPrep](https://github.com/RaphaelRibes/FastPrep) (`dev`) | adapter + polyX trimming |
+| `tools/fastcheck` | [FastCheck](https://github.com/RaphaelRibes/FastCheck) (`dev`) | quality control + profile measurement |
+| `tools/fastmaps` | [FastMaps](https://github.com/RaphaelRibes/FastMaps) (`dev`) | base-composition heatmaps |
+| `tools/fastsim` | [FastSim](https://github.com/RaphaelRibes/FastSim) (`dev`) | read simulator with ground truth |
+| `tools/fasthelper` | [FastHelper](https://github.com/RaphaelRibes/FastHelper) (`dev`) | runner, reports, config check |
+| `papers/fastprep` | [FastPrep-Paper](https://github.com/RaphaelRibes/FastPrep-Paper) (`dev`) | the trimming paper (Typst) |
+| `papers/fastdedup` | [FastDedup-Paper](https://github.com/RaphaelRibes/FastDedup-Paper) (`dev`) | the deduplication paper (Typst) |
+| `docs/` `bench/` `scripts/` `recipes/` `examples/` `deploy/` | this repo | the suite itself: spec, benchmarks, CI, packaging |
+
+FastDedup's `main`/`dev` still carry the published 1.2.2 line; this suite's
+version lives on its `fastsuite-1.4` branch and is pinned from there, so nothing
+on that repo had to be rewritten.
+
+Work on a tool happens **in its repository**. To record it here:
+
+```bash
+cd tools/fastprep && git commit -am "..." && git push    # in the sub-repo
+cd ../.. && pixi run sync-submodules                     # advances every pin, one commit
+```
+
+Pinning rather than tracking means six months from now this commit still builds
+what it built today; the cost is that `sync-submodules` must be run (and
+committed) to move anything. A fresh clone needs
+`git clone --recursive` (or `git submodule update --init --recursive`), and
+`pixi run ci` here still runs all six suites plus the cross-tool gates.
 
 ## What this is
 
@@ -136,7 +171,7 @@ FastSuite/
 for t in fastcheck fastdedup fastprep fastsim fastmaps fasthelper
     cd tools/$t; and cargo test --offline; and cd ../..
 end
-# 962 tests, 0 failures (as of the 2026-10-26 fix wave; scripts/ci.sh asserts
+# 1009 tests, 0 failures (as of the 2026-10-26 fix wave; scripts/ci.sh asserts
 # every per-tool count against scripts/expected-test-counts.txt)
 ```
 

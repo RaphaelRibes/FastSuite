@@ -1,10 +1,16 @@
 # Splitting FastSuite into one repo per tool and per paper
 
-Status: **prepared, not executed.** Steps 1–2 below are done (tag, splits,
-standalone verification); the rest waits on the five decisions at the end,
-because three of them (repo names, visibility, and what to do with the existing
-`FastDedup` / `FastDedup-Paper` repos) cannot be guessed without publishing
-something the wrong shape.
+Status: **executed 2026-10-26.** Every tool and both papers live in their own
+public repository; this repo pins them as submodules at the same paths, and
+`pixi run ci` is green (GRAND 1009) against the pinned trees.
+
+Decisions taken: dev branches (`main` on the new repos is the tidy initial
+import; work happens on `dev`), capitalised names matching `FastDedup`, public,
+pinned submodules, and one paper repo per paper mounted at `papers/<tool>/`.
+
+FastDedup already had a `dev` branch (the 1.2.2 line, last commit 2026-05-20),
+so this suite's version did **not** overwrite it: it lives on `fastsuite-1.4`
+and the submodule is pinned to that branch. `main` and `dev` there are untouched.
 
 ## Target shape
 

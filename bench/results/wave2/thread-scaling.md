@@ -46,7 +46,7 @@ The published 1.3.0 binary shows the same curve (`scale3.tsv`, tag `base`: 1.00�
 / 0.43× / 0.52× / 0.23× / 0.09×), so **this is not caused by the wave** — but it
 contradicts the tool's purpose and the qualitative advice in its own paper
 ("one worker thread per physical core", §5.4 of
-`tools/fastdedup/paper/paper.typ`).
+`papers/fastdedup/paper.typ`).
 
 Measured details (`scale3.tsv`, `scale4.tsv`, `scale5.tsv`; 3–5 reps, min and
 median within 2 % of each other, so this is systematic, not contention noise):

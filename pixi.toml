@@ -176,6 +176,9 @@ ci = "bash scripts/ci.sh"
 # while it did not exist.
 ground-truth = { cmd = "/usr/bin/python3 tools/fastcheck/tests/ground_truth.py", depends-on = ["build"] }
 doctor = "./tools/fasthelper/target/release/fasthelper doctor --tools-dir tools"
+# One repo per tool, one per paper, all pinned as submodules: this advances every
+# pin to the head of its branch and records it in a single commit.
+sync-submodules = "bash scripts/sync-submodules.sh"
 demo = "bash examples/demo.sh"
 report = "./tools/fasthelper/target/release/fasthelper report examples/runs/demo -o examples/runs/demo --format html,tsv"
 schema = "./tools/fasthelper/target/release/fasthelper schema"

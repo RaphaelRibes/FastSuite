@@ -209,7 +209,7 @@ any firing on adapter-free data is disqualifying.
 | `bench/scripts/trim_report.py` | per-mate columns + readthrough slicing + `pe_trims` |
 | `bench/scripts/insert_window_survey.py` | new — the Phase 0 survey (Task 0.3) |
 | `docs/OVERTRIM-PAIRED.md` | the with/without result |
-| `tools/fastprep/paper/paper.typ` | banner number or removal |
+| `papers/fastprep/paper.typ` | banner number or removal |
 | `docs/CLI-SPEC.md` | the new flag |
 | `scripts/expected-test-counts.txt` | only if a test is added (same commit) |
 

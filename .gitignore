@@ -35,7 +35,7 @@ fastp.json
 **/.snakemake/
 
 # built papers (generated from paper.typ, never committed)
-tools/*/paper/*.pdf
+papers/*/paper.pdf
 
 # misc
 *.bak

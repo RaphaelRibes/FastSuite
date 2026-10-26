@@ -1,0 +1,32 @@
+[submodule "tools/fastprep"]
+	path = tools/fastprep
+	url = git@github.com:RaphaelRibes/FastPrep.git
+	branch = dev
+[submodule "tools/fastcheck"]
+	path = tools/fastcheck
+	url = git@github.com:RaphaelRibes/FastCheck.git
+	branch = dev
+[submodule "tools/fastmaps"]
+	path = tools/fastmaps
+	url = git@github.com:RaphaelRibes/FastMaps.git
+	branch = dev
+[submodule "tools/fastsim"]
+	path = tools/fastsim
+	url = git@github.com:RaphaelRibes/FastSim.git
+	branch = dev
+[submodule "tools/fasthelper"]
+	path = tools/fasthelper
+	url = git@github.com:RaphaelRibes/FastHelper.git
+	branch = dev
+[submodule "tools/fastdedup"]
+	path = tools/fastdedup
+	url = git@github.com:RaphaelRibes/FastDedup.git
+	branch = fastsuite-1.4
+[submodule "papers/fastprep"]
+	path = papers/fastprep
+	url = git@github.com:RaphaelRibes/FastPrep-Paper.git
+	branch = dev
+[submodule "papers/fastdedup"]
+	path = papers/fastdedup
+	url = git@github.com:RaphaelRibes/FastDedup-Paper.git
+	branch = dev
