@@ -1,9 +1,10 @@
-// PolyX trimming — formal specification + Rust implementation guide
+// PolyX trimming — formal specification and measured behaviour
 // Revised 2026-04-23: asymmetric per-step score, clean indexing,
 //                     separated end-scan / interior-scan, tuned naming,
 //                     whole-pipeline complexity, captioned figures.
-// Extended 2026-05-26: Introduction (§1) and Rust implementation
-//                     parts (§8--§10) bridging math to production code.
+// Revised 2026-10-26: the source-code walkthrough (former §8--§9) is
+//                     removed; the specification, the procedures and the
+//                     measured tables stand on their own.
 
 #set page(paper: "a4", margin: 2cm)
 #set text(font: "New Computer Modern", size: 11pt)
@@ -286,11 +287,16 @@ this specification's scope.
 The remainder of this document is structured in two parts. Part I (§2--§7)
 gives the formal specification: the asymmetric per-step score, the stopping
 rule, the end-scan and interior-scan procedures, the adapter sub-procedures,
-and the EPYC-specific optimisations. Part II (§8--§10) bridges the
-specification to the Rust implementation: the reproducible build environment,
-the type-level encoding of every mathematical object, and the
-performance-critical code paths with their micro-optimisations
-(quality-gate LUT, fused streaming walk, const-generic monomorphisation).
+and the EPYC-specific optimisations. Part II describes the binary metadata
+stream (the per-read record that carries every trim decision downstream) and
+the performance and safety properties the implementation must hold: the
+allocation budget per read, the concurrency design, the crash-safety guards and
+the effect each micro-optimisation (quality-gate LUT, fused streaming walk,
+const-generic monomorphisation) had when measured.
+
+The implementation itself is not reproduced here. It lives in the repository,
+where a listing can be compiled and tested; a listing in a paper can only be
+read, and goes stale the first time the code moves.
 
 = PolyX trimming
 
@@ -2313,8 +2319,7 @@ mechanism, and k-mer auto-detection for libraries where the adapter
 sequence is unknown.
 
 @sec:pxmt documents the binary metadata stream and @sec:rust-perf summarises
-the performance and safety properties
-to the Rust implementation. Each mathematical object (the parameter tuple,
+the performance and safety properties. Each mathematical object (the parameter tuple,
 the per-step score, the scan result, the trim decision, the adapter hint)
 maps to a Rust type whose fields use the same names as the math. The hot
 path is built around three load-bearing micro-optimisations: a 256-entry
