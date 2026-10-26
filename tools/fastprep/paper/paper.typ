@@ -994,23 +994,19 @@ loop, presented in @alg:scan. With the gap-increment table of
 @sec:xor, each iteration is one gather-load, one add, one compare.
 
 #figure(
-```
-procedure ScanFrom(s, u) → (K*, mode, m*)
-    Γ ← 0;  K ← 0;  m* ← 0
-    while s + K + 1 ≤ u do
-        Γ ← Γ + ΔΓ[b[s+K], b[s+K+1], q[s+K], q[s+K+1]]
-        if b[s+K] = b[s+K+1] then m* ← m* + 1   // match count
-        K ← K + 1
-        if Γ > Δ_m then return (K, mercy, m*)
-    return (K, boundary, m*)
-```,
-  caption: [Scan primitive. Walks from position $s$ toward upper
-    index $u$, accumulating gap mass until mercy or boundary
-    termination. Returns the step count $K$, the stopping mode, and
-    the match count $m^*$ (number of matching steps). The match
-    count is the load-bearing input to the homopolymer-length
-    threshold $m^* + 1 >= m_h$ used downstream; thresholding on
-    $K^*$ alone would conflate run length with mercy overshoot.],
+  block(stroke: 0.5pt, inset: 0.7em, radius: 2pt, width: 100%,[
+    Starting at position $s$ with zero gap mass $Gamma$, zero steps $K$ and zero
+    matched steps $m^*$, the walk advances one position at a time toward $u$. Each
+    step adds the table entry $Delta Gamma[b_j, b_(j+1), q_j, q_(j+1)]$ of the
+    adjacent base pair to $Gamma$ and increments $m^*$ exactly when the two bases
+    are equal. The walk stops on the first step that pushes $Gamma$ past $Delta_m$
+    — the *mercy* stop — or when the next step would pass $u$, the *boundary* stop;
+    $K$ is the number of steps taken in either case. The procedure returns the triple
+    $(K, "mode", m^*)$, and $m^*$ is the quantity the homopolymer-length threshold
+    consumes: the run anchored at $s$ qualifies as an artefact when the tested run
+    length, $m^* + 1$, reaches $m_h$.
+  ]),
+  caption: [The shared inner loop of all three scans: it returns the step count, the stopping mode and the match count that the length threshold tests.],
 ) <alg:scan>
 
 The reverse variant, $"ScanFromReverse"(s, ell)$, is structurally
@@ -1031,47 +1027,28 @@ zone, avoiding double-counting. Three short-circuit points (lines
 inevitable.
 
 #figure(
-```
-procedure PolyXTrim(R, Q, L)
-    s ← 0;  T_5 ← 0;  H_int ← 0;  runs ← [ ]
-    (K*, mode, m*) ← ScanFrom(0, L - 1)
-    if m* + 1 < m_h then
-        T_5 ← 0
-    else if mode = mercy then
-        T_5 ← K*
-    else
-        T_5 ← K* + 1
-    if T_5 > Δ_L then return DROP              // 5′ short-circuit
-    s ← K* + 1
-    while s ≤ L - 2 do                         // interior scan
-        (K*, mode, m*) ← ScanFrom(s, L - 1)
-        if mode = mercy and m* + 1 ≥ m_h then
-            H_int ← H_int + K*
-            append (s, K*) to runs
-            if T_5 + H_int > Δ_L then return DROP
-        s ← s + K* + 1
-    (K̃*, mode, m̃*) ← ScanFromReverse(0, Δ_L - T_5)   // Pass 2
-    if m̃* + 1 < m_h then
-        T_3 ← 0
-    else if mode = mercy then
-        T_3 ← K̃*
-    else
-        T_3 ← K̃* + 1
-    if T_5 + T_3 > Δ_L then return DROP
-    for (start, len) in reversed(runs) do      // reconcile
-        if start + len - 1 ≥ L - T_3 then
-            H_int ← H_int - len
-        else break
-    if T_5 + T_3 + H_int > Δ_L then return DROP
-    return EMIT(R[T_5 : L - T_3], Q[T_5 : L - T_3])
-```,
-  caption: [Main pipeline. Pass 1 (lines 2–18) fuses 5′ end-scan
-    and interior scan in a single forward traversal; Pass 2 (line
-    19) is a budget-capped reverse scan; lines 27–30 reconcile
-    interior runs that straddle the 3′ boundary. The
-    homopolymer-length threshold uses the match count $m^*$ rather
-    than $K^*$ to avoid trimming on scans whose distance was
-    inflated by mercy overshoot.],
+  block(stroke: 0.5pt, inset: 0.7em, radius: 2pt, width: 100%,[
+    The forward pass opens with the 5' end scan from position 0: the run qualifies
+    when $m^* + 1 >= m_h$, and is then cut to $K^*$ under a mercy stop or to
+    $K^* + 1$ under a boundary stop, while a non-qualifying run leaves $T_5 = 0$. A
+    5' cut that alone exceeds the budget $Delta_L$ drops the read immediately. The
+    interior scan then resumes at $s = K^* + 1$ and repeats the same scan from every
+    position up to $L - 2$: a run that qualifies *and* stopped on mercy is recorded as
+    an interior removal $(s, K^*)$, its length is added to $H_"int"$, and the read is
+    dropped as soon as $T_5 + H_"int"$ exceeds $Delta_L$; the scan always resumes
+    past the run, at $s + K^* + 1$.
+
+    The reverse pass owns the 3' end. Over the window $[0, Delta_L - T_5)$ — the
+    budget the 5' cut left — it applies the same qualifying rule in the reverse
+    direction to fix $T_3$, and the read is dropped if $T_5 + T_3 > Delta_L$. The
+    reconciliation pass then walks the recorded interior runs from the last to the
+    first: any run whose last base lies at or beyond $L - T_3$ has already been
+    absorbed by the 3' cut, so its length is subtracted from $H_"int"$, and the walk
+    stops at the first run that ends before that frontier. The read is dropped if
+    $T_5 + T_3 + H_"int"$ now exceeds $Delta_L$; otherwise the emitted read is the
+    sub-read $[T_5, L - T_3)$.
+  ]),
+  caption: [The forward pass (5′ end and interior), the reverse pass (3′ end over the remaining budget) and the reconciliation pass.],
 ) <alg:main>
 
 #Prop (correctness of reconciliation). The reconciliation step
@@ -1361,22 +1338,18 @@ mixing the two would allow a surviving mate to collide with an
 unrelated read.
 
 #figure(
-```
-procedure Dedup(R1, R2 or ⊥, S, a, k)
-    w1 ← R1[a : a + k]
-    if R2 = ⊥ then
-        φ ← H(w1)
-    else
-        w2 ← R2[a : a + k]
-        φ ← H(w1) xor rot(H(w2), N/2)
-    if φ ∈ S then return DROP(Duplicate)
-    S ← S ∪ {φ}
-    return CONTINUE
-```,
-  caption: [Deduplication stage. Runs before every other operation on
-    the read. $S$ is the fingerprint set, $[a, a+k)$ the anchor window
-    of @sec:dedup. The set is the only unbounded state in the
-    pipeline; all other stages are chunk-bounded.],
+  block(stroke: 0.5pt, inset: 0.7em, radius: 2pt, width: 100%,[
+    The anchor window of length $k$ at offset $a$ is fingerprinted: in
+    single-end mode $phi = H(w_1)$; in paired-end mode the two anchors are
+    combined as $phi = H(w_1) xor "rot"(H(w_2), N\/2)$, which preserves the pair
+    orientation without a second table. A fingerprint already in the set $S$ means
+    the record is the duplicate of an earlier one and is dropped with reason
+    `Duplicate`; otherwise it is registered in $S$ and the record continues. Because
+    the decision is taken on the fingerprint of the anchor only, it is independent of
+    trimming and of the rest of the read, which is what makes it the first stage of
+    every pipeline.
+  ]),
+  caption: [Fingerprint the anchor window; a hit in the fingerprint set drops the record.],
 ) <alg:dedup>
 
 === Admission control and saturation <sec:dedup-mem>
@@ -1580,20 +1553,16 @@ The complete pipeline including extensions is:
   the decision rule.
 
 #figure(
-```
-procedure HardTrim(R, Q, L, T_5_hard, T_3_hard, Δ_L)
-    if T_5_hard + T_3_hard > Δ_L then return DROP
-    L' ← L - T_5_hard - T_3_hard
-    if L' < 2 then return DROP
-    R' ← R[T_5_hard : L - T_3_hard]
-    Q' ← Q[T_5_hard : L - T_3_hard]
-    Δ_L' ← Δ_L - T_5_hard - T_3_hard
-    return (R', Q', Δ_L')
-```,
-  caption: [Hard-trim wrapper. Returns either a working sub-read
-    $(R', Q')$ with reduced budget $Delta_L'$ for the polyX
-    procedure, or a drop decision when the hard trim alone makes
-    the read non-emittable.],
+  block(stroke: 0.5pt, inset: 0.7em, radius: 2pt, width: 100%,[
+    A hard trim is admissible only if the two requested cuts fit inside the
+    budget: $T_5^"hard" + T_3^"hard" > Delta_L$ drops the read. The remaining length
+    $L' = L - T_5^"hard" - T_3^"hard"$ must leave at least two bases, or the read is
+    dropped as too short to carry a homopolymer decision. Otherwise the procedure
+    returns the working sub-read $(R', Q')$ together with the reduced budget
+    $Delta_L' = Delta_L - T_5^"hard" - T_3^"hard"$, so the polyX stage that follows
+    cannot spend bases the hard trim already took.
+  ]),
+  caption: [Apply the requested cuts or drop, and hand the remaining sub-read its reduced budget.],
 ) <alg:hardtrim>
 
 #Rem (orthogonality). Neither extension affects the asymmetric
@@ -1714,22 +1683,18 @@ candidates where the seed matches but Hamming verification fails.
 The sequence-matching procedure is shown in @alg:adp-se.
 
 #figure(
-```
-procedure MatchAdapters(R, L, 𝒜, ε, o_SE) → (T3_adp, name)
-    best_k ← 0;  best_name ← ∅
-    for (η, A) with |A| = p in 𝒜 do
-        for k ← min(L, p) downto o_SE do          // greediest first
-            mm ← count_mismatches(R[L−k : L], A[0 : k])
-            if mm / k ≤ ε then
-                if k > best_k then
-                    best_k ← k;  best_name ← η
-                break                               // largest k for this adapter
-    return (best_k, best_name)
-```,
-  caption: [Single-end adapter matching. Tries overlaps from largest
-    to smallest for each adapter; accepts the first admissible overlap
-    per adapter, then reports the globally largest overlap. Returns
-    $T_3^"adp" = 0$ when no adapter matches.],
+  block(stroke: 0.5pt, inset: 0.7em, radius: 2pt, width: 100%,[
+    Every adapter in the set is tried at every admissible overlap length, from
+    the largest possible one, $\min(L, p)$, downward to the minimum admissible
+    overlap $o_"SE"$ — greediest first, because the longest admissible overlap is the
+    one that explains the most read. An overlap is admissible when its mismatch rate
+    does not exceed the error tolerance, $m m \/ k <= epsilon$. For each adapter the
+    scan stops at the first admissible length, and across adapters the procedure
+    keeps the longest admissible overlap found, remembering the adapter's name. When
+    no overlap is admissible it reports zero trimmed bases and no name, which is the
+    "no adapter present" answer rather than a failure.
+  ]),
+  caption: [Longest admissible overlap per adapter, with the minimum overlap bounding the search.],
 ) <alg:adp-se>
 
 == Paired-end overlap detection <sec:adp-pe>
@@ -1817,23 +1782,18 @@ cost is one complement comparison with no table lookup.
 The PE overlap procedure is shown in @alg:adp-pe.
 
 #figure(
-```
-procedure DetectPEOverlap(R1, R2, L1, L2, ε, o_PE) → T_PE
-    for I ← min(L1, L2) downto o_PE do
-        mm ← 0
-        for i ← 0 to I − 1 do
-            if R1[i] ≠ complement(R2[I − 1 − i]) then mm ← mm + 1
-        if mm / I ≤ ε then
-            T_PE ← L1 − I           // adapter length in R1
-            if T_PE = 0 then return 0   // no adapter content
-            return T_PE
-    return 0                         // no overlap found; use SE fallback
-```,
-  caption: [Paired-end overlap detection. Scans insert sizes in
-    decreasing order (conservative: smallest trim first) and
-    accepts the first admissible overlap. Returns 0 when no
-    overlap is found; the caller applies sequence matching as a
-    fallback in that case.],
+  block(stroke: 0.5pt, inset: 0.7em, radius: 2pt, width: 100%,[
+    Candidate insert sizes are scanned from the largest, $\min(L_1, L_2)$, down to
+    the minimum overlap $o_"PE"$: the read pair is compared over $I$ bases as
+    $R_1[i]$ against $"complement"(R_2[I - 1 - i])$, and the candidate is accepted
+    when its mismatch rate is within tolerance, $m m \/ I <= epsilon$. Accepting the
+    first (largest) admissible $I$ is the conservative choice — it implies the
+    smallest trim — and the adapter length in $R_1$ is then $T_"PE" = L_1 - I$. An
+    admissible overlap with $T_"PE" = 0$ means the pair carries no adapter content,
+    and a scan that finds no admissible overlap returns zero, which routes the pair
+    to single-end matching.
+  ]),
+  caption: [Largest admissible overlap first — the smallest trim — with no overlap falling back to single-end matching.],
 ) <alg:adp-pe>
 
 #Prop (PE complexity). $"DetectPEOverlap"$ costs $O(L^2)$ in the
@@ -1966,35 +1926,27 @@ optional adapter name $eta$:
 The procedure is shown in @alg:trim.
 
 #figure(
-```
-procedure Trim(R, Q, L, Θ, Hint) → TrimOutput
-    // Step 1: resolve adapter trim
-    if Hint = Override(T5a, T3a, η) then
-        T5_adp ← T5a;  T3_adp ← T3a;  name ← η
-    else
-        (T3_adp, name) ← MatchAdapters(R, L, 𝒜, ε, o_SE)
-        T5_adp ← 0
-    T_adp ← T5_adp + T3_adp
-    // Step 2: adapter budget check
-    if T_adp > Δ_L then return Drop(Adapter)
-    // Step 3: polyX scan on adapter-trimmed sub-read
-    safe5 ← min(T5_adp, L);  safe3 ← min(T3_adp, L − safe5)
-    R' ← R[safe5 : L − safe3];  Q' ← Q[safe5 : L − safe3]
-    Θ' ← Θ with Δ_L' ← Δ_L − T_adp, L_orig ← L
-    res ← PolyXTrim(R', Q', L − T_adp, Θ')
-    // Step 4: coordinate reconstruction
-    match res with
-    | Drop(reason, T5px, T3px) →
-        return Drop(reason, T5_adp, T3_adp, T5px, T3px)
-    | Emit(T5px, T3px, runs) →
-        abs_runs ← [(start + safe5, len) for (start, len) in runs]
-        return Emit(T5_adp, T3_adp, T5px, T3px, abs_runs, name)
-```,
-  caption: [Combined adapter + polyX trim. The adapter trim is
-    applied first; any remaining budget is passed to the polyX
-    procedure. Interior-run start positions are translated back
-    to original-read coordinates by adding the 5′ adapter trim.
-    The `Drop(Adapter)` path exits without scanning.],
+  block(stroke: 0.5pt, inset: 0.7em, radius: 2pt, width: 100%,[
+    The adapter trim is resolved first. With an `Override` hint — the paired-end
+    overlap result — the two cut lengths and the adapter name come from that hint
+    and the 3' length is the trim it computed; without one, single-end matching
+    produces $T_3^"adp"$ and its name, and $T_5^"adp"$ is zero, because single-end
+    matching can only see a 3' artefact. A total adapter trim larger than the budget
+    drops the read with reason `Adapter`.
+
+    The polyX procedure then runs on the adapter-trimmed sub-read, clamped so the two
+    cuts cannot overlap: the sub-read is $R["safe"_5 , L - "safe"_3]$ with
+    $"safe"_5 = min(T_5^"adp", L)$ and $"safe"_3 = min(T_3^"adp", L - "safe"_5)$, and
+    it inherits both the reduced budget $Delta_L' = Delta_L - T_"adp"$ and the
+    original read length the thresholds are expressed in terms of.
+
+    The final step rebuilds coordinates. A drop keeps the adapter contribution
+    alongside the polyX contribution, so the metadata records what each stage did
+    rather than only the stage that fired last; an emit shifts every interior run by
+    $"safe"_5$ and returns the adapter cuts, the polyX cuts, the absolute runs and the
+    adapter name.
+  ]),
+  caption: [Adapter trim first, then polyX on the trimmed sub-read, then reconstruction of absolute coordinates.],
 ) <alg:trim>
 
 #Prop (budget invariant). For any input $(R, Q, L)$ and any
