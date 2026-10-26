@@ -807,6 +807,21 @@ Recommendations:
   read length, and how much of the pipeline is fused into a single
   worker.
 
+#Rem (measured scaling, 2026-10-26). The recommendations above describe
+the scan kernel; they are not a measurement of this implementation's
+end-to-end thread scaling, and the difference matters. On four corpora
+(200 k to 4.8 M read pairs, gz and uncompressed, run with the tool's own
+clock) wall time *rises* with the worker count on the current build:
+speedup against one thread is 0.41--0.53× at two, 0.37--0.55× at four,
+0.31--0.57× at eight and 0.09--0.12× at sixteen, and the same curve is
+reproduced by the published 1.3.0 binary. The cause is in the
+parallelisation of the deduplication decision, not in the scan loop whose
+bandwidth argument is given here, and the reproduction and the numbers
+live in the repository (`bench/results/wave2/thread-scaling.md`) rather
+than in this document, because they describe a defect under repair and
+not a property of the method. Until it is repaired, the configuration
+that maximises throughput is one worker.
+
 Pin threads explicitly (`sched_setaffinity` or `taskset`) rather
 than relying on the kernel scheduler. On a 96-core socket, thread
 migration across CCDs costs more than the scheduler is accounting
