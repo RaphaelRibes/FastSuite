@@ -3002,3 +3002,25 @@ fn dedup_writes_the_first_occurrence_in_input_order() {
         }
     }
 }
+
+/// A named output's missing parent directories are created, like every other
+/// tool in the suite. `-o results/run/o.fq` used to fail with "Failed to create
+/// file" on a directory the caller had not made by hand.
+#[test]
+fn named_output_creates_its_missing_parent_directories() {
+    let temp_dir = assert_fs::TempDir::new().unwrap();
+    let input = generer_fastq(&temp_dir, "in.fastq", 4, 0);
+    let nested = temp_dir.child("a/b/c/out.fastq");
+
+    cmd()
+        .arg("-1")
+        .arg(input.path())
+        .arg("-o")
+        .arg(nested.path())
+        .arg("-q")
+        .assert()
+        .success();
+
+    let text = fs::read_to_string(nested.path()).unwrap();
+    assert_eq!(text.lines().filter(|l| l.starts_with('@')).count(), 4);
+}

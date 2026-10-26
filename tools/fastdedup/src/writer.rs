@@ -78,6 +78,18 @@ pub fn prepare_writer(
     force: bool,
     compression_level: u32,
 ) -> Result<(Box<dyn Write>, OutputFormat)> {
+    // Create the parent directories a named output needs. Every other tool in
+    // the suite does this (fastprep, fastcheck, fastmaps, fastsim), and
+    // `-o results/run/o.fq` here failed with "Failed to create file" on a
+    // directory the caller had not made by hand: same flag, same meaning, one
+    // tool refusing. A stream never reaches this function.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {} for {}", parent.display(), path.display()))?;
+        }
+    }
+
     let format = OutputFormat::from_extension(path);
     let is_gz = OutputFormat::is_gz(path);
 
