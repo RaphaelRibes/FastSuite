@@ -78,6 +78,15 @@ moves the absolute values both reports publish, not the difference between them.
 The fix wave changes what the reports *say*, not the agreement they measure, so
 this stage is a regression check and its reproduction of 183/306 is the result.
 
+There is a second, independent reason the file did not move, and it is the
+sharper one: the two fastcheck fields this wave corrected — `head_dropout` and
+the profile's `g_mean` — are **not read by fastsim at all** (`grep -rn 'g_mean\|head_dropout'
+tools/fastsim/src/` returns nothing). The simulator draws from the base plane,
+the quality planes, the insert CDF, `gc` and the adapter model, none of which the
+fix touched. Correcting a scalar the consumer never reads cannot change a
+simulated read, so byte-identity with `gt2026` (produced before the fix) is the
+expected outcome, not a coincidence.
+
 ## Trim accuracy — `trim-accuracy-shipped.tsv`
 
 Shipped default (`0.67L`, `--min-run 12`, `--mercy 3`, `--head-dropout 4`,

@@ -286,9 +286,11 @@ closed loop **183/306 = 59.8%**, **60/102** datasets passing every variant,
 median G-fraction **0.0092**, identical gate counts (g_frac 121, mean_q 8, gc 4)
 and identical per-domain splits. The three files are not merely equal row by row:
 they are **byte-identical**, sha256 `2076d6a0…`, all 25 columns including
-`verdict`, `failing` and the `_lm` columns. That invariance is expected rather than reassuring: every scored
-quantity is produced by the same `fastcheck` on both sides, so a report-side
-error cancels out, and none of the waves' defects feeds these four gates.
+`verdict`, `failing` and the `_lm` columns. That invariance is expected rather than reassuring, for two independent
+reasons: every scored quantity is produced by the same `fastcheck` on both
+sides, so a report-side estimator error cancels; and the two fields this wave
+corrected (`head_dropout`, the profile's `g_mean`) are not read by `fastsim` at
+all, so correcting them cannot move a simulated read.
 
 The trim table does move, and each move is the defect it closes. First wave:
 **77.87% exact / 20.00% overtrim / 2.13% undertrim** (was 75.5 / 22.5 / 2.0) —
