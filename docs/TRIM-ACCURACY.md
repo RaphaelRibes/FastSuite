@@ -183,6 +183,12 @@ overcut. Nothing else in the table moves: the fix is confined to the
 (both-ends-artefact × budget-exhausted) corner, which this corpus hits in
 0.012% of scored mates.
 
+Checked row by row rather than in aggregate, because a net delta can hide two
+opposing effects: all 39 changed datasets are pure reclassifications (each
+one's four deltas sum to 0 to the mate) and **no** dataset moves `undertrim`
+upward. The movement is one direction of travel, which is what a targeted fix
+looks like.
+
 The closed loop is **unchanged** by this wave — 183/306, 60/102, median
 G-fraction 0.0092 — and `closed_loop.tsv` is byte-identical to both
 `bench/results/fix2026/` and `bench/results/gt2026/` (sha256 `2076d6a0…`, all 25
