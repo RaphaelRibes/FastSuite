@@ -161,6 +161,35 @@ exact: the fix closes the case where a 3′ polyX run whose trim landed at the
 trim-budget boundary was emitted **whole** (a 48-base artefact on a 151 bp read
 at `0.67L`). The row is measured on the fixed build, not spliced in.
 
+### The same measurement after the second fix wave (2026-10-26, `bench/results/wave2/`)
+
+Same 102 datasets, same scorer, same shipped defaults, on the build that fixes
+the **two-sided** polyX case (a 3′ artefact was emitted whole when a 5′ artefact
+had already spent the trim budget):
+
+| | mates | of scored | of all | Δ vs the row above |
+|---|---|---|---|---|
+| exact | 13,914,963 | **77.88%** | 68.20% | +1,690 |
+| overtrim | 3,574,241 | 20.00% | 17.52% | +433 |
+| undertrim | 378,184 | **2.12%** | 1.85% | **−2,143** |
+| dropped | 2,532,612 | — | 12.41% | +20 |
+| scored | 17,867,388 | | | −20 |
+
+The movement is entirely in the **undertrim** row, which is the defect: 2,143
+mates had kept an artefact at the 3′ end, and 20 of them now carry both ends
+past the floor and are dropped instead of emitted with a trimmed-head,
+untrimmed-tail read. 1,690 of the 2,143 land on the exact cut, 433 on an
+overcut. Nothing else in the table moves: the fix is confined to the
+(both-ends-artefact × budget-exhausted) corner, which this corpus hits in
+0.012% of scored mates.
+
+The closed loop is **unchanged** by this wave — 183/306, 60/102, median
+G-fraction 0.0092, byte-identical to `bench/results/fix2026/` over the scored
+columns. That is expected and it is not evidence of a thorough fix: every
+scored quantity is produced by the same `fastcheck` on both sides of the
+comparison, so a report-side error cancels. The wave's real gains are in the
+report, the GT and the output paths, which this loop does not measure.
+
 ### Tolerance 0 (strict), undertrim decomposed
 
 `bench/scripts/trim_report.py`, output `bench/results/phase-d/trim-report-20261018.tsv`.

@@ -279,13 +279,22 @@ tests**, was 852). The ones with real consequences:
   0.03% adapter content; the aggregate is stamped `fastsuite.aggregate.v1` and
   validates.
 
-**Re-derivation on the fixed build** (`bench/results/fix2026/`): the closed loop
-reproduces **183/306 = 59.8%**, 60/102 datasets, median G-fraction 0.0092 —
-byte-identical to `gt2026` over the scored columns, because the fixes are
-report/GT-integrity defects that do not feed these four gates. The trim table's
-shipped-default row, however, moves: **77.87% exact / 20.00% overtrim / 2.13%
-undertrim** on 17.9 M scored mates (was 75.5 / 22.5 / 2.0), which is the
-budget-boundary fix.
+**Re-derivation on the fixed builds.** Two full desktop campaigns, both over the
+same 102 datasets × 3 variants. `bench/results/fix2026/` (first wave) and
+`bench/results/wave2/` (second wave) agree with each other and with `gt2026`:
+closed loop **183/306 = 59.8%**, **60/102** datasets passing every variant,
+median G-fraction **0.0092**, identical gate counts (g_frac 121, mean_q 8, gc 4)
+and identical per-domain splits — the first 17 columns are byte-identical across
+all three. That invariance is expected rather than reassuring: every scored
+quantity is produced by the same `fastcheck` on both sides, so a report-side
+error cancels out, and none of the waves' defects feeds these four gates.
+
+The trim table does move, and each move is the defect it closes. First wave:
+**77.87% exact / 20.00% overtrim / 2.13% undertrim** (was 75.5 / 22.5 / 2.0) —
+the budget-boundary fix. Second wave: **77.88 / 20.00 / 2.12**, where the whole
+delta is in the undertrim row (**−2,143 mates**) and is the two-sided polyX fix
+(a 3′ artefact no longer survives when the 5′ one spent the budget); 20 of those
+mates are now dropped rather than emitted with an untrimmed tail.
 
 ## Fixed in the 2026-10-21 review round (full-suite review: six crates + six papers)
 
