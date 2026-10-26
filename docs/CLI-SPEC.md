@@ -57,6 +57,11 @@ Rules:
 
 0. **`-` means the stream** (D-4). FASTQ input from stdin and FASTQ/report
    output to stdout, in a pipe or on a file, with no intermediate on disk.
+   A summary line never shares a stream with data: whenever `-o -`, `-p -` or
+   `--json -` puts data on stdout, the `fastdedup:` summary goes to stderr, and
+   `--json -` together with any `-` output is refused. (`-p -` was the missing
+   sibling until 2026-10-26: the summary was appended to the R2 stream, so
+   `-p - | gzip > r2.fq.gz` produced a file no FASTQ parser accepts.)
    Working today: `zcat in.fq.gz | fastdedup -1 - -o - | gzip > d.fq.gz`, and
    `fastcheck -` reads a stream. **`fastprep` is still file-only**, so the
    three-stage pipe `… | fastprep -1 - …` is the target, not a working

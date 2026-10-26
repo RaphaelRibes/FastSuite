@@ -32,11 +32,11 @@
 # REGENERATE after a legitimate change: run `pixi run ci`, read the ACTUAL
 # column of its per-tool table, and copy those numbers here.
 
-fastcheck    162
-fastdedup    151
-fastprep     315
-fastsim      103
-fastmaps     135
-fasthelper    95
+fastcheck    172
+fastdedup    152
+fastprep     319
+fastsim      107
+fastmaps     150
+fasthelper    107
 pathology    1
-GRAND        962
+GRAND        1008
