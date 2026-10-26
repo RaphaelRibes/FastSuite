@@ -3,6 +3,32 @@
 Newest first. Default-behaviour changes are marked **DEFAULT** and always carry
 the measurement that justified them.
 
+## 0.6.0 — 2026-10-26
+
+### Fixed — the 3′ end of a budget-exhausted read
+
+A read whose 5′ polyX run spent the whole trim budget (`--min-len` doubles as
+the budget) kept an untrimmed 3′ artefact: the reverse pass was capped at the
+5′ extent instead of at the budget the 5′ cut left, so a run that started
+before the cap and continued past it was measured as nothing. The pass now
+measures the run's extent beyond the budget and cuts what it finds.
+
+Measured on the desktop campaign (102 datasets, 20.4 M mates, shipped
+defaults): **undertrim 380,327 → 378,184 mates** — 1,690 more exact cuts, 433
+more overcuts, and 20 reads dropped instead of being emitted with a trimmed
+head and an untrimmed tail. All 39 changed datasets are pure
+reclassifications (their four deltas sum to zero, none moves undertrim upward);
+the corner is hit by 0.012 % of scored mates. `docs/TRIM-ACCURACY.md` carries
+the table and `bench/results/wave2/` the raw TSVs.
+
+### Fixed — smaller
+
+- `--singletons1/--singletons2` now apply the same output-format check as the
+  main outputs instead of writing a format that contradicts the extension.
+- Missing output parent directories are created rather than refused.
+- A shipped-defaults test pins the values `--help` advertises, so a default
+  cannot drift again without a test failing.
+
 ## 0.5.0 — 2026-10-23
 
 ### Added — `--auto-params`: the model recommendation is real

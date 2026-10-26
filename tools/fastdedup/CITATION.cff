@@ -15,8 +15,8 @@ authors:
     given-names: Alice
     orcid: "https://orcid.org/0000-0001-7142-5864"
     affiliation: "ISEM, Université de Montpellier, CNRS, IRD, Montpellier, France"
-date-released: "2026-04-29"
-version: 1.3.0
+date-released: "2026-10-26"
+version: 1.4.0
 license: MIT
 repository-code: "https://github.com/RaphaelRibes/FastDedup"
 preferred-citation:

@@ -2,7 +2,7 @@
 
 > **Pre-1.0: the tools work, the interfaces can still move.** Six crates, 852
 > tests green on CI (`.github/workflows/ci.yml`), and results measured on 102
-> real ENA libraries — but only `fastdedup` (1.3.0) and `fastprep` (0.5.0) are
+> real ENA libraries — but only `fastdedup` (1.4.0) and `fastprep` (0.6.0) are
 > past 0.1.0, the CLI is still converging (see `docs/CLI-SPEC.md` §4), and no
 > release is tagged. Pin a commit rather than trusting `main` in a production
 > pipeline.
@@ -20,8 +20,8 @@ shared crate, kept consistent by tests rather than by a compiler.
 
 | tool | replaces | what it does | maturity |
 |---|---|---|---|
-| **fastdedup** | `fastp --dedup` as a separate step (and `seqkit rmdup`, `prinseq++`) | the same exact fingerprint dedup as `fastprep --dedup`, as a standalone pipeable binary — use it when dedup is its own pipeline step | v1.3.0, WIP (published: bioRxiv 2026.04.29.721745) |
-| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, **native deduplication** (`--dedup`, on by default — the same exact fingerprint model as fastdedup) | v0.5.0, WIP |
+| **fastdedup** | `fastp --dedup` as a separate step (and `seqkit rmdup`, `prinseq++`) | the same exact fingerprint dedup as `fastprep --dedup`, as a standalone pipeable binary — use it when dedup is its own pipeline step | v1.4.0, WIP (published: bioRxiv 2026.04.29.721745) |
+| **fastprep** | `fastp` (trimming + adapter + filters) | asymmetric quality-weighted polyX trimming (5′ **and** 3′ **and** interior), adapter trimming with catalogue auto-detection, hard trim, mean-Q filter, **native deduplication** (`--dedup`, on by default — the same exact fingerprint model as fastdedup) | v0.6.0, WIP |
 | **fastsim** | *no equivalent* (benchmark scaffolding) | NovaSeq-like PE read simulator with full ground truth: artefact CDFs, quality curves, adapters, duplicates, must-drop class — driven by a profile measured from real data or fitted by `fastcheck` | v0.1.0, WIP |
 | **fastmaps** | FastQC/Falco composition plots | 2-D heatmap of reads by base composition `(x = T+C, y = T+G)`; natively exposes polyA/polyT/polyG/polyC corners and off-diagonal mass, per mate | v0.1.0, WIP |
 | **fastcheck** | FastQC / Falco | exact one-pass QC: basic statistics, per-position base/N/quality matrices, per-read length/GC/mean-Q histograms, duplication levels, polyX runs, bounded repeated-sequence and k-mer counters, insert-size histogram — no sampling, no verdicts, memory printed before the run. `--profile` writes a fastsim profile directly | v0.1.0, WIP |

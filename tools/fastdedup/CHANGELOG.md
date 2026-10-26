@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.4.0 — 2026-10-26
 
 ### ✨ New Features
 
@@ -8,6 +8,36 @@
 - `--out-format <fastq|fasta>` and `--out-compression <none|gz>`: explicit format and compression when writing to a stream; named paths keep inferring both from the extension.
 - `--json -` writes the report to stdout; the summary line then moves to stderr.
 - Input compression is detected from magic bytes, so gzip on a stream is decoded like gzip in a file.
+
+### 🐛 Fixes
+
+- **Which copy of a duplicated record survives no longer depends on thread
+  scheduling.** At `-j 8` under load, six runs kept six different header
+  multisets (sequence multiset identical); on a quiet box the same binary was
+  24/24 identical. The writer now re-orders worker results by input ordinal
+  before the decision, so the retained copy is the **first occurrence in input
+  order** — a documented contract, not an accident.
+- **A refused FASTA destination is no longer destroyed.** Writing FASTA to a
+  `.fq` path truncated the file and then refused it; with `--force` it deleted
+  it first. The format check now runs before any output is opened, so the
+  destination survives intact and no zero-byte file is left behind.
+- **`-p -` no longer writes the summary line into the R2 stream.** The summary
+  moves to stderr whenever stdout carries data, and `-p - --json -` is refused
+  instead of interleaved.
+- **The paired-end summary counts reads**, matching its own `--json` report; it
+  used to count pairs and disagree with itself by a factor of two.
+- **A missing output parent directory is created**, as the other five tools do,
+  instead of failing with "Failed to create file".
+
+### ⚠️ Behaviour changes
+
+- The report publishes the resume accounting: `reads_preloaded`,
+  `reads_already_present`, `reads_new`, with `reads_out == reads_preloaded +
+  reads_new` and `reads_in == reads_new + reads_already_present +
+  reads_duplicate`. A resumed run says so on stderr unless `-q`.
+- `-p -` routes the summary to stderr; `--json -` alongside any `-` output is
+  refused.
+- The PE summary's unit changes from pairs to reads.
 
 ## v1.3.0 — 2025-05-18
 

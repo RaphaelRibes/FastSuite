@@ -1,6 +1,6 @@
 [package]
 name = "fasthelper"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "FastSuite orchestrator and report aggregator: one config in, one multi-sample report out"
 authors = ["Raphaël Ribes <raphael.ribes@gmail.com>"]

@@ -1,6 +1,6 @@
 [package]
 name = "fastcheck"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Exact, one-pass FASTQ quality control: no sampling, no hidden thresholds, no verdicts"
 authors = ["Raphaël Ribes <raphael.ribes@gmail.com>"]
