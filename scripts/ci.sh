@@ -362,23 +362,42 @@ cases=""
 # now nothing ran it on the suite's own output: that is how fastdedup shipped
 # `metrics.abundance = false` (a boolean in a numeric namespace, schema rule 1)
 # while its validator rejected the file. Every tool's report must pass here.
+#
+# The gate needs a BINARY, and `ci` does not build one (it runs `cargo test`).
+# A clean clone therefore has no tools/*/target/{release,debug}/<tool> at all:
+# that is a skip with a visible note, never a failure — failing a fresh clone
+# for a binary the gate never asked anyone to build is the bug this replaces.
 schema_gate() {
-    local tmp t rep rc=0
+    local tmp t rep bin rc=0 ran=0 skipped=0
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/fs-schema.XXXXXX") || return 1
     printf '@r1\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n' > "$tmp/a.fq"
-    printf '@r2\nTTGGTTGGTTGGTTGGTTGGTTGGTTGGTTGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n' > "$tmp/b.fq"
     local th=tools/fasthelper/target/release/fasthelper
     for t in fastdedup fastprep fastcheck fastsim fastmaps; do
+        bin=""
+        for cand in "tools/$t/target/release/$t" "tools/$t/target/debug/$t"; do
+            [ -x "$cand" ] && bin="$cand" && break
+        done
+        if [ -z "$bin" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        ran=$((ran + 1))
         rep="$tmp/$t.report.json"
         case "$t" in
-            fastdedup) tools/fastdedup/target/release/fastdedup -1 "$tmp/a.fq" -o "$tmp/d.fq" --json "$rep" -q --force >/dev/null 2>&1 ;;
-            fastprep)  tools/fastprep/target/release/fastprep -1 "$tmp/a.fq" -o "$tmp/p.fq" --json "$rep" --no-adapter -q --force >/dev/null 2>&1 ;;
-            fastcheck) tools/fastcheck/target/release/fastcheck "$tmp/a.fq" --json "$rep" -q >/dev/null 2>&1 ;;
-            fastsim)   tools/fastsim/target/release/fastsim --profile tools/fastsim/profiles/test_small.json --pairs 50 -o "$tmp/sim" --json "$rep" --force >/dev/null 2>&1 ;;
-            fastmaps)  tools/fastmaps/target/release/fastmaps -o "$tmp/maps" "$tmp/a.fq" --json "$rep" -q --force >/dev/null 2>&1 ;;
+            fastdedup) "$bin" -1 "$tmp/a.fq" -o "$tmp/d.fq" --json "$rep" -q --force >/dev/null 2>"$tmp/$t.err" ;;
+            fastprep)  "$bin" -1 "$tmp/a.fq" -o "$tmp/p.fq" --json "$rep" --no-adapter -q --force >/dev/null 2>"$tmp/$t.err" ;;
+            fastcheck) "$bin" "$tmp/a.fq" --json "$rep" -q >/dev/null 2>"$tmp/$t.err" ;;
+            fastsim)   "$bin" --profile tools/fastsim/profiles/test_small.json --pairs 50 -o "$tmp/sim" --json "$rep" --force >/dev/null 2>"$tmp/$t.err" ;;
+            fastmaps)  "$bin" -o "$tmp/maps" "$tmp/a.fq" --json "$rep" -q --force >/dev/null 2>"$tmp/$t.err" ;;
         esac
+        if [ $? -ne 0 ]; then
+            echo "  ! $t exited non-zero; a report it wrote anyway cannot be trusted"
+            sed 's/^/      /' "$tmp/$t.err"
+            rc=1
+            continue
+        fi
         if [ ! -s "$rep" ]; then
-            echo "  ! $t wrote no --json report: the schema gate cannot verify it"
+            echo "  ! $t exited 0 but wrote no --json report: the schema gate cannot verify it"
             rc=1
             continue
         fi
@@ -390,6 +409,12 @@ schema_gate() {
             echo "  $t report: schema ok"
         fi
     done
+    if [ "$ran" -eq 0 ]; then
+        echo "  SKIPPED: no tool binaries present (neither target/release nor target/debug)."
+        echo "           Run \`pixi run build\` first to enable this gate."
+    elif [ "$skipped" -gt 0 ]; then
+        echo "  note: $skipped tool(s) skipped for lack of a binary, $ran verified"
+    fi
     rm -rf "$tmp"
     return "$rc"
 }
