@@ -525,6 +525,21 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
     let counts_join =
         |arr: &[u64]| arr.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
 
+    // The grid carries the same metric namespace as the v1 report, rendered by
+    // the same function, so the two files cannot disagree about a run. It used
+    // to carry none of it: `no_call_reads` lived only in the report, and a
+    // counts-only reader of this file scored a run of all-N reads as
+    // `polyA_frac 1.000` where the report said 0.
+    //
+    // `threads` is the one exception: the grid is part of the `-j`-invariance
+    // contract (the same command at -j 1 and -j 4 must produce identical
+    // files), and the worker count describes the execution, not the data.
+    let grid_metrics = {
+        let mut m = metrics.clone();
+        m.remove("threads");
+        crate::report::metrics_json(&m)
+    };
+
     let json = format!(
         concat!(
             "{{\n",
@@ -540,6 +555,7 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
             "  \"preview_reads_per_pixel\": {pn},\n",
             "  \"preview_reads_per_pixel_per_kind\": {pn},\n",
             "  \"max_previews_per_pixel\": {max_pv},\n",
+            "  \"metrics\": {{\n{metrics}\n  }},\n",
             "{labels}",
             "  \"counts\": [{counts}],\n",
             "  \"counts_r1\": [{counts_r1}],\n",
@@ -558,6 +574,7 @@ pub fn write_format(state: SpillerState, opts: &FormatOpts<'_>) -> std::io::Resu
         pfc       = per_file_json,
         pn        = preview_n,
         max_pv    = max_previews_per_pixel,
+        metrics   = grid_metrics,
         labels    = data_labels,
         counts    = counts_join(&counts_arr),
         counts_r1 = counts_join(&counts_r1_arr),

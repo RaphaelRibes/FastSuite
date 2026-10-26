@@ -184,11 +184,7 @@ pub fn write_report_v1(
 ) -> std::io::Result<()> {
     use crate::encode::json_escape;
 
-    let metrics_json = metrics
-        .iter()
-        .map(|(k, v)| format!("    {}: {}", json_escape(k), fmt_f64(*v)))
-        .collect::<Vec<_>>()
-        .join(",\n");
+    let metrics_block = metrics_json(metrics);
     let files_json = files
         .iter()
         .map(|f| json_escape(f))
@@ -220,7 +216,7 @@ pub fn write_report_v1(
         fmt_f64(elapsed_s),
         grid = json_escape(grid_name),
         files = files_json,
-        metrics = metrics_json,
+        metrics = metrics_block,
         notes = notes_json,
     );
 
@@ -228,6 +224,24 @@ pub fn write_report_v1(
     use std::io::Write;
     f.write_all(doc.as_bytes())?;
     f.flush()
+}
+
+/// Render a metric map as the flat numeric JSON object both shapes carry.
+///
+/// One definition for both files. `fastsuite.report.v1` puts it under
+/// `metrics`, and `<output-dir>/heatmap.json` carries the same object, because
+/// the two described the same run and did not agree: the grid had no
+/// `no_call_reads`, so a consumer that recomputed the corner fractions from
+/// `counts` — fasthelper's documented `concatenate` adapter does that — read
+/// `polyA_frac 1.000` for a run of all-N reads where the report said 0. A
+/// no-call read has no measurable composition but still lands on the (0,0)
+/// pixel, so only this number can take it back out of the polyA corner.
+pub fn metrics_json(metrics: &BTreeMap<String, f64>) -> String {
+    metrics
+        .iter()
+        .map(|(k, v)| format!("    {}: {}", crate::encode::json_escape(k), fmt_f64(*v)))
+        .collect::<Vec<_>>()
+        .join(",\n")
 }
 
 /// Compact float rendering: integers print without a `.0`, everything else

@@ -5,19 +5,39 @@ use std::path::Path;
 
 use crate::worker::PixelAcc;
 
+/// Lowest `t` a *non-zero* count may map to.
+///
+/// `ln(1) / ln(max)` is 0 for every grid whose busiest pixel holds more than one
+/// read, and `heat_color(0)` is `[0, 0, 0]` — the background. A pixel holding
+/// exactly one read was therefore painted exactly like an empty cell: on a 3×3
+/// plane with three occupied pixels, two of them count 1, the PNG and the SVG
+/// both showed 8 of 9 cells black and the reads were invisible.
+///
+/// A non-zero count is never "no reads", so it is lifted to the first clearly
+/// visible step of the scale — dark blue, `#000099` — instead of to the
+/// background. Counts keep their `ln(c) / ln(max)` order above the floor, and
+/// count 0 stays the background.
+const MIN_VISIBLE_T: f64 = 0.1;
+
 /// Normalised log-count `t` in `[0, 1]` for the heat scale: `ln(c) / ln(max)`.
 ///
-/// The degenerate case `max_count <= 1` (every occupied pixel holds exactly
-/// one read, so `ln(max) == ln(1) == 0`) is special-cased to `1.0`: every
-/// occupied pixel *is* the maximum there, so it maps to the top of the scale
-/// rather than the `0/0` NaN that blacked out the PNG/SVG and emitted an
-/// invalid `color: [NaN]` array into the Plotly page.
+/// Two degenerate cases, both of which used to black out real pixels:
+///
+/// * `max_count <= 1` — every occupied pixel holds exactly one read, so
+///   `ln(max) == ln(1) == 0`: the `0/0` NaN blacked out the PNG/SVG and emitted
+///   an invalid `color: [NaN]` array into the Plotly page. Every occupied pixel
+///   *is* the maximum there, so it maps to the top of the scale.
+/// * `count == 1` with `max_count > 1` — `ln(1) == 0`, i.e. the background
+///   colour for a pixel that is not empty. Lifted to [`MIN_VISIBLE_T`].
 fn log_norm(count: u64, max_count: u64) -> f64 {
-    if max_count <= 1 {
-        1.0
-    } else {
-        (count as f64).ln() / (max_count as f64).ln()
+    if count == 0 {
+        return 0.0;
     }
+    if max_count <= 1 {
+        return 1.0;
+    }
+    let t = (count as f64).ln() / (max_count as f64).ln();
+    t.max(MIN_VISIBLE_T)
 }
 
 /// The PNG encoder's error type is not `io::Error`; every caller here is
@@ -319,13 +339,30 @@ mod tests {
     }
 
     /// The fix must not disturb the ordinary case: with a real `max > 1` the
-    /// normalisation stays `ln(c) / ln(max)` (min → 0, max → 1).
+    /// normalisation stays `ln(c) / ln(max)` (max → 1) for every count whose
+    /// value is above the visibility floor.
     #[test]
     fn log_norm_unchanged_for_normal_grids() {
         assert!((log_norm(10, 10) - 1.0).abs() < 1e-12);
-        assert!((log_norm(1, 10) - 0.0).abs() < 1e-12);
+        assert!((log_norm(5, 100) - (5f64.ln() / 100f64.ln())).abs() < 1e-12);
+        assert!((log_norm(50, 100) - (50f64.ln() / 100f64.ln())).abs() < 1e-12);
         let mid = log_norm(5, 100);
         assert!((mid - (5f64.ln() / 100f64.ln())).abs() < 1e-12);
+    }
+
+    /// `ln(1)` is 0, and 0 is the background: a pixel holding one read used to
+    /// be painted exactly like an empty one whenever the busiest pixel held more
+    /// than one. Count 0 is still the background.
+    #[test]
+    fn count_one_is_lifted_off_the_background() {
+        for max in [2u64, 3, 10, 1_000, 1_000_000] {
+            let t = log_norm(1, max);
+            assert!(t >= MIN_VISIBLE_T, "count 1 on max {max} gave {t}");
+            assert_ne!(heat_color(t), [0, 0, 0], "count 1 on max {max} is black");
+            // The scale still orders the counts around it.
+            assert!(t < log_norm(max, max), "count 1 must stay below the maximum");
+        }
+        assert_eq!(log_norm(0, 1_000), 0.0, "no reads is the background");
     }
 
     /// FM-12: the Plotly series is sorted by `(x, y)`, not emitted in `HashMap`

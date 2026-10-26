@@ -10,7 +10,7 @@ mod worker;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -83,6 +83,80 @@ fn first_collision(targets: &[(String, PathBuf)]) -> Option<(String, String, Pat
     None
 }
 
+// ── Input identity ───────────────────────────────────────────────────────────
+//
+// "Would this run write over one of its own inputs?" is the same question as
+// "is this output one of the inputs?", and a path is not an identity: a
+// hardlink is another name for one file, and `--json ./b.fq` is the same name
+// spelled differently. Both spellings destroy the input, so both are refused.
+
+/// Device and inode of the file `p` names, when it exists.
+///
+/// Two paths with the same `(dev, ino)` are the same file, however they are
+/// spelled and however many names it has. Nothing else about the file matters
+/// here, and a missing path has no identity to clash with.
+#[cfg(unix)]
+fn file_identity(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Off unix there is no inode to compare; the path comparisons still apply.
+#[cfg(not(unix))]
+fn file_identity(_p: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// One input's identity: lexically normalised path, canonical path where it
+/// resolves, and `(dev, ino)`. Computed once per input, however many targets the
+/// run has.
+type InputId = (PathBuf, Option<PathBuf>, Option<(u64, u64)>);
+
+/// First output target that names an input, with both sides spelled out.
+///
+/// `--json b.fq` (and `--json ./b.fq`, and `--json link.fq` where `link.fq` is
+/// a hardlink to `b.fq`) exited 0 with the 753-byte report where the FASTQ had
+/// been: `first_collision` compares this run's outputs with each other, the
+/// clobber guard asks "does this file already exist", and neither ever looked
+/// at `args.files`. Nothing re-reads an input afterwards, so the run reported
+/// success over destroyed data.
+///
+/// Checked before the first `File::create` and never bypassed by `--force`:
+/// --force is about files that were already there, not about the input the run
+/// is measuring.
+fn first_input_clash(
+    inputs: &[String],
+    targets: &[(String, PathBuf)],
+) -> Option<(String, PathBuf, String)> {
+    // Each input's identity, computed once: the whole input list is compared
+    // against every target, and a run may carry tens of thousands of files.
+    let ids: Vec<InputId> = inputs
+        .iter()
+        .map(|i| {
+            let p = Path::new(i);
+            (
+                normalise_path(p),
+                std::fs::canonicalize(p).ok(),
+                file_identity(p),
+            )
+        })
+        .collect();
+    for (label, path) in targets {
+        let norm = normalise_path(path);
+        let real = std::fs::canonicalize(path).ok();
+        let id = file_identity(path);
+        for (i, (inorm, ireal, iid)) in ids.iter().enumerate() {
+            let same = *inorm == norm
+                || real.as_deref().is_some_and(|a| ireal.as_deref() == Some(a))
+                || (id.is_some() && *iid == id);
+            if same {
+                return Some((label.clone(), path.clone(), inputs[i].clone()));
+            }
+        }
+    }
+    None
+}
+
 // ── Per-run temp directory ───────────────────────────────────────────────────
 
 /// A unique directory under `--temp-dir` holding this run's spill rows.
@@ -108,11 +182,19 @@ struct TempRunDir {
 struct TempCleanup {
     root: PathBuf,
     dir: PathBuf,
+    /// Outputs staged under a temporary name (see `StagedFile`) and not yet
+    /// renamed into place. `process::exit` runs no destructors, so a failure
+    /// path has to be able to remove them explicitly, exactly as it removes the
+    /// per-run temp directory.
+    staged: Vec<PathBuf>,
 }
 
 impl TempCleanup {
     fn run(&self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+        for p in &self.staged {
+            let _ = std::fs::remove_file(p);
+        }
         // Only when empty: a `--temp-dir` the user already owned stays theirs.
         let _ = std::fs::remove_dir(&self.root);
     }
@@ -148,6 +230,7 @@ impl TempRunDir {
         TempCleanup {
             root: self.root.clone(),
             dir: self.dir.clone(),
+            staged: Vec::new(),
         }
     }
 }
@@ -155,6 +238,54 @@ impl TempRunDir {
 impl Drop for TempRunDir {
     fn drop(&mut self) {
         self.cleanup().run();
+    }
+}
+
+// ── Staged outputs ───────────────────────────────────────────────────────────
+
+/// An output written under a temporary name and renamed into place once it is
+/// complete.
+///
+/// `corners_*.fq` used to be created at its final name before the first read was
+/// parsed, and the workers wrote records straight into it: a run that failed
+/// half way (a truncated FASTQ record in a later file, a spill error) exited 1
+/// with the `BufWriter`'s tail lost, leaving a file that ends in the middle of a
+/// record — 510 matching reads produced 505 records plus a dangling `+`, and
+/// nothing on stderr mentioned the file. A consumer cannot tell that apart from
+/// a short extraction.
+///
+/// The extraction is written to `<name>.part-<pid>` instead. `rename` is atomic
+/// within one filesystem, so a file carrying the final name is always a whole
+/// number of records; a failed run leaves only the staged name, which
+/// [`TempCleanup`] removes (a SIGKILL can leave that staged name behind, never a
+/// partial file under the name a consumer reads).
+struct StagedFile {
+    final_path: PathBuf,
+    tmp_path: PathBuf,
+}
+
+impl StagedFile {
+    /// Create the staged file beside its destination; the returned `File` is
+    /// what the writer writes to.
+    fn create(final_path: PathBuf) -> std::io::Result<(Self, File)> {
+        let name = final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "output".to_string());
+        let tmp_path = final_path.with_file_name(format!("{name}.part-{}", std::process::id()));
+        let f = File::create(&tmp_path)?;
+        Ok((
+            Self {
+                final_path,
+                tmp_path,
+            },
+            f,
+        ))
+    }
+
+    /// Move the complete file to the name a consumer looks for.
+    fn commit(&self) -> std::io::Result<()> {
+        std::fs::rename(&self.tmp_path, &self.final_path)
     }
 }
 
@@ -286,6 +417,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    // ── Input guard ───────────────────────────────────────────────────────
+    // No output of this run — and not `-o` itself — may name an input. The
+    // collision guard above compares outputs with each other; `--json b.fq`
+    // went unremarked by it (and by the clobber guard, which only asks whether
+    // the file exists) and the report replaced the FASTQ at exit 0. Checked
+    // before the first `File::create`, with every spelling of one file: plain,
+    // `./`-prefixed, symlinked, hardlinked.
+    let mut write_targets = targets.clone();
+    write_targets.push(("-o".to_string(), output_dir.clone()));
+    if let Some((label, path, input)) = first_input_clash(&args.files, &write_targets) {
+        eprintln!(
+            "Error: {label} {} is an input of this run ({input}). fastmaps never writes over \
+             its inputs; change the --json path or the -o directory.",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+
     // ── Clobber guard ─────────────────────────────────────────────────────
     // Checked before the first `File::create`, so a refused run leaves the
     // directory untouched.
@@ -328,7 +477,7 @@ fn main() {
     // so a `--temp-dir` reused after a hard kill cannot feed this run the dead
     // run's rows (M2). `temp_run`'s Drop removes it on success and on error.
     let temp_dir: PathBuf = temp_run.path().to_path_buf();
-    let temp_cleanup = temp_run.cleanup();
+    let mut temp_cleanup = temp_run.cleanup();
 
     // ── Input files ───────────────────────────────────────────────────────
     let files = args.files;
@@ -361,16 +510,21 @@ fn main() {
 
     // ── Corner extractors ─────────────────────────────────────────────────
     // One output file per box (the boxes were parsed before the clobber
-    // guard); created only now that the guard has passed.
+    // guard); created only now that the guard has passed, and staged under a
+    // temporary name so a mid-run failure cannot leave half a record behind.
+    let mut staged_corners: Vec<StagedFile> = Vec::with_capacity(corner_bounds.len());
     let corner_extractors: Vec<CornerExtractor> = corner_bounds
         .iter()
         .map(|&bounds| {
             let fname = corners_filename(bounds);
             let path = output_dir.join(&fname);
-            let f = File::create(&path).unwrap_or_else(|e| {
+            let (staged, f) = StagedFile::create(path.clone()).unwrap_or_else(|e| {
                 eprintln!("Cannot create {}: {e}", path.display());
+                temp_cleanup.run();
                 std::process::exit(1);
             });
+            temp_cleanup.staged.push(staged.tmp_path.clone());
+            staged_corners.push(staged);
             let ((x1, y1), (x2, y2)) = bounds;
             eprintln!(
                 "Corner extraction x=[{x1},{x2}] y=[{y1},{y2}] → {fname}"
@@ -504,6 +658,27 @@ fn main() {
     }
 
     let state = spiller_handle.join().unwrap();
+
+    // ── Commit the corner extractions ─────────────────────────────────────
+    // Every read has been seen and every worker has returned, so what the
+    // corner writers hold is the complete extraction. Flush it and rename each
+    // staged file into place: from here on, a file carrying a `corners_*.fq`
+    // name is a whole number of records (a run that failed before this point
+    // left only the `.part-<pid>` names, which the failure paths removed).
+    for ce in &corner_extractors {
+        if let Err(e) = ce.writer.lock().unwrap().flush() {
+            eprintln!("Error writing corner extraction: {e}");
+            temp_cleanup.run();
+            std::process::exit(1);
+        }
+    }
+    for staged in &staged_corners {
+        if let Err(e) = staged.commit() {
+            eprintln!("Cannot rename {}: {e}", staged.final_path.display());
+            temp_cleanup.run();
+            std::process::exit(1);
+        }
+    }
 
     if state.total_reads == 0 {
         eprintln!("No reads found.");
