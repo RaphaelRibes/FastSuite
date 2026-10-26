@@ -284,8 +284,9 @@ same 102 datasets × 3 variants. `bench/results/fix2026/` (first wave) and
 `bench/results/wave2/` (second wave) agree with each other and with `gt2026`:
 closed loop **183/306 = 59.8%**, **60/102** datasets passing every variant,
 median G-fraction **0.0092**, identical gate counts (g_frac 121, mean_q 8, gc 4)
-and identical per-domain splits — the first 17 columns are byte-identical across
-all three. That invariance is expected rather than reassuring: every scored
+and identical per-domain splits. The three files are not merely equal row by row:
+they are **byte-identical**, sha256 `2076d6a0…`, all 25 columns including
+`verdict`, `failing` and the `_lm` columns. That invariance is expected rather than reassuring: every scored
 quantity is produced by the same `fastcheck` on both sides, so a report-side
 error cancels out, and none of the waves' defects feeds these four gates.
 

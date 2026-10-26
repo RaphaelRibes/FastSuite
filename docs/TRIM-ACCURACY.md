@@ -184,8 +184,9 @@ overcut. Nothing else in the table moves: the fix is confined to the
 0.012% of scored mates.
 
 The closed loop is **unchanged** by this wave — 183/306, 60/102, median
-G-fraction 0.0092, byte-identical to `bench/results/fix2026/` over the scored
-columns. That is expected and it is not evidence of a thorough fix: every
+G-fraction 0.0092 — and `closed_loop.tsv` is byte-identical to both
+`bench/results/fix2026/` and `bench/results/gt2026/` (sha256 `2076d6a0…`, all 25
+columns, not only the scored ones). That is expected and it is not evidence of a thorough fix: every
 scored quantity is produced by the same `fastcheck` on both sides of the
 comparison, so a report-side error cancels. The wave's real gains are in the
 report, the GT and the output paths, which this loop does not measure.

@@ -1,0 +1,109 @@
+{
+  "closed_loop": {
+    "rows": 306,
+    "pass": 183,
+    "pass_pct": 59.8,
+    "datasets": 102,
+    "datasets_all_variants_pass": 60,
+    "per_domain": {
+      "bacterial_isolate": [
+        40,
+        51
+      ],
+      "generalised": [
+        47,
+        51
+      ],
+      "human_gut": [
+        51,
+        51
+      ],
+      "metagenomics": [
+        3,
+        51
+      ],
+      "rna_seq": [
+        21,
+        51
+      ],
+      "virome": [
+        21,
+        51
+      ]
+    },
+    "fail_by_gate": {
+      "mean_q": 8,
+      "g_frac": 121,
+      "gc": 4
+    },
+    "median_g_frac_max_diff": 0.0092,
+    "median_g_frac_max_diff_raw": 0.00925,
+    "rows_with_failing_nonempty": 123
+  },
+  "trim": {
+    "exact": {
+      "mates": 13914963,
+      "pct_of_all": 68.21,
+      "pct_of_scored": 77.88,
+      "fix2026_mates": 13913273,
+      "delta_pp_of_all": 0.01
+    },
+    "overtrim": {
+      "mates": 3574241,
+      "pct_of_all": 17.52,
+      "pct_of_scored": 20.0,
+      "fix2026_mates": 3573808,
+      "delta_pp_of_all": 0.0
+    },
+    "undertrim": {
+      "mates": 378184,
+      "pct_of_all": 1.85,
+      "pct_of_scored": 2.12,
+      "fix2026_mates": 380327,
+      "delta_pp_of_all": -0.01
+    },
+    "unaligned": {
+      "mates": 0,
+      "pct_of_all": 0.0
+    },
+    "dropped": {
+      "mates": 2532612,
+      "pct_of_all": 12.41,
+      "fix2026_mates": 2532592,
+      "delta_pp_of_all": 0.0
+    },
+    "total_mates": 20400000,
+    "scored_total": 17867388,
+    "fix2026_scored_total": 17867408,
+    "exact_pct_of_scored": 77.88,
+    "fix2026_exact_pct_of_scored": 77.87,
+    "scored_delta_pp": 0.01
+  },
+  "trim_changed_rows": 39,
+  "trim_changed_rows_by_domain": {
+    "bacterial_isolate": 10,
+    "generalised": 10,
+    "human_gut": 11,
+    "metagenomics": 1,
+    "rna_seq": 5,
+    "virome": 2
+  },
+  "trim_net_mate_delta": {
+    "exact": 1690,
+    "overtrim": 433,
+    "undertrim": -2143,
+    "dropped_or_missing": 20
+  },
+  "comparison": {
+    "fix2026_rows": 306,
+    "closed_loop_rows_changed_verdict": 0,
+    "closed_loop_nonscored_columns_differing": [],
+    "closed_loop_first17_byte_identical_to_fix2026": true,
+    "closed_loop_first17_byte_identical_to_gt2026": true,
+    "closed_loop_whole_file_sha256_equal_fix2026": true,
+    "closed_loop_sha256": "2076d6a075e11d22265943e8adfab5d9e79f46898321b01dde55d3ae0717ff5b",
+    "trim_sha256": "9ec284a7e47712209e663550b208d5337e2d3c633a0d7a2080183e934bc104d3",
+    "trim_sha256_equal_fix2026": false,
+    "trim_exact_pct_of_scored_delta_pp": 0.01
+  }
+}
