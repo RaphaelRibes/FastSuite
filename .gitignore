@@ -61,3 +61,5 @@ fastsuite.def
 
 # optimisation dossier build products
 docs/optim/report/*.pdf
+# `fasthelper run` test fixtures write into the crate directory
+tools/fasthelper/fastsuite_run/
