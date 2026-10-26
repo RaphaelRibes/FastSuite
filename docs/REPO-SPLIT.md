@@ -109,3 +109,46 @@ outside `paper/`, and both compile from a bare clone.
 
 Question 1 is the only one that can destroy something; the other four are cheap
 to change later.
+
+## What the split broke that the verification had not caught
+
+Two things only showed up once a repo was cloned *alone* and built with its own
+environment, both caused by file that lived at the suite root and therefore was
+not part of any `tools/<crate>` subtree:
+
+6. **`.cargo/config.toml`.** It carries `linker = "/usr/bin/cc"` **and**
+   `rustflags = ["-C", "link-arg=-fuse-ld=bfd"]`. Without the whole file the
+   first standalone build died inside LLVM's linker (or, on glibc ≥ 2.34, with
+   `undefined symbol: __libc_csu_init`): the `LINKER` env var alone is not
+   enough, because the system `cc` then picks `lld` against the conda sysroot.
+   Every tool repo now carries its own copy; verified by building
+   `FastCheck` alone — `pixi run build` then `pixi run test` → **172 passed,
+   1 ignored**, the suite's own count for that crate.
+7. **`.gitignore` and the fasthelper report files.** The suite's `.gitignore`
+   ignored `<crate>/target/` from above; a standalone repo has no "above", so
+   the build directory and the reports fasthelper's CLI tests write into the
+   working directory appeared as untracked on the first build. Each repo now
+   has its own.
+
+## Migrating an existing checkout (both machines did this)
+
+`git checkout` removes a crate's *tracked* files when it becomes a submodule,
+but leaves untracked ones (`target/`, a stray `report.json`, a cluster
+`validate.sbatch`), and `git submodule update --init` then refuses:
+
+```
+fatal: le chemin de destination '.../tools/fastcheck' existe déjà et n'est pas un répertoire vide
+```
+
+Move the stale directories aside once, then initialise:
+
+```bash
+for p in tools/*/ papers/*/; do
+  [[ -d "$p" && ! -e "$p/.git" ]] && mv "$p" "/tmp/presplit/$(basename "$p")"
+done
+git submodule update --init --recursive
+```
+
+The desktop also needed a `Host github.com` entry in `~/.ssh/config`: it has a
+working key (`~/.ssh/github`) but no rule selecting it, so every submodule clone
+failed with "impossible de lire le dépôt distant".
