@@ -6,6 +6,7 @@
 //! tool's `--help` text.
 
 use anyhow::{bail, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,10 +22,53 @@ fn help_text(bin: &Path) -> Option<String> {
     Some(s)
 }
 
-/// Is `flag` (a token starting with `--`) accepted by the tool's help text?
-fn flag_accepted(help: &str, flag: &str) -> bool {
-    // --insert-hist and --insert-hist=... both count; --foo bar never does.
-    help.contains(flag)
+/// Every long-flag token the help text advertises, as WHOLE tokens.
+///
+/// The old test was `help.contains(flag)`, so `--min-le` was accepted because
+/// `--min-len` appears in the help. Usage lines wrap a flag in punctuation and
+/// may attach a value (`--flag`, `--flag,`, `[--flag`, `--flag=VALUE`), so each
+/// word is cut at `=` and trimmed of the punctuation around it.
+fn help_flags(help: &str) -> BTreeSet<String> {
+    help.split_whitespace()
+        .map(|w| w.split('=').next().unwrap_or(w))
+        .map(|w| w.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')))
+        .filter(|w| w.starts_with("--") && w.len() > 2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The flag a config argument names: `--min-len=30` is `--min-len`.
+fn flag_token(arg: &str) -> &str {
+    arg.split('=').next().unwrap_or(arg)
+}
+
+/// A config value the TOML types accept but the tools do not.
+///
+/// `check` reports these next to everything else it finds, and `run` bails on
+/// them at minute zero: `check -c` used to bless `gz_level = 42` (every tool
+/// requires 1..=9), an absurd thread count, and a `steps = []` config that
+/// produced an empty report and exited 0.
+pub fn config_problems(cfg: &Config) -> Vec<String> {
+    /// 0 is the documented "all cores" sentinel; an explicit count is a worker
+    /// count. The ceiling is a typo gate, not a policy on oversubscription.
+    const MAX_THREADS: usize = 4096;
+    let mut out = Vec::new();
+    if cfg.run.steps.is_empty() {
+        out.push("run.steps is empty — there is nothing to run (list at least one step)".to_string());
+    }
+    if !(1..=9).contains(&cfg.run.gz_level) {
+        out.push(format!(
+            "run.gz_level is {} — every tool requires --gz-level in [1, 9]",
+            cfg.run.gz_level
+        ));
+    }
+    if cfg.run.threads > MAX_THREADS {
+        out.push(format!(
+            "run.threads is {} — 0 means all cores; an explicit count must be in [1, {MAX_THREADS}]",
+            cfg.run.threads
+        ));
+    }
+    out
 }
 
 pub fn cmd_check(args: &CheckArgs) -> Result<()> {
@@ -44,9 +88,9 @@ pub fn cmd_check(args: &CheckArgs) -> Result<()> {
     let tools_dir = cfg.tools_dir(args.tools_dir.clone());
     let ts = runner::toolset(tools_dir);
 
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = config_problems(&cfg);
 
-    // 1. Step names.
+    // 1. Step names, then every flag the step passes.
     for step in &cfg.run.steps {
         if !runner::is_known_step(step) {
             errors.push(format!(
@@ -54,18 +98,24 @@ pub fn cmd_check(args: &CheckArgs) -> Result<()> {
                 runner::KNOWN_STEPS.join(", ")
             ));
         }
-        if let Some(extra) = cfg.step(step).args.iter().find(|a| a.starts_with("--")) {
-            if cfg.step(step).enabled {
-                if let Some(bin) = ts.get(step) {
-                    if let Some(h) = help_text(bin) {
-                        if !flag_accepted(&h, extra) {
-                            errors.push(format!(
-                                "{step} does not accept '{extra}' (see {})",
-                                bin.display()
-                            ));
-                        }
-                    }
-                }
+    }
+    for step in &cfg.run.steps {
+        let s = cfg.step(step);
+        if !s.enabled {
+            continue;
+        }
+        let Some(bin) = ts.get(step) else { continue };
+        let Some(h) = help_text(bin) else { continue };
+        let accepted = help_flags(&h);
+        // EVERY token, not only the first: `.find()` stopped at the first
+        // `--flag`, so a typo in the second one was never looked at.
+        for arg in s.args.iter().filter(|a| a.starts_with("--")) {
+            let token = flag_token(arg);
+            if !accepted.contains(token) {
+                errors.push(format!(
+                    "{step} does not accept '{token}' (see {})",
+                    bin.display()
+                ));
             }
         }
     }
@@ -134,17 +184,7 @@ pub fn cmd_check(args: &CheckArgs) -> Result<()> {
 ///
 /// The suite has no shared crate (D-1): the report schema is the only contract
 /// between the tools, and until this existed nothing could REJECT a report. The
-/// rules checked here are the ones the schema states:
-///
-/// 1. the `schema` tag is `fastsuite.report.v1` and the identifying keys are
-///    present (`tool`, `tool_version`, `command`, `metrics`);
-/// 2. every `metrics` value is a number (rule 1: flat numeric namespace);
-/// 3. the recommended shared keys are reported — a WARNING, not an error,
-///    because the schema says none are mandatory;
-/// 4. when `bases_out` and `bases_dropped` are both present, the base identity
-///    `bases_in == bases_out + bases_trimmed + bases_dropped` must hold. That
-///    identity is what makes a run reconcilable, and no tool could be checked
-///    against it before.
+/// rules live in [`validate_report`], which the runner calls too.
 pub fn check_report(path: &Path) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
@@ -160,6 +200,56 @@ pub fn check_report(path: &Path) -> Result<()> {
         return check_aggregate(path, &doc);
     }
 
+    let verdict = validate_report(&doc);
+    for w in &verdict.warnings {
+        eprintln!("fasthelper check: warning: {w}");
+    }
+    if verdict.errors.is_empty() {
+        println!(
+            "fasthelper check: OK — {} report from {}, schema fastsuite.report.v1, {} metric(s), {} warning(s)",
+            path.display(),
+            doc.get("tool").and_then(|v| v.as_str()).unwrap_or("?"),
+            verdict.metrics,
+            verdict.warnings.len()
+        );
+        return Ok(());
+    }
+    for e in &verdict.errors {
+        eprintln!("fasthelper check: {e}");
+    }
+    let n = verdict.errors.len();
+    bail!("{n} problem(s) in the report")
+}
+
+/// The verdict of the `fastsuite.report.v1` rule set.
+pub struct ReportCheck {
+    /// Reasons the report cannot be trusted: the caller must refuse it.
+    pub errors: Vec<String>,
+    /// Contract advice (a missing recommended key); never fatal.
+    pub warnings: Vec<String>,
+    /// Metric count in `metrics` (0 when the object is missing).
+    pub metrics: usize,
+}
+
+/// The ONE implementation of the `fastsuite.report.v1` rules.
+///
+/// `check --report` and the runner both call it, so a report the validator
+/// rejects can never be ingested by the production path:
+///
+/// 1. the `schema` tag is `fastsuite.report.v1` and the identifying keys are
+///    present (`tool`, `tool_version`, `command`);
+/// 2. every `metrics` value is a number (rule 1: a flat numeric namespace);
+/// 3. the recommended shared keys are reported — a WARNING, not an error,
+///    because the schema says none are mandatory;
+/// 4. the record identity. `reads_in == reads_out + reads_dropped` when those
+///    three operands are present: a report whose `reads_out` exceeds its
+///    `reads_in` is not reconcilable. A run that adopted a previous output
+///    states it as `reads_preloaded`, and its identity is then
+///    `reads_in + reads_preloaded == reads_out + reads_duplicate`;
+/// 5. the base identity `bases_in == bases_out + bases_trimmed + bases_dropped`
+///    once `bases_out` and `bases_dropped` are present, a missing operand
+///    reading as 0 (REPORT-SCHEMA).
+pub fn validate_report(doc: &serde_json::Value) -> ReportCheck {
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -173,12 +263,14 @@ pub fn check_report(path: &Path) -> Result<()> {
             errors.push(format!("missing or non-string `{key}`"));
         }
     }
-    let Some(metrics) = doc.get("metrics").and_then(|v| v.as_object()) else {
-        errors.push("missing `metrics` object".into());
-        for e in &errors {
-            eprintln!("fasthelper check: {e}");
+    let metrics = doc.get("metrics").and_then(|v| v.as_object());
+    let empty = serde_json::Map::new();
+    let metrics = match metrics {
+        Some(m) => m,
+        None => {
+            errors.push("missing `metrics` object".into());
+            &empty
         }
-        bail!("{} problem(s) in the report", errors.len());
     };
 
     // Rule 1: a flat numeric namespace. A nested object here is how a tool
@@ -206,12 +298,44 @@ pub fn check_report(path: &Path) -> Result<()> {
     }
 
     let num = |k: &str| metrics.get(k).and_then(|v| v.as_f64());
-    if let (Some(bin), Some(bout), Some(btrim), Some(bdrop)) = (
-        num("bases_in"),
-        num("bases_out"),
-        num("bases_trimmed"),
-        num("bases_dropped"),
-    ) {
+    // The record identity. A resumed run publishes `reads_preloaded` — the
+    // reads it adopted instead of reprocessing — and its budget is the
+    // three-term one; the two-term rule would reject a legitimate resume
+    // (`reads_out` alone can exceed `reads_in`).
+    if num("reads_preloaded").is_some() {
+        if let (Some(rin), Some(pre), Some(rout), Some(rdup)) = (
+            num("reads_in"),
+            num("reads_preloaded"),
+            num("reads_out"),
+            num("reads_duplicate"),
+        ) {
+            if rin + pre != rout + rdup {
+                errors.push(format!(
+                    "record identity broken: reads_in {rin} + reads_preloaded {pre} != \
+                     reads_out {rout} + reads_duplicate {rdup} (sum {})",
+                    rout + rdup
+                ));
+            }
+        }
+    } else if let (Some(rin), Some(rout), Some(rdrop)) =
+        (num("reads_in"), num("reads_out"), num("reads_dropped"))
+    {
+        if rin != rout + rdrop {
+            errors.push(format!(
+                "record identity broken: reads_in {rin} != reads_out {rout} + \
+                 reads_dropped {rdrop} (sum {})",
+                rout + rdrop
+            ));
+        }
+    }
+
+    // The base identity, whenever the report states what left and what was
+    // dropped: `bases_trimmed` (and `bases_in`) may be absent and then read as
+    // 0, which is what REPORT-SCHEMA documents. Requiring all four operands
+    // skipped the check for every report that named only three.
+    if let (Some(bout), Some(bdrop)) = (num("bases_out"), num("bases_dropped")) {
+        let bin = num("bases_in").unwrap_or(0.0);
+        let btrim = num("bases_trimmed").unwrap_or(0.0);
         if bin != bout + btrim + bdrop {
             errors.push(format!(
                 "base identity broken: bases_in {bin} != bases_out {bout} + bases_trimmed \
@@ -221,24 +345,11 @@ pub fn check_report(path: &Path) -> Result<()> {
         }
     }
 
-    for w in &warnings {
-        eprintln!("fasthelper check: warning: {w}");
+    ReportCheck {
+        errors,
+        warnings,
+        metrics: metrics.len(),
     }
-    if errors.is_empty() {
-        println!(
-            "fasthelper check: OK — {} report from {}, schema fastsuite.report.v1, {} metric(s), {} warning(s)",
-            path.display(),
-            doc.get("tool").and_then(|v| v.as_str()).unwrap_or("?"),
-            metrics.len(),
-            warnings.len()
-        );
-        return Ok(());
-    }
-    for e in &errors {
-        eprintln!("fasthelper check: {e}");
-    }
-    let n = errors.len();
-    bail!("{n} problem(s) in the report")
 }
 
 /// `fasthelper check --report` for the aggregate document
@@ -358,6 +469,89 @@ mod tests {
         let p = tmp("identity.json", &GOOD.replace("\"bases_trimmed\": 1200", "\"bases_trimmed\": 0"));
         let err = check_report(&p).unwrap_err().to_string();
         assert!(err.contains("problem"), "{err}");
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn a_report_where_reads_out_exceeds_reads_in_is_refused() {
+        // The reproduced defect: reads_in 10, reads_out 1e6 passed as OK while
+        // REPORT-SCHEMA states reads_in == reads_out + reads_dropped. Nothing
+        // checked the record identity at all, so a report could invent reads.
+        let p = tmp(
+            "reads_identity.json",
+            &GOOD.replace(
+                "\"reads_out\": 90, \"reads_dropped\": 10",
+                "\"reads_out\": 1000000, \"reads_dropped\": 0",
+            ),
+        );
+        let err = check_report(&p).unwrap_err().to_string();
+        assert!(err.contains("problem"), "{err}");
+        std::fs::remove_file(p).ok();
+
+        // The rule itself names the broken identity, not just "a problem".
+        let doc: serde_json::Value = serde_json::from_str(
+            &GOOD.replace(
+                "\"reads_out\": 90, \"reads_dropped\": 10",
+                "\"reads_out\": 1000000, \"reads_dropped\": 0",
+            ),
+        )
+        .unwrap();
+        let v = validate_report(&doc);
+        assert!(
+            v.errors.iter().any(|e| e.contains("record identity broken")),
+            "the record identity must be the reason: {:?}",
+            v.errors
+        );
+    }
+
+    #[test]
+    fn a_resumed_run_reconciles_through_reads_preloaded() {
+        // fastdedup publishes `reads_preloaded` when it adopts an existing
+        // output: reads_out alone can legitimately exceed reads_in, so the
+        // two-term rule must not be applied to that shape.
+        let resumed = r#"{
+          "schema": "fastsuite.report.v1",
+          "tool": "fastdedup",
+          "tool_version": "1.3.0",
+          "command": "fastdedup -1 a.fq -o b.fq",
+          "metrics": {
+            "reads_in": 4, "reads_preloaded": 19999,
+            "reads_out": 20000, "reads_duplicate": 3
+          }
+        }"#;
+        let doc: serde_json::Value = serde_json::from_str(resumed).unwrap();
+        let v = validate_report(&doc);
+        assert!(v.errors.is_empty(), "{:?}", v.errors);
+
+        // A resumed report whose three terms do not close is still refused.
+        let broken: serde_json::Value =
+            serde_json::from_str(&resumed.replace("\"reads_duplicate\": 3", "\"reads_duplicate\": 4"))
+                .unwrap();
+        let v = validate_report(&broken);
+        assert!(
+            v.errors.iter().any(|e| e.contains("reads_preloaded")),
+            "the three-term identity must be reported: {:?}",
+            v.errors
+        );
+    }
+
+    #[test]
+    fn the_base_identity_is_checked_without_bases_trimmed() {
+        // REPORT-SCHEMA: the identity applies when bases_out and bases_dropped
+        // are present, a missing operand reading as 0. Requiring all four meant
+        // a report that simply omitted bases_trimmed skipped the check.
+        let p = tmp("no_trim.json", &GOOD.replace("\"bases_trimmed\": 1200, ", ""));
+        let err = check_report(&p).unwrap_err().to_string();
+        assert!(err.contains("problem"), "{err}");
+        std::fs::remove_file(p).ok();
+
+        // The same shape that DOES close (bases_in == bases_out + bases_dropped)
+        // must pass: the check is the identity, not the presence of a key.
+        let closing = GOOD
+            .replace("\"bases_trimmed\": 1200, ", "")
+            .replace("\"bases_in\": 15000", "\"bases_in\": 13800");
+        let p = tmp("no_trim_ok.json", &closing);
+        assert!(check_report(&p).is_ok(), "a closing three-term identity must pass");
         std::fs::remove_file(p).ok();
     }
 

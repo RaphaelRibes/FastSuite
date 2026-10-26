@@ -353,22 +353,30 @@ fn run_sample(
                     && outputs_present
                 {
                     println!("fasthelper: resumed {key}");
-                    entries.push((
-                        step_idx,
-                        serde_json::json!({
-                            "sample": sample.name,
-                            "tool": tool,
-                            "binary": prev.binary.clone(),
-                            "argv": prev.argv.clone(),
-                            "exit": prev.exit,
-                            "elapsed_s": 0.0,
-                            "log": s(&log),
-                            "resumed": true,
-                            "tool_version": prev.version.clone(),
-                            "inputs": inputs_json(&prev.inputs),
-                            "outputs": inputs_json(&prev.outputs),
-                        }),
-                    ));
+                    let mut entry = serde_json::json!({
+                        "sample": sample.name,
+                        "tool": tool,
+                        "binary": prev.binary.clone(),
+                        "argv": prev.argv.clone(),
+                        "exit": prev.exit,
+                        "elapsed_s": 0.0,
+                        "log": s(&log),
+                        "resumed": true,
+                        "tool_version": prev.version.clone(),
+                        "inputs": inputs_json(&prev.inputs),
+                        "outputs": inputs_json(&prev.outputs),
+                    });
+                    // Re-emit the guard verdict this step recorded: a resumed
+                    // step is not re-measured, so a run that forgot the block
+                    // published `tripped_samples: []` and exited 0 on the exact
+                    // run that had exited 2.
+                    if let Some(g) = &prev.adapter_guard {
+                        entry["adapter_guard"] = g.clone();
+                        if g.get("tripped").and_then(|t| t.as_bool()) == Some(true) {
+                            adapter_trips.push(sample.name.clone());
+                        }
+                    }
+                    entries.push((step_idx, entry));
                     reports.push((sample.name.clone(), json_path.clone()));
                     // The chain continues from this step's output: the file
                     // the resumed step produced (same argv, same inputs) is
@@ -419,19 +427,22 @@ fn run_sample(
                 failed.push(format!("{}/{}", sample.name, tool));
                 break;
             }
-            // The report must also PARSE. A tool that exited 0 and left a
-            // corrupt --json used to pass this check, be published as a
-            // zero-metric "unparsable" row, and then be resumed forever: the
-            // resume signature is size+mtime, and neither ever changed.
-            if let Err(e) = parses_as_json(&json_path) {
+            // The report must also satisfy the contract. A tool that exited 0
+            // and left a corrupt --json used to pass this check, be published
+            // as a zero-metric "unparsable" row, and then be resumed forever:
+            // the resume signature is size+mtime, and neither ever changed.
+            // The same rules `check --report` applies run here, so a report the
+            // validator refuses cannot be ingested silently (a nested metric
+            // used to disappear from the aggregate with no note and exit 0).
+            if let Err(e) = report_contract_problems(&json_path) {
                 eprintln!(
-                    "fasthelper: {} for {} exited 0 but wrote an unparsable report: {} is not \
-                     valid JSON ({e}) — treating the step as failed",
+                    "fasthelper: {} for {} exited 0 but wrote an unusable report: {} — \
+                     {e} — treating the step as failed",
                     tool,
                     sample.name,
                     json_path.display()
                 );
-                failed.push(format!("{}/{}", sample.name, tool));
+                failed.push(format!("{}/{tool}", sample.name));
                 break;
             }
         }
@@ -595,15 +606,27 @@ fn s(p: &Path) -> String {
     p.display().to_string()
 }
 
-/// Does `path` parse as JSON? Returns the parse error text when it does not.
+/// Parse a step's `--json` report and check it against the contract
+/// `check --report` enforces — one rule set, one implementation, so a report
+/// the validator rejects can never be ingested by the production path.
 ///
-/// A step's `--json` file is its measurement: an unparsable one is not a report
-/// of zero metrics, it is no report at all, and the run must not continue on it.
-fn parses_as_json(path: &Path) -> std::result::Result<(), String> {
+/// A document with no `schema` key is a legacy raw report (fastmaps' heatmap
+/// grid, pre-wrapper fastprep stats): the aggregator accepts those by design,
+/// so the runner does not refuse them here. A document that NAMES a schema must
+/// satisfy the rules that schema states.
+fn report_contract_problems(path: &Path) -> std::result::Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str::<serde_json::Value>(&text)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let doc = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("not valid JSON: {e}"))?;
+    if doc.get("schema").is_none() {
+        return Ok(());
+    }
+    let verdict = crate::check::validate_report(&doc);
+    if verdict.errors.is_empty() {
+        Ok(())
+    } else {
+        Err(verdict.errors.join("; "))
+    }
 }
 
 /// Run `<bin> --version` and return its trimmed stdout (None if it fails).
@@ -652,6 +675,10 @@ struct ResumeEntry {
     inputs: Vec<(String, u64, i64, u32)>,
     /// The same signature for every file the step was expected to produce.
     outputs: Vec<(String, u64, i64, u32)>,
+    /// The residual-adapter guard's verdict for this step, when it ran. Without
+    /// it a resumed run forgot that the sample tripped the guard: the trip is
+    /// measured in the step, and a resumed step never re-measures.
+    adapter_guard: Option<serde_json::Value>,
 }
 
 /// (path, size, mtime_secs, mtime_nanos) for each of `paths`. Cheap, and an
@@ -740,6 +767,10 @@ fn load_resume(outdir: &Path) -> BTreeMap<String, ResumeEntry> {
             let exit = c["exit"].as_i64().unwrap_or(-1) as i32;
             let inputs = sig_from_json(&c["inputs"]);
             let outputs = sig_from_json(&c["outputs"]);
+            // The guard's verdict travels with the step it measured: a resumed
+            // step cannot re-measure it, and dropping the block turned a
+            // --fail-on-adapter-residual run into exit 0 on the second pass.
+            let adapter_guard = c.get("adapter_guard").cloned().filter(|v| !v.is_null());
             map.insert(
                 format!("{sample}/{tool}"),
                 ResumeEntry {
@@ -749,6 +780,7 @@ fn load_resume(outdir: &Path) -> BTreeMap<String, ResumeEntry> {
                     exit,
                     inputs,
                     outputs,
+                    adapter_guard,
                 },
             );
         }
@@ -884,6 +916,13 @@ pub fn run(args: &RunArgs) -> Result<()> {
         cfg.run.keep_intermediate = true;
     }
     let force = args.force;
+    // The values `check -c` refuses are refused here too, at minute zero: an
+    // empty step list produced an empty report and exit 0, `gz_level = 42`
+    // passed validation and died inside the first tool, and a thread count
+    // beyond any machine was handed to every step.
+    for problem in crate::check::config_problems(&cfg) {
+        bail!("{problem}");
+    }
     // Minute zero: a step name that `check` would reject must fail here too,
     // before a sample directory exists or a tool is forked. A typo used to be
     // skipped with a warning (and, before that, fail only after the earlier

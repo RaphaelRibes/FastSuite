@@ -562,10 +562,17 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
             .unwrap_or("unknown")
             .to_string();
         let mut metrics = BTreeMap::new();
+        // A metric the tolerant reader has to drop is NAMED: silently losing it
+        // is how `{"adapter_content": {"r1": 12}}` vanished from an aggregate
+        // with exit 0 (the v1 rule is a flat numeric namespace).
+        let mut dropped: Vec<String> = Vec::new();
         if let Some(m) = v.get("metrics").and_then(|m| m.as_object()) {
             for (k, val) in m {
-                if let Some(f) = num(val) {
-                    metrics.insert(k.clone(), f);
+                match num(val) {
+                    Some(f) => {
+                        metrics.insert(k.clone(), f);
+                    }
+                    None => dropped.push(k.clone()),
                 }
             }
         }
@@ -585,7 +592,7 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
         // dropped with every other top-level block, so a --no-quality caveat
         // never reached the aggregate. A note is the carrier: the aggregate's
         // json and html both render notes, and `metrics` must stay numeric.
-        let notes = v
+        let mut notes = v
             .get("assumptions")
             .and_then(|a| a.as_array())
             .map(|assumptions| {
@@ -605,6 +612,11 @@ pub fn adapt_file(path: &Path, sample_hint: Option<&str>) -> Result<Option<ToolR
                     .collect::<Vec<String>>()
             })
             .unwrap_or_default();
+        for k in &dropped {
+            notes.push(format!(
+                "metric `{k}` dropped: not a number (metrics must stay a flat numeric namespace)"
+            ));
+        }
         return Ok(Some(ToolReport {
             sample,
             tool,
@@ -1198,10 +1210,10 @@ pub fn write_reports(
     formats: &[String],
     matrix: Option<&Matrix<'_>>,
 ) -> Result<Vec<PathBuf>> {
-    std::fs::create_dir_all(outdir)
-        .with_context(|| format!("creating {}", outdir.display()))?;
-    let mut written = Vec::new();
-    let mut owned_matrix: Option<Matrix<'_>> = None;
+    // Validate the WHOLE list before the first file is created: a bad entry
+    // used to surface after report.json had been written, so `--format
+    // json,bogus` left a half-published directory behind on a usage error.
+    let mut plan: Vec<(&str, &str)> = Vec::with_capacity(formats.len());
     for f in formats {
         let name = match f.trim() {
             "json" => "report.json",
@@ -1210,11 +1222,18 @@ pub fn write_reports(
             "html" => "report.html",
             other => anyhow::bail!("unknown format '{other}' (json,tsv,md,html)"),
         };
+        plan.push((f.trim(), name));
+    }
+    std::fs::create_dir_all(outdir)
+        .with_context(|| format!("creating {}", outdir.display()))?;
+    let mut written = Vec::new();
+    let mut owned_matrix: Option<Matrix<'_>> = None;
+    for (f, name) in plan {
         let path = outdir.join(name);
         let file = std::fs::File::create(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         let mut w = BufWriter::new(file);
-        match f.trim() {
+        match f {
             "json" => write_json(&mut w, title, reports)?,
             "tsv" => {
                 if matrix.is_none() && owned_matrix.is_none() {
@@ -1416,6 +1435,16 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
         None
     };
     let written = write_reports(title, &reports, &a.outdir, &formats, matrix.as_ref())?;
+    // The table goes out BEFORE any gate: `--stdout` is how a caller reads the
+    // aggregate, and `process::exit(2)` below used to skip it exactly when a
+    // threshold tripped (exit 2 with zero bytes on stdout).
+    if a.stdout {
+        let stdout = std::io::stdout();
+        let mut w = BufWriter::new(stdout.lock());
+        write_matrix_tsv(&mut w, matrix.as_ref().expect("built when --stdout"))
+            .context("printing report.tsv")?;
+        w.flush()?;
+    }
     if !thresholds.is_empty() {
         let tripped = evaluate_thresholds(&reports, &thresholds);
         if !tripped.is_empty() {
@@ -1428,13 +1457,6 @@ pub fn cmd_concatenate(a: &ReportArgs) -> Result<()> {
             );
             std::process::exit(2);
         }
-    }
-    if a.stdout {
-        let stdout = std::io::stdout();
-        let mut w = BufWriter::new(stdout.lock());
-        write_matrix_tsv(&mut w, matrix.as_ref().expect("built when --stdout"))
-            .context("printing report.tsv")?;
-        w.flush()?;
     }
     println!(
         "fasthelper: concatenated {} report(s) from {} sample(s) -> {}",

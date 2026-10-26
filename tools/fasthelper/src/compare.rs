@@ -50,6 +50,19 @@ pub fn cmd_compare(before: &[PathBuf], after: &[PathBuf], outdir: &Path) -> Resu
                 samples.iter().next().copied().unwrap_or("<sample>")
             );
         }
+        // The same collision one level down: two tools of one sample merged
+        // last-wins, so `--before` holding fastdedup.json and fastprep.json
+        // published fastprep's numbers and dropped fastdedup's with exit 0.
+        let tools: BTreeSet<&str> = reports.iter().map(|r| r.tool.as_str()).collect();
+        if tools.len() > 1 {
+            anyhow::bail!(
+                "compare is a single-tool before/after tool: --{side} holds {} tools ({}). \
+                 Point it at one tool's report per side, e.g. --{side} <run>/<sample>/{}.json",
+                tools.len(),
+                tools.iter().copied().collect::<Vec<_>>().join(", "),
+                tools.iter().next().copied().unwrap_or("<tool>")
+            );
+        }
     }
     let bm = merge_metrics(&b);
     let am = merge_metrics(&a);

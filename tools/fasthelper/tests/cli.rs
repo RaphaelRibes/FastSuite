@@ -600,7 +600,7 @@ while [ $# -gt 0 ]; do
 done
 mkdir -p "$(dirname "$out")" "$(dirname "$json")"
 md5sum "$in" > "$out"
-printf '{"schema":"fastsuite.report.v1","tool":"fastdedup","tool_version":"9.9.9","metrics":{"duplicate_rate":0.0}}\n' > "$json"
+printf '{"schema":"fastsuite.report.v1","tool":"fastdedup","tool_version":"9.9.9","command":"fastdedup stub","metrics":{"duplicate_rate":0.0}}\n' > "$json"
 "#;
 
 #[test]
@@ -906,7 +906,7 @@ fn check_refuses_duplicate_sample_names() {
     std::fs::write(
         &ok,
         format!(
-            "[run]\nname = \"ok\"\nsteps = []\n\n[[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n\n\
+            "[run]\nname = \"ok\"\nsteps = [\"fastcheck\"]\n\n[steps.fastcheck]\nenabled = false\n\n[[samples]]\nname = \"lib1\"\nr1 = \"{}\"\n\n\
              [[samples]]\nname = \"lib2\"\nr1 = \"{}\"\n",
             a.display(),
             b.display()
@@ -1349,7 +1349,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 mkdir -p "$(dirname "$json")"
-printf '{"schema":"fastsuite.report.v1","tool":"fastcheck","tool_version":"9.9.9","metrics":{"reads":2}}\n' > "$json"
+printf '{"schema":"fastsuite.report.v1","tool":"fastcheck","tool_version":"9.9.9","command":"fastcheck stub","metrics":{"reads":2}}\n' > "$json"
 exit 0
 "#;
 
@@ -2411,4 +2411,366 @@ fn check_validates_the_simulate_block() {
         stderr.contains("fastsim"),
         "the missing fastsim binary must be named: {stderr}"
     );
+}
+
+// ------------------------------------ 2026-10-26 contract/gate round ---- //
+
+/// A stand-in fastcheck that writes a v1 report carrying a NESTED metric: the
+/// shape `check --report` refuses (rule 1: a flat numeric namespace).
+const FAKE_NESTED_METRIC_CHECK: &str = r#"#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo "fastcheck 9.9.9"; exit 0; fi
+json=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) json="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$(dirname "$json")"
+printf '{"schema":"fastsuite.report.v1","tool":"fastcheck","tool_version":"9.9.9","command":"fastcheck stub","metrics":{"reads":2,"adapter_content":{"r1":12}}}\n' > "$json"
+exit 0
+"#;
+
+#[test]
+fn a_step_whose_report_breaks_the_contract_fails_like_check_report() {
+    // The production path ingested what the validator rejects: a report with
+    // `"adapter_content": {"r1": 12}` was accepted by `concatenate` with exit 0
+    // and the metric silently absent. The runner must apply the same rules.
+    let d = tmpdir("nested_metric_run");
+    let tools = d.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    write_exe(&tools.join("fastcheck"), FAKE_NESTED_METRIC_CHECK);
+    let out = d.join("out");
+    let fq = sample_fastq(&d);
+    let cfg = d.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"nested\"\noutdir = \"{}\"\nsteps = [\"fastcheck\"]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            out.display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run(&[
+        "run",
+        "-c",
+        cfg.to_str().unwrap(),
+        "--tools-dir",
+        tools.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "an invalid report must fail the step: {stderr}");
+    assert!(
+        stderr.contains("S1/fastcheck.json"),
+        "the failure must name the report: {stderr}"
+    );
+    assert!(
+        stderr.contains("adapter_content") && stderr.contains("not a number"),
+        "the failure must carry the validator's reason: {stderr}"
+    );
+    let agg = std::fs::read_to_string(out.join("report.json")).unwrap_or_default();
+    assert!(
+        !agg.contains("adapter_content"),
+        "a rejected report must not reach the aggregate: {agg}"
+    );
+}
+
+#[test]
+fn concatenate_names_every_metric_the_tolerant_reader_drops() {
+    // The tolerant adapter still ingests such a file (concatenate is not the
+    // gate), but a metric it cannot carry must be NAMED, never silently absent.
+    let d = tmpdir("nested_metric_note");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    let doc = serde_json::json!({
+        "schema": "fastsuite.report.v1",
+        "tool": "fastprep",
+        "tool_version": "0.4.1",
+        "command": "fastprep stub",
+        "metrics": {
+            "reads_in": 10, "reads_out": 10, "reads_dropped": 0,
+            "adapter_content": {"r1": 12}
+        }
+    });
+    std::fs::write(
+        reports.join("fastprep.json"),
+        serde_json::to_string(&doc).unwrap(),
+    )
+    .unwrap();
+    let out = d.join("out");
+
+    let (_, stderr, code) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "the tolerant path still ingests it: {stderr}");
+    let agg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("report.json")).unwrap()).unwrap();
+    let row = &agg["reports"][0];
+    assert!(
+        row["metrics"].get("adapter_content").is_none(),
+        "a nested value cannot be a metric: {agg}"
+    );
+    let notes = row["notes"].to_string();
+    assert!(
+        notes.contains("adapter_content") && notes.contains("dropped"),
+        "the note must name the dropped metric: {notes}"
+    );
+}
+
+/// A config whose only step carries `args`, for the `check -c` flag tests.
+fn write_args_config(dir: &Path, args: &str) -> PathBuf {
+    let fq = sample_fastq(dir);
+    let cfg = dir.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[run]\nname = \"flags\"\noutdir = \"{}\"\nsteps = [\"fastprep\"]\n\n\
+             [steps.fastprep]\nargs = [{args}]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            dir.join("out").display(),
+            fq.display()
+        ),
+    )
+    .unwrap();
+    cfg
+}
+
+#[test]
+fn check_refuses_a_flag_that_is_only_a_prefix_of_a_real_one() {
+    // `--min-le` is a substring of `--min-len`, and the old test was
+    // `help.contains(flag)`, so a truncated flag validated and the tool then
+    // died on an unknown argument at the first step.
+    require_tool("fastprep");
+    let d = tmpdir("check_prefix_flag");
+    let td = tools_dir();
+    let cfg = write_args_config(&d, "\"--min-le\", \"100\"");
+    let (_, stderr, code) = run(&[
+        "check",
+        "-c",
+        cfg.to_str().unwrap(),
+        "--tools-dir",
+        td.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "a prefix of a real flag must be refused: {stderr}");
+    assert!(
+        stderr.contains("does not accept '--min-le'"),
+        "the refusal must name the truncated flag: {stderr}"
+    );
+
+    // The whole flag it was truncated from still validates.
+    let ok = write_args_config(&d, "\"--min-len\", \"100\"");
+    let (_, ok_err, ok_code) = run(&[
+        "check",
+        "-c",
+        ok.to_str().unwrap(),
+        "--tools-dir",
+        td.to_str().unwrap(),
+    ]);
+    assert_eq!(ok_code, 0, "a real flag must stay valid: {ok_err}");
+}
+
+#[test]
+fn check_validates_every_flag_not_just_the_first() {
+    // `.find()` returned only the first `--token`, so a typo in the SECOND one
+    // was never looked at: the gate blessed a config the tool refuses.
+    require_tool("fastprep");
+    let d = tmpdir("check_second_flag");
+    let td = tools_dir();
+    let cfg = write_args_config(&d, "\"--min-len\", \"100\", \"--bogus-flag\", \"1\"");
+    let (_, stderr, code) = run(&[
+        "check",
+        "-c",
+        cfg.to_str().unwrap(),
+        "--tools-dir",
+        td.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "the second unknown flag must be refused: {stderr}");
+    assert!(
+        stderr.contains("does not accept '--bogus-flag'"),
+        "the refusal must name the second flag: {stderr}"
+    );
+    assert!(
+        !stderr.contains("does not accept '--min-len'"),
+        "the valid first flag must not be blamed: {stderr}"
+    );
+}
+
+#[test]
+fn check_refuses_gz_level_threads_and_empty_steps_the_tools_refuse() {
+    let d = tmpdir("check_ranges");
+    let fq = sample_fastq(&d);
+    let body = |run_extra: &str, steps: &str| {
+        format!(
+            "[run]\nname = \"r\"\noutdir = \"{}\"\n{run_extra}steps = [{steps}]\n\n\
+             [[samples]]\nname = \"S1\"\nr1 = \"{}\"\n",
+            d.join("out").display(),
+            fq.display()
+        )
+    };
+    let td = tools_dir();
+    let td = td.to_str().unwrap();
+
+    // gz_level 42: every tool bails on --gz-level outside 1..=9, and `check`
+    // used to bless it.
+    let gz = d.join("gz.toml");
+    std::fs::write(&gz, body("gz_level = 42\n", "\"fastcheck\"")).unwrap();
+    let (_, stderr, code) = run(&[
+        "check",
+        "-c",
+        gz.to_str().unwrap(),
+        "--tools-dir",
+        td,
+    ]);
+    assert_ne!(code, 0, "gz_level 42 must be refused: {stderr}");
+    assert!(
+        stderr.contains("gz_level") && stderr.contains("[1, 9]"),
+        "the refusal must state the range: {stderr}"
+    );
+    // `run` refuses the same value, before any tool is forked.
+    let (_, run_err, run_code) = run(&[
+        "run",
+        "-c",
+        gz.to_str().unwrap(),
+        "--tools-dir",
+        td,
+    ]);
+    assert_ne!(run_code, 0, "run must refuse it too: {run_err}");
+    assert!(run_err.contains("gz_level"), "{run_err}");
+
+    // A thread count no machine has: a typo gate, refused at minute zero.
+    let th = d.join("threads.toml");
+    std::fs::write(&th, body("threads = 100000\n", "\"fastcheck\"")).unwrap();
+    let (_, stderr, code) = run(&[
+        "check",
+        "-c",
+        th.to_str().unwrap(),
+        "--tools-dir",
+        td,
+    ]);
+    assert_ne!(code, 0, "an absurd thread count must be refused: {stderr}");
+    assert!(stderr.contains("threads"), "{stderr}");
+
+    // No steps at all: the run produced an empty report and exited 0.
+    let empty = d.join("empty.toml");
+    std::fs::write(&empty, body("", "")).unwrap();
+    let (_, stderr, code) = run(&[
+        "check",
+        "-c",
+        empty.to_str().unwrap(),
+        "--tools-dir",
+        td,
+    ]);
+    assert_ne!(code, 0, "an empty step list must be refused: {stderr}");
+    assert!(
+        stderr.contains("steps is empty"),
+        "the refusal must say there is nothing to run: {stderr}"
+    );
+}
+
+#[test]
+fn compare_refuses_more_than_one_tool_per_side() {
+    // One level below the multi-sample refusal: two tools of one sample were
+    // merged last-wins, so one tool's numbers were published and the other's
+    // dropped, with exit 0 and no hint that a report had been discarded.
+    let d = tmpdir("compare_multitool");
+    let before = d.join("before").join("alpha");
+    let after = d.join("after").join("alpha");
+    std::fs::create_dir_all(&before).unwrap();
+    std::fs::create_dir_all(&after).unwrap();
+    write_report(&before, "fastcheck.json", 100, 0.41);
+    write_metric_report(&before, "fastdedup.json", "reads_in", 100.0);
+    write_report(&after, "fastcheck.json", 90, 0.42);
+    let out = d.join("out");
+
+    let (_, stderr, code) = run(&[
+        "compare",
+        "--before",
+        d.join("before").to_str().unwrap(),
+        "--after",
+        d.join("after").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "two tools on one side must be refused: {stderr}");
+    assert!(
+        stderr.contains("fastcheck") && stderr.contains("fastdedup"),
+        "the refusal must name the tools it found: {stderr}"
+    );
+    assert!(
+        stderr.contains("before"),
+        "the refusal must name the side that holds them: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("single-tool"),
+        "it must say compare is a single-tool before/after tool: {stderr}"
+    );
+    assert!(
+        !out.join("compare.tsv").exists(),
+        "a refused compare must not publish a table built from one tool's numbers"
+    );
+}
+
+#[test]
+fn stdout_is_printed_before_a_threshold_exits_2() {
+    // `process::exit(2)` ran before the `--stdout` block, so the gate that
+    // tripped also threw away the table the caller asked for: exit 2, 0 bytes.
+    let d = tmpdir("stdout_gate");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    write_report(&reports, "a.json", 100, 0.41);
+    let out = d.join("out");
+
+    let (stdout, stderr, code) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--format",
+        "json",
+        "--stdout",
+        "--fail-on",
+        "gc_fraction>0.1",
+    ]);
+    assert_eq!(code, 2, "a tripped threshold must exit 2: {stderr}");
+    assert!(
+        !stdout.trim().is_empty(),
+        "--stdout must not be lost when the threshold trips: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("gc_fraction"),
+        "--stdout must carry the table: {stdout}"
+    );
+    assert!(stderr.contains("threshold tripped"), "{stderr}");
+}
+
+#[test]
+fn an_unknown_format_is_refused_before_anything_is_written() {
+    // `--format json,bogus` wrote report.json and only then bailed on "bogus":
+    // a usage error left a half-published directory behind.
+    let d = tmpdir("format_bogus");
+    let reports = d.join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    write_report(&reports, "a.json", 10, 0.5);
+    let out = d.join("out");
+
+    let (_, stderr, code) = run(&[
+        "concatenate",
+        reports.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--format",
+        "json,bogus",
+    ]);
+    assert_ne!(code, 0, "an unknown format must be an error: {stderr}");
+    assert!(stderr.contains("bogus"), "{stderr}");
+    assert!(
+        !out.join("report.json").exists(),
+        "a usage error must not publish a partial aggregate"
+    );
+    assert!(!out.join("report.tsv").exists());
 }

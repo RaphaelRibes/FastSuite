@@ -412,3 +412,55 @@ fn random_dna(n: usize, seed: u64) -> String {
 }
 
 const TRUSEQ_R1: &str = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
+
+/// Scenario 4 — a resumed run must keep the verdict the first run measured.
+///
+/// The guard trips inside the trimming step; the second run resumes that step,
+/// so nothing re-measures anything. It used to publish
+/// `adapter_guard.tripped_samples: []` and exit 0 on the exact config that had
+/// exited 2 — the verdict was erased by the resume, not by a changed input.
+#[test]
+fn a_resumed_run_still_exits_2_on_the_same_residual_adapter() {
+    require_tools(&["fastcheck", "fastprep"]);
+    let d = tmpdir("resume_trip");
+    let raw = d.join("s1_R1.fastq");
+    fixture_fastq(&raw);
+    let out = d.join("run");
+    let cfg = d.join("fastsuite.toml");
+    // --no-adapter leaves the adapter in place: the guard trips.
+    write_config(&cfg, &out, &raw, "\"fastprep\"", "\"--no-adapter\"");
+    let td = tools_dir();
+    let args = [
+        "run",
+        "-c",
+        cfg.to_str().unwrap(),
+        "--tools-dir",
+        td.to_str().unwrap(),
+        "--fail-on-adapter-residual",
+    ];
+
+    let (_, stderr1, code1) = run(&args);
+    assert_eq!(code1, 2, "the first run must trip and exit 2: {stderr1}");
+    assert_eq!(read_manifest(&out)["adapter_guard"]["tripped_samples"][0], "s1");
+
+    // Same config, same inputs, same outdir: every step is resumed.
+    let (stdout2, stderr2, code2) = run(&args);
+    assert!(
+        stdout2.contains("resumed s1/fastprep"),
+        "this test is about the resumed path: {stdout2}"
+    );
+    assert_eq!(
+        code2, 2,
+        "a resume must not erase the guard's verdict: {stderr2}"
+    );
+    let man = read_manifest(&out);
+    let tripped = man["adapter_guard"]["tripped_samples"]
+        .as_array()
+        .unwrap();
+    assert!(
+        tripped.iter().any(|s| s == "s1"),
+        "the resumed manifest must still name the tripped sample: {man}"
+    );
+    // The measurement itself is carried, not just the boolean.
+    assert_eq!(man["commands"][0]["adapter_guard"]["tripped"], true, "{man}");
+}
