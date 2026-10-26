@@ -196,7 +196,7 @@ phase 2.5 — the replacement map is written to survive scrutiny.
 
 * The six binaries build in this tree; `cargo test` green: fastcheck 143,
   fastdedup 135, fastprep 306, fastsim 93, fastmaps 96, fasthelper 78, plus the
-  pathology bundle — 852 tests, 0 failures (2026-10-23; the per-tool manifest
+  pathology bundle — 962 tests, 0 failures (2026-10-26; the per-tool manifest
   `scripts/expected-test-counts.txt` is authoritative and `pixi run ci` asserts
   it). The 436 this bullet used to quote was the 2026-10 figure.
 * `fasthelper run -c examples/fastsuite.toml` executes

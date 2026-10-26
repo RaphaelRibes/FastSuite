@@ -613,7 +613,7 @@ the 57-grid**, the winner being config 37 — the shipped default with
 4 threads) —
 fastprep-winner is faster on 100/101 datasets (median 2.00×) and lighter on
 101/101 (34.3 MB median vs fastp's 1134.7 MB). The trim-accuracy benchmark
-(`docs/TRIM-ACCURACY.md`, `bench/scripts/overtrim_vs_fastp.py`) is a separate
+(`docs/TRIM-ACCURACY.md`; its four-tool producer is **missing from the repo** — `bench/scripts/trim_score.py` re-derives the fastprep rows) is a separate
 axis: there fastprep's **shipped** default is the worst of the four
 configurations and fastprep with `--head-dropout 0` matches or edges
 fastp-default. The earlier "fastp-default leads, 92.2% vs 66.5%" reading is
